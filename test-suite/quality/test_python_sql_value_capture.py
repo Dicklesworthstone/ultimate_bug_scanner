@@ -197,6 +197,136 @@ def program(body):
     return 'def run(cursor, qs, user, rows):\n' + body
 
 
+SET_UPDATE_HASH_REPRO = '''def run(cursor, qs, user, rows):
+    query = "SELECT count(*) FROM users WHERE name = 'alice'"
+    class Key:
+        def __hash__(self):
+            nonlocal query
+            query = f"SELECT count(*) FROM users WHERE name = '{user}'"
+            return 0
+    seen = set()
+    seen.update(Key() for _ in (1,))
+    return cursor.execute(query).fetchone()[0]
+'''
+
+
+OPAQUE_DONE_CURSOR_REPRO = '''def run(cursor, user):
+    query = "SELECT count(*) FROM users WHERE name = 'alice'"
+    class Consumer:
+        def update(self, values):
+            nonlocal query
+            query = f"SELECT count(*) FROM users WHERE name = '{user}'"
+    pending = (0 for _ in ())
+    tuple(pending)
+    Consumer().update(pending)
+    tuple(pending)
+    return cursor.execute(query).fetchone()[0]
+'''
+
+
+def set_update_hash_cases():
+    """Runtime effects of hashing, independently of the analyzer's model."""
+    prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+              '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
+              '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+              '            return 0\n    seen = set()\n')
+    tail = '    return cursor.execute(query).fetchone()[0]\n'
+    yield 'exact-bead', SET_UPDATE_HASH_REPRO
+    for name, update in (
+            ('eager-list', '    seen.update([Key()])\n'),
+            ('receiver-alias', '    receiver = seen\n    receiver.update(Key() for _ in (1,))\n'),
+            ('saved-method', '    consume = seen.update\n    consume(Key() for _ in (1,))\n'),
+            ('saved-receiver', '    consume = seen.update\n    seen = []\n'
+             '    consume(Key() for _ in (1,))\n'),
+            ('nested-tuple', '    seen.update((Key(),) for _ in (1,))\n'),
+            ('named-generator', '    pending = (Key() for _ in (1,))\n'
+             '    seen.update(pending)\n'),
+            ('unbound', '    set.update(seen, (Key() for _ in (1,)))\n'),
+            ('saved-unbound', '    consume = set.update\n'
+             '    consume(seen, (Key() for _ in (1,)))\n'),
+            ('qualified-constructor', '    import builtins\n    other = builtins.set()\n'
+             '    other.update(Key() for _ in (1,))\n'),
+            ('imported-constructor', '    from builtins import set as build\n    other = build()\n'
+             '    other.update(Key() for _ in (1,))\n'),
+            ('qualified-unbound', '    import builtins\n'
+             '    builtins.set.update(seen, (Key() for _ in (1,)))\n'),
+            ('conditional-receiver', '    receiver = seen if user else None\n'
+             '    receiver.update(Key() for _ in (1,))\n'),
+            ('conditional-callable', '    consume = seen.update if user else tuple\n'
+             '    consume(Key() for _ in (1,))\n'),
+            ('saved-conditional-receiver', '    receiver = seen if user else None\n'
+             '    consume = receiver.update\n    receiver = []\n'
+             '    consume(Key() for _ in (1,))\n'),
+            ('conditional-unpacked-callable', '    consume, ignored = (seen.update if user else tuple, 0)\n'
+             '    consume(Key() for _ in (1,))\n'),
+            ('conditional-unpacked-receiver', '    receiver, ignored = (seen if user else None, 0)\n'
+             '    receiver.update(Key() for _ in (1,))\n'),
+            ('mixed-generator-eager', '    values = (0 for _ in ()) if not user else [Key()]\n'
+             '    seen.update(values)\n'),
+            ('starred-inputs', '    chunks = ([Key()],)\n    seen.update(*chunks)\n'),
+            ('closure-captured-receiver', '    def consume():\n        seen.update([Key()])\n'
+             '    consume()\n'),
+            ('comprehension-captured-receiver', '    results = [seen.update([Key()]) for _ in (1,)]\n')):
+        yield name, program(prefix + update + tail)
+    yield 'equality-collision', program(
+        '    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+        '    class Key:\n        def __hash__(self):\n            return 0\n'
+        '        def __eq__(self, other):\n            nonlocal query\n'
+        '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+        '            return False\n    seen = set()\n'
+        '    seen.update(Key() for _ in (1, 2))\n' + tail)
+    yield 'captured-mutable-query', program(
+        '    queries = ["SELECT count(*) FROM users WHERE name = \'alice\'"]\n'
+        '    class Key:\n        def __hash__(self):\n'
+        '            queries[0] = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+        '            return 0\n    seen = set()\n'
+        '    seen.update(Key() for _ in (1,))\n'
+        '    return cursor.execute(queries[0]).fetchone()[0]\n')
+    yield 'delegated-write', program(
+        '    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+        '    def poison():\n        nonlocal query\n'
+        '        query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+        '    class Key:\n        def __hash__(self):\n            poison()\n'
+        '            return 0\n    seen = set()\n'
+        '    seen.update(Key() for _ in (1,))\n' + tail)
+    yield 'sql-named-zeroarg-helper', program(
+        '    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+        '    def execute():\n        nonlocal query\n'
+        '        query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+        '    class Key:\n        def __hash__(self):\n            execute()\n'
+        '            return 0\n    seen = set()\n'
+        '    seen.update(Key() for _ in (1,))\n' + tail)
+    # Saved conditional aliases can outlive a later execution of the same
+    # assignment AST. This is a mandatory activation oracle for origin history,
+    # not a claim that the proposed snapshot implementation already passes it.
+    yield 'loop-revisited-saved-conditional', program(prefix
+        + '    class Consumer:\n        def update(self, values):\n'
+        '            for value in values:\n                pass\n'
+        '    receiver = seen\n'
+        '    for index in (0, 1):\n'
+        '        current = receiver.update if user else tuple\n'
+        '        if index == 0:\n            saved = current\n'
+        '        receiver = Consumer()\n'
+        '    saved(Key() for _ in (1,))\n' + tail)
+
+    yield 'global-conditional-receiver', 'receiver = None\n' + program(
+        '    global receiver\n' + prefix
+        + '    receiver = set() if user else None\n'
+        '    receiver.update(Key() for _ in (1,))\n' + tail)
+    yield 'nonlocal-conditional-receiver', program(prefix
+        + '    receiver = None\n'
+        '    def choose():\n        nonlocal receiver\n'
+        '        receiver = set() if user else None\n'
+        '    choose()\n    receiver.update(Key() for _ in (1,))\n' + tail)
+    yield 'saved-callable-finally', program(prefix
+        + '    class Consumer:\n        def update(self, values):\n'
+        '            for value in values:\n                pass\n'
+        '    receiver = seen\n'
+        '    try:\n        consume = receiver.update if user else tuple\n'
+        '    finally:\n        receiver = Consumer()\n'
+        '    consume(Key() for _ in (1,))\n' + tail)
+
+
 STRING_JOIN_CASES = (
     ('string-join-generator-write', '    separator = ""\n    query = "SELECT 1"\n'
      '    separator.join((query := f"SELECT {user}") for unused in [0])\n'
@@ -765,6 +895,8 @@ with closing(sqlite3.connect(':memory:')) as connection:
         if inputs['mode'] == 'keyword':
             cursor = KeywordCursor(cursor)
         actual = run(cursor, None, inputs['value'], [])
+    elif inputs['mode'] == 'cursor-user':
+        actual = run(cursor, inputs['value'])
     else:
         raise ValueError('unknown witness mode')
 print(json.dumps({'rows': actual, 'python': sys.version, 'sqlite_version': sqlite3.sqlite_version,
@@ -1669,7 +1801,7 @@ class SQLValueCaptureTests(unittest.TestCase):
                     folder.mkdir()
                     path = folder / 'case.py'
                     path.write_text(source, encoding='utf-8')
-                    expected = [('case.py', sink_line)]
+                    expected = [] if sink_line is None else [('case.py', sink_line)]
                     for filename, (body, lines) in (sources or {}).items():
                         (folder / filename).write_text(body, encoding='utf-8')
                         expected.extend((filename, line) for line in lines)
@@ -1865,7 +1997,244 @@ class SQLValueCaptureTests(unittest.TestCase):
                          '    seen = set()\n    seen.update(Key() for _ in (1,))\n'
                          '    return cursor.fetchone()[0]\n')
         self.assertEqual(sqlite_witness(self.artifacts, 'set-update-hash-sink', source)['rows'], 2)
-        self.inspect('set-update-hash-sink', source, ((CRITICAL, 4),))
+        path = self.artifacts / 'set-update-hash-sink.py'
+        path.write_text(source, encoding='utf-8')
+        hits = []
+        # Recognizing the direct sink never proves all callback effects.
+        # Keep the exact known finding while making that boundary explicit.
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
+            for rule, found, line, column, code in detector.find([path]):
+                hits.append((rule, found, line, column))
+        self.assertEqual(hits, [(CRITICAL, path, 4, 1)])
+
+    def test_set_update_hash_callbacks_never_certify_mutated_sql_clean(self):
+        # The bead's exact source yields a plain Key(), with no SQL text in
+        # the yielded object. Hashing that object still writes the later SQL.
+        # Reporting an explicit unsupported protocol is sound until class
+        # callback effects can be followed; a complete empty result is not.
+        for name, source in set_update_hash_cases():
+            with self.subTest(case=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'update-hash-' + name, source)['rows'], 2)
+                path = self.artifacts / ('update-hash-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                expected = [(CRITICAL, len(source.splitlines()))]
+                found = []
+                failure = None
+                started = time.perf_counter()
+                try:
+                    with patch.dict(os.environ, {detector.SANITIZER_ENV: ''}):
+                        found.extend(detector.find([path]))
+                except detector.SQLFlowLimit as exc:
+                    failure = exc
+                actual = sorted((rule, line) for rule, _, line, _, _ in found)
+                (self.artifacts / ('update-hash-' + name + '.json')).write_text(json.dumps({
+                    'case': name, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                    'detector_sha256': self.identity, 'python': sys.version,
+                    'elapsed_seconds': time.perf_counter() - started,
+                    'expected_critical': expected, 'actual': actual,
+                    'incomplete_reason': str(failure) if failure else None,
+                    'components': failure.components if failure else [],
+                }, indent=2) + '\n', encoding='utf-8')
+                if failure is None:
+                    self.assertEqual(actual, expected, source)
+                else:
+                    reason = {'captured-mutable-query':
+                              '(?:key callbacks|generator consumer|list mutation at an aliased target)',
+                              'mixed-generator-eager':
+                              '(?:key callbacks|mixed generator binding)'}.get(
+                                  name, '(?:key callbacks|generator consumer)')
+                    self.assertRegex(str(failure), reason + '.*incomplete')
+                    self.assertTrue(failure.components)
+                    self.assertTrue(all(component['file'] == str(path) for component in failure.components))
+                    self.assertTrue(set(actual).issubset(expected), actual)
+                self.assertTrue(all(found_path == path and col == 1
+                                    for _, found_path, _, col, _ in found))
+
+    def test_set_update_hash_free_controls(self):
+        prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+                  '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
+                  '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+                  '            return 0\n    seen = set()\n')
+        for name, update in (
+                ('primitive-list', '    seen.update([None, 1, "field", ("pair", 2)])\n'),
+                ('primitive-generator', '    seen.update(value for value in (None, 1, "field", ("pair", 2)))\n'),
+                ('empty-list', '    seen.update([])\n'),
+                ('empty-generator', '    seen.update(Key() for _ in ())\n'),
+                ('filtered-generator', '    seen.update(Key() for _ in (1,) if False)\n'),
+                ('exhausted-generator', '    pending = (Key() for _ in (1,))\n'
+                 '    alias = pending\n    list(pending)\n    seen.update(alias)\n'),
+                ('nonhashing-list-consumer', '    seen = []\n    seen.extend(Key() for _ in (1,))\n')):
+            source = program(prefix + update + '    return cursor.execute(query).fetchone()[0]\n')
+            with self.subTest(case=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'update-hash-free-' + name, source)['rows'], 1)
+                self.inspect('update-hash-free-' + name, source, ())
+
+    def test_set_update_review_preserves_inert_protocols_and_nonhashing_targets(self):
+        inert = program(
+            '    class Key:\n        def __hash__(self):\n            return 0\n'
+            '        def __eq__(self, other):\n            return False\n'
+            '    seen = set()\n    seen.update(Key() for _ in (1, 2))\n'
+            '    return cursor.execute("SELECT count(*) FROM users WHERE name = \'alice\'").fetchone()[0]\n')
+        self.assertEqual(sqlite_witness(self.artifacts, 'update-inert-protocols', inert)['rows'], 1)
+        self.inspect('update-inert-protocols', inert, ())
+        prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+                  '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
+                  '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+                  '            return 0\n    seen = set()\n')
+        for name, consume in (
+                ('unbound-empty', '    set.update(seen, ())\n'),
+                ('exhausted-reuse', '    pending = (Key() for _ in (1,))\n'
+                 '    tuple(pending)\n    seen.update(pending)\n    tuple(pending)\n'),
+                ('overwritten-callable', '    consume = seen.update\n    consume = tuple\n'
+                 '    consume(Key() for _ in (1,))\n'),
+                ('dead-conditional-callable', '    consume = seen.update if False else tuple\n'
+                 '    consume(Key() for _ in (1,))\n'),
+                ('dead-short-circuit-callable', '    consume = False and seen.update or tuple\n'
+                 '    consume(Key() for _ in (1,))\n'),
+                ('overwritten-conditional-callable', '    consume = seen.update if user else tuple\n'
+                 '    consume = tuple\n    consume(Key() for _ in (1,))\n'),
+                ('overwritten-receiver', '    class Consumer:\n'
+                 '        def update(self, values):\n'
+                 '            for value in values:\n                pass\n'
+                 '    receiver = seen\n    receiver = Consumer()\n'
+                 '    receiver.update(Key() for _ in (1,))\n'),
+                ('unrelated-unpacked-slot', '    class Consumer:\n'
+                 '        def update(self, values):\n'
+                 '            for value in values:\n                pass\n'
+                 '    receiver, unused = (Consumer(), seen)\n'
+                 '    receiver.update(Key() for _ in (1,))\n'),
+                ('overwritten-outer-cell', '    class Consumer:\n'
+                 '        def update(self, values):\n'
+                 '            for value in values:\n                pass\n'
+                 '    receiver = seen\n    receiver = Consumer()\n'
+                 '    def consume():\n        receiver.update([Key()])\n'
+                 '    consume()\n'),
+                ('overwritten-comprehension-cell', '    class Consumer:\n'
+                 '        def update(self, values):\n'
+                 '            for value in values:\n                pass\n'
+                 '    receiver = seen\n    receiver = Consumer()\n'
+                 '    results = [receiver.update([Key()]) for _ in (1,)]\n'),
+                ('starred-primitives', '    seen.update(*((1, 2), ("field",)))\n')):
+            source = program(prefix + consume + '    return cursor.execute(query).fetchone()[0]\n')
+            with self.subTest(control=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'update-review-' + name, source)['rows'], 1)
+                self.inspect('update-review-' + name, source, ())
+
+        # Saved list mutators already have their own explicit boundary. A
+        # definite overwrite must not resurrect the older native-set origin.
+        source = program(prefix + '    consume = seen.update\n    items = []\n'
+                         '    consume = items.extend\n    consume(Key() for _ in (1,))\n'
+                         '    return cursor.execute(query).fetchone()[0]\n')
+        self.assertEqual(sqlite_witness(self.artifacts, 'update-overwritten-list-method', source)['rows'], 1)
+        path = self.artifacts / 'update-overwritten-list-method.py'
+        path.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'list mutation capability escapes.*incomplete'):
+            list(detector.find([path]))
+
+        custom = ('class Consumer:\n    def update(self, values):\n'
+                  '        for value in values:\n            pass\n')
+        for name, declaration, consume in (
+                ('shadowed-set', custom + 'set = Consumer\n',
+                 '    seen.update(Key() for _ in (1,))\n'),
+                ('lookalike-qualified-set', custom
+                 + 'class Factory:\n    set = Consumer\nbuiltins = Factory()\n',
+                 '    other = builtins.set()\n    other.update(Key() for _ in (1,))\n')):
+            source = declaration + program(prefix + consume
+                                           + '    return cursor.execute(query).fetchone()[0]\n')
+            with self.subTest(control=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'update-review-' + name, source)['rows'], 1)
+                self.inspect('update-review-' + name, source, ())
+
+    def test_set_update_review_keeps_yielded_sinks_and_never_restarts_partial_cursors(self):
+        prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+                  '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
+                  '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+                  '            return 0\n    seen = set()\n')
+        cases = (
+            ('yielded-sink', '    seen.update((cursor.execute('
+             'f"SELECT count(*) FROM users WHERE name = \'{user}\'"), Key())[1] for _ in (1,))\n',
+             'collection key callbacks', [(CRITICAL, 9)], 2),
+            ('partial-cursor', '    pending = (Key() for _ in (1, 2))\n'
+             '    next(pending)\n    seen.update(pending)\n',
+             'partial generator consumption', [], 2),
+            # next() discards the Key without hashing it. A private probe
+            # must not restart at that item and invent its callback effect;
+            # precise remaining offsets are an existing explicit boundary.
+            ('partial-primitive-suffix', '    pending = (value for value in (Key(), 1))\n'
+             '    next(pending)\n    seen.update(pending)\n',
+             'partial generator consumption', [], 1),
+        )
+        for name, update, reason, expected, rows in cases:
+            source = program(prefix + update + '    return cursor.execute(query).fetchone()[0]\n')
+            path = self.artifacts / ('update-review-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            hits = []
+            with self.subTest(case=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'update-review-' + name, source)['rows'], rows)
+                with self.assertRaisesRegex(detector.SQLFlowLimit, reason + '.*incomplete'):
+                    for rule, found, line, column, code in detector.find([path]):
+                        self.assertEqual((found, column), (path, 1))
+                        hits.append((rule, line))
+                self.assertEqual(hits, expected)
+
+    def test_set_update_review_refuses_unproved_callback_class_identity(self):
+        for name, declaration in (
+                ('decorator', '    def identity(cls):\n        return cls\n'
+                 '    @identity\n    class Key:\n'),
+                ('metaclass', '    class Key(metaclass=type):\n')):
+            source = program(declaration
+                             + '        def __hash__(self):\n            return 0\n'
+                             '    seen = set()\n    seen.update(Key() for _ in (1,))\n'
+                             '    return cursor.execute("SELECT count(*) FROM users WHERE name = \'alice\'").fetchone()[0]\n')
+            path = self.artifacts / ('update-class-' + name + '.py')
+            path.write_text(source, encoding='utf-8')
+            with self.subTest(owner=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'update-class-' + name, source)['rows'], 1)
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
+                    list(detector.find([path]))
+
+    def test_exhausted_generator_does_not_prove_opaque_consumer_is_inert(self):
+        # This exact independent witness was incomplete on the incumbent.
+        # An empty exhausted iterator does not constrain arbitrary consumer
+        # effects; only a proven native operation can preserve a clean path.
+        source = OPAQUE_DONE_CURSOR_REPRO
+        self.assertEqual(sqlite_witness(self.artifacts, 'opaque-done-cursor', source,
+                                       mode='cursor-user', value="alice' OR 1=1 --")['rows'], 2)
+        path = self.artifacts / 'opaque-done-cursor.py'
+        path.write_text(source, encoding='utf-8')
+        findings = []
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'partial generator consumption.*incomplete'):
+            findings.extend(detector.find([path]))
+        self.assertEqual(findings, [])
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_set_update_hash_review(self):
+        cases = dict(set_update_hash_cases())
+        for name in ('unbound', 'qualified-constructor', 'sql-named-zeroarg-helper'):
+            self._assert_partial_cli('set-update-review-' + name, cases[name], None,
+                                     reason='key callbacks')
+        prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+                  '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
+                  '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+                  '            return 0\n    seen = set()\n')
+        source = program(prefix
+                         + '    seen.update((cursor.execute('
+                         'f"SELECT count(*) FROM users WHERE name = \'{user}\'"), Key())[1] for _ in (1,))\n'
+                         '    return cursor.execute(query).fetchone()[0]\n')
+        self._assert_partial_cli('set-update-review-yielded-sink', source, 9,
+                                 reason='key callbacks')
+        self._assert_partial_cli('set-update-review-opaque-done', OPAQUE_DONE_CURSOR_REPRO, None,
+                                 reason='partial generator consumption')
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_set_update_hash_callback_boundary(self):
+        self._assert_partial_cli('set-update-hash-boundary', SET_UPDATE_HASH_REPRO, None,
+                                 reason='key callbacks')
+        source = program('    cursor.execute(f"SELECT count(*) FROM users WHERE name = \'{user}\'")\n'
+                         + ''.join(SET_UPDATE_HASH_REPRO.splitlines(keepends=True)[1:]))
+        self.assertEqual(sqlite_witness(self.artifacts, 'update-hash-known-sink', source)['rows'], 2)
+        self._assert_partial_cli('set-update-hash-keeps-finding', source, 2,
+                                 reason='key callbacks')
 
     @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
     def test_real_cli_literal_sql_set_update_generators(self):

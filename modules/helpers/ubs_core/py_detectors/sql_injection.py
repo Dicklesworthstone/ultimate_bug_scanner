@@ -2894,6 +2894,20 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return (*facts[:5], SQLInjectionAnalyzer.generator_refs(facts), kind, element_kind)
 
     @staticmethod
+    def set_update_capabilities(kind):
+        """May-call capabilities authorize refusal, never native execution.
+
+        Exact sets retain their ordinary shape. A mixed receiver/callable
+        join instead carries a finite frozenset of possible capabilities;
+        it must not acquire an exact builtin type or an exhaustion proof.
+        Keeping these in the value lattice preserves saved aliases across
+        loop/finally re-evaluation and kills them on definite overwrites.
+        """
+        if kind == 'set':
+            return frozenset({'receiver'})
+        return kind if isinstance(kind, frozenset) else frozenset()
+
+    @staticmethod
     def hash_safe_shape(shape):
         """Exact immutable builtin keys cannot invoke user hash/equality code.
 
@@ -2920,6 +2934,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             return ()
         if len(present) == 1:
             return next(iter(present))
+        capabilities = frozenset().union(*(
+            SQLInjectionAnalyzer.set_update_capabilities(shape) for shape in present))
+        if capabilities:
+            return capabilities
         if all(isinstance(shape, tuple) and len(shape) == 2 and shape[0] == 'tuple'
                for shape in present):
             return ('tuple', SQLInjectionAnalyzer.join_element_shapes(*(shape[1] for shape in present)))
@@ -2933,6 +2951,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def join_kinds(*pairs):
         kinds = {pair[0] for pair in pairs}
         if len(kinds) != 1:
+            capabilities = frozenset().union(*(
+                SQLInjectionAnalyzer.set_update_capabilities(kind) for kind in kinds))
+            if capabilities:
+                return capabilities, ''
             if kinds and kinds <= {'number', 'str', 'none', 'scalar'}:
                 # A lexical cell can alternate between exact immutable
                 # primitives. Keep that non-aliasing fact without claiming
@@ -2965,7 +2987,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def element_facts(facts):
         shape = SQLInjectionAnalyzer.fact_kinds(facts)[1]
         pair = shape if isinstance(shape, tuple) and len(shape) == 2 else (
-            shape if isinstance(shape, str) else '', 'str' if shape == 'str' else '')
+            shape if isinstance(shape, (str, frozenset)) else '', 'str' if shape == 'str' else '')
         return SQLInjectionAnalyzer.with_kinds(facts, *pair)
 
     @staticmethod
@@ -3707,6 +3729,17 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
 
     def visit_Attribute(self, node):
         self.generic_visit(node)
+        if (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
+                and node.attr == 'update'):
+            capabilities = self.set_update_capabilities(self.value_kind(node.value)[0])
+            methods = ({'bound'} if 'receiver' in capabilities else set())
+            if 'constructor' in capabilities:
+                methods.add('unbound')
+            if methods:
+                # Capture the receiver now. Later argument or alias writes
+                # cannot redirect an already loaded bound method.
+                self._evaluated_values[node] = self.with_kinds(
+                    self.value_facts(node), frozenset(methods))
         if self._short_circuiting and isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
             bindings = self.ownership_bindings()
             protocols = self.generator_protocol_names()
@@ -4016,6 +4049,85 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             shape = element if kind == 'frozenset' else self.element_shape((kind, element))
             if not self.hash_safe_shape(shape):
                 raise SQLFlowLimit('SQL collection key callbacks are unresolved; analysis is incomplete')
+
+    def collection_key_effects_unmodeled(self):
+        """Only inert visible protocol bodies need no callback effect model.
+
+        An SQL sink spelling is not purity: a local execute() may rewrite a
+        captured query. Independently reached callback findings stay visible
+        when the enclosing hash/equality effects require an incomplete result.
+        """
+        cache = self._ownership_syntax
+        if 'collection_key_effects_unmodeled' not in cache:
+            bindings = self.ownership_bindings()
+            protocols = {'__hash__', '__eq__'}
+            unresolved = bool(protocols & bindings.member_writes or bindings.reflective_member_writes)
+            for function in bindings.key_callbacks:
+                self.step()
+                if function.name not in protocols:
+                    continue
+                owner = bindings.owner_scopes[function]['parent']
+                owner = owner['node'] if owner is not None else None
+                if (function.decorator_list or isinstance(owner, ast.ClassDef)
+                        and (owner.decorator_list or owner.keywords)):
+                    # Decorators and metaclasses may replace a literal body.
+                    unresolved = True
+                for statement in function.body:
+                    self.step()
+                    if isinstance(statement, ast.Pass):
+                        continue
+                    if isinstance(statement, ast.Return) and (
+                            statement.value is None or isinstance(statement.value, ast.Constant)):
+                        continue
+                    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+                        continue
+                    unresolved = True
+            cache['collection_key_effects_unmodeled'] = unresolved
+        return cache['collection_key_effects_unmodeled']
+
+    def check_set_update_keys(self, node):
+        """Check actual possible emissions without advancing a real cursor."""
+        capabilities = self.set_update_capabilities(self.value_kind(node.func)[0])
+        if (not capabilities.intersection({'bound', 'unbound'})
+                or not self.has_collection_key_callbacks()
+                or not self.collection_key_effects_unmodeled()):
+            return
+        arguments, pending = [], list(reversed(node.args))
+        while pending:
+            self.step()
+            argument = pending.pop()
+            if isinstance(argument, ast.Starred):
+                if not isinstance(argument.value, (ast.List, ast.Tuple)):
+                    # Opaque expansion can hide the receiver and later inputs.
+                    self.check_collection_keys([(None, None, None, False, 'unknown')])
+                pending.extend(reversed(argument.value.elts))
+            else:
+                arguments.append(argument)
+        offset = 0 if 'bound' in capabilities else 1
+        # An unbound method's receiver is not a newly hashed input iterable.
+        for argument in [*arguments[offset:], *(keyword.value for keyword in node.keywords)]:
+            self.step()
+            references = self.generator_refs(self.value_facts(argument))
+            if not references:
+                self.check_collection_keys(self.collection_key_facts(argument))
+                continue
+            probe = self.flow_probe()
+            try:
+                # A mixed generator/non-generator binding remains explicitly
+                # unsupported. A partial cursor must never restart at fresh;
+                # an exhausted cursor emits no keys and has no hash effects.
+                probe.materialize_generators(references, hash_keys=True)
+            except SQLNoNormalReturn as exc:
+                # May-call recognition cannot remove the real successor.
+                raise SQLFlowLimit('SQL set.update key iteration is unresolved; analysis is incomplete') from exc
+            finally:
+                # A yielded expression can reach SQL before its key protocol
+                # becomes unsupported. Preserve that evidence, not the probe's
+                # speculative stores or cursor progress.
+                for identity, finding in probe._sink_risks.items():
+                    previous = self._sink_risks.get(identity)
+                    if previous is None or finding[0] == 'critical':
+                        self._sink_risks[identity] = finding
 
     def collection_key_facts(self, value, *, mapping=False):
         """Captured keys of literal inputs; unknown objects keep no proof."""
@@ -4676,12 +4788,22 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             # generator itself has no SQL effects. Aliases keep this opaque
             # cursor boundary; the direct modeled consumers above are unchanged.
             self.check_collection_constructor(node)
-            # An opaque consumer of a read-only, non-SQL generator cannot
-            # change a tracked SQL binding. Do not turn routine any()/sum()
-            # idioms into file-wide failures. Its cursor is now unknown:
-            # subsequent modeled consumption must refuse, not restart it.
+            # An exhausted argument does not prove an opaque consumer inert:
+            # the call itself may rewrite captured SQL without iterating it.
+            # Only a direct native set.update with an exact set receiver and
+            # exclusively exhausted generator inputs has no possible callback
+            # here. May-call capability tags cannot authorize this exception.
+            inert_update = (isinstance(node.func, ast.Attribute) and node.func.attr == 'update'
+                            and self.value_kind(node.func.value)[0] == 'set'
+                            and not node.keywords and len(arguments) == len(node.args)
+                            and not any(isinstance(argument, ast.Starred) for argument in node.args)
+                            and all(self.generator_phases.get(identity) == frozenset({'done'})
+                                    for identity in references))
+            # Retain the ordinary opaque-consumer boundary otherwise: later
+            # modeled consumption must refuse instead of certifying the call.
             for identity in references:
-                self.generator_phases[identity] = frozenset({'partial'})
+                if not inert_update:
+                    self.generator_phases[identity] = frozenset({'partial'})
             self._evaluated_values[node] = (None, None, None, False, 'unknown')
             return True
         if arguments and not receiver and self.local_generator_consumer(node, arguments):
@@ -5955,7 +6077,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return self.with_numeric_reference(facts, reference) if reference is not None else facts
 
     def value_kind(self, value):
-        """Exact builtin shapes only; unknown/rebound values carry no proof."""
+        """Exact shapes, plus negative-only set/update may-call capabilities."""
         if value in self._evaluated_values:
             return self.fact_kinds(self.value_facts(value))
         if isinstance(value, ast.Name):
@@ -5968,7 +6090,15 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             if (pair[0] == 'list' and pair[1] != ''
                     and value.id not in self.exclusive_lists):
                 return 'list', ''
+            if (value.id not in self.value_risks
+                    and self.ownership_bindings().resolve(value) in {
+                        ('unbound', 'set'), ('import', 'builtins.set')}):
+                return frozenset({'constructor'}), ''
             return pair
+        if (isinstance(value, ast.Attribute)
+                and self.ownership_bindings().resolve(value) in {
+                    ('unbound', 'set'), ('import', 'builtins.set')}):
+            return frozenset({'constructor'}), ''
         if isinstance(value, ast.Constant):
             if value.value is None:
                 return 'none', ''
@@ -6060,6 +6190,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 and self._closure_cell_writes.get(self._generator_scope[-1], frozenset()).intersection(names)
                 and (self.fact_kinds(facts)[0] not in {'number', 'str', 'none', 'scalar'}
                      or self.generator_refs(facts))):
+            if self.set_update_capabilities(self.fact_kinds(facts)[0]):
+                raise SQLFlowLimit('SQL collection key callbacks through a closure cell are unresolved; analysis is incomplete')
             raise SQLFlowLimit('SQL closure cell alias is unresolved; analysis is incomplete')
         self.invalidate_validation(names)
         risk, fragment_risk, select_risk, template, provenance = facts[:5]
@@ -6668,14 +6800,22 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                         and self._generator_scope
                         and self.ownership_bindings().owner_scopes[target[1]]['parent']['node']
                             is self._generator_scope[-1]
-                        and (self.string_result(node) or self._short_circuiting
+                        and (self.string_result(node)
+                             or self.declared_closure_cells(target[1])
+                             and self.has_collection_key_callbacks()
+                             and self.collection_key_effects_unmodeled()
+                             or self._short_circuiting
                              and target[1] in self.ownership_bindings().local_sql_effects())):
                     # A return-shape proof alone is not a text-provenance
                     # proof. Interpret a stable local string or SQL helper
                     # with its actual inputs, even with no enclosing list.
+                    # A nonlocal receiver/callable write can also introduce a
+                    # set.update path; the cell model must interpret or refuse
+                    # that alias instead of discarding its deferred effects.
                     # SQL effects inside a predicate need the same guarded
                     # closure transfer as explicit calls to cursor.execute.
                     self.sealed_list_captures(target[1], allow_empty=True)
+            self.check_set_update_keys(node)
             handled = (list_plan is not None and self.local_list_effect_call(node, list_plan)
                        or self.sealed_closure_call(node) or self.generator_call(node) or joined is not None)
             if (self._short_circuiting and not handled and not is_sink
@@ -6725,6 +6865,19 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     and not any(isinstance(argument, ast.Starred) for argument in node.args)):
                 facts = self.value_facts(node.args[0]) if node.args else (None, None, None, False, 'static')
                 self._evaluated_values[node] = self.with_kinds(facts, 'list', self.fact_kinds(facts)[1])
+            if 'constructor' in self.set_update_capabilities(self.value_kind(node.func)[0]):
+                facts = self.value_facts(node)
+                if self.fact_kinds(facts)[0] != 'set':
+                    native = (self.ownership_call_target(node) in {
+                                  ('unbound', 'set'), ('import', 'builtins.set')}
+                              and len(node.args) <= 1 and not node.keywords
+                              and not any(isinstance(argument, ast.Starred) for argument in node.args)
+                              and self.closed_generator_builtin_binding('set'))
+                    # Construction proves a receiver, never mutable element
+                    # shapes. Mixed callable joins retain refusal capability
+                    # only, without claiming that a native call took place.
+                    self._evaluated_values[node] = self.with_kinds(
+                        facts, 'set' if native else frozenset({'receiver'}))
             if self.intrinsic_range_call(node):
                 # range either raises or yields integers; its bounds are not
                 # SQL values. Their eager side effects have already run.

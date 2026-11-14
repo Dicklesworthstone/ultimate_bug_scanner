@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Detect request-controlled PHP `Location` destinations with the native
+  `php.security.open-redirect` rule and `php.redirect` category. Preserve header
+  alternatives across branches and helpers, resolve native callable identity and
+  named arguments, and distinguish fixed URL authorities and encoded relative
+  components from attacker-controlled hosts. Unsupported header names and status
+  controls remain incomplete. PHP scans also retain their actual workspaces when
+  `UBS_KEEP_TEMP=1` is requested.
+
 - Preserve native Go reader, JSON/XML decoder and HTML escaper behavior through
   selected package helper parameters and return values. Keep decoded destination
   writes and payload/error result positions distinct, carry decoder input across

@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.77-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.78-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -322,8 +322,9 @@ survive these boundaries, and partial results are not cached as complete.
 #### PHP request flow and template output
 
 PHP and PHTML files are scanned by a bounded native analyzer without requiring
-PHP or ast-grep to be installed. Six critical rules track request data into SQL,
-shell commands, dynamic code, includes, unsafe deserialization and HTML output.
+PHP or ast-grep to be installed. Seven critical rules track request data into SQL,
+shell commands, dynamic code, includes, unsafe deserialization, HTML output and
+open redirects.
 Use `ubs --only=php --format=json .` or inspect a rule with
 `ubs explain php.security.sql-injection`.
 
@@ -338,14 +339,26 @@ Named arguments bind to the selected local function, method, constructor or
 closure signature, and to supported PHP, PDO and mysqli native signatures.
 Argument expressions retain their original evaluation order; skipped optional
 parameters use their defaults. Simple variable references retain their caller
-destinations. Unknown names, duplicate slots, unpacking, named variadics and
-complex reference destinations produce an explicit incomplete result.
+destinations. Native `header` calls also accept exact array argument unpacking.
+Unknown names, duplicate slots, other unpacking, named variadics and complex
+reference destinations produce an explicit incomplete result.
 
-PHP's five category IDs are `php.sql`, `php.execution`, `php.includes`,
-`php.deserialization` and `php.output`. Native rules appear in `--list-rules` and
+`php.security.open-redirect` follows request data into native `Location` headers,
+including selected aliases, helpers and branch alternatives. A fixed path prefix
+or a fixed authority followed by `/`, `?` or `#` establishes a safe destination
+boundary; an unfinished hostname, a single slash or an encoded attacker-chosen
+hostname does not. Computed header names and unsupported status or replacement
+controls remain incomplete. This rule checks individual header writes; it does
+not prove which queued header is eventually delivered.
+
+PHP's six category IDs are `php.sql`, `php.execution`, `php.includes`,
+`php.deserialization`, `php.output` and `php.redirect` (category 6).
+Native rules appear in `--list-rules` and
 share ordinary file selection, exclusions, profiles, suppression, incremental
 cache and JSON/SARIF reporting. Custom ast-grep rules additionally require
 ast-grep. PHP native rules do not have an ast-grep `--dump-rules` representation.
+Use `UBS_KEEP_TEMP=1` to retain scanner workspaces, with `TMPDIR` selecting their
+parent directory.
 
 This is selected PHP 8.1+ syntax and local flow, not whole-program framework
 resolution. Unsupported syntax, unresolved effects and exhausted analysis limits

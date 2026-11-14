@@ -30,6 +30,7 @@ RULES = {
     "include": "php.security.dynamic-include",
     "deserialize": "php.security.unsafe-deserialization",
     "xss": "php.security.xss",
+    "redirect": "php.security.open-redirect",
 }
 CATEGORIES = {
     RULES["sql"]: "php.sql",
@@ -38,6 +39,7 @@ CATEGORIES = {
     RULES["include"]: "php.includes",
     RULES["deserialize"]: "php.deserialization",
     RULES["xss"]: "php.output",
+    RULES["redirect"]: "php.redirect",
 }
 
 
@@ -784,6 +786,123 @@ NAMED_PARTIAL = (
 CASES = (*CASES, *NAMED_CASES)
 
 
+REDIRECT_CASES = (
+    Case("redirect_request", "header('Location: ' . $_GET['next']); // expect: redirect header"),
+    Case("redirect_helper", """
+        function safe_redirect($target) {
+            header('Location: ' . $target); // expect: redirect header
+        }
+        $target = $_POST['next'];
+        safe_redirect($target);
+    """),
+    Case("redirect_native_alias_named", r"""
+        namespace App;
+        use function header as send_header;
+        send_header(response_code: 303, header: 'Location: ' . $_GET['next'], replace: true); // expect: redirect send_header
+    """),
+    Case("redirect_native_unpack", """
+        $arguments = ['header' => 'Location: ' . $_GET['next'], 'response_code' => 307];
+        header(...$arguments); // expect: redirect header
+    """),
+    Case("redirect_native_string_callable", """
+        $emit = 'header';
+        $saved = $emit;
+        $emit = 'unrelated';
+        $saved('Location: ' . $_GET['next']); // expect: redirect $saved
+    """),
+    Case("redirect_header_branch", """
+        if ($_GET['mode']) {
+            $line = 'Location: ' . $_GET['next'];
+        } else {
+            $line = 'X-Trace: ' . $_GET['next'];
+        }
+        header($line); // expect: redirect header
+    """),
+    Case("redirect_unrelated_branch_source", """
+        if ($_GET['mode']) {
+            $line = 'Location: /home';
+        } else {
+            $line = 'X-Trace: ' . $_GET['next'];
+        }
+        header($line);
+    """),
+    Case("redirect_safe_path_branches", """
+        if ($_GET['mode']) {
+            $target = '/reports/' . $_GET['next'];
+        } else {
+            $target = '/profile/' . $_GET['next'];
+        }
+        header('Location: ' . $target);
+    """),
+    Case("redirect_fixed_authority_query", "header('Location: https://trusted.example?next=' . $_GET['next']);"),
+    Case("redirect_fixed_authority_fragment", "header('Location: https://trusted.example#' . $_GET['next']);"),
+    Case("redirect_relative_fragment", "header('Location: #' . $_GET['next']);"),
+    Case("redirect_single_slash", "header('Location: /' . $_GET['next']); // expect: redirect header"),
+    Case("redirect_authority_suffix", "header('Location: https://trusted.example' . $_GET['next']); // expect: redirect header"),
+    Case("redirect_authority_userinfo", "header('Location: https://trusted.example@' . $_GET['host']); // expect: redirect header"),
+    Case("redirect_authority_port", "header('Location: https://trusted.example:' . $_GET['suffix']); // expect: redirect header"),
+    Case("redirect_encoded_host", "header('Location: https://' . rawurlencode($_GET['host']) . '/go'); // expect: redirect header"),
+    Case("redirect_encoded_component", "header('Location: ' . rawurlencode($_GET['next']));"),
+    Case("redirect_decoded_component", "header('Location: ' . rawurldecode(rawurlencode($_GET['next']))); // expect: redirect header"),
+    Case("redirect_html_is_not_url_proof", "header('Location: ' . htmlspecialchars($_GET['next'])); // expect: redirect header"),
+    Case("redirect_formatting", "header(sprintf('Location: %s', $_GET['next'])); // expect: redirect header"),
+    Case("redirect_strict_allowlist", """
+        $target = $_GET['next'];
+        if (!in_array($target, ['/home', '/profile'], true)) { return; }
+        header('Location: ' . $target);
+    """),
+    Case("redirect_later_namespace_shadow", """
+        namespace App;
+        header('Location: ' . $_GET['next']);
+        function header($line) { return 1; }
+    """),
+    Case("redirect_qualified_over_shadow", r"""
+        namespace App;
+        function header($line) { return 1; }
+        \header('Location: ' . $_GET['next']); // expect: redirect \header
+    """),
+    Case("redirect_previous_status", """
+        http_response_code(307);
+        header('Location: ' . $_GET['next']); // expect: redirect header
+    """),
+    Case("redirect_named_eager_capture", """
+        $target = $_GET['next'];
+        header(header: 'Location: ' . $target, replace: (($target = '/home') === '/home')); // expect: redirect header
+    """),
+    Case("redirect_named_eager_clean", """
+        $target = $_GET['next'];
+        header(replace: (($target = '/home') === '/home'), header: 'Location: ' . $target);
+    """),
+    Case("redirect_hex_single_slash", r'''header("Location: \x2f" . $_GET['next']); // expect: redirect header'''),
+    Case("redirect_octal_single_slash", r'''header("Location: \057" . $_GET['next']); // expect: redirect header'''),
+    Case("redirect_unicode_single_slash", r'''header("Location: \u{2f}" . $_GET['next']); // expect: redirect header'''),
+    Case("redirect_encoded_header_name", r'''header("\x4cocation: " . $_GET['next']); // expect: redirect header'''),
+    Case("redirect_literal_examples", r"""
+        $example = 'header("Location: " . $_GET["next"]);';
+        // header('Location: ' . $_GET['next']);
+        header('X-Trace: ' . $_GET['next']);
+        header('Location: /home');
+    """),
+)
+
+REDIRECT_PARTIAL = (
+    Case("redirect_computed_header", "header($_GET['line']);"),
+    Case("redirect_computed_name", "header($_GET['name'] . ': /home');"),
+    Case("redirect_nonredirect_status", "header('Location: ' . $_GET['next'], response_code: 201);"),
+    Case("redirect_previous_nonredirect_status", "http_response_code(201); header('Location: ' . $_GET['next']);"),
+    Case("redirect_status_line", "header('HTTP/1.1 201 Created'); header('Location: ' . $_GET['next']);"),
+    Case("redirect_unknown_status", "header('Location: ' . $_GET['next'], response_code: intval($_GET['status']));"),
+    Case("redirect_duplicate_header", "header('Location: ' . $_GET['next'], replace: false);"),
+    Case("redirect_wrong_native_name", "header(string: 'Location: ' . $_GET['next']);"),
+    Case("redirect_unknown_unpack", "header(...$_GET['arguments']);"),
+    Case("redirect_unknown_prefix", "function send_to($base) { header('Location: ' . $base . $_GET['next']); }"),
+    Case("redirect_literal_newline_suffix", r'''header('Location: ' . $_GET['next'] . "\r\nX-Extra: value");'''),
+    Case("redirect_literal_nul_suffix", r'''header('Location: ' . $_GET['next'] . "\0suffix");'''),
+)
+
+CASES = (*CASES, *REDIRECT_CASES)
+
+
 def identities():
     paths = [
         Path(__file__),
@@ -864,6 +983,12 @@ class PHPNativeTests(EvidenceTest):
                 with self.assertRaisesRegex(ValueError, "(?i)incomplete|budget|limit"):
                     list(native.scan_file_findings(source))
 
+    def test_redirect_category_disable_skips_unresolved_header_analysis(self):
+        native = importlib.import_module("ubs_core.analyzers.taint_php")
+        case = REDIRECT_PARTIAL[0]
+        source = self.materialize((case,), "redirect-disabled") / case.filename
+        self.assertEqual(list(native.scan_file_findings(source, frozenset({RULES['sql']}))), [])
+
 
 def native_test(case, incomplete=False):
     def run(self):
@@ -876,6 +1001,8 @@ for _case in CASES:
 for _case in PARTIAL:
     setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
 for _case in NAMED_PARTIAL:
+    setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
+for _case in REDIRECT_PARTIAL:
     setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
 
 
@@ -955,6 +1082,40 @@ class PHPPublicTests(EvidenceTest):
         for mode in ("module-json", "module-sarif", "json", "sarif"):
             with self.subTest(mode=mode):
                 self.assert_report(*self.execute(directory, mode), mode, CASES)
+
+    def test_public_redirect_formats_categories_and_suppression(self):
+        unsafe = REDIRECT_CASES[0]
+        clean = next(case for case in REDIRECT_CASES if case.name == "redirect_fixed_authority_query")
+        suppressed = Case("redirect_suppressed", "header('Location: ' . $_GET['next']); // ubs:ignore["
+                          + RULES['redirect'] + "]")
+        cases = (unsafe, clean, suppressed)
+        directory = self.materialize(cases, "redirect-formats")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                extra = ("--only=6",) if mode.startswith("module-") else ("--only=php",)
+                self.assert_report(*self.execute(directory, mode, extra=extra), mode, cases)
+        self.assert_report(*self.execute(directory, "module-json", extra=("--skip=6",)),
+                           "module-json", cases, expected_override=[])
+        self.assert_report(*self.execute(directory, "json", extra=("--skip-php=6",)),
+                           "json", cases, expected_override=[])
+        partial = self.materialize((REDIRECT_PARTIAL[0],), "redirect-partial")
+        for mode in ("module-json", "sarif"):
+            self.assert_report(*self.execute(partial, mode), mode, (REDIRECT_PARTIAL[0],), partial=True)
+
+    def test_public_redirect_cache_tracks_source_and_policy(self):
+        unsafe = REDIRECT_CASES[0]
+        directory = self.materialize((unsafe,), "redirect-cache")
+        target = directory / unsafe.filename
+        for _ in range(2):
+            self.assert_report(*self.execute(directory, cached=True), "json", (unsafe,))
+        self.assert_report(*self.execute(directory, cached=True, extra=("--skip-php=6",)),
+                           "json", (unsafe,), expected_override=[])
+        self.assert_report(*self.execute(directory, cached=True), "json", (unsafe,))
+        clean = Case(unsafe.name, "header('Location: /account/' . $_GET['next']);")
+        target.write_text(clean.source, encoding='utf-8')
+        self.assert_report(*self.execute(directory, cached=True), "json", (clean,))
+        target.write_text(unsafe.source, encoding='utf-8')
+        self.assert_report(*self.execute(directory, cached=True), "json", (unsafe,))
 
     def test_public_partial_keeps_known_findings_and_neighbor(self):
         cases = (CASES[0], CASES[2], PARTIAL[-2])

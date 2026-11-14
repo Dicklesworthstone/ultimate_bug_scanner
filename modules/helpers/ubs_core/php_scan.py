@@ -29,8 +29,8 @@ def _skip_set(value: str) -> set[int]:
 
 def _category_set(value: str) -> set[int]:
     categories = _skip_set(value)
-    if not categories or not categories <= set(range(1, 6)):
-        raise argparse.ArgumentTypeError("PHP categories must be comma-separated integers from 1 to 5")
+    if not categories or not categories <= set(range(1, 7)):
+        raise argparse.ArgumentTypeError("PHP categories must be comma-separated integers from 1 to 6")
     return categories
 
 
@@ -83,12 +83,12 @@ def main(argv: list[str] | None = None) -> int:
     # Stable deduplication preserves the caller's spelling, including embedded
     # newlines and spaces. Cache association uses canonical source identities.
     files = list(dict.fromkeys(Path(os.fsdecode(entry)).resolve() for entry in entries if entry))
-    selected = set(range(1, 6)) if args.only is None else args.only
+    selected = set(range(1, 7)) if args.only is None else args.only
     enabled = frozenset(rule for rule, (_slug, category, _title) in RULES.items()
                         if category in selected and category not in args.skip)
     cache = ScanCache(
         lang="php", project_dir=args.project_dir, custom_rules=args.custom_rules,
-        skip=",".join(str(value) for value in sorted(set(range(1, 6)) - selected | args.skip)),
+        skip=",".join(str(value) for value in sorted(set(range(1, 7)) - selected | args.skip)),
         extra=json.dumps({"limits": policy_limits(), "enabled": sorted(enabled)}, sort_keys=True),
     )
     cached, pending = cache.partition_files(files)

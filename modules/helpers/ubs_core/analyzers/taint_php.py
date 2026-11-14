@@ -27,6 +27,7 @@ CODE = "php.security.dynamic-code"
 INCLUDE = "php.security.dynamic-include"
 DESERIALIZE = "php.security.unsafe-deserialization"
 XSS = "php.security.xss"
+REDIRECT = "php.security.open-redirect"
 RULES = {
     SQL: ("php.sql", 1, "Request-derived SQL reaches query execution"),
     COMMAND: ("php.execution", 2, "Request-derived input reaches command execution"),
@@ -34,6 +35,7 @@ RULES = {
     INCLUDE: ("php.includes", 3, "Request-derived input selects an included PHP file"),
     DESERIALIZE: ("php.deserialization", 4, "Request-derived input reaches unserialize"),
     XSS: ("php.output", 5, "Request-derived output lacks escaping for its HTML context"),
+    REDIRECT: ("php.redirect", 6, "Request-derived Location header can select an external destination"),
 }
 _REMEDIATIONS = {
     SQL: "Keep the SQL template static and bind request values separately at execution. Allowlist identifiers that cannot be bound.",
@@ -42,6 +44,7 @@ _REMEDIATIONS = {
     INCLUDE: "Map an allowlisted application key to a fixed local include path.",
     DESERIALIZE: "Use a data-only format with schema validation for untrusted input; allowed_classes does not establish input trust.",
     XSS: "Escape for the actual output context. Quoted attributes need quote escaping; URL and script contexts need additional validation or encoding.",
+    REDIRECT: "Choose a fixed destination or constrain redirects to a local path or an explicitly allowed origin.",
 }
 RULE_METADATA = {
     rule: {"language": "php", "category": category, "category_id": category,
@@ -85,9 +88,16 @@ class Value:
     array: bool = False
     refs: frozenset[int] = frozenset()
     parts: tuple[Part, ...] = ()
+    string_choices: tuple[tuple[Part, ...], ...] = ()
 
 
 EMPTY = Value()
+MAX_STRING_CHOICES = 32
+
+
+def string_choices(value: Value) -> tuple[tuple[Part, ...], ...]:
+    """Keep finite string alternatives separate from aggregate source facts."""
+    return value.string_choices or (value.parts or (Part(None, value.fact),),)
 
 
 def scalar(literal: Any) -> Value:
@@ -125,7 +135,17 @@ def joined(*values: Value) -> Value:
         items = {key: joined(*(dict(value.items).get(key, value.fallback or EMPTY) for value in values)) for key in keys}
         fallback = joined(*(value.fallback or EMPTY for value in values))
         return array_value(items, fallback)
-    return Value(fact, literal=literal, refs=refs, parts=(Part(None, fact),))
+    choices = []
+    for value in values:
+        for choice in string_choices(value):
+            if choice not in choices:
+                if len(choices) == MAX_STRING_CHOICES:
+                    # Losing the header's name cannot establish a clean
+                    # redirect. The selected sink reports that boundary.
+                    return Value(fact, literal=literal, refs=refs, parts=(Part(None, fact),))
+                choices.append(choice)
+    return Value(fact, literal=literal, refs=refs, parts=(Part(None, fact),),
+                 string_choices=tuple(choices))
 
 
 def tagged(value: Value, *tags: str, remove: frozenset[str] = frozenset()) -> Value:
@@ -210,6 +230,8 @@ class NativeSignature:
 # References: php/php-src PHP-8.4 ext/{standard,pdo,mysqli,filter,json,pcntl}
 # *.stub.php and https://www.php.net/manual/en/functions.arguments.php.
 _NATIVE_FUNCTIONS = {
+    "header": NativeSignature(("header", "replace", "response_code"), (scalar(True), scalar(0))),
+    "http_response_code": NativeSignature(("response_code",), (scalar(0),)),
     "system": NativeSignature(("command", "result_code"), (scalar(None),)),
     "exec": NativeSignature(("command", "output", "result_code"), (scalar(None), scalar(None))),
     "shell_exec": NativeSignature(("command",)),
@@ -546,13 +568,137 @@ class Engine:
             else:
                 self.record(XSS, token, self.unsafe(Value(part.fact), "html", context=self.html_context()))
 
+    def response_status(self) -> Value:
+        # Heap identity zero is invocation-local response state; allocations
+        # start at one. Existing branch and helper transport preserves it.
+        response = self.heap.get(0)
+        return dict(response.fields).get("status", scalar(200)) if response else scalar(200)
+
+    def set_response_status(self, value: Value) -> None:
+        self.heap[0] = Object("response", fields=(("status", value),))
+
+    @staticmethod
+    def local_redirect(parts: tuple[Part, ...]) -> bool:
+        """Prove a fixed URL authority or a relative path before source bytes.
+
+        Browser HTTP URL parsing treats backslashes as slashes and discards
+        tab/newline characters. A single slash, a host prefix, or an encoded
+        hostname does not establish an origin. Query and fragment boundaries
+        do establish it, including immediately after a fixed authority.
+        """
+        prefix = ""
+        for part in parts:
+            if part.literal is None:
+                break
+            prefix += part.literal
+        prefix = prefix.lstrip("".join(chr(code) for code in range(33)))
+        prefix = prefix.replace("\t", "").replace("\r", "").replace("\n", "").replace("\\", "/")
+        if prefix.startswith(("?", "#")):
+            return True
+        if prefix.startswith("/") and len(prefix) > 1 and prefix[1] != "/":
+            return True
+        authority = None
+        if prefix.startswith("//"):
+            authority = prefix[2:]
+        else:
+            scheme = re.match(r"(?i)^https?://", prefix)
+            if scheme:
+                authority = prefix[scheme.end():]
+        if authority is not None:
+            boundary = re.search(r"[/?#]", authority)
+            return bool(boundary and boundary.start() > 0)
+        if re.match(r"^[^:/?#]+[/?#]", prefix):
+            return True
+        dynamic = [part for part in parts if part.literal is None]
+        encoded = dynamic and all(part.fact and all(
+            trace.tags & {"numeric", "url-component"} for trace in part.fact) for part in dynamic)
+        if encoded:
+            # Encoded components cannot introduce a scheme or authority, but
+            # literal punctuation around them still can. In particular an
+            # encoded value between https:// and / remains a chosen host.
+            literals = "".join(part.literal or "" for part in parts)
+            return not any(char in literals for char in ":/\\") or literals == "/"
+        return False
+
+    def response_header(self, args: tuple[Value, ...], token: Token) -> None:
+        if REDIRECT not in self.enabled:
+            return
+        if not 1 <= len(args) <= 3 or args[0].array or args[0].refs:
+            self.issue("PHP header arguments do not establish the native string contract")
+            return
+        value = args[0]
+        replace_header = args[1].literal if len(args) > 1 else True
+        requested = args[2].literal if len(args) > 2 else 0
+        if type(requested) is int and requested != 0:
+            self.set_response_status(scalar(requested))
+        elif requested is not UNKNOWN and requested != 0:
+            self.set_response_status(EMPTY)
+        elif requested is UNKNOWN:
+            self.set_response_status(EMPTY)
+        for parts in string_choices(value):
+            fact = join(*(part.fact for part in parts))
+            prefix = ""
+            split = 0
+            for split, part in enumerate(parts):
+                if part.literal is None:
+                    break
+                prefix += part.literal
+            else:
+                split = len(parts)
+            if any(part.literal is not None and any(char in part.literal for char in "\x00\r\n")
+                   for part in parts):
+                self.issue("PHP response header contains a rejected literal control character")
+                continue
+            if prefix.startswith("HTTP/"):
+                status = re.match(r"HTTP/\d+(?:\.\d+)?\s+(\d{3})(?:\s|$)", prefix)
+                self.set_response_status(scalar(int(status.group(1))) if status else EMPTY)
+                continue
+            colon = prefix.find(":")
+            if colon < 0:
+                # An untyped declaration probe has no established request
+                # source; it must not invent one for an unknown argument.
+                if fact or not self.declaration_probe:
+                    self.issue("PHP response header name is unresolved")
+                continue
+            if prefix[:colon].lower() != "location":
+                continue
+            status = self.response_status().literal
+            if (type(requested) is not int or type(status) is not int
+                    or replace_header is not True
+                    or requested != 0 and requested not in {301, 302, 303, 307, 308}
+                    or requested == 0 and status == 201
+                    or requested == 0 and 300 <= status <= 399 and status not in {301, 302, 303, 307, 308}):
+                if fact:
+                    self.issue("PHP Location status or replacement behavior is outside the selected redirect contract")
+                continue
+            if requested == 0 and status not in {301, 302, 303, 307, 308}:
+                self.set_response_status(scalar(302))
+            destination = (Part(prefix[colon + 1:]), *parts[split:])
+            if fact and not self.local_redirect(destination):
+                first_unknown = next((part for part in destination if part.literal is None), None)
+                if first_unknown is not None and not first_unknown.fact:
+                    self.issue("PHP Location destination prefix is unresolved")
+                else:
+                    self.record(REDIRECT, token, fact)
+
     def concat(self, left: Value, right: Value) -> Value:
         parts = (left.parts or (Part(None, left.fact),)) + (right.parts or (Part(None, right.fact),))
         self.budget.spend(len(parts))
         if len(parts) > 2048:
             raise AnalysisLimit("PHP concatenation limit exceeded; analysis is incomplete")
         literal = php_string(left.literal) + php_string(right.literal) if left.literal is not UNKNOWN and right.literal is not UNKNOWN else UNKNOWN
-        return Value(join(left.fact, right.fact), literal=literal, parts=parts)
+        fact = join(left.fact, right.fact)
+        choices = ()
+        if left.string_choices or right.string_choices:
+            first, second = string_choices(left), string_choices(right)
+            self.budget.spend(len(first) * len(second))
+            if len(first) * len(second) <= MAX_STRING_CHOICES:
+                choices = tuple(dict.fromkeys(a + b for a in first for b in second))
+                if any(len(choice) > 2048 for choice in choices):
+                    raise AnalysisLimit("PHP string alternative limit exceeded; analysis is incomplete")
+            else:
+                choices = ((Part(None, fact),),)
+        return Value(fact, literal=literal, parts=parts, string_choices=choices)
 
     def read_index(self, value: Value, key: Value) -> Value:
         if not value.array:
@@ -611,6 +757,31 @@ class Engine:
         # never reorder or repeat those evaluations (including caller writes).
         return tuple(self.evaluate(node.children[0] if node.kind == "named" else node)
                      for node in nodes)
+
+    def header_arguments(self, nodes: tuple[Node, ...]):
+        """Expand only proven native header arrays, once and in source order."""
+        values, targets = [], []
+        unpacked, invalid = False, False
+        for node in nodes:
+            if node.kind == "spread":
+                unpacked = True
+                value = self.evaluate(node.children[0])
+                if not value.array or value.fallback is not None:
+                    self.issue("PHP header argument unpacking requires an exact array")
+                    invalid = True
+                    continue
+                for key, item in value.items:
+                    self.budget.spend()
+                    values.append(item)
+                    targets.append(Node("named", node.token, key, (node.children[0],))
+                                   if isinstance(key, str) else node.children[0])
+            else:
+                values.append(self.evaluate(node.children[0] if node.kind == "named" else node))
+                targets.append(node)
+                if unpacked and node.kind != "named":
+                    self.issue("PHP positional header argument follows unpacking")
+                    invalid = True
+        return None if invalid else (tuple(values), tuple(targets))
 
     def bind_arguments(self, args: tuple[Value, ...], nodes: tuple[Node | None, ...],
                        names: tuple[str, ...], required: int):
@@ -922,7 +1093,25 @@ class Engine:
 
     def decode_literal(self, text: str) -> str:
         translations = {"n": "\n", "r": "\r", "t": "\t", "v": "\v", "e": "\x1b", "f": "\f", "\\": "\\", '"': '"', "$": "$"}
-        return re.sub(r"\\([nrtvef\\\"$])", lambda match: translations[match.group(1)], text)
+
+        def decode(match):
+            escaped = match.group(1)
+            if escaped in translations:
+                return translations[escaped]
+            if escaped.startswith("x"):
+                return chr(int(escaped[1:], 16))
+            if escaped.startswith("u{"):
+                digits = escaped[2:-1]
+                if (not escaped.endswith("}") or not re.fullmatch(r"[0-9a-fA-F]+", digits)
+                        or len(digits) > 6 or int(digits, 16) > 0x10ffff):
+                    raise ValueError("Invalid PHP Unicode string escape; analysis is incomplete")
+                return chr(int(digits, 16))
+            return chr(int(escaped, 8) & 0xff)
+
+        # PHP double-quoted strings decode octal bytes, hex bytes and Unicode
+        # codepoints. Keeping their source spelling could invent a safe URL
+        # path prefix (for example \\x2f followed by request data).
+        return re.sub(r"\\([nrtvef\\\"$]|x[0-9a-fA-F]{1,2}|[0-7]{1,3}|u\{[^}]*\}?)", decode, text)
 
     def evaluate(self, node: Node) -> Value:
         self.budget.spend()
@@ -1141,6 +1330,10 @@ class Engine:
     def call(self, node: Node) -> Value:
         target, arg_nodes = node.children[0], node.children[1:]
         if target.kind == "name":
+            selected = self.resolve(target.value, "function").lower()
+            if selected == "header" and selected not in self.functions:
+                bound = self.header_arguments(arg_nodes)
+                return self.builtin(selected, *bound, node.token) if bound is not None else EMPTY
             args = self.call_arguments(arg_nodes)
             name = self.resolve(target.value, "function").lower()
             if name in self.functions:
@@ -1155,6 +1348,9 @@ class Engine:
             name = target.value[1].lower()
             return self.method(receiver, name, args, arg_nodes, node.token)
         receiver = self.evaluate(target)
+        if isinstance(receiver.literal, str) and receiver.literal.lower() in {"header", "\\header"}:
+            bound = self.header_arguments(arg_nodes)
+            return self.builtin("header", *bound, node.token) if bound is not None else EMPTY
         args = self.call_arguments(arg_nodes)
         if receiver.refs and all(ref in self.closures for ref in receiver.refs):
             return joined(*(self.invoke(self.closures[ref], args, arg_nodes, node.token) for ref in receiver.refs))
@@ -1280,6 +1476,14 @@ class Engine:
             return EMPTY
         args, arg_nodes = bound
         first = args[0] if args else EMPTY
+        if name == "header":
+            self.response_header(args, token)
+            return EMPTY
+        if name == "http_response_code":
+            previous = self.response_status()
+            if args and first.literal != 0:
+                self.set_response_status(first if type(first.literal) is int else EMPTY)
+            return previous
         if name in ("mysqli_connect", "mysqli_init"):
             return self.allocate("mysqli")
         if name.startswith("mysqli_"):
@@ -1404,7 +1608,7 @@ class Engine:
             return tagged(first, "html-text", "html-double", "html-single", "html-url")
         if name == "file_get_contents" and first.literal == "php://input":
             return self.source(token, "PHP raw request body")
-        if name in ("isset", "empty", "is_null", "is_array", "is_object", "is_string", "is_int", "is_integer", "is_float", "is_numeric", "is_bool", "ctype_digit", "in_array", "array_key_exists", "key_exists", "count", "sizeof", "strlen", "mb_strlen", "strpos", "str_contains", "str_starts_with", "str_ends_with", "preg_match", "preg_match_all", "assert", "getenv", "time", "date", "random_int", "random_bytes", "session_start", "session_write_close", "setcookie", "header", "http_response_code", "error_log", "exit", "die"):
+        if name in ("isset", "empty", "is_null", "is_array", "is_object", "is_string", "is_int", "is_integer", "is_float", "is_numeric", "is_bool", "ctype_digit", "in_array", "array_key_exists", "key_exists", "count", "sizeof", "strlen", "mb_strlen", "strpos", "str_contains", "str_starts_with", "str_ends_with", "preg_match", "preg_match_all", "assert", "getenv", "time", "date", "random_int", "random_bytes", "session_start", "session_write_close", "setcookie", "error_log", "exit", "die"):
             return EMPTY
         if name == "unset":
             for target in arg_nodes:

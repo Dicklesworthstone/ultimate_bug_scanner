@@ -763,6 +763,64 @@ class KeepTempCliTests(unittest.TestCase):
                                      for name in ("rubocop", "bundle")
                                      for line in observations["executions"]), context)
 
+    def test_php_redirect_reports_retain_findings_and_scratch(self) -> None:
+        rule = "php.security.open-redirect"
+        cases = (
+            ("unsafe", "<?php\nheader('Location: ' . $_GET['next']);\n", [(rule, 2)]),
+            ("clean", "<?php\nheader('Location: /account/' . $_GET['next']);\n", []),
+            ("partial", "<?php\nheader('Location: ' . $_GET['next']);\n"
+             "header($_GET['header']);\n", [(rule, 2)]),
+        )
+        for scenario, text, expected in cases:
+            source = self.source("php-" + scenario + ".php", text)
+            for direct in (True, False):
+                for output_format in ("json", "sarif"):
+                    with self.subTest(scenario=scenario, direct=direct, format=output_format):
+                        sidecar = self.root / f"php-{scenario}-{direct}-{output_format}.json"
+                        arguments = [f"--format={output_format}", "--fail-on-warning"]
+                        if direct:
+                            arguments.extend(("--only=6", f"--json-out={sidecar}"))
+                        else:
+                            arguments.extend(("--only=php", f"--module-dir={ROOT / 'modules'}",
+                                              f"--report-json={sidecar}"))
+                        arguments.append(str(source))
+                        result, observations, run = self.run_scan(
+                            "php", source, *arguments, command_mode="--ci", direct_module=direct)
+                        context = f"{run}\n{result.stdout}\n{result.stderr}"
+                        self.assertEqual(result.returncode,
+                                         2 if scenario == "partial" else 1 if expected else 0, context)
+                        summary = json.loads(sidecar.read_text(encoding="utf-8"))
+                        self.assertEqual(summary["status"], "partial" if scenario == "partial" else "ok", context)
+                        counts = summary if direct else summary["totals"]
+                        self.assertEqual({key: counts[key] for key in SEVERITIES},
+                                         {"critical": len(expected), "warning": 0, "info": 0}, context)
+                        actual = sorted((row["rule"] if direct else row["rule_id"], row["line"])
+                                        for row in summary.get("findings", []))
+                        self.assertEqual(actual, expected, context)
+                        document = json.loads(result.stdout)
+                        if output_format == "json":
+                            self.assertEqual(document["status"], summary["status"], context)
+                        else:
+                            actual = sorted((row["ruleId"], row["locations"][0]["physicalLocation"]
+                                             ["region"]["startLine"])
+                                            for scan in document["runs"] for row in scan["results"])
+                            self.assertEqual(actual, expected, context)
+                            failures = [invocation for scan in document["runs"]
+                                        for invocation in scan.get("invocations", [])
+                                        if invocation["executionSuccessful"] is False]
+                            self.assertEqual(bool(failures), scenario == "partial", context)
+                        workspaces = list((run / "tmp").glob("ubs-php.*"))
+                        self.assertEqual(len(workspaces), 1, context)
+                        for name in ("files", "findings", "summary", "complete"):
+                            self.assertTrue((workspaces[0] / name).is_file(), context)
+                        cache_receipts = ([workspaces[0] / "findings.cache"] if direct
+                                          else list((run / "tmp").glob("*/php.cache")))
+                        self.assertEqual(len(cache_receipts), 1, context)
+                        cache_stats = json.loads(cache_receipts[0].read_text())
+                        self.assertEqual((cache_stats["hits"], cache_stats["misses"], cache_stats["total"]),
+                                         (0, 1, 1), context)
+                        self.assertTrue(observations["created_paths"], context)
+
     def test_sql_reports_retain_source_cache_and_partial_findings(self) -> None:
         unsafe = (
             "\\set ON_ERROR_STOP on\n"
@@ -961,16 +1019,16 @@ class KeepTempCliTests(unittest.TestCase):
         self.assertEqual(set(listed), dumped, context)
         self.assertTrue(observations["created_paths"], context)
 
-    def test_unsupported_php_refuses_before_module_execution(self) -> None:
-        source = self.source("unsupported.php", '<?php eval($_GET["code"]);\n')
+    def test_unsupported_java_refuses_before_module_execution(self) -> None:
+        source = self.source("Unsupported.java", 'class Unsupported {}\n')
         (source.parent / "supported.py").write_text(CASES["python"][3], encoding="utf-8")
-        for languages, target in (("php", source), ("python,php", source.parent)):
+        for languages, target in (("java", source), ("python,java", source.parent)):
             with self.subTest(languages=languages):
                 result, observations, run = self.run_scan(languages, target)
                 context = f"{run}\n{result.stdout}\n{result.stderr}"
                 self.assertEqual(result.returncode, 2, context)
                 self.assertIn("UBS_KEEP_TEMP", result.stderr + result.stdout, context)
-                self.assertIn("php", (result.stderr + result.stdout).lower(), context)
+                self.assertIn("java", (result.stderr + result.stdout).lower(), context)
                 self.assertEqual(json.loads(result.stdout)["reason"],
                                  "retention-unsupported-language", context)
                 self.assertFalse(any(re.search(r"ubs-[a-z]+\.sh", line)

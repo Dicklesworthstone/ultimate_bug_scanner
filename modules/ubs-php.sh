@@ -5,7 +5,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="9ad384f0d919b945098a5613ee58020943d99344004c31e1ecdb7496043101d6"
+UBS_LIB_CHECKSUM="6f3486640817f66be997daf29393f51757faede839aa4e897020e3f6a2af4002"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -83,7 +83,7 @@ Options:
 --jobs=N           parallel hint (native analysis is bounded and sequential)
 --exclude=GLOBS    additional path globs to skip (forwarded by the meta-runner)
 --include-ext=CSV  extra file extensions to scan (default: php,phtml)
---skip=CSV         skip category numbers (1 SQL, 2 execution, 3 includes, 4 deserialization, 5 output)
+--skip=CSV         skip category numbers (1 SQL, 2 execution, 3 includes, 4 deserialization, 5 output, 6 redirect)
 --only=CSV         run only these category numbers
 --report-json=FILE write NDJSON findings sink to FILE
 --files-from=FILE  NUL-separated file list to scan
@@ -96,6 +96,7 @@ Options:
 --project=DIR      project root recorded in reports
 --version          print module version and exit
 -h, --help         this help
+UBS_KEEP_TEMP=1    retain scanner scratch; use TMPDIR to choose storage
 contract: v2
 USAGE
 }
@@ -141,7 +142,7 @@ while [[ $# -gt 0 ]]; do
     --project) require_value "$@"; SOURCE_PROJECT_DIR="$2"; shift 2;;
     --list-rules) LIST_RULES=1; shift;;
     --list-categories)
-      printf '1  sql              SQL query construction and binding\n2  execution        Shell commands and dynamic code\n3  includes         Dynamic file inclusion\n4  deserialization  Untrusted object deserialization\n5  output           HTML output contexts\n'
+      printf '1  sql              SQL query construction and binding\n2  execution        Shell commands and dynamic code\n3  includes         Dynamic file inclusion\n4  deserialization  Untrusted object deserialization\n5  output           HTML output contexts\n6  redirect         Request-controlled redirect destinations\n'
       exit 0;;
     --version) printf 'ubs-php %s\n' "$VERSION"; exit 0;;
     -h|--help) usage; exit 0;;
@@ -170,7 +171,11 @@ fi
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/ubs-php.XXXXXX")" || { echo "ERROR: cannot allocate PHP scan workspace" >&2; exit 2; }
 # Called by Bash when this scanner exits; these are invocation-owned artifacts.
 # shellcheck disable=SC2317,SC2329
-cleanup(){ rm -f -- "$work_dir/files" "$work_dir/findings" "$work_dir/findings.cache" "$work_dir/summary" "$work_dir/sarif" "$work_dir/text" "$work_dir/complete"; rmdir -- "$work_dir" 2>/dev/null || true; }
+cleanup(){
+  [[ "${UBS_KEEP_TEMP:-0}" == "1" ]] && return 0
+  ubs_remove_temp -f -- "$work_dir/files" "$work_dir/findings" "$work_dir/findings.cache" "$work_dir/summary" "$work_dir/sarif" "$work_dir/text" "$work_dir/complete"
+  rmdir -- "$work_dir" 2>/dev/null || true
+}
 trap cleanup EXIT
 source_dir="$PROJECT_DIR"
 [[ ! -f "$source_dir" ]] || source_dir="$(dirname -- "$source_dir")"

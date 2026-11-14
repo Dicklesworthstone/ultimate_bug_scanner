@@ -646,7 +646,7 @@ class _Flow:
 
 class _Analysis:
     def __init__(self, source: str, code: str, rule: str, summaries: dict[str, _Summary],
-                 imports: _ImportContexts, uncertain_globals=None):
+                 imports: _ImportContexts, uncertain_globals=None, global_cells=frozenset()):
         self.source, self.code, self.rule, self.summaries = source, code, rule, summaries
         self.imports = imports
         self.effects = {}
@@ -657,6 +657,7 @@ class _Analysis:
         self.native_mutations: set[str] = set()
         self.native_escapes: set[str] = set()
         self.uncertain_globals = uncertain_globals if uncertain_globals is not None else set()
+        self.global_cells = global_cells
 
     @staticmethod
     def unparenthesize(expr, offset=0):
@@ -921,16 +922,26 @@ class _Analysis:
             if opening is not None and opening in pairs:
                 close = pairs[opening]
                 parameters = _parameter_names(code[match.end():param_end])
-                closure_scope, closure_state = scope.child(), dict(state)
+                closure_scope = scope.child()
                 invocation = close + 1
                 while invocation < len(code) and code[invocation].isspace():
                     invocation += 1
-                immediate = invocation < len(code) and code[invocation] == '(' and invocation in pairs
+                invoked = invocation < len(code) and code[invocation] == '(' and invocation in pairs
+                delayed = re.search(r'\b(?:go|defer)\s*$', code[:match.start()]) is not None
+                immediate = invoked and not delayed
                 arguments = []
-                if immediate:
+                if invoked:
                     arguments = [self.value(expr[invocation + 1 + start:invocation + 1 + end],
                                             offset + invocation + 1 + start, state, scope)
                                  for start, end in _parts(code[invocation + 1:pairs[invocation]])]
+                closure_state = dict(state)
+                if not immediate:
+                    for key, native in closure_state.items():
+                        if isinstance(key, _NativeKey) and key.cell not in self.global_cells:
+                            # A delayed body reads the eventual outer local
+                            # cell, not the value at the function literal.
+                            # Package cells keep the package mutation proof.
+                            closure_state[key] = _join_native(native, _UNKNOWN_NATIVE)
                 for index, parameter in enumerate(parameters):
                     if parameter:
                         key = closure_scope.declare(parameter, offset + match.start())
@@ -938,7 +949,7 @@ class _Analysis:
                             arguments[index] if index < len(arguments) else _CLEAN)
                         closure_state[_NativeKey(key)] = _UNKNOWN_NATIVE
                 nested = _Analysis(self.source, self.code, self.rule, self.summaries, self.imports,
-                                   self.uncertain_globals)
+                                   self.uncertain_globals, self.global_cells)
                 nested.native_escapes = set(self.native_escapes)
                 nested.block(_Parser(self.code).block(offset + opening + 1, offset + close),
                              closure_state, closure_scope)
@@ -951,6 +962,7 @@ class _Analysis:
                     self.effect(sink_offset, label, fact)
                 if immediate:
                     facts.extend(nested.returns)
+                if invoked:
                     close = pairs[invocation]
                 cover(match.start(), close + 1)
         for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code):
@@ -1200,7 +1212,7 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
     declare_globals(global_nodes)
     global_cells = set(globals_scope.bindings.values())
     uncertain_globals = set()
-    global_analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals)
+    global_analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals, global_cells)
     global_state = {}
     by_name = defaultdict(list)
     for function in functions:
@@ -1219,7 +1231,7 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
         name = pending.popleft()
         queued.discard(name)
         if name == '@globals':
-            global_analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals)
+            global_analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals, global_cells)
             updated = global_analysis.block(global_nodes, dict(global_state), globals_scope).normal or {}
             updated = _join_states(global_state, updated)
             newly_uncertain = (global_analysis.native_escapes & global_cells) - uncertain_globals
@@ -1237,7 +1249,7 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
         variants = []
         mutations = set()
         for function in by_name[name]:
-            analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals)
+            analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals, global_cells)
             state, scope = dict(global_state), globals_scope.child()
             for index, parameter in enumerate(function.parameters):
                 if parameter and parameter != '_':

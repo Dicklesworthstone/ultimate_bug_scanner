@@ -748,6 +748,34 @@ class SavedNativeValueOracleTests(packages.PackageTestCase):
                           'fmt.Fprint(w, escaped(r.FormValue("q")))', (('helper-write', 'sql'),))
 
 
+    def test_deferred_closure_reads_the_eventual_outer_cell(self):
+        self.check_source('import "html"',
+                          'escape := html.EscapeString\n'
+                          'render := func() { fmt.Fprint(w, escape(r.FormValue("q"))) } // deferred-read\n'
+                          'escape = passthrough\nrender()', (('deferred-read', 'xss'),),
+                          'func passthrough(value string) string { return value }')
+
+    def test_deferred_closure_keeps_local_global_and_immediate_native_proofs(self):
+        self.check_source('import "html"',
+                          'outer := html.EscapeString\n'
+                          'render := func() { local := html.EscapeString; '
+                          'fmt.Fprint(w, local(r.FormValue("q"))); '
+                          'fmt.Fprint(w, packageEscape(r.FormValue("q"))) }\nrender()\n'
+                          'func() { fmt.Fprint(w, outer(r.FormValue("q"))) }()', (),
+                          'var packageEscape = html.EscapeString')
+
+    def test_defer_and_go_keep_argument_snapshots_but_not_outer_callable_proofs(self):
+        for scheduling in ('defer', 'go'):
+            with self.subTest(scheduling=scheduling):
+                self.check_source('import "html"',
+                                  'escape := html.EscapeString\n' + scheduling + ' func() { '
+                                  'fmt.Fprint(w, escape(r.FormValue("q"))) }() // delayed-read\n'
+                                  + scheduling + ' func(value string) { fmt.Fprint(w, value) }'
+                                  '(escape(r.FormValue("q")))\nescape = passthrough',
+                                  (('delayed-read', 'xss'),),
+                                  'func passthrough(value string) string { return value }')
+
+
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 for real scanner tests')
 class GoSanitizerRunnerTests(unittest.TestCase):
     def test_actual_json_and_sarif_use_imported_sanitizer_identity(self):

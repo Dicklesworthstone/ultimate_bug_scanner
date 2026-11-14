@@ -190,6 +190,20 @@ class DecodingFlowTests(packages.PackageTestCase):
 
 
 class NativeFunctionValueTests(packages.PackageTestCase):
+    def test_deferred_reader_capture_does_not_snapshot_a_clean_error_contract(self):
+        self.source('handler.go', '''
+            package app
+            import "io"
+            func custom(reader io.Reader) ([]byte, error) { return nil, fmt.Errorf("%v", reader) }
+            func h() {
+                read := io.ReadAll
+                render := func() { _, err := read(r.Body); fmt.Fprint(w, err) }
+                read = custom
+                render()
+            }
+        ''')
+        self.assert_hits([('handler.go', 6, 'go.taint.xss')])
+
     def test_saved_reader_and_unmarshal_keep_output_and_error_positions(self):
         for reader in ('io', 'io/ioutil'):
             for codec in ('encoding/json', 'encoding/xml'):

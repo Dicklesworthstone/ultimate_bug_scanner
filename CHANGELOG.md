@@ -10,6 +10,11 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Prevent stored, deferred and goroutine Go closures from treating a captured
+  local function variable as a permanently native sanitizer or reader. Preserve
+  immediate calls, aliases declared inside the closure, stable package bindings
+  and arguments evaluated when a deferred or goroutine call is scheduled.
+
 - Report incomplete Python SQL analysis when a nonlocal helper with unresolved
   hashing/equality effects cannot be modeled, including captured callable
   defaults. A rejected helper model no longer silently discards a possible

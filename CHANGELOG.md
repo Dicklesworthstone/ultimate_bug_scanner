@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Follow standard-input contents through native Python `csv.reader` and
+  `csv.DictReader` rows, selected helpers and iterator consumers. Keep reader
+  construction lazy, distinguish input-derived headers from fixed field names,
+  and leave metadata and fixed input clean. Preserve valid parser alternatives
+  when another option branch fails. Unresolved argument expansions, dialect
+  hooks, reader mutation/escape and producer lifetime effects remain explicitly
+  incomplete, including effects before an unused reader is returned.
+
 - Track PHP environment values from native `getenv` and `$_ENV` through all
   seven existing security domains. Support named arguments, nullable/all-value
   getter forms and selected helper returns; `local_only` does not sanitize

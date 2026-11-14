@@ -922,6 +922,179 @@ class EagerStdinParserTests(SourceTest):
                          {('eval',2),('eval',6)})
 
 
+class CsvStdinParserTests(SourceTest):
+    def test_consumed_rows_reach_each_sink_domain(self):
+        for sink, rule in (("eval(value)", 'eval'), ("cursor.execute(value)", 'sql'),
+                           ("os.system(value)", 'command'), ("HttpResponse(value)", 'xss'),
+                           ("requests.get(value)", 'ssrf')):
+            with self.subTest(sink=sink):
+                findings = self.assert_rules('import csv, sys, os, requests\n'
+                                            'value = next(csv.reader(sys.stdin))[0]\n' + sink + '\n', rule)
+                self.assertEqual([finding['line'] for finding in findings], [3])
+
+    def test_iterator_aliases_and_consumption_forms(self):
+        setups = (
+            'value = next(csv.reader(sys.stdin))[0]',
+            'value = list(csv.reader(sys.stdin))[0][0]',
+            'value = tuple(csv.reader(sys.stdin))[0][0]',
+            'for row in csv.reader(sys.stdin):\n    value = row[0]',
+            'value = [row[0] for row in csv.reader(sys.stdin)][0]',
+            'rows = iter(csv.reader(sys.stdin))\nvalue = next(rows)[0]',
+            'rows = csv.reader(sys.stdin)\nalias = rows\nvalue = next(alias)[0]',
+            'rows = csv.reader(sys.stdin)\nadvance = rows.__next__\nvalue = advance()[0]',
+            'rows = csv.reader(sys.stdin).__iter__()\nvalue = rows.__next__()[0]',
+            'from csv import reader as parse\nvalue = next(parse(sys.stdin))[0]',
+            'parse = csv.reader\ncsv = None\nvalue = next(parse(sys.stdin))[0]',
+            'parsers = (csv.reader,)\nvalue = next(parsers[0](sys.stdin))[0]',
+            'args = (sys.stdin,)\nvalue = next(csv.reader(*args))[0]',
+            'value = next(csv.reader(sys.stdin, **{"delimiter": ","}))[0]',
+            'value = next(csv.reader(sys.stdin), ["1"])[0]',
+            'from sys import __stdin__ as stream\nvalue = next(csv.reader(stream))[0]',
+        )
+        for setup in setups:
+            with self.subTest(setup=setup):
+                self.assert_rules('import csv, sys\n' + setup + '\neval(value)\n', 'eval')
+
+    def test_dict_rows_and_implicit_header_are_input(self):
+        for setup in (
+                'value = next(csv.DictReader(sys.stdin))["code"]',
+                'value = next(csv.DictReader(f=sys.stdin))["code"]',
+                'value = next(csv.DictReader(sys.stdin, fieldnames=["code"]))["code"]',
+                'value = next(csv.DictReader(sys.stdin, ("code",)))["code"]',
+                'value = next(csv.DictReader(sys.stdin, fieldnames="x"))["x"]',
+                'value = next(csv.DictReader(**{"f": sys.stdin}, fieldnames=["code"]))["code"]',
+                'rows = csv.DictReader(sys.stdin)\nvalue = rows.fieldnames[0]',
+                'rows = csv.DictReader(sys.stdin)\nvalue = next(rows.reader)[0]',
+                'header = None if condition else ["code"]\n'
+                'rows = csv.DictReader(sys.stdin, fieldnames=header)\nvalue = rows.fieldnames[0]'):
+            with self.subTest(setup=setup):
+                self.assert_rules('import csv, sys\n' + setup + '\neval(value)\n', 'eval')
+
+    def test_native_factories_and_consumer_helpers_preserve_identity(self):
+        for setup in (
+                'def parse(stream):\n    return csv.reader(stream)\nvalue = next(parse(sys.stdin))[0]',
+                'def parse():\n    return csv.reader(sys.stdin)\nvalue = next(parse())[0]',
+                'def parse(factory, stream):\n    return factory(stream)\n'
+                'value = next(parse(csv.reader, sys.stdin))[0]',
+                'def parse(stream):\n    return csv.DictReader(stream, fieldnames=["code"])\n'
+                'value = next(parse(sys.stdin))["code"]',
+                'def take(rows):\n    return next(rows)[0]\nvalue = take(csv.reader(sys.stdin))',
+                'def identity(rows):\n    return rows\nvalue = next(identity(csv.reader(sys.stdin)))[0]',
+                'def take(advance):\n    return advance()[0]\n'
+                'rows = csv.reader(sys.stdin)\nvalue = take(rows.__next__)',
+                'def factory():\n    return csv.reader\nvalue = next(factory()(sys.stdin))[0]'):
+            with self.subTest(setup=setup):
+                self.assert_rules('import csv, sys\n' + setup + '\neval(value)\n', 'eval')
+
+    def test_handle_metadata_and_fixed_input_remain_clean(self):
+        for setup in (
+                'rows = csv.reader(sys.stdin)\nvalue = "1"',
+                'rows = csv.reader(sys.stdin)\nvalue = rows.line_num',
+                'rows = csv.reader(sys.stdin)\nnext(rows)\nvalue = rows.line_num',
+                'rows = csv.reader(sys.stdin)\nvalue = rows.dialect.delimiter',
+                'rows = csv.DictReader(sys.stdin)\nvalue = rows.line_num',
+                'rows = csv.DictReader(sys.stdin, fieldnames=["1"])\nvalue = rows.fieldnames[0]',
+                'value = next(csv.reader(io.StringIO("1\\n")))[0]',
+                'value = next(csv.DictReader(io.StringIO("code\\n1\\n")))["code"]',
+                'value = next(csv.reader(["1"]))[0]',
+                'value = next(csv.reader(sys.stdin))[0]\nvalue = "1"',
+                'from csv import reader\nreader = lambda stream: iter([["1"]])\nvalue = next(reader(sys.stdin))[0]',
+                'from . import csv\nvalue = next(csv.reader(sys.stdin))[0]'):
+            with self.subTest(setup=setup):
+                self.assert_rules('import csv, sys, io\n' + setup + '\neval(value)\n')
+
+    def test_literal_options_keep_rows_and_domain_safety(self):
+        for options in (', dialect="excel-tab"', ', "unix"', ', delimiter=";", quotechar="\'"',
+                        ', escapechar="\\\\", quoting=csv.QUOTE_NONE', ', strict=True, skipinitialspace=True'):
+            with self.subTest(options=options):
+                self.assert_rules('import csv, sys\nvalue = next(csv.reader(sys.stdin' + options + '))[0]\n'
+                                  'eval(value)\n', 'eval')
+        self.assert_rules('''
+            import csv, sys, html, shlex, os
+            value = next(csv.DictReader(sys.stdin))["code"]
+            cursor.execute('SELECT ?', (value,))
+            HttpResponse(html.escape(value))
+            os.system('echo ' + shlex.quote(value))
+        ''')
+        self.assert_rules('import csv, sys, html\neval(html.escape(next(csv.reader(sys.stdin))[0]))\n', 'eval')
+
+    def test_invalid_option_alternative_keeps_valid_reader_branch(self):
+        for key, alternatives in (('delimiter', '"" if flag else ","'),
+                                  ('quotechar', '"" if flag else "\\\""'),
+                                  ('escapechar', '"" if flag else None'),
+                                  ('lineterminator', '4 if flag else "\\r\\n"')):
+            with self.subTest(key=key):
+                self.assert_rules('import csv, sys\noption = ' + alternatives + '\n'
+                                  'eval(next(csv.reader(sys.stdin, ' + key + '=option))[0])\n', 'eval')
+        self.assert_rules('import csv, sys\noption = "" if flag else "long"\n'
+                          'eval(next(csv.reader(sys.stdin, delimiter=option))[0])\n')
+
+    def test_invalid_native_shapes_and_binary_streams_do_not_produce_rows(self):
+        for expression in ('csv.reader(f=sys.stdin)', 'csv.reader(sys.stdin, "excel", "extra")',
+                           'csv.DictReader(sys.stdin, f=sys.stdin)', 'csv.reader(sys.stdin, unsupported=True)',
+                           'csv.reader(sys.stdin, delimiter="")', 'csv.reader(sys.stdin, lineterminator=4)',
+                           'csv.reader(sys.stdin, quotechar=None, quoting=csv.QUOTE_ALL)'):
+            with self.subTest(expression=expression):
+                self.assert_rules('import csv, sys\neval(next(' + expression + ')[0])\n')
+        for expression in ('next(csv.reader(sys.stdin), default=["1"])',
+                           'list(csv.reader(sys.stdin), extra=True)',
+                           'csv.reader(sys.stdin).__next__("bad")'):
+            with self.subTest(expression=expression):
+                self.assert_rules('import csv, sys\neval(' + expression + ')\n')
+        self.assert_rules('''
+            import csv, sys
+            try:
+                value = next(csv.reader(sys.stdin.buffer))[0]
+            except csv.Error:
+                value = '1'
+            eval(value)
+        ''')
+
+    def test_opaque_dialects_headers_and_registry_effects_are_explicit(self):
+        for setup in (
+                'rows = csv.reader(sys.stdin, dialect=CustomDialect)',
+                'rows = csv.reader(sys.stdin, delimiter=custom)',
+                'rows = csv.reader(sys.stdin, quoting=csv.QUOTE_NONNUMERIC)',
+                'rows = csv.DictReader(sys.stdin, fieldnames=custom)',
+                'rows = csv.DictReader(sys.stdin, fieldnames=[input()])',
+                'rows = csv.reader(sys.stdin, **options)',
+                'options = {"f": sys.stdin}\nrows = csv.DictReader(**options, fieldnames=["code"])',
+                'def make(**options):\n    return csv.DictReader(**options)\n'
+                'rows = make(f=sys.stdin, fieldnames=["code"])',
+                'csv.register_dialect("excel", delimiter=";")\nrows = csv.DictReader(sys.stdin)',
+                'csv.DictReader.fieldnames = property(callback)\nrows = csv.DictReader(sys.stdin)',
+                'csv.DictReader.line_num = property(callback)\nrows = csv.DictReader(sys.stdin)',
+                'csv.reader = replacement\nrows = csv.reader(sys.stdin)'):
+            with self.subTest(setup=setup):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'CSV reader'):
+                    self.scan('import csv, sys\n' + setup + '\n')
+
+    def test_reader_storage_mutation_and_producer_frames_are_explicit(self):
+        for setup in (
+                'rows = [csv.reader(sys.stdin)]\nvalue = next(rows[0])[0]',
+                'rows = csv.DictReader(sys.stdin)\nrows.reader = opaque\nvalue = next(rows)["code"]',
+                'rows = csv.reader(sys.stdin)\nunknown(rows)\nvalue = next(rows)[0]',
+                'def make():\n    owned = Owner()\n    return csv.reader(sys.stdin)\n'
+                'value = next(make())[0]',
+                'def make(unused=Owner()):\n    return csv.reader(sys.stdin)\n'
+                'value = next(make())[0]',
+                'def make(unused):\n    return csv.reader(sys.stdin)\n'
+                'value = next(make(Owner()))[0]'):
+            with self.subTest(setup=setup):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'CSV reader'):
+                    self.scan('import csv, sys\n' + setup + '\neval(value)\n')
+
+    def test_unused_factory_results_cannot_hide_return_time_finalizers(self):
+        for returned in ('csv.reader(sys.stdin)', 'csv.reader', 'csv', 'csv.reader(sys.stdin).__next__'):
+            with self.subTest(returned=returned):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'CSV reader producer'):
+                    self.scan('import csv, sys\nvalue = "1"\n'
+                              'class Owner:\n    def __del__(self):\n        global value\n'
+                              '        value = sys.stdin.readline()\n'
+                              'def make():\n    owned = Owner()\n    return ' + returned + '\n'
+                              'unused = make()\neval(value)\n')
+
+
 class ReachingDefinitionTests(SourceTest):
     def test_safe_reassignment_kills_taint(self):
         self.assert_rules("q = input()\nq = 'safe'\neval(q)\n")
@@ -1139,6 +1312,13 @@ class RunnerIntegrationTests(unittest.TestCase):
                                ("import tomllib, sys\ncursor.execute('SELECT %s', (tomllib.load(sys.stdin.buffer)['query'],))\n", False),
                                ("import json, sys\narguments={'fp':sys.stdin}\n"
                                 "cursor.execute(json.load(**arguments)['query'])\n", True),
+                               ("import csv, sys\ncursor.execute(next(csv.reader(sys.stdin))[0])\n", True),
+                               ("import csv, sys\ncursor.execute(next(csv.DictReader(sys.stdin))['query'])\n", True),
+                               ("import csv, sys\nfor row in csv.reader(sys.stdin):\n    cursor.execute(row[0])\n", True),
+                               ("import csv, sys\ncursor.execute(csv.DictReader(sys.stdin).fieldnames[0])\n", True),
+                               ("import csv, sys\ncursor.execute('SELECT ?', (next(csv.reader(sys.stdin))[0],))\n", False),
+                               ("import csv, sys\nrows=csv.reader(sys.stdin)\nnext(rows)\ncursor.execute(rows.line_num)\n", False),
+                               ("import csv, io\ncursor.execute(next(csv.reader(io.StringIO('SELECT 1')))[0])\n", False),
                                ("from json import load\nimport sys\nload=lambda stream: {'query':'SELECT 1'}\n"
                                 "cursor.execute(load(sys.stdin)['query'])\n", False),
                                ("from . import json\nimport sys\ncursor.execute(json.load(sys.stdin)['query'])\n", False),

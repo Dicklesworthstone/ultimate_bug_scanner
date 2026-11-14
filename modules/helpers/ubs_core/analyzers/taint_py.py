@@ -71,7 +71,9 @@ _STDIN_UNMODELED = frozenset(f'{stream}.{method}' for stream in _STDIN_STREAMS
                             for method in ('readinto', 'readinto1', 'detach'))
 _STDIN_API_NAMES = frozenset(_STDIN_READERS) | frozenset(_STDIN_ITERATORS) | _STDIN_UNMODELED
 _STDIN_EAGER_PARSERS = frozenset({'json.load', 'tomllib.load'})
-_STDIN_PARSER_CARRIERS = _STDIN_EAGER_PARSERS | _STDIN_STREAMS | {'json', 'tomllib', 'sys'}
+_STDIN_CSV_PARSERS = frozenset({'csv.reader', 'csv.DictReader'})
+_STDIN_PARSER_CARRIERS = (_STDIN_EAGER_PARSERS | _STDIN_CSV_PARSERS | _STDIN_STREAMS
+                          | {'json', 'tomllib', 'csv', 'sys'})
 _STDIN_OPAQUE_ARGUMENTS = '@stdin:opaque-arguments'
 _SOURCE_MEMBERS = {'os': frozenset({'getenv', 'getenvb', 'environ', 'environb'}),
                    'sys': frozenset({'argv', 'stdin', '__stdin__'}),
@@ -415,6 +417,15 @@ class _LiteralMapping:
     # retains producer authority without building a growing object graph.
     value_binding: object = None
     keys: frozenset | None = None
+
+
+@dataclass(frozen=True)
+class _CsvReader:
+    """A native lazy CSV iterator; its handle and metadata are not row data."""
+    stream: str
+    dictionary: bool = False
+    input_header: bool = False
+    format_safe: bool = True
 
 
 _LITERAL_MAPPING_GET = '@literal-mapping.get'
@@ -1015,6 +1026,8 @@ def _without_object_contract(binding):
         raise AnalysisLimit('mutated functools.partial object; analysis is incomplete')
     choices = []
     for value in _binding_choices(binding):
+        if isinstance(value, _CsvReader):
+            raise AnalysisLimit('CSV reader mutation or escape is unresolved; analysis is incomplete')
         if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance,
                               _LiteralMethodInstance, _ProcessInput, ast.ClassDef)):
             value = None
@@ -1627,7 +1640,7 @@ def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
         # Network clients and stream parsers require real import identities.
         # An unresolved relative import or local shadow cannot recover one
         # merely because its receiver has the standard library's spelling.
-        if node.id in {'requests', 'httpx', 'json', 'tomllib'}:
+        if node.id in {'requests', 'httpx', 'json', 'tomllib', 'csv'}:
             return ''
         return node.id
     if isinstance(node, ast.Attribute):
@@ -2339,6 +2352,9 @@ class _Flow:
     def escape_literal_mapping(self, binding, references, state):
         """Heap aggregates do not retain these finite object contracts."""
         for value in _binding_choices(binding):
+            if (isinstance(value, _CsvReader) or isinstance(value, _BoundCallable)
+                    and isinstance(value.receiver_binding, _CsvReader)):
+                raise AnalysisLimit('CSV reader storage or escape is unresolved; analysis is incomplete')
             if isinstance(value, (_LiteralMapping, _LiteralJoinInstance, _LiteralMethodInstance)):
                 self.mutate(references, CLEAN, state)
             elif isinstance(value, _BoundCallable) and (
@@ -3251,7 +3267,8 @@ class _Flow:
     @staticmethod
     def unproved_producer(binding):
         return any(isinstance(value, _UnprovedProducer)
-                   or isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance)) and not value.format_safe
+                   or isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance,
+                                         _CsvReader)) and not value.format_safe
                    for value in _binding_choices(binding))
 
     @staticmethod
@@ -3320,6 +3337,8 @@ class _Flow:
                 value = _LiteralJoinInstance(value.owner, value.result, False)
             elif isinstance(value, _LiteralMethodInstance):
                 value = _LiteralMethodInstance(value.owner, value.function, False)
+            elif isinstance(value, _CsvReader):
+                value = _CsvReader(value.stream, value.dictionary, value.input_header, False)
             elif isinstance(value, str) and value in _STDIN_PARSER_CARRIERS:
                 value = _BoundCallable(value, NO_REFERENCES, namespace_proven=True,
                                        producer_unproved=True)
@@ -4514,9 +4533,19 @@ class _Flow:
         method objects and other metadata are not its externally supplied data.
         Keep this separate from source() so aliases retain that distinction.
         """
-        return join_facts(*(frozenset({TaintTrace(name, path=(name,))})
-                            for value in _binding_choices(binding)
-                            if (name := self.stdin_identity(value)) in _STDIN_STREAMS))
+        sources = []
+        for value in _binding_choices(binding):
+            if isinstance(value, _CsvReader):
+                if not value.format_safe:
+                    raise AnalysisLimit('CSV reader producer effects are unresolved; analysis is incomplete')
+                # _csv.reader requires str records. A binary stream raises
+                # before producing any row; it is not a decoded text source.
+                name = value.stream if value.stream in {'sys.stdin', 'sys.__stdin__'} else None
+            else:
+                name = self.stdin_identity(value)
+            if name in _STDIN_STREAMS:
+                sources.append(frozenset({TaintTrace(name, path=(name,))}))
+        return join_facts(*sources)
 
     def stdin_parser_after(self, execution, consumer, seen=frozenset()):
         """Prove an eval cannot run before any invocation of this parser.
@@ -4533,10 +4562,17 @@ class _Flow:
                 return False
             child, ancestors = consumer, set()
             while child in engine.parents and engine.parents[child] is not scope:
-                child = engine.parents[child]
-                if isinstance(child, (ast.For, ast.AsyncFor, ast.While,
-                                      ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                parent = engine.parents[child]
+                # A for/comprehension's first iterable is constructed once,
+                # before its loop starts. Its body and later clauses can run
+                # after an earlier iteration's eval, so retain that boundary.
+                if (isinstance(parent, (ast.For, ast.AsyncFor)) and parent.iter is not child
+                        or isinstance(parent, ast.comprehension) and parent.iter is not child
+                        or isinstance(parent, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
+                        and parent.generators[0] is not child
+                        or isinstance(parent, ast.While)):
                     return False
+                child = parent
                 ancestors.add(child)
             if execution in ancestors:
                 return True  # The enclosing eval executes after its argument.
@@ -4564,10 +4600,11 @@ class _Flow:
             calls.append(parent)
         return bool(calls) and all(self.stdin_parser_after(execution, call, seen | {scope}) for call in calls)
 
-    def stdin_parser_stable(self, node):
+    def stdin_parser_stable(self, node, *, members=None):
         """Require the native loader's decoder and module to remain intact."""
-        names = {'load', 'loads', 'JSONDecoder', '_default_decoder', 'read',
-                 'decode', 'raw_decode', 'scan_once', '__code__', '__defaults__', '__kwdefaults__'}
+        names = (members if members is not None else {
+            'load', 'loads', 'JSONDecoder', '_default_decoder', 'read',
+            'decode', 'raw_decode', 'scan_once', '__code__', '__defaults__', '__kwdefaults__'})
         if (self.class_environments or self.engine.generator_namespace_exposed
                 or self.engine.generator_frame_exposed):
             return False
@@ -4680,12 +4717,208 @@ class _Flow:
         self.possible_exception(state)
         return join_facts(consumed, receiver, *inputs.arguments, *inputs.keywords.values())
 
+    def csv_parser(self, node, state, target, name, inputs):
+        """Construct a lazy native reader without reading its first record."""
+        positions = self.call_positions(node, inputs.arguments, state)
+        keywords = {key: self.expression_bindings.get(expression, expression)
+                    for key, expression in inputs.keyword_nodes.items()}
+        supplied = [binding for _expression, _fact, binding, _refs in positions]
+        supplied.extend(keywords.values())
+        # An unresolved expansion can contain the input itself. Literal
+        # expansions already normalized by call_positions keep their exact
+        # arguments; opaque mappings cannot certify an absent stdin stream.
+        if (None in keywords or any(isinstance(expression, (ast.Starred, _ArgumentExpansion))
+                for expression, _fact, _binding, _refs in positions)):
+            raise AnalysisLimit('CSV reader argument expansion is unresolved; analysis is incomplete')
+        if not any(self.stdin_identity(value) in _STDIN_STREAMS
+                   for binding in supplied for value in _binding_choices(binding)):
+            return None
+        dictionary = name == 'csv.DictReader'
+        parameters = ('f', 'fieldnames', 'restkey', 'restval', 'dialect') if dictionary else ('f', 'dialect')
+        options = {key: binding for key, (_expression, _fact, binding, _refs)
+                   in zip(parameters, positions)}
+        if (len(positions) > len(parameters) or any(key in options for key in keywords)
+                or not dictionary and ('f' in keywords or not positions)):
+            self.possible_exception(state)
+            return CLEAN
+        options.update(keywords)
+        binding = options.pop('f', None)
+        if binding is None:
+            self.possible_exception(state)
+            return CLEAN
+        self.require_value(binding)
+        streams = [self.stdin_identity(value) for value in _binding_choices(binding)]
+        if not any(stream in _STDIN_STREAMS for stream in streams):
+            return None
+        if any(stream not in _STDIN_STREAMS for stream in streams):
+            raise AnalysisLimit('CSV reader input iteration is unresolved; analysis is incomplete')
+        members = {'reader', 'DictReader', 'fieldnames', '_fieldnames', 'line_num', 'dialect', 'restkey', 'restval',
+                   '__next__', '__iter__', '__init__', '__new__', '__getattr__', '__getattribute__', '__setattr__',
+                   '__class__', '__bases__', '__del__', '__code__', '__defaults__', '__kwdefaults__'}
+        if (isinstance(target, _BoundCallable) and target.producer_unproved
+                or any(isinstance(value, _BoundCallable) and value.producer_unproved
+                       for value in _binding_choices(binding))
+                or any(engine.generator_csv_registry_exposed for engine in self.engine.generator_peers)
+                or not self.stdin_parser_stable(node, members=members)):
+            raise AnalysisLimit('CSV reader identity or producer effects are unresolved; analysis is incomplete')
+        known = {'dialect', 'delimiter', 'quotechar', 'escapechar', 'doublequote',
+                 'skipinitialspace', 'lineterminator', 'quoting', 'strict'}
+        if dictionary:
+            known.update({'fieldnames', 'restkey', 'restval'})
+        if options.keys() - known:
+            self.possible_exception(state)
+            return CLEAN
+        input_header = dictionary
+        normal = True
+        for key, option in options.items():
+            self.require_value(option)
+            option_normal = False
+            if key == 'fieldnames':
+                input_header = any(isinstance(value, ast.Constant) and value.value is None
+                                   for value in _binding_choices(option))
+            for value in _binding_choices(option):
+                literal = value.value if isinstance(value, (ast.Constant, _LiteralString)) else _MISSING
+                if isinstance(value, _LiteralString) and not value.format_safe:
+                    literal = _MISSING
+                if key == 'fieldnames':
+                    if literal is None or type(literal) is str:
+                        option_normal = True
+                        continue
+                    if (not isinstance(value, _ArgumentVector) or any(
+                            not all(isinstance(part, _LiteralString) and part.format_safe
+                                    or isinstance(part, ast.Constant) and type(part.value) is str
+                                    for part in _binding_choices(item))
+                            for item, _fact in value.operands)):
+                        raise AnalysisLimit('CSV reader header iteration is unresolved; analysis is incomplete')
+                elif key == 'dialect':
+                    if literal is not None and literal not in {'excel', 'excel-tab', 'unix'}:
+                        raise AnalysisLimit('CSV reader dialect hooks are unmodeled; analysis is incomplete')
+                elif key == 'quoting':
+                    if value in {'csv.QUOTE_MINIMAL', 'csv.QUOTE_ALL', 'csv.QUOTE_NONE'}:
+                        option_normal = True
+                        continue
+                    if type(literal) is not int or literal not in {0, 1, 3}:
+                        raise AnalysisLimit('CSV reader numeric conversion is unmodeled; analysis is incomplete')
+                elif literal is _MISSING or type(literal) not in {str, bytes, int, float, bool, type(None)}:
+                    raise AnalysisLimit('CSV reader options may invoke user protocols; analysis is incomplete')
+                elif key in {'delimiter', 'quotechar', 'escapechar'} and not (
+                        type(literal) is str and len(literal) == 1
+                        or key != 'delimiter' and literal is None):
+                    continue
+                elif key == 'lineterminator' and type(literal) is not str:
+                    continue
+                option_normal = True
+            # A failing alternative does not remove another branch's valid
+            # reader. Inspect all options for callbacks before rejecting a
+            # call whose native alternatives all fail validation.
+            normal = normal and option_normal
+        if (not normal or 'quotechar' in options and 'quoting' in options
+                and all(isinstance(value, ast.Constant) and value.value is None
+                        for value in _binding_choices(options['quotechar']))
+                and all(value != 'csv.QUOTE_NONE'
+                        and not (isinstance(value, ast.Constant) and value.value == 3)
+                        for value in _binding_choices(options['quoting']))):
+            # Explicit quoting requires a quote character. Omitting quoting
+            # with quotechar=None instead selects QUOTE_NONE natively.
+            self.possible_exception(state)
+            return CLEAN
+        self.expression_bindings[node] = _join_bindings(*(
+            _CsvReader(stream, dictionary, input_header) for stream in streams))
+        self.expression_references[node] = frozenset({node})
+        self.possible_exception(state)
+        return CLEAN
+
+    def csv_parser_factory(self, node, target, state):
+        """Prove a small reader/alias factory cannot release opaque locals.
+
+        The ordinary summary already proves the actual CSV construction.
+        This separate proof covers its whole producer frame, including every
+        supplied argument, instead of treating a native return as ownership.
+        """
+        function = target.function if isinstance(target, _FunctionValue) else target
+        if (not isinstance(function, ast.FunctionDef) or self.engine.owner(function) is not self.engine
+                or function.decorator_list or function.returns is not None
+                or function in self.engine.generators or self.engine.closures.get(function)
+                or not self.engine.generator_helper_identity(function)):
+            return False
+        signature = function.args
+        positional = [*signature.posonlyargs, *signature.args]
+        if (signature.vararg or signature.kwarg or signature.defaults
+                or any(value is not None for value in signature.kw_defaults)
+                or any(argument.annotation is not None for argument in (*positional, *signature.kwonlyargs))
+                or len(node.args) > len(positional)
+                or any(isinstance(value, ast.Starred) for value in node.args)):
+            return False
+        values = {argument.arg: self.expression_bindings.get(value, value)
+                  for argument, value in zip(positional, node.args)}
+        accepted = {argument.arg for argument in (*signature.args, *signature.kwonlyargs)}
+        for keyword in node.keywords:
+            if keyword.arg not in accepted or keyword.arg in values:
+                return False
+            values[keyword.arg] = self.expression_bindings.get(keyword.value, keyword.value)
+        if set(values) != {argument.arg for argument in (*positional, *signature.kwonlyargs)}:
+            return False
+
+        def native(binding):
+            return all((self.stdin_identity(value) in _STDIN_STREAMS
+                        or isinstance(value, str) and value in _STDIN_CSV_PARSERS
+                        or isinstance(value, _BoundCallable) and value.namespace_proven
+                        and value.name in _STDIN_CSV_PARSERS)
+                       and not (isinstance(value, _BoundCallable) and value.producer_unproved)
+                       or isinstance(value, _CsvReader) and value.format_safe
+                       or self.materialized_generator_binding(value, NO_REFERENCES, state)
+                       for value in _binding_choices(binding))
+
+        if not all(native(value) for value in values.values()):
+            return False
+
+        def identity(expression):
+            if isinstance(expression, ast.Name):
+                return (values[expression.id] if expression.id in values
+                        else self.global_contents(expression.id, state).binding)
+            if isinstance(expression, ast.Attribute):
+                parent = identity(expression.value)
+                return parent + '.' + expression.attr if isinstance(parent, str) else None
+            return expression if isinstance(expression, ast.Constant) else None
+
+        def inert(expression):
+            self.engine.budget.spend()
+            if isinstance(expression, (ast.Tuple, ast.List)):
+                return all(inert(value) for value in expression.elts)
+            return native(identity(expression))
+
+        body = [statement for statement in function.body if not isinstance(statement, ast.Pass)
+                and not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant))]
+        if len(body) != 1 or not isinstance(body[0], ast.Return):
+            return False
+        returned = body[0].value
+        if isinstance(returned, ast.Call):
+            return (identity(returned.func) in _STDIN_CSV_PARSERS
+                    and all(inert(value) for value in returned.args)
+                    and all(keyword.arg is not None and inert(keyword.value) for keyword in returned.keywords))
+        return inert(returned)
+
     def stdin_call(self, node, state, target, name, receiver, inputs):
         """Finite read/iteration contracts; None leaves ordinary calls alone."""
         native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
         arguments, keywords = inputs.arguments, inputs.keywords
         if native and name in _STDIN_EAGER_PARSERS:
             return self.stdin_parser(node, state, target, name, receiver, inputs)
+        if native and name in _STDIN_CSV_PARSERS:
+            return self.csv_parser(node, state, target, name, inputs)
+        if isinstance(target, _BoundCallable) and isinstance(target.receiver_binding, _CsvReader):
+            reader = target.receiver_binding
+            if target.references & state.mutated or target.producer_unproved:
+                raise AnalysisLimit('CSV reader mutation or producer effects are unresolved; analysis is incomplete')
+            self.possible_exception(state)
+            if arguments or keywords:
+                return CLEAN  # Native iterator methods take no arguments.
+            if name == '@csv.__iter__':
+                self.expression_bindings[node] = reader
+                self.expression_references[node] = target.references
+                return CLEAN
+            if name == '@csv.__next__':
+                return self.stdin_source(reader)
         if native and name in _STDIN_UNMODELED:
             # readinto mutates a caller-owned buffer; detach transfers an
             # underlying stream and invalidates its old owner. Neither is a
@@ -4761,8 +4994,13 @@ class _Flow:
                 if (stream := self.stdin_identity(value)) in _STDIN_STREAMS
                 and (stream.endswith(('.buffer', '.raw')) if bytes_join
                      else stream in {'sys.stdin', 'sys.__stdin__'})))
+        csv_readers = any(isinstance(value, _CsvReader) for value in _binding_choices(binding))
+        if csv_readers and builtins_consumer and (
+                keywords or len(positions) > (2 if consumer.rsplit('.', 1)[-1] == 'next' else 1)):
+            self.possible_exception(state)
+            return CLEAN
         consumed = self.stdin_source(binding)
-        if not consumed:
+        if not consumed and not csv_readers:
             return None
         if builtins_consumer and any(
                 engine.generator_builtin_reflection or engine.generator_namespace_exposed
@@ -4771,9 +5009,10 @@ class _Flow:
         self.possible_exception(state)
         if consumer in {'iter', 'builtins.iter'} and len(positions) == 1 and not keywords:
             self.expression_bindings[node] = _join_bindings(*(
-                stream if (stream := self.stdin_identity(value)) in _STDIN_STREAMS else None
+                value if isinstance(value, _CsvReader)
+                else stream if (stream := self.stdin_identity(value)) in _STDIN_STREAMS else None
                 for value in _binding_choices(binding)))
-            self.expression_references[node] = NO_REFERENCES
+            self.expression_references[node] = _references if csv_readers else NO_REFERENCES
             return first
         if consumer in {'iter', 'builtins.iter'}:
             return None
@@ -6395,7 +6634,7 @@ class _Flow:
             # the caller's distinct generator/closure cells.
             format_frame_inert = (bool(self.materialized_generator_depth) or not any(
                 isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _LiteralMethodInstance,
-                                   _ArgumentVector, _LiteralMapping,
+                                   _ArgumentVector, _LiteralMapping, _CsvReader,
                                    _SymbolicValue, ast.Constant))
                 or isinstance(value, str) and value in _STDIN_PARSER_CARRIERS
                 or isinstance(value, _BoundCallable) and (
@@ -6403,12 +6642,24 @@ class _Flow:
                 for value in _binding_choices(summary.returned_binding)))
             if not format_frame_inert and isinstance(node, ast.Call):
                 format_frame_inert = self.materialized_generator_call(node, target, state)
+                csv_return = any(isinstance(value, _CsvReader)
+                    or isinstance(value, str) and value in _STDIN_CSV_PARSERS | {'csv'}
+                    or isinstance(value, _BoundCallable) and (
+                        isinstance(value.receiver_binding, _CsvReader)
+                        or value.namespace_proven and value.name in _STDIN_CSV_PARSERS | {'csv'})
+                    for value in _binding_choices(summary.returned_binding))
+                if not format_frame_inert and csv_return:
+                    format_frame_inert = self.csv_parser_factory(node, target, state)
                 if not format_frame_inert and all(
                         value in _STDIN_PARSER_CARRIERS if isinstance(value, str)
                         else isinstance(value, _BoundCallable) and value.namespace_proven
                         and value.name in _STDIN_PARSER_CARRIERS and not value.producer_unproved
                         for value in _binding_choices(summary.returned_binding)):
                     format_frame_inert = self.stdin_parser_factory(node, target)
+                if not format_frame_inert and csv_return:
+                    # Releasing a factory's locals/defaults happens now,
+                    # even if its returned lazy reader is never consumed.
+                    raise AnalysisLimit('CSV reader producer effects are unresolved; analysis is incomplete')
             for parameter, written in summary.mutations:
                 fact = substitute(written)
                 self.mutate(self._lookup_refs(references, parameter), fact, state)
@@ -6854,6 +7105,24 @@ class _Flow:
                                             if isinstance(ref, str) and ref.startswith('@global:'))
             for base in _binding_choices(self.expression_bindings.get(node.value)):
                 function = base.function if isinstance(base, (_FunctionValue, _ClosureValue)) else base
+                if isinstance(base, _CsvReader):
+                    if not base.format_safe or receiver_refs & state.mutated:
+                        raise AnalysisLimit('CSV reader mutation or producer effects are unresolved; analysis is incomplete')
+                    if node.attr in {'__next__', '__iter__'}:
+                        candidates.append(_BoundCallable('@csv.' + node.attr, receiver_refs,
+                                                          namespace_proven=True, receiver_binding=base))
+                    elif node.attr == 'fieldnames' and base.dictionary:
+                        if base.input_header:
+                            fact = join_facts(fact, self.stdin_source(base))
+                            self.possible_exception(state)
+                        candidates.append(None)
+                    elif node.attr == 'reader' and base.dictionary:
+                        candidates.append(_CsvReader(base.stream))
+                    elif node.attr in {'line_num', 'dialect'} or base.dictionary and node.attr in {'restkey', 'restval'}:
+                        candidates.append(None)
+                    else:
+                        raise AnalysisLimit('CSV reader attribute protocol is unmodeled; analysis is incomplete')
+                    continue
                 if isinstance(function, ast.FunctionDef) and function in self.engine.generators:
                     raise AnalysisLimit('generator function metadata access is unmodeled; analysis is incomplete')
                 if base == _PARTIAL_CHANGED_MODULE:
@@ -8185,6 +8454,12 @@ class _Analysis:
             for node in literal_authority)
         self.generator_attribute_writes = {node.attr for node in nodes if isinstance(node, ast.Attribute)
                                            and isinstance(node.ctx, (ast.Store, ast.Del))}
+        self.generator_csv_registry_exposed = any(
+            isinstance(node, ast.Attribute) and node.attr in {'register_dialect', 'unregister_dialect'}
+            or isinstance(node, ast.Name) and node.id in {'register_dialect', 'unregister_dialect'}
+            or isinstance(node, ast.ImportFrom) and node.module == 'csv'
+            and any(alias.name in {'register_dialect', 'unregister_dialect'} for alias in node.names)
+            for node in nodes)
         frame_capabilities, literal_frames = (tuple(
             node for node in group if
             isinstance(node, ast.Name) and node.id in {'locals', '_getframe', 'currentframe', '_current_frames'}
@@ -9140,7 +9415,7 @@ class _Analysis:
                 # Partial captures may retain exact scalar options such as
                 # shell=False. Their source AST identities are finite.
                 pass
-            elif not isinstance(value, (str, _LiteralMapping, _ProcessInput, ast.FunctionDef, ast.AsyncFunctionDef,
+            elif not isinstance(value, (str, _LiteralMapping, _ProcessInput, _CsvReader, ast.FunctionDef, ast.AsyncFunctionDef,
                                         ast.Lambda, ast.ClassDef)):
                 value = _SymbolicValue(name) if captured else None
             choices.append(value)
@@ -9239,7 +9514,7 @@ class _Analysis:
                 if (binding is nominal
                         and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
                                                      _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
-                                                     _LiteralMapping, _ProcessInput))
+                                                     _LiteralMapping, _ProcessInput, _CsvReader))
                         and not explicit_override
                         and gname in owner_bindings
                         and gname not in owner_fn.locals[function]
@@ -9252,7 +9527,7 @@ class _Analysis:
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
                                            ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
                                            _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
-                                           _LiteralMapping, _ProcessInput, ast.Constant))
+                                           _LiteralMapping, _ProcessInput, _CsvReader, ast.Constant))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):

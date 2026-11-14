@@ -943,6 +943,8 @@ with closing(sqlite3.connect(':memory:')) as connection:
         actual = run(cursor, None, inputs['value'], [])
     elif inputs['mode'] == 'cursor-user':
         actual = run(cursor, inputs['value'])
+    elif inputs['mode'] == 'cursor-user-flag':
+        actual = run(cursor, inputs['value'], inputs['flag'])
     else:
         raise ValueError('unknown witness mode')
 print(json.dumps({'rows': actual, 'python': sys.version, 'sqlite_version': sqlite3.sqlite_version,
@@ -2173,6 +2175,25 @@ class SQLValueCaptureTests(unittest.TestCase):
                      'bound-default-method'):
             self._assert_partial_cli('update-helper-cli-' + name, cases[name][0], None)
         self.assert_real_cli_capture(clean_cases, wrap=False)
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_ignored_generator_call_time_cells(self):
+        cases = {name: source for name, source, _rows in set_update_helper_cases()}
+        originals = []
+        advisories = {}
+        for name in ('closure-reads-overwritten-method', 'closure-reads-overwritten-receiver',
+                     'nonlocal-overwritten-method'):
+            # Restore the original witness signature from the shared SQL
+            # fixture wrapper; every generator and cell operation is intact.
+            source = 'def run(cursor, user, flag):\n' + cases[name].partition('\n')[2]
+            label = 'ignored-generator-original-' + name
+            self.assertEqual(sqlite_witness(self.artifacts, label, source,
+                                           mode='cursor-user-flag', flag=True)['rows'], 1)
+            originals.append((label, source, ()))
+            advisories[label] = [('py.sqlite-no-retry', len(source.splitlines()))]
+            if name == 'closure-reads-overwritten-receiver':
+                advisories[label].append(('py.stub-function-pass', 9))
+        self.assert_real_cli_capture(originals, wrap=False, clean_advisories=advisories)
 
     def test_set_update_hash_free_controls(self):
         prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
@@ -6430,7 +6451,7 @@ class SQLValueCaptureTests(unittest.TestCase):
         )
         self.assert_real_cli_capture(cases, wrap=False)
 
-    def assert_real_cli_capture(self, cases, *, wrap=True):
+    def assert_real_cli_capture(self, cases, *, wrap=True, clean_advisories=None):
         for name, body, expected in cases:
             for entry in ('ubs', 'modules/ubs-python.sh'):
                 for fmt in ('json', 'sarif'):
@@ -6461,6 +6482,7 @@ class SQLValueCaptureTests(unittest.TestCase):
                         (folder / 'stderr.log').write_text(result.stderr, encoding='utf-8')
                         (folder / 'run.json').write_text(json.dumps({
                             'command': command, 'status': result.returncode, 'detector_sha256': self.identity,
+                            'taint_sha256': hashlib.sha256((ROOT / 'modules/helpers/ubs_core/analyzers/taint_py.py').read_bytes()).hexdigest(),
                             'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
                             'entry_sha256': hashlib.sha256((ROOT / entry).read_bytes()).hexdigest(),
                             'elapsed_seconds': time.perf_counter() - started,
@@ -6476,6 +6498,17 @@ class SQLValueCaptureTests(unittest.TestCase):
                             self.assertEqual(len(scans), 1)
                             scan = scans[0]
                             self.assertEqual((scan['status'], scan['files']), ('ok', 1))
+                            if clean_advisories is not None:
+                                self.assertEqual(document['status'], 'ok')
+                                self.assertEqual(scan['analysis_errors'], [])
+                                self.assertEqual((scan['critical'], scan['warning'], scan['info']),
+                                                 (0, 0, len(clean_advisories[name])))
+                                self.assertEqual(sorted((finding.get('rule_id', finding.get('rule')),
+                                                         finding['severity'], finding['count'],
+                                                         [sample['line'] for sample in finding['samples']])
+                                                        for finding in scan['findings']),
+                                                 sorted((rule, 'info', 1, [line])
+                                                        for rule, line in clean_advisories[name]))
                             for severity in ('critical', 'warning', 'info'):
                                 self.assertEqual(scan[severity], sum(f['count'] for f in scan['findings'] if f['severity'] == severity))
                             for finding in scan['findings']:
@@ -6486,6 +6519,17 @@ class SQLValueCaptureTests(unittest.TestCase):
                                         self.assertEqual(Path(sample['file']).name, source.name)
                                         actual.append((rule, sample['line']))
                         else:
+                            if clean_advisories is not None:
+                                self.assertEqual(len(document['runs']), 1)
+                                self.assertFalse(any(invocation.get('executionSuccessful') is False
+                                                     for run in document['runs']
+                                                     for invocation in run.get('invocations', [])))
+                                self.assertEqual(sorted((finding['ruleId'], finding['level'],
+                                                         finding['properties']['category_id'],
+                                                         finding['locations'][0]['physicalLocation']['region']['startLine'])
+                                                        for run in document['runs'] for finding in run.get('results', [])),
+                                                 sorted((rule, 'note', 'py', line)
+                                                        for rule, line in clean_advisories[name]))
                             for run in document['runs']:
                                 for finding in run.get('results', []):
                                     if finding['ruleId'] in {CRITICAL, WARNING}:

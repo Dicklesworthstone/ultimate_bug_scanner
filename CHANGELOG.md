@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve Python generator laziness when a proven local helper does not read or
+  escape the generator argument. Evaluate the outer iterable and ordinary helper
+  effects while leaving the unconsumed element, filters and inner iterables
+  deferred. Resolve selected closed wrappers in their actual captured-cell
+  context. Unproved iterators, object finalizers, callable mutation and escapes
+  retain explicit incomplete coverage.
+
 - Enable a qualified Go nil-pointer rule in ordinary scans. Report actual
   pointer dereferences reached from zero initialization, explicit nil values or
   nil-proven branches, with lexical scope, returning guards, pointer repairs and

@@ -1314,6 +1314,208 @@ class GeneratorResumeTests(SourceTest):
                 self.scan(source)
 
 
+class DiscardedGeneratorArgumentTests(SourceTest):
+    def assert_native(self, source, output, *rules, incomplete=False):
+        source = textwrap.dedent(source).lstrip('\n')
+        # Real input/eval and object lifetime semantics run in an isolated
+        # process; the numeric input cannot execute an external operation.
+        native = subprocess.run([sys.executable, '-I', '-B', '-c', source],
+                                input='42\n99\n', text=True, capture_output=True, timeout=10)
+        self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+        self.assertEqual(native.stdout, output)
+        if incomplete:
+            with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(source)
+        else:
+            self.assert_rules(source, *rules)
+
+    def test_unused_element_filters_and_inner_iterators_never_run(self):
+        for expression in ('(code := input()) for unused in (0,)',
+                           "'unused' for unused in (0,) if (code := input())",
+                           "'unused' for first in (0,) for second in inner()"):
+            with self.subTest(expression=expression):
+                self.assert_native("code = '1'\ndef inner():\n"
+                                   "    global code\n    code = input()\n    return (0,)\n"
+                                   'def discard(values):\n    pass\n'
+                                   f'discard({expression})\nprint(eval(code))\n', '1\n')
+
+    def test_lambda_keyword_and_literal_method_consumers_keep_lazy_bodies(self):
+        for definition, call in (
+                ('discard = lambda values: None', 'discard({})'),
+                ('def discard(*, values): pass', 'discard(values=({}))'),
+                ('class Consumer:\n    def discard(self, values): pass\nvalue = Consumer()',
+                 'value.discard({})')):
+            with self.subTest(definition=definition):
+                self.assert_native(definition + "\ncode = '1'\n"
+                                   + call.format('(code := input()) for unused in (0,)')
+                                   + '\nprint(eval(code))\n', '1\n')
+
+    def test_ignored_body_cannot_clear_existing_taint(self):
+        self.assert_native('''
+            def discard(values):
+                pass
+            code = input()
+            discard((code := '1') for unused in (0,))
+            print(eval(code))
+        ''', '42\n', 'eval')
+        for sink, rule in (('cursor.execute(code)', 'sql'), ('os.system(code)', 'command'),
+                           ('HttpResponse(code)', 'xss'), ('requests.get(code)', 'ssrf')):
+            with self.subTest(rule=rule):
+                self.assert_rules("import os, requests\ndef discard(values): pass\ncode = input()\n"
+                                  "discard((code := '1') for unused in (0,))\n" + sink + '\n', rule)
+
+    def test_outer_iterator_operands_execute_once_in_order(self):
+        for values, output, rules in (('replace(input()),', '42\n', ('eval',)),
+                                      ("replace(input()), replace('1')", '1\n', ())):
+            with self.subTest(values=values):
+                self.assert_native("code = '1'\ndef replace(value):\n"
+                                   '    global code\n    code = value\n    return 0\n'
+                                   'def discard(values): pass\n'
+                                   f'discard(value for value in ({values}))\n'
+                                   'print(eval(code))\n', output, *rules)
+        self.assert_native('''
+            code = '1'
+            def outer():
+                global code
+                code = input()
+                return (0,)
+            def discard(values):
+                pass
+            discard('unused' for unused in outer())
+            print(eval(code))
+        ''', '42\n', 'eval')
+
+    def test_consumer_body_and_return_still_execute(self):
+        for initial, replacement, output, rules in (("'1'", 'input()', '42\n', ('eval',)),
+                                                   ('input()', "'1'", '1\n', ())):
+            with self.subTest(initial=initial):
+                self.assert_native(f'code = {initial}\ndef discard(values):\n'
+                                   f'    global code\n    code = {replacement}\n'
+                                   "discard((code := input()) for unused in (0,))\n"
+                                   'print(eval(code))\n', output, *rules)
+        self.assert_native('''
+            def discard(values):
+                return input()
+            print(eval(discard(input() for unused in (0,))))
+        ''', '42\n', 'eval')
+
+    def test_outer_failure_prevents_the_consumer_body(self):
+        self.assert_native('''
+            code = input()
+            def outer():
+                raise ValueError('stop')
+            def discard(values):
+                global code
+                code = '1'
+            try:
+                discard('unused' for unused in outer())
+            except ValueError:
+                print(eval(code))
+        ''', '42\n', 'eval')
+
+    def test_callee_is_captured_before_later_argument_rebinding(self):
+        self.assert_native('''
+            code = input()
+            def discard(values, extra):
+                pass
+            def consume(values, extra):
+                list(values)
+            discard(((code := '1') for unused in (0,)), (discard := consume))
+            print(eval(code))
+        ''', '42\n', 'eval')
+        self.assert_native('''
+            code = '1'
+            def consume(values, extra):
+                list(values)
+            def discard(values, extra):
+                pass
+            consume(((code := input()) for unused in (0,)), (consume := discard))
+            print(eval(code))
+        ''', '42\n', incomplete=True)
+
+    def test_consuming_or_escaping_parameters_remain_incomplete(self):
+        for body in ('list(values)', 'global saved\n    saved = values'):
+            with self.subTest(body=body):
+                tail = 'next(saved)\n' if 'saved' in body else ''
+                self.assert_native("code = '1'\ndef consume(values):\n    " + body + '\n'
+                                   'consume((code := input()) for unused in (0,))\n'
+                                   + tail + 'print(eval(code))\n', '42\n', incomplete=True)
+
+    def test_custom_outer_iteration_and_owned_finalizers_remain_incomplete(self):
+        for protocol, returned, iterable in (
+                ('__iter__', '\n        return iter((0,))', 'Effect()'),
+                ('__del__', '', '[Effect()]')):
+            with self.subTest(protocol=protocol):
+                self.assert_native("code = '1'\nclass Effect:\n"
+                                   f'    def {protocol}(self):\n'
+                                   '        global code\n        code = input()'
+                                   + returned + '\n'
+                                   'def discard(values): pass\n'
+                                   f"discard('unused' for unused in {iterable})\n"
+                                   'print(eval(code))\n', '42\n', incomplete=True)
+
+    def test_ignored_call_still_checks_defaults_other_arguments_and_owned_locals(self):
+        prefix = ("code = '1'\nclass Release:\n"
+                  '    def __del__(self):\n        global code\n        code = input()\n')
+        for call in (
+                'def discard(values, extra): pass\n'
+                "discard(((code := '1') for unused in (0,)), Release())\n",
+                "(lambda values, owned=Release(): None)((code := '1') for unused in (0,))\n",
+                'def discard(values):\n    owned = Release()\n'
+                "discard((code := '1') for unused in (0,))\n"):
+            with self.subTest(call=call):
+                self.assert_native(prefix + call + 'print(eval(code))\n', '42\n', incomplete=True)
+        self.assert_native('''
+            code = input()
+            (lambda values, owned='literal': None)((code := '1') for unused in (0,))
+            print(eval(code))
+        ''', '42\n', 'eval')
+
+    def test_live_sql_cells_select_the_actual_ignored_consumer(self):
+        prefix = textwrap.dedent('''
+            def run(cursor, user):
+                query = "SELECT count(*) FROM users WHERE name = 'alice'"
+                class Key:
+                    def __hash__(self):
+                        nonlocal query
+                        query = f"SELECT count(*) FROM users WHERE name = '{user}'"
+                        return 0
+        ''').lstrip('\n')
+        variants = (
+            ('update = set().update\ndef drain():\n    update(Key() for _ in (1,))\n',
+             'update = lambda values: None\n', 'drain()\n'),
+            ('class Other:\n    def update(self, values):\n        pass\n'
+             'seen = set()\ndef drain():\n    seen.update(Key() for _ in (1,))\n',
+             'seen = Other()\n', 'drain()\n'),
+            ('update = set().update\n',
+             'def replace():\n    nonlocal update\n    update = lambda values: None\nreplace()\n',
+             'update(Key() for _ in (1,))\n'),
+        )
+        runtime = textwrap.dedent('''
+            import sqlite3
+            connection = sqlite3.connect(':memory:')
+            connection.execute('CREATE TABLE users(name TEXT)')
+            connection.executemany('INSERT INTO users VALUES (?)', [('alice',), ('bob',)])
+            print(run(connection.cursor(), "' OR 1=1 --"))
+            connection.close()
+        ''')
+        for index, (setup, overwrite, call) in enumerate(variants):
+            for ignored in (False, True):
+                with self.subTest(variant=index, ignored=ignored):
+                    source = prefix + textwrap.indent(
+                        setup + (overwrite if ignored else '') + call
+                        + 'return cursor.execute(query).fetchone()[0]\n', '    ')
+                    native = subprocess.run([sys.executable, '-I', '-B', '-c', source + runtime],
+                                            text=True, capture_output=True, timeout=10)
+                    self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+                    self.assertEqual(native.stdout, '1\n' if ignored else '2\n')
+                    if ignored:
+                        self.assert_rules(source)
+                    else:
+                        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                            self.scan(source)
+
+
 class GeneratorProjectTests(unittest.TestCase):
     def project(self, sources):
         artifacts = ROOT / 'test-suite' / 'artifacts' / 'generator-followup'

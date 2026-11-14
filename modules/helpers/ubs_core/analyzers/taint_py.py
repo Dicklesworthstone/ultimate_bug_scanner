@@ -50,6 +50,7 @@ SKIP_DIRS = {'.git', '.venv', '__pycache__', 'node_modules', '.mypy_cache', '.py
 EXTS = {'.py', '.pyi'}
 PATH_LIMIT = 5
 _INCOMPLETE_PROOF = 'taint:incomplete'
+_DISCARDED_GENERATOR = object()
 _MAX_CAPTURE_DEPTH = 64
 _PARTIAL_MODULE_REF = '@stdlib:functools'
 _PARTIAL_CHANGED_MODULE = '@partial:changed-module'
@@ -391,6 +392,14 @@ class _LiteralJoinInstance:
     """A closed, inert local class whose sole method returns one string."""
     owner: ast.ClassDef
     result: str
+    format_safe: bool = True
+
+
+@dataclass(frozen=True)
+class _LiteralMethodInstance:
+    """One closed local instance with a parameter-independent leaf method."""
+    owner: ast.ClassDef
+    function: ast.FunctionDef
     format_safe: bool = True
 
 
@@ -1006,7 +1015,8 @@ def _without_object_contract(binding):
         raise AnalysisLimit('mutated functools.partial object; analysis is incomplete')
     choices = []
     for value in _binding_choices(binding):
-        if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance, _ProcessInput, ast.ClassDef)):
+        if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance,
+                              _LiteralMethodInstance, _ProcessInput, ast.ClassDef)):
             value = None
         elif isinstance(value, _BoundCallable) and value.name == _LITERAL_MAPPING_GET:
             value = _BoundCallable('<object>.get', value.references, value.receiver,
@@ -2329,7 +2339,7 @@ class _Flow:
     def escape_literal_mapping(self, binding, references, state):
         """Heap aggregates do not retain these finite object contracts."""
         for value in _binding_choices(binding):
-            if isinstance(value, (_LiteralMapping, _LiteralJoinInstance)):
+            if isinstance(value, (_LiteralMapping, _LiteralJoinInstance, _LiteralMethodInstance)):
                 self.mutate(references, CLEAN, state)
             elif isinstance(value, _BoundCallable) and (
                     value.name == _LITERAL_MAPPING_GET or isinstance(value.receiver_binding, _LiteralJoinInstance)):
@@ -2867,7 +2877,120 @@ class _Flow:
         selected = selected.function if isinstance(selected, _FunctionValue) else selected
         return _LiteralJoinInstance(target, returned.value) if selected is method else None
 
-    def generator_consumer_stable(self, consumer, names, *, scope=None):
+    def literal_method_instance(self, node, target, state):
+        """Resolve a single inert method without inferring general object types."""
+        self.engine.budget.spend()
+        if (not isinstance(node, ast.Call) or node.args or node.keywords
+                or not isinstance(target, ast.ClassDef) or self.engine.owner(target) is not self.engine
+                or target.bases or target.keywords or target.decorator_list or len(target.body) != 1
+                or not self.generator_builtins_stable()):
+            return None
+        method = target.body[0]
+        if (not isinstance(method, ast.FunctionDef) or method.name.startswith('__')
+                or method.decorator_list or method.returns is not None
+                or len(method.body) != 1):
+            return None
+        statement = method.body[0]
+        if not (isinstance(statement, ast.Pass) or isinstance(statement, ast.Return)
+                and (statement.value is None or isinstance(statement.value, ast.Constant)
+                     and type(statement.value.value) in {str, bytes, int, float, complex, bool, type(None)})):
+            return None
+        signature = method.args
+        positional = [*signature.posonlyargs, *signature.args]
+        if (len(positional) != 2 or signature.kwonlyargs or signature.vararg or signature.kwarg
+                or signature.defaults or any(argument.annotation is not None for argument in positional)
+                or not self.generator_consumer_stable(node, {
+                    method.name, '__new__', '__init__', '__del__', '__class__', '__bases__',
+                    '__getattribute__', '__code__', '__defaults__', '__kwdefaults__'})):
+            return None
+        for reference, parent in self.engine.parents.items():
+            self.engine.budget.spend()
+            if isinstance(reference, ast.Name) and reference.id == target.name and (
+                    not isinstance(reference.ctx, ast.Load) or not isinstance(parent, ast.Call)
+                    or parent.func is not reference):
+                return None
+        members = self.engine.class_members.get(target, {})
+        if self.engine.reads is not None:
+            self.engine.reads[('class_members', target)] = members
+        selected = members.get(method.name)
+        selected = selected.function if isinstance(selected, _FunctionValue) else selected
+        return _LiteralMethodInstance(target, method) if selected is method else None
+
+    def discarded_generator_argument(self, node, state):
+        """Prove this evaluated local consumer never observes the lazy argument.
+
+        Only the outer iterator exists before the call. Parameter-independent
+        bodies still run through ordinary summaries; this proof grants no
+        purity, return-value or generator-consumption authority to the helper.
+        """
+        consumer = self.engine.parents.get(node)
+        if isinstance(consumer, ast.keyword):
+            consumer = self.engine.parents.get(consumer)
+        if not isinstance(consumer, ast.Call):
+            return False
+        consumer = self.engine.call_sites.get(consumer, consumer)
+        if (any(isinstance(argument, ast.Starred) for argument in consumer.args)
+                or any(keyword.arg is None for keyword in consumer.keywords)
+                or not self.generator_consumer_stable(consumer, {
+                    '__code__', '__defaults__', '__kwdefaults__'}, unstarted=node)):
+            return False
+        targets = _binding_choices(self.expression_bindings.get(consumer.func))
+        if not targets:
+            return False
+        for target in targets:
+            self.engine.budget.spend()
+            implicit = 0
+            if isinstance(target, _BoundCallable):
+                self.require_value(target.receiver_binding)
+            if isinstance(target, _BoundClassMethod):
+                if not target.valid or target.references & state.mutated:
+                    return False
+                implicit, target = 1, target.function
+            if isinstance(target, _ClosureValue):
+                target = target.value
+            if isinstance(target, _FunctionValue):
+                target = target.function
+            if (not isinstance(target, (ast.FunctionDef, ast.Lambda))
+                    or self.engine.owner(target) is not self.engine
+                    or target in self.engine.generators or getattr(target, 'decorator_list', ())):
+                return False
+            signature = target.args
+            positional = [argument.arg for argument in (*signature.posonlyargs, *signature.args)]
+            keywords = {argument.arg for argument in (*signature.args, *signature.kwonlyargs)}
+            count = len(consumer.args) + implicit
+            supplied = dict(zip(positional[implicit:], consumer.args))
+            if (signature.vararg or signature.kwarg or count > len(positional)
+                    or implicit and not positional):
+                return False
+            for keyword in consumer.keywords:
+                if (keyword.arg not in keywords or keyword.arg in supplied
+                        or keyword.arg in positional[:implicit]):
+                    return False
+                supplied[keyword.arg] = keyword.value
+            required = set(positional[implicit:len(positional) - len(signature.defaults)])
+            required.update(argument.arg for argument, default in
+                            zip(signature.kwonlyargs, signature.kw_defaults) if default is None)
+            if not required <= supplied.keys():
+                return False
+            parameter = next((name for name, expression in supplied.items() if expression is node), None)
+            if parameter is None:
+                return False
+            key = (target, parameter)
+            if key not in self.engine.generator_discard_proofs:
+                body = [target.body] if isinstance(target, ast.Lambda) else target.body
+                self.engine.generator_discard_proofs[key] = not any(
+                    isinstance(part, ast.Name) and part.id == parameter and isinstance(part.ctx, ast.Load)
+                    for statement in body for part in ast.walk(statement))
+            if not self.engine.generator_discard_proofs[key]:
+                return False
+            # A callable passed to opaque code can have its metadata changed
+            # without a visible attribute store. Name replacement itself is
+            # harmless: the actual callable was captured before arguments.
+            if not self.engine.generator_discard_identity(target):
+                return False
+        return True
+
+    def generator_consumer_stable(self, consumer, names, *, scope=None, unstarted=None):
         """Require native consumer identities without exposed execution state."""
         scope = self.scope if scope is None else scope
         if (self.class_environments or self.engine.generator_namespace_exposed
@@ -2889,6 +3012,15 @@ class _Flow:
                     or engine is not self.engine and engine.generator_namespace_exposed):
                 return False
             for capability in engine.generator_execution_capabilities:
+                if unstarted is not None and engine is self.engine:
+                    if unstarted not in self.engine.generator_discard_nodes:
+                        delayed = [unstarted.elt,
+                                   *(condition for clause in unstarted.generators for condition in clause.ifs),
+                                   *(clause.iter for clause in unstarted.generators[1:])]
+                        self.engine.generator_discard_nodes[unstarted] = frozenset(
+                            part for expression in delayed for part in ast.walk(expression))
+                    if capability in self.engine.generator_discard_nodes[unstarted]:
+                        continue  # This body cannot run in a discarded argument.
                 call = engine.parents.get(capability)
                 spelling = capability.id if isinstance(capability, ast.Name) else capability.attr
                 if (engine is not self.engine or spelling == 'exec'
@@ -2897,6 +3029,63 @@ class _Flow:
                         or call.lineno <= consumer.end_lineno and call not in enclosing_calls):
                     return False
         return True
+
+    def discarded_generator_frame(self, node, target, state):
+        """Prove the whole ignored call cannot release opaque owned values.
+
+        A never-started generator can be an inert frame operand only after
+        its outer iterator was proved inert. Other arguments, defaults and
+        callee locals still need their own lifetime proof. This proof view
+        never replaces the actual call, its values or its ordinary effects.
+        """
+        def operand(expression):
+            binding = self.expression_bindings.get(expression)
+            if binding is _DISCARDED_GENERATOR:
+                return ast.copy_location(ast.Constant(value=None), expression)
+            if self.materialized_generator_inert(expression, state):
+                return expression
+            # A later argument may rebind the callable name to a plain local
+            # function. The captured old callee remains selected, and such an
+            # argument owns no finalizer when its captures/defaults are inert.
+            if self.expression_references.get(expression, NO_REFERENCES) & state.mutated:
+                return None
+            for value in _binding_choices(binding):
+                if isinstance(value, _ClosureValue):
+                    for _name, ref in value.cells:
+                        contents = self.cell_contents(ref, state)
+                        if (contents.bound is not True or not self.materialized_generator_binding(
+                                contents.binding, contents.references, state)):
+                            return None
+                    value = value.value
+                function = value.function if isinstance(value, _FunctionValue) else value
+                if (not isinstance(function, (ast.FunctionDef, ast.Lambda))
+                        or self.engine.owner(function) is not self.engine
+                        or getattr(function, 'decorator_list', ())
+                        or getattr(function, 'returns', None) is not None
+                        or function.args.vararg or function.args.kwarg
+                        or any(argument.annotation is not None for argument in (
+                            *function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs))
+                        or any(not isinstance(default, ast.Constant)
+                               or type(default.value) not in {str, bytes, int, float, complex, bool, type(None)}
+                               for default in (*function.args.defaults, *function.args.kw_defaults)
+                               if default is not None)):
+                    return None
+            return ast.copy_location(ast.Constant(value=None), expression) if _binding_choices(binding) else None
+
+        arguments = [operand(expression) for expression in node.args]
+        keywords = [ast.keyword(arg=keyword.arg, value=operand(keyword.value)) for keyword in node.keywords]
+        if any(value is None for value in arguments) or any(keyword.value is None for keyword in keywords):
+            return False
+        if isinstance(target, _BoundClassMethod):
+            if not target.valid or target.references & state.mutated:
+                return False
+            receiver = self.expression_bindings.get(node.func.value) if isinstance(node.func, ast.Attribute) else None
+            if not isinstance(receiver, (_LiteralMethodInstance, _LiteralJoinInstance)) or not receiver.format_safe:
+                return False
+            arguments.insert(0, ast.copy_location(ast.Constant(value=None), node.func))
+            target = target.function
+        view = ast.copy_location(ast.Call(func=node.func, args=arguments, keywords=keywords), node)
+        return self.materialized_generator_call(view, target, state, discarded=True)
 
     def immediate_next(self, node, state, binding):
         """Capture an iterator, evaluate the default, then resume to one yield.
@@ -3129,6 +3318,8 @@ class _Flow:
                                         if value.value_binding is not None else _UnprovedProducer(), value.keys)
             elif isinstance(value, _LiteralJoinInstance):
                 value = _LiteralJoinInstance(value.owner, value.result, False)
+            elif isinstance(value, _LiteralMethodInstance):
+                value = _LiteralMethodInstance(value.owner, value.function, False)
             elif isinstance(value, str) and value in _STDIN_PARSER_CARRIERS:
                 value = _BoundCallable(value, NO_REFERENCES, namespace_proven=True,
                                        producer_unproved=True)
@@ -3255,13 +3446,15 @@ class _Flow:
                 and self.materialized_generator_binding(self.expression_bindings.get(node),
                     self.expression_references.get(node, NO_REFERENCES), state))
 
-    def materialized_generator_call(self, node, target, state):
+    def materialized_generator_call(self, node, target, state, *, discarded=False):
         """Prove calls cannot hide owned finalizers, including exceptional exits.
 
         A primitive return alone says nothing about released locals/defaults.
         Admit native input and a bounded straight-line helper subset whose
         entire frame contains primitive values. General callbacks, defaults,
         argument expansion and nested calls still need an ownership summary.
+        The discarded-argument proof also permits literal defaults and leaf
+        lambdas; it has already proved the selected lazy parameter unread.
         """
         self.engine.budget.spend()
         if (any(isinstance(value, ast.Starred) for value in node.args)
@@ -3278,14 +3471,18 @@ class _Flow:
             target = closure.value
         if isinstance(target, _FunctionValue):
             target = target.function
-        if (not isinstance(target, ast.FunctionDef) or self.engine.owner(target) is not self.engine
-                or target in self.engine.generators or target.decorator_list or target.returns is not None
-                or not self.engine.generator_helper_identity(target)):
+        if (not isinstance(target, (ast.FunctionDef, ast.Lambda) if discarded else ast.FunctionDef)
+                or self.engine.owner(target) is not self.engine or target in self.engine.generators
+                or getattr(target, 'decorator_list', ()) or getattr(target, 'returns', None) is not None
+                or not (self.engine.generator_discard_identity(target) if discarded
+                        else self.engine.generator_helper_identity(target))):
             return False
         signature = target.args
         positional = [*signature.posonlyargs, *signature.args]
-        if (signature.vararg or signature.kwarg or signature.defaults
-                or any(value is not None for value in signature.kw_defaults)
+        defaults = [*signature.defaults, *(value for value in signature.kw_defaults if value is not None)]
+        if (signature.vararg or signature.kwarg
+                or defaults and (not discarded or any(not isinstance(value, ast.Constant)
+                    or type(value.value) not in {str, bytes, int, float, complex, bool, type(None)} for value in defaults))
                 or any(argument.annotation is not None for argument in (*positional, *signature.kwonlyargs))
                 or len(node.args) > len(positional)):
             return False
@@ -3295,6 +3492,12 @@ class _Flow:
             if keyword.arg not in accepted or keyword.arg in arguments:
                 return False
             arguments[keyword.arg] = keyword.value
+        if discarded:
+            for argument, default in zip(positional[len(positional) - len(signature.defaults):], signature.defaults):
+                arguments.setdefault(argument.arg, default)
+            for argument, default in zip(signature.kwonlyargs, signature.kw_defaults):
+                if default is not None:
+                    arguments.setdefault(argument.arg, default)
         if set(arguments) != {argument.arg for argument in (*positional, *signature.kwonlyargs)}:
             return False
         captured = {}
@@ -3407,7 +3610,8 @@ class _Flow:
                     return isinstance(exception, type) and issubclass(exception, BaseException)
             return False
 
-        for statement in target.body:
+        body = [ast.Return(value=target.body)] if isinstance(target, ast.Lambda) else target.body
+        for statement in body:
             self.engine.budget.spend()
             if isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)):
                 continue
@@ -5653,6 +5857,8 @@ class _Flow:
                 keyword_nodes[keyword.arg] = keyword.value
         if not state.reachable:
             return CLEAN
+        discarded = any(self.expression_bindings.get(expression) is _DISCARDED_GENERATOR
+                        for expression in (*node.args, *keyword_nodes.values()))
         # Scalars are snapshots, but passed objects observe mutations performed
         # while evaluating later arguments. Never re-evaluate the source AST.
         def live_argument(expression, fact):
@@ -5675,6 +5881,8 @@ class _Flow:
             self.expression_references.pop(node, None)
             result = self.invoke(node, branch, _CallTarget(target, fallback_name, receiver, receiver_refs),
                                  _CallInputs(arguments, keywords, keyword_nodes))
+            if discarded and not self.discarded_generator_frame(node, target, state):
+                raise AnalysisLimit('discarded generator consumer frame lifetime is unresolved; analysis is incomplete')
             if branch.reachable:
                 results.append(result)
                 references.append(self.expression_references.get(node, frozenset({node})))
@@ -5701,6 +5909,8 @@ class _Flow:
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
         if isinstance(target, ast.ClassDef):
             instance = self.literal_join_instance(node, target, state)
+            if instance is None:
+                instance = self.literal_method_instance(node, target, state)
             if instance is not None:
                 self.expression_bindings[node] = instance
                 self.expression_references[node] = frozenset({node, target})
@@ -6080,6 +6290,7 @@ class _Flow:
                     continue
                 if any(isinstance(value, (str, _LiteralString, _GeneratorString, _UnprovedProducer,
                                           _LiteralMapping, _ArgumentVector, _ProcessInput,
+                                          _LiteralMethodInstance,
                                           _FunctionValue, _ClosureValue,
                                           ast.FunctionDef, ast.AsyncFunctionDef,
                                           ast.Lambda, ast.Constant, _BoundClassMethod))
@@ -6183,7 +6394,8 @@ class _Flow:
             # substitute returned handles yet: apply_cells first allocates
             # the caller's distinct generator/closure cells.
             format_frame_inert = (bool(self.materialized_generator_depth) or not any(
-                isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _ArgumentVector, _LiteralMapping,
+                isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _LiteralMethodInstance,
+                                   _ArgumentVector, _LiteralMapping,
                                    _SymbolicValue, ast.Constant))
                 or isinstance(value, str) and value in _STDIN_PARSER_CARRIERS
                 or isinstance(value, _BoundCallable) and (
@@ -6454,7 +6666,7 @@ class _Flow:
                 if {'functools', _PARTIAL_CHANGED_MODULE} & _binding_choices(value) and name not in {
                         'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr'}:
                     self.mutate(frozenset({_PARTIAL_MODULE_REF}), CLEAN, state)
-                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, _LiteralJoinInstance,
+                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, _LiteralJoinInstance, _LiteralMethodInstance,
                                            ast.ClassDef, _BoundClassMethod))
                        for choice in _binding_choices(value)) and name not in SANITIZERS and name not in {
                            'print', 'str', 'len', 'repr', 'tuple', 'list', 'bool', 'int', 'float',
@@ -6548,7 +6760,7 @@ class _Flow:
                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                             ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
                             _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _GeneratorString,
-                            _UnprovedProducer, _LiteralMapping, _LiteralJoinInstance,
+                            _UnprovedProducer, _LiteralMapping, _LiteralJoinInstance, _LiteralMethodInstance,
                             _ProcessInput, ast.Constant)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
@@ -6669,6 +6881,21 @@ class _Flow:
                     if isinstance(member, _ClassMethodDescriptor):
                         member = _BoundClassMethod(member.function, base, receiver_refs, receiver_fact)
                     candidates.append(member)
+                    continue
+                if isinstance(base, _LiteralMethodInstance):
+                    self.require_value(base)
+                    members = self.engine.class_members.get(base.owner, {})
+                    if self.engine.reads is not None:
+                        self.engine.reads[('class_members', base.owner)] = members
+                    selected = members.get(node.attr)
+                    function = selected.function if isinstance(selected, _FunctionValue) else selected
+                    if (base.format_safe and function is base.function
+                            and not receiver_refs & state.mutated
+                            and self.generator_consumer_stable(node, {
+                                node.attr, '__code__', '__defaults__', '__kwdefaults__', '__getattribute__'})):
+                        candidates.append(_BoundClassMethod(selected, base.owner, receiver_refs, receiver_fact))
+                    else:
+                        candidates.append(None)
                     continue
                 if isinstance(base, _ModuleBinding):
                     owner = base.project.modules.get(base.key)
@@ -7047,8 +7274,21 @@ class _Flow:
                                               predicate=consumer if consumer in {'any', 'all'} else None)
                 finally:
                     self.materialized_generator_depth -= 1
+            discarded = self.discarded_generator_argument(node, state)
             iterable = self.expr(first.iter, state)
             if not state.reachable:
+                return CLEAN
+            if discarded:
+                # Constructing a generator acquires the outer iterator, but
+                # cannot evaluate its body, filters or inner iterables. Its
+                # discarded frame must not own an unmodeled finalizer either.
+                if (any(clause.is_async for clause in node.generators)
+                        or not self.materialized_generator_iterable(first.iter, state)
+                        or not self.materialized_generator_inert(first.iter, state)):
+                    raise AnalysisLimit('discarded generator outer iterator or captured lifetime is unresolved; '
+                                        'analysis is incomplete')
+                self.expression_bindings[node] = _DISCARDED_GENERATOR
+                self.expression_references[node] = NO_REFERENCES
                 return CLEAN
             if any(isinstance(value, (_DeferredGenerator, _GeneratorNext))
                    for value in _binding_choices(self.expression_bindings.get(first.iter))):
@@ -7904,6 +8144,10 @@ class _Analysis:
         self.generators = set()
         self.generator_peers = (self,)
         self.generator_helper_proofs = {}
+        self.generator_discard_proofs = {}
+        self.generator_discard_nodes = {}
+        self.generator_discard_identities = {}
+        self.generator_context_wrappers = {}
         self.generator_receiver_proofs = {}
         self.generator_literal_elements = {}
         self.definition_writers = set()
@@ -8366,6 +8610,73 @@ class _Analysis:
 
         return immutable(statement.value)
 
+    def generator_discard_identity(self, function):
+        """Cache only syntactic escape facts, never a live callable binding."""
+        if function not in self.generator_discard_identities:
+            names = {function.name} if isinstance(function, ast.FunctionDef) else set()
+            parent = self.parents.get(function)
+            proven = True
+            if isinstance(function, ast.Lambda):
+                destinations = (parent.targets if isinstance(parent, ast.Assign)
+                                else [parent.target] if isinstance(parent, (ast.AnnAssign, ast.NamedExpr)) else [])
+                proven = bool(destinations) or isinstance(parent, ast.Call) and parent.func is function
+                proven &= all(isinstance(destination, ast.Name) for destination in destinations)
+                names.update(destination.id for destination in destinations if isinstance(destination, ast.Name))
+            if proven:
+                for reference, parent in self.parents.items():
+                    self.budget.spend()
+                    if (isinstance(reference, ast.Name) and reference.id in names
+                            and isinstance(reference.ctx, ast.Load)
+                            and not (isinstance(parent, ast.Call) and parent.func is reference)):
+                        proven = False
+                        break
+            self.generator_discard_identities[function] = proven
+        return self.generator_discard_identities[function]
+
+    def generator_context_wrapper(self, function):
+        """A closed lexical wrapper can only run in its demanded cell context.
+
+        Its invented standalone entry has no current value for the captured
+        consumer. Analyze every real call instead; an unresolved or escaping
+        caller still takes the ordinary incomplete path. Restrict this to a
+        zero-argument, single-call wrapper with direct calls in its defining
+        function, so no framework, foreign or unobserved entry is omitted.
+        """
+        if function not in self.generator_context_wrappers:
+            owner = self.enclosing(function)
+            args = function.args
+            proven = (isinstance(function, ast.FunctionDef)
+                      and isinstance(owner, ast.FunctionDef) and not owner.decorator_list
+                      and not function.decorator_list and function.returns is None
+                      and not (args.posonlyargs or args.args or args.kwonlyargs or args.vararg or args.kwarg)
+                      and len(function.body) == 1 and isinstance(function.body[0], ast.Expr)
+                      and isinstance(function.body[0].value, ast.Call)
+                      and self.generator_binders.get(owner, {}).get(function.name) == [function])
+            if proven:
+                call = function.body[0].value
+                receiver = call.func.value if isinstance(call.func, ast.Attribute) else call.func
+                proven = (isinstance(receiver, ast.Name) and receiver.id in self.closures[function]
+                          and len(call.args) == 1 and isinstance(call.args[0], ast.GeneratorExp)
+                          and not call.keywords)
+            calls = 0
+            if proven:
+                for reference, parent in self.parents.items():
+                    self.budget.spend()
+                    if isinstance(reference, ast.Name) and reference.id == function.name:
+                        if (not isinstance(reference.ctx, ast.Load) or not isinstance(parent, ast.Call)
+                                or parent.func is not reference or self.enclosing(reference) is not owner
+                                or parent.args or parent.keywords):
+                            proven = False
+                            break
+                        calls += 1
+            self.generator_context_wrappers[function] = proven and bool(calls)
+        return (self.generator_context_wrappers[function] and not any(
+            engine.generator_namespace_exposed or engine.generator_frame_exposed
+            or engine.generator_builtin_reflection or engine.generator_literal_authority_exposed
+            or engine.generator_execution_capabilities
+            or engine.generator_attribute_writes & {'__code__', '__defaults__', '__kwdefaults__'}
+            for engine in self.generator_peers))
+
     def generator_helper_identity(self, function):
         """A delayed helper must not escape through an unmodeled metadata writer."""
         if function not in self.generator_helper_proofs:
@@ -8823,6 +9134,8 @@ class _Analysis:
                 pass
             elif isinstance(value, _LiteralJoinInstance) and (captured or name in value_parameters):
                 pass
+            elif isinstance(value, _LiteralMethodInstance) and (captured or name in value_parameters):
+                pass
             elif isinstance(value, ast.Constant) and name in value_parameters:
                 # Partial captures may retain exact scalar options such as
                 # shell=False. Their source AST identities are finite.
@@ -8966,6 +9279,10 @@ class _Analysis:
                 context.append((name, _join_bindings(*choices)))
         if len(context) > 1:
             context.sort(key=lambda item: item[0])
+        if not context and owner.generator_context_wrapper(function):
+            # A call with an unresolved capture must still be solved. It may
+            # not accidentally reuse the deliberately absent standalone job.
+            context.append(('@generator-wrapper', None))
         key = (function, tuple(context)) if context else function
         summary = self.summaries.get(key)
         if summary is None:
@@ -9367,7 +9684,8 @@ class _Analysis:
                 initializer_jobs.update(key for (table, key) in reads if table == 'summaries')
                 if not initializer_jobs:
                     initializing = False
-            jobs = [*self.functions, *(key for key in self.summaries
+            jobs = [*(function for function in self.functions if not self.generator_context_wrapper(function)),
+                    *(key for key in self.summaries
                                       if isinstance(key, tuple) and key not in inherited)]
             if initializing:
                 jobs = [key for key in jobs if key in initializer_jobs]
@@ -9506,6 +9824,8 @@ class _Analysis:
                 # an invented standalone/framework entry into a foreign scope.
                 projections = [(self.tree, [(*key, fact) for key, fact in module.effects.items()])]
                 for function in self.functions:
+                    if self.generator_context_wrapper(function):
+                        continue  # Its effects already belong to each actual caller.
                     key = self.framework_summary_key(function)
                     scope_effects = (self.summaries[key].effects if isinstance(key, tuple)
                                      else solved[function][2])

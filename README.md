@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.79-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.80-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -2047,8 +2047,15 @@ unresolved executable into a known data-only program.
 Generators with live lexical cells still require a suspension/resumption model.
 A narrow supported case is a proven stable local list used only as an
 ignored-result `append`, `extend`, or `insert` receiver: its weak heap writes
-remain conservative. Other live-cell generators report incomplete analysis and
-retain already established findings.
+remain conservative. A generator passed directly to a proven local helper that
+never reads or exports that parameter keeps its body deferred. Construction
+still evaluates the outer iterable, and the helper's ordinary effects still
+run. Selected closed wrappers use their actual captured-cell values, including
+an overwritten no-op function or inert local method. This requires proven
+callable identity and inert iterator, argument, default and local lifetimes;
+custom iteration or possible finalizer effects remain incomplete. Other
+live-cell generators report incomplete analysis and retain already established
+findings.
 The existing heap model also does not infer arbitrary alias relationships
 between separate helper parameters.
 

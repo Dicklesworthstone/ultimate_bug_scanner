@@ -1,0 +1,394 @@
+# UNAPPLIED REGRESSION ORACLES -- NO GO IMPLEMENTATION IS INCLUDED
+#
+# Related beads: ultimate_bug_scanner-go-import-provenance,
+# ultimate_bug_scanner-go-html-sanitizer-identity (D6).
+# Base: 2ebfc78a7248a2743ec1d24e0fe8245f74850634
+# This patch preserves two separately authored source-analysis test sets.
+# They deliberately expect the missing behavior and FAIL on the base. They
+# are not installed in the active test suite until the feature is implemented.
+# The workspace became unavailable during the first implementation edit;
+# no taint_go.py implementation change was successfully applied.
+#
+# Confirmed gaps:
+# - Saved io.ReadAll/io/ioutil.ReadAll lose payload versus error result slots.
+# - Saved encoding/json and encoding/xml Unmarshal lose destination writes.
+# - Saved NewDecoder factories lose reader/decoder identity.
+# - Saved standard HTML escaping functions lose sink-specific sanitization.
+# - Local aliases, package helpers and lexical closures expose these losses.
+#
+# DSR baselines executed before the outage:
+# python3 test-suite/quality/test_taint_go_decoding.py NativeFunctionValueTests
+#   13 methods; 13 failing method/subtest assertions; exit 1.
+#   Recorded log: test-suite/artifacts/session-20261114/go-native-values-baseline.log
+#   SHA256: 715112c6838876e1a44f09095c759469d01bd66de7b39174593ab89e78714f96
+# python3 test-suite/quality/test_taint_go_domains.py SavedNativeValueOracleTests
+#   11 methods; 14 failing method/subtest assertions; exit 1.
+#   Recorded log: test-suite/artifacts/session-20261114/go-native-independent-baseline.log
+#   SHA256: 8b9256513a948c078faac22b0aff7fea5ab6a8d5f08f4a58d871e6cdfbe63f45
+# Counts are assertions, not distinct defects. Fixed inputs, parameter binding,
+# lookalikes, lexical scopes, unknown choices and overwritten callables are
+# included as controls. Tests are source analysis, not native Go runtime proof.
+# DSR source: 8d4d4befc7d979edcbb6e9d905f6e4bcbb8212fc/src/quality_gates.sh
+# Full transient logs could not be recovered after the workspace outage.
+#
+# Reconstruction SHA256:
+# test_taint_go_decoding.py: 8fa6d6d477f72887714988d32f8f42ca15d60a4648f34652a76d7ec999eefd07
+# test_taint_go_domains.py: 28e1c677db0414ead4ec2e60369c77556ee4ade1724474f555b090833eb153bd
+# Reconstructed from the recorded manual edits; exact insertion or reversible
+# hunk replay checked against pinned GitHub source. Native git apply and Python
+# execution could not be rerun on the reconstructed artifact after the outage.
+#
+# IMPLEMENTATION DIRECTION:
+# Carry finite native callable identities alongside pointer/decoder metadata,
+# resolved from the existing file-local import authority. Copy captured
+# identities through assignments; retain unknown alternatives at joins.
+# Reuse native-call evaluation for result slots, destination writes and HTML
+# sanitizer domains. Preserve argument evaluation/effects. Unknown alternatives
+# must not grant sanitizer proof or clean error-result contracts. Reassignment,
+# address escapes and possible captured/package writes invalidate authority.
+# Higher-order parameter/return transport needs separately bounded proof.
+#
+# BEFORE ACTIVATION:
+# Implement the callable flow; run these unchanged source oracles, compiled
+# native witnesses, existing Go regressions, real module/runner JSON/SARIF,
+# selection/suppression/cache controls and canonical integrity checks through
+# DSR. Complete independent review. The removed saved-escape boundary case
+# is replaced by stricter exact-domain oracles; selector/index boundaries stay.
+#
+diff --git a/test-suite/quality/test_taint_go_decoding.py b/test-suite/quality/test_taint_go_decoding.py
+--- a/test-suite/quality/test_taint_go_decoding.py
++++ b/test-suite/quality/test_taint_go_decoding.py
+@@ -189,6 +189,196 @@
+                    '// json.NewDecoder(r.Body).Decode(&p)\ndb.Query(p.SQL)')
+ 
+ 
++class NativeFunctionValueTests(packages.PackageTestCase):
++    def test_saved_reader_and_unmarshal_keep_output_and_error_positions(self):
++        for reader in ('io', 'io/ioutil'):
++            for codec in ('encoding/json', 'encoding/xml'):
++                with self.subTest(reader=reader, codec=codec):
++                    self.source('handler.go', 'package app\nimport (\n'
++                                'stream "' + reader + '"\ncodec "' + codec + '"\n)\n'
++                                'func h() {\nread := stream.ReadAll\ndecode := codec.Unmarshal\n'
++                                'raw, readErr := read(r.Body)\nvar p Payload\n'
++                                'decodeErr := decode(raw, &p)\n'
++                                'db.Query(string(raw))\ndb.Query(p.SQL)\n'
++                                'db.Query(readErr.Error())\ndb.Query(decodeErr.Error())\n}\n')
++                    self.assert_hits([('handler.go', 12, 'go.taint.sql'),
++                                      ('handler.go', 13, 'go.taint.sql')])
++
++    def test_saved_decoder_constructor_and_alias_keep_reader_capture(self):
++        for codec in ('encoding/json', 'encoding/xml'):
++            with self.subTest(codec=codec):
++                self.source('handler.go', 'package app\nimport codec "' + codec + '"\n'
++                            'func h() {\nfactory := (codec.NewDecoder)\nalias := factory\n'
++                            'dec := alias(r.Body)\nvar p Payload\nerr := dec.Decode(&p)\n'
++                            'db.Query(p.SQL)\ndb.Query(err.Error())\n}\n')
++                self.assert_hits([('handler.go', 9, 'go.taint.sql')])
++
++    def test_saved_constructor_immediate_decode_preserves_destination(self):
++        self.source('handler.go', '''
++            package app
++            import "encoding/json"
++            func h() {
++                factory := json.NewDecoder
++                var p Payload
++                factory(r.Body).Decode(&p)
++                db.Query(p.SQL)
++            }
++        ''')
++        self.assert_hits([('handler.go', 7, 'go.taint.sql')])
++
++    def test_saved_dot_imports_and_parallel_aliases_keep_identity(self):
++        self.source('handler.go', '''
++            package app
++            import (. "encoding/json"; . "io")
++            func h() {
++                read, decode := ReadAll, Unmarshal
++                reader, decoder := read, decode
++                raw, err := reader(r.Body)
++                var p Payload
++                decodeErr := decoder(raw, &p)
++                db.Query(p.SQL)
++                db.Query(err.Error())
++                db.Query(decodeErr.Error())
++            }
++        ''')
++        self.assert_hits([('handler.go', 9, 'go.taint.sql')])
++
++    def test_native_unmarshal_choice_keeps_all_destination_writes(self):
++        self.source('handler.go', '''
++            package app
++            import ("encoding/json"; "encoding/xml")
++            func h() {
++                decode := json.Unmarshal
++                if xmlBody { decode = xml.Unmarshal }
++                var p Payload
++                err := decode([]byte(r.FormValue("body")), &p)
++                db.Query(p.SQL)
++                db.Query(err.Error())
++            }
++        ''')
++        self.assert_hits([('handler.go', 8, 'go.taint.sql')])
++
++    def test_unknown_reader_choice_does_not_borrow_clean_error_contract(self):
++        self.source('handler.go', '''
++            package app
++            import "io"
++            func h() {
++                read := io.ReadAll
++                if choice { read = customRead }
++                raw, err := read(r.Body)
++                db.Query(string(raw))
++                db.Query(err.Error())
++            }
++        ''')
++        self.assert_hits([('handler.go', 7, 'go.taint.sql'), ('handler.go', 8, 'go.taint.sql')])
++
++    def test_native_alias_retains_identity_after_original_binding_changes(self):
++        self.source('handler.go', '''
++            package app
++            import "encoding/json"
++            func h() {
++                decode := json.Unmarshal
++                saved := decode
++                decode = customDecode
++                var p Payload
++                saved([]byte(r.FormValue("body")), &p)
++                db.Query(p.SQL)
++            }
++        ''')
++        self.assert_hits([('handler.go', 9, 'go.taint.sql')])
++
++    def test_overwritten_callable_does_not_keep_native_return_contract(self):
++        self.source('handler.go', '''
++            package app
++            import "io"
++            func h() {
++                read := io.ReadAll
++                read = customRead
++                _, err := read(r.Body)
++                db.Query(err.Error())
++            }
++        ''')
++        self.assert_hits([('handler.go', 7, 'go.taint.sql')])
++
++    def test_saved_lookalike_package_never_gets_native_result_contract(self):
++        self.source('handler.go', '''
++            package app
++            import io "example.test/reader"
++            func h() {
++                read := io.ReadAll
++                _, err := read(r.Body)
++                db.Query(err.Error())
++            }
++        ''')
++        self.assert_hits([('handler.go', 6, 'go.taint.sql')])
++
++    def test_block_shadow_does_not_change_captured_native_value(self):
++        self.source('handler.go', '''
++            package app
++            import "io"
++            func h() {
++                read := io.ReadAll
++                { read := customRead; _, err := read(r.Body); db.Query(err.Error()) }
++                _, err := read(r.Body)
++                db.Query(err.Error())
++            }
++        ''')
++        self.assert_hits([('handler.go', 5, 'go.taint.sql')])
++
++    def test_helper_local_native_alias_retains_output_parameter_summary(self):
++        self.source('helper.go', '''
++            package app
++            import codec "encoding/json"
++            func decode(raw []byte, dst *Payload) {
++                run := codec.Unmarshal
++                run(raw, dst)
++            }
++        ''')
++        self.source('handler.go', '''
++            package app
++            func h() {
++                var p Payload
++                decode([]byte(r.FormValue("body")), &p)
++                db.Query(p.SQL)
++                db.Query("SELECT $1", p.SQL)
++            }
++        ''')
++        self.assert_hits([('handler.go', 5, 'go.taint.sql')])
++
++    def test_closure_can_use_a_lexically_captured_native_decoder(self):
++        self.source('handler.go', '''
++            package app
++            import "encoding/json"
++            func h() {
++                decode := json.Unmarshal
++                query := func() string {
++                    var p Payload
++                    decode([]byte(r.FormValue("body")), &p)
++                    return p.SQL
++                }()
++                db.Query(query)
++            }
++        ''')
++        self.assert_hits([('handler.go', 10, 'go.taint.sql')])
++
++    def test_saved_native_operations_with_fixed_data_stay_clean(self):
++        self.source('handler.go', '''
++            package app
++            import ("encoding/json"; "io"; "strings")
++            func h() {
++                read := io.ReadAll
++                decode := json.Unmarshal
++                raw, err := read(strings.NewReader(`{"SQL":"SELECT 1"}`))
++                var p Payload
++                decodeErr := decode(raw, &p)
++                db.Query(p.SQL)
++                db.Query(err.Error())
++                db.Query(decodeErr.Error())
++            }
++        ''')
++        self.assert_hits([])
++
++
+ class ImportIdentityTests(packages.PackageTestCase):
+     def test_aliased_json_and_xml_decode_destinations(self):
+         for path, operation in (('encoding/json', 'Decode(&p)'),
+diff --git a/test-suite/quality/test_taint_go_domains.py b/test-suite/quality/test_taint_go_domains.py
+--- a/test-suite/quality/test_taint_go_domains.py
++++ b/test-suite/quality/test_taint_go_domains.py
+@@ -581,9 +581,8 @@
+                 self.check('import safe "html"', declaration + '\n'
+                            'fmt.Fprint(w, safe.EscapeString(r.FormValue("q")))', 'xss', 'xss')
+ 
+-    def test_saved_callable_and_selector_suffix_boundaries_are_preserved(self):
+-        for expression, setup in (('escape(value)', 'escape := safe.EscapeString'),
+-                                  ('obj . safe.EscapeString(value)', ''),
++    def test_selector_suffix_boundaries_are_preserved(self):
++        for expression, setup in (('obj . safe.EscapeString(value)', ''),
+                                   ('safe.EscapeString(value)[1:]', '')):
+             with self.subTest(expression=expression):
+                 self.check('import safe "html"', 'value := r.FormValue("q")\n' + setup + '\n'
+@@ -634,6 +633,121 @@
+         self.check(r'import safe "\x68tml"', 'fmt.Fprint(w, safe.EscapeString(r.FormValue("q")))')
+ 
+ 
++class SavedNativeValueOracleTests(packages.PackageTestCase):
++    """Independent source oracles for native function values, with exact sinks.
++
++    Capturing a Go function preserves that function's behavior; changing an
++    import alias later in another file cannot change the captured value. A
++    possible pass-through alternative, however, cannot prove HTML escaping.
++    """
++
++    def check_source(self, imports, body, expected, helpers=''):
++        source = 'package app\n' + imports + '\n' + helpers + '\nfunc h() {\n' + body + '\n}\n'
++        self.source('handler.go', source)
++        sites = []
++        for marker, rule in expected:
++            lines = [line for line, text in enumerate(source.splitlines(), 1) if marker in text]
++            self.assertEqual(len(lines), 1, (marker, source))
++            sites.append(('handler.go', lines[0], 'go.taint.' + rule))
++        return self.assert_hits(sites)
++
++    def test_saved_escapers_keep_only_the_html_domain_clean(self):
++        for package, member in (('html', 'EscapeString'), ('html/template', 'HTMLEscapeString'),
++                                ('text/template', 'HTMLEscapeString')):
++            with self.subTest(package=package):
++                self.check_source('import safe "' + package + '"',
++                                  'escape := safe.' + member + '\n'
++                                  'alias := escape\nvalue := alias(r.FormValue("q"))\n'
++                                  'fmt.Fprint(w, value) // escaped output\n'
++                                  'db.Query(value) // sql-site\n'
++                                  'exec.Command("sh", "-c", value) // command-site',
++                                  (('sql-site', 'sql'), ('command-site', 'command')))
++
++    def test_saved_escaper_does_not_hide_argument_effects_or_raw_siblings(self):
++        self.check_source('import "html"',
++                          'escape := html.EscapeString\nvalue := r.FormValue("q")\n'
++                          '_ = escape(render(value)) // effect-site\n'
++                          'fmt.Fprint(w, escape(value) + value) // sibling-site',
++                          (('effect-site', 'xss'), ('sibling-site', 'xss')),
++                          'func render(value string) string { fmt.Fprint(w, value); return value }')
++
++    def test_captured_function_survives_package_name_shadowing(self):
++        self.check_source('import "html"',
++                          'escape := html.EscapeString\n'
++                          'html := fake\n_ = html\nfmt.Fprint(w, escape(r.FormValue("q")))', ())
++
++    def test_callable_reassignment_and_scope_restore_do_not_keep_stale_sanitization(self):
++        self.check_source('import "html"',
++                          'escape := html.EscapeString\nvalue := r.FormValue("q")\n'
++                          '{ escape := passthrough; fmt.Fprint(w, escape(value)) } // shadow-site\n'
++                          'fmt.Fprint(w, escape(value)) // restored outer binding\n'
++                          'escape = passthrough\nfmt.Fprint(w, escape(value)) // overwrite-site',
++                          (('shadow-site', 'xss'), ('overwrite-site', 'xss')),
++                          'func passthrough(value string) string { return value }')
++
++    def test_function_choice_sanitizes_only_when_every_alternative_escapes(self):
++        helpers = 'func passthrough(value string) string { return value }'
++        self.check_source('import ("html"; "text/template")',
++                          'escape := html.EscapeString\n'
++                          'if choice { escape = template.HTMLEscapeString }\n'
++                          'fmt.Fprint(w, escape(r.FormValue("q")))', (), helpers)
++        self.check_source('import "html"',
++                          'escape := html.EscapeString\nif choice { escape = passthrough }\n'
++                          'fmt.Fprint(w, escape(r.FormValue("q"))) // maybe-raw',
++                          (('maybe-raw', 'xss'),), helpers)
++
++    def test_lookalike_and_dot_imports_keep_their_actual_identity(self):
++        self.check_source('import html "example.test/passthrough"',
++                          'escape := html.EscapeString\n'
++                          'fmt.Fprint(w, escape(r.FormValue("q"))) // raw-site',
++                          (('raw-site', 'xss'),))
++        self.check_source('import . "html"',
++                          'escape := EscapeString\nfmt.Fprint(w, escape(r.FormValue("q")))', ())
++
++    def test_saved_decoding_and_reading_preserve_payload_but_not_error_slots(self):
++        for package in ('encoding/json', 'encoding/xml'):
++            with self.subTest(package=package):
++                self.check_source('import (codec "' + package + '"; "io")',
++                                  'read := io.ReadAll\nraw, readErr := read(r.Body)\n'
++                                  'decode := codec.Unmarshal\nvar p Payload\n'
++                                  'decodeErr := decode(raw, &p)\n'
++                                  'db.Query(p.SQL) // payload-site\n'
++                                  'db.Query(readErr.Error())\ndb.Query(decodeErr.Error())\n'
++                                  'db.Query("SELECT $1", p.SQL)',
++                                  (('payload-site', 'sql'),))
++
++    def test_saved_decoder_factory_retains_the_reader(self):
++        for package in ('encoding/json', 'encoding/xml'):
++            with self.subTest(package=package):
++                self.check_source('import codec "' + package + '"',
++                                  'makeDecoder := codec.NewDecoder\n'
++                                  'decoder := makeDecoder(r.Body)\nvar p Payload\n'
++                                  'err := decoder.Decode(&p)\ndb.Query(p.SQL) // payload-site\n'
++                                  'db.Query(err.Error())', (('payload-site', 'sql'),))
++
++    def test_clean_saved_decoder_and_escaped_outputs_stay_clean(self):
++        self.check_source('import ("encoding/json"; "strings"; "html")',
++                          'makeDecoder := json.NewDecoder\n'
++                          'decoder := makeDecoder(strings.NewReader(`{"SQL":"SELECT 1"}`))\n'
++                          'var p Payload\ndecoder.Decode(&p)\ndb.Query(p.SQL)\n'
++                          'escape := html.EscapeString\nfmt.Fprint(w, escape(r.FormValue("q")))', ())
++
++    def test_decoder_choice_keeps_possible_output_parameter_writes(self):
++        self.check_source('import ("encoding/json"; "encoding/xml")',
++                          'decode := json.Unmarshal\nif choice { decode = xml.Unmarshal }\n'
++                          'var p Payload\ndecode([]byte(r.FormValue("body")), &p)\n'
++                          'db.Query(p.SQL) // possible-write', (('possible-write', 'sql'),))
++
++    def test_saved_operations_in_local_helpers_keep_file_authority(self):
++        self.source('helper.go', 'package app\nimport ("encoding/json"; "html")\n'
++                    'func decode(raw []byte, out *Payload) { call := json.Unmarshal; call(raw, out) }\n'
++                    'func escaped(value string) string { call := html.EscapeString; return call(value) }\n')
++        self.check_source('import html "example.test/passthrough"',
++                          'var p Payload\ndecode([]byte(r.FormValue("body")), &p)\n'
++                          'db.Query(p.SQL) // helper-write\n'
++                          'fmt.Fprint(w, escaped(r.FormValue("q")))', (('helper-write', 'sql'),))
++
++
+ @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 for real scanner tests')
+ class GoSanitizerRunnerTests(unittest.TestCase):
+     def test_actual_json_and_sarif_use_imported_sanitizer_identity(self):

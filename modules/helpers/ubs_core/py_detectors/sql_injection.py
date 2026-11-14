@@ -4658,8 +4658,16 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self._evaluated_values[argument] = self.materialize_generators(refs)
             return True
         references = receiver | frozenset().union(*(refs for _, refs in arguments))
+        # GH #222: concatenated iterable data can carry fragment risk without
+        # supplying SQL. The complete literal-statement inventory proves that
+        # no SQL slot can consume those fragments, including through aliases
+        # or other scopes. Keep complete SQL exports, writes, sinks and cursor
+        # effects on the ordinary refusal path; no consumer identity or full
+        # exhaustion is inferred from this proof.
         if opaque_literal_reducer or all(
-                identity is not None and not self.generator_has_sql_effects(identity) for identity in references):
+                identity is not None and not self.generator_has_sql_effects(
+                    identity, include_fragments=self._literal_statement_scopes is None)
+                for identity in references):
             if self._short_circuiting:
                 # A read-only argument says nothing about its opaque
                 # consumer: that call can still mutate captured heap state.
@@ -5408,7 +5416,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         captures, filters and generator-local bindings retain their normal
         semantics. Writes and SQL sinks still require a modeled consumer.
         A proven literal-only SQL inventory cannot use projected values as
-        fragments; its opaque reducers still cannot export complete SQL text.
+        fragments; its opaque consumers still cannot export complete SQL text.
         """
         if identity not in self._generator_specs or self.generator_has_writes_or_sinks(identity):
             return True

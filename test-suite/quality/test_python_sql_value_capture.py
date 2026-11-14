@@ -1737,6 +1737,10 @@ class SQLValueCaptureTests(unittest.TestCase):
             ('opaque-does-not-clean-outer',
              '    query = f"SELECT {user}"\n    consume(None for item in [query])\n    cursor.execute(query)\n',
              ((CRITICAL, 4),)),
+            # Fragment-like data cannot alter a proven literal statement;
+            # bound parameters remain data even beside an opaque consumer.
+            ('literal-bound-fragment-data',
+             '    consume(f"name = {item}" for item in [user])\n    cursor.execute("SELECT %s", (user,))\n', ()),
         )
         for name, body, expected in cases:
             with self.subTest(case=name):
@@ -1747,7 +1751,7 @@ class SQLValueCaptureTests(unittest.TestCase):
             '    pending = (None for item in [user])\n    consume(pending)\n    list(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
             '    query = f"SELECT {user}"\n    consume((query := "SELECT 1") for item in [1])\n    cursor.execute(query)\n',
             '    consume(cursor.execute(f"SELECT {user}") for item in [1])\n',
-            '    consume(f"name = {item}" for item in [user])\n    cursor.execute("SELECT %s", (user,))\n',
+            '    consume(f"name = {item}" for item in [user])\n    qs.extra(where=["name = %s"], params=[user])\n',
             '    query = "SELECT 1"\n    pending = (query for item in [1])\n    consume(pending)\n    query = f"SELECT {user}"\n    consume(pending)\n    cursor.execute(next(pending, "SELECT 1"))\n',
         )
         for index, body in enumerate(refusals):
@@ -1756,6 +1760,119 @@ class SQLValueCaptureTests(unittest.TestCase):
                 path.write_text(program(body), encoding='utf-8')
                 with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator.*incomplete'):
                     list(detector.find([path]))
+
+    def test_literal_sql_set_update_generators_do_not_abort(self):
+        # GH #222: concatenating the outer iterable adds fragment provenance,
+        # but that data goes to a set, never to the literal SQL statement.
+        cases = (
+            ('concat', '', 'a + b', 'set()', 'seen.update(x for x in s)'),
+            ('named-concat', '    both = a + b\n', 'both', 'set()', 'seen.update(x for x in s)'),
+            ('single-list', '', 'a', 'set()', 'seen.update(x for x in s)'),
+            ('list-comprehension', '', 'a + b', 'set()', 'seen.update([x for x in s])'),
+            ('list-extend', '', 'a + b', '[]', 'seen.extend(x for x in s)'),
+            ('set-alias', '    alias = seen\n', 'a + b', 'set()', 'alias.update(x for x in s)'),
+        )
+        for name, setup, iterable, constructor, update in cases:
+            source = ('def f(con, a, b):\n    con.execute("select 1")\n'
+                      f'    seen = {constructor}\n' + setup
+                      + f'    for s in {iterable}:\n        {update}\n'
+                      '    return seen\n')
+            with self.subTest(case=name):
+                self.inspect('set-update-literal-' + name, source, ())
+
+        # A resolved local alias still has an exact literal statement slot.
+        source = ('def f(con, a, b):\n    execute = con.execute\n    execute("select 1")\n'
+                  '    seen = set()\n    for s in a + b:\n'
+                  '        seen.update(x for x in s)\n    return seen\n')
+        self.inspect('set-update-literal-saved-sink', source, ())
+
+        for name, statement, expected_rows in (
+                ('static', '"SELECT count(*) FROM users WHERE name = \'alice\'"', 1),
+                ('bound', '"SELECT count(*) FROM users WHERE name = ?", (user,)', 0)):
+            source = program(f'    cursor.execute({statement})\n'
+                             '    left = [(user,)]\n    right = [("alice",)]\n'
+                             '    seen = set()\n    for values in left + right:\n'
+                             '        seen.update(value for value in values)\n'
+                             '    return cursor.fetchone()[0]\n')
+            with self.subTest(sqlite=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'set-update-safe-' + name, source)['rows'],
+                                 expected_rows)
+                self.inspect('set-update-safe-' + name, source, ())
+
+    def test_literal_sql_opaque_consumers_keep_sql_and_cursor_boundaries(self):
+        update = ('    seen = set()\n    for s in a + b:\n'
+                  '        seen.update(x for x in s)\n')
+        cases = (
+            ('computed-statement', '    query = "select 1"\n' + update
+             + '    con.execute(query)\n', 'unknown generator consumer'),
+            ('opaque-result', '    query = consume(x for x in a + b)\n'
+             '    con.execute(query)\n', 'unknown generator consumer'),
+            ('fragment-sink', '    con.execute("select 1")\n' + update
+             + '    qs.extra(where=["name = %s"], params=[a])\n', 'unknown generator consumer'),
+            ('escaped-sink', '    con.execute("select 1")\n' + update
+             + '    callbacks = [con.execute]\n', 'unknown generator consumer'),
+            ('complete-sql-export', '    con.execute("select 1")\n    seen = set()\n'
+             '    seen.update(f"SELECT {x}" for x in a + b)\n', 'unknown generator consumer'),
+            ('write', '    con.execute("select 1")\n    seen = set()\n'
+             '    seen.update((last := x) for x in a + b)\n', 'unknown generator consumer'),
+            ('literal-sink-in-generator', '    seen = set()\n'
+             '    seen.update(con.execute("select 1") for x in a + b)\n', 'unknown generator consumer'),
+            ('computed-sink-in-generator', '    seen = set()\n'
+             '    seen.update(con.execute(f"SELECT {x}") for x in a + b)\n', 'unknown generator consumer'),
+            ('partial-cursor', '    con.execute("select 1")\n    seen = set()\n'
+             '    pending = (x for x in a + b)\n    seen.update(pending)\n'
+             '    list(pending)\n', 'partial generator consumption'),
+        )
+        for name, body, reason in cases:
+            path = self.artifacts / ('set-update-boundary-' + name + '.py')
+            path.write_text('def f(con, a, b, qs):\n' + body, encoding='utf-8')
+            with self.subTest(boundary=name), self.assertRaisesRegex(
+                    detector.SQLFlowLimit, reason + '.*incomplete'):
+                list(detector.find([path]))
+
+        # The proof covers all SQL owners, including a separate deferred body.
+        source = ('def f(con, a, b):\n    con.execute("select 1")\n' + update
+                  + 'def other(con, query):\n    con.execute(query)\n')
+        path = self.artifacts / 'set-update-computed-sibling.py'
+        path.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'unknown generator consumer.*incomplete'):
+            list(detector.find([path]))
+
+    def test_set_update_callbacks_cannot_clean_later_sql(self):
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        for name, setup, update in (
+                ('hash', '    class Key:\n        def __init__(self, value):\n'
+                 '            self.value = value\n        def __hash__(self):\n'
+                 '            nonlocal query\n' + f'            query = {unsafe}\n'
+                 '            return 0\n    seen = set()\n',
+                 '    seen.update(Key(f"name = {user}") for _ in (1,))\n'),
+                ('custom-consumer', '    class Consumer:\n        def update(self, values):\n'
+                 '            nonlocal query\n' + f'            query = {unsafe}\n'
+                 '    seen = Consumer()\n',
+                 '    seen.update(f"name = {user}" for _ in (1,))\n')):
+            source = program(f'    query = {safe}\n' + setup + update
+                             + '    return cursor.execute(query).fetchone()[0]\n')
+            with self.subTest(callback=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'set-update-' + name, source)['rows'], 2)
+                path = self.artifacts / ('set-update-callback-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
+                    list(detector.find([path]))
+
+        source = program('    class Key:\n        def __hash__(self):\n'
+                         + f'            cursor.execute({unsafe})\n            return 0\n'
+                         '    seen = set()\n    seen.update(Key() for _ in (1,))\n'
+                         '    return cursor.fetchone()[0]\n')
+        self.assertEqual(sqlite_witness(self.artifacts, 'set-update-hash-sink', source)['rows'], 2)
+        self.inspect('set-update-hash-sink', source, ((CRITICAL, 4),))
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_literal_sql_set_update_generators(self):
+        source = ('def f(con, a, b):\n    con.execute("select 1")\n'
+                  '    seen = set()\n    for s in a + b:\n'
+                  '        seen.update(x for x in s)\n    return seen\n')
+        self.assert_real_cli_capture((('set-update-literal-cli', source, ()),), wrap=False)
 
     def test_collection_concatenation_preserves_contents_without_fabricating_sql(self):
         cases = (

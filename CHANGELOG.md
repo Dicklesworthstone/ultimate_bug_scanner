@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve Go taint through ordinary pointer assignments, explicit struct-field
+  writes and selected helper output parameters. Track bounded field paths and
+  actual pointer cells so value copies, rebinding, clean sibling fields and
+  exact local resets retain their meaning. Unknown pointer alternatives cannot
+  establish a strong reset, and field projections retain enclosing aggregate
+  provenance. Native decoder writes remain weak; general heap/container aliases
+  and promoted-field resolution remain outside this bounded model.
+
 - Follow standard-input contents through native Python `csv.reader` and
   `csv.DictReader` rows, selected helpers and iterator consumers. Keep reader
   construction lazy, distinguish input-derived headers from fixed field names,

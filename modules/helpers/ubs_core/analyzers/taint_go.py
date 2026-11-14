@@ -13,8 +13,9 @@ payload traces. Excessive specialization is an explicit incomplete analysis.
 Callable joins retain unknown alternatives instead of borrowing a native
 sanitizer or clean error-result contract. Decoders and Unmarshal
 propagate input through local destination pointers and package helper output
-parameters, using conservative aggregate writes rather than field-sensitive
-heap models. Only explicitly
+parameters. Ordinary writes retain bounded selector paths and value copies;
+native decoding uses weak writes and deep or unknown targets remain conservative.
+This is not a general heap model. Only explicitly
 selected files in the same directory AND package share summaries. Both output
 entrypoints consume the same finding stream.
 """
@@ -35,6 +36,7 @@ SKIP_DIRS = {'.git', 'vendor', '.cache', 'bin', 'dist', '.idea'}
 EXTS = {'.go'}
 PATH_LIMIT = 6
 NATIVE_CONTEXT_LIMIT = 256
+FIELD_PATH_LIMIT = 8
 
 _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
                     'io': 'io', 'io/ioutil': 'ioutil', 'html': 'html',
@@ -235,6 +237,14 @@ _CLEAN: _Fact = frozenset()
 class _Target:
     cell: str
     parameter: int | None = None
+    whole: bool = True
+    path: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _FieldKey:
+    cell: str
+    path: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -283,8 +293,10 @@ def _join_value_info(*values):
     decoder = (_DecoderInfo(_join(*(item.source for item in decoders if item is not None)),
                             all(item is not None and item.definite for item in decoders))
                if any(item is not None for item in decoders) else None)
-    return _ValueInfo(_join_native(*(value.native for value in values)), decoder,
-                      frozenset().union(*(value.pointers for value in values)))
+    pointers = frozenset().union(*(value.pointers for value in values))
+    if not all(value.pointers for value in values):
+        pointers = frozenset(replace(target, whole=False) for target in pointers)
+    return _ValueInfo(_join_native(*(value.native for value in values)), decoder, pointers)
 
 
 def _join_native(*values):
@@ -319,6 +331,30 @@ def _advance(fact: _Fact, step: str) -> _Fact:
     return frozenset(result)
 
 
+def _field_base(state, cell, path=()):
+    # Field facets refine tracked ordinary writes, not an unknown aggregate's
+    # layout. Retain enclosing provenance: promoted fields and pointer-valued
+    # members can alias paths that this bounded model does not resolve.
+    return _join(state.get(cell, _CLEAN),
+                 *(state.get(_FieldKey(cell, path[:length]), _CLEAN)
+                   for length in range(1, len(path) + 1)))
+
+
+def _field_fact(state, cell, path=()):
+    return _join(_field_base(state, cell, path),
+                 *(fact for key, fact in state.items() if isinstance(key, _FieldKey)
+                   and key.cell == cell and len(key.path) > len(path) and key.path[:len(path)] == path))
+
+
+def _field_target(target, suffix):
+    path = target.path + tuple(suffix)
+    # Recursive helpers may walk arbitrarily deep structures. Widen a deep
+    # destination to its aggregate instead of growing an unbounded path or
+    # granting a strong update to an unrepresented descendant.
+    return (replace(target, path=path) if len(path) <= FIELD_PATH_LIMIT
+            else replace(target, path=(), whole=False))
+
+
 def _join_states(*states):
     states = [state for state in states if state is not None]
     if not states:
@@ -326,13 +362,18 @@ def _join_states(*states):
     result = {}
     for name in set().union(*(state.keys() for state in states)):
         if isinstance(name, _PointerKey):
-            result[name] = frozenset().union(*(state.get(name, frozenset()) for state in states))
+            alternatives = [state.get(name, frozenset()) for state in states]
+            targets = frozenset().union(*alternatives)
+            result[name] = (targets if all(alternatives) else
+                            frozenset(replace(target, whole=False) for target in targets))
         elif isinstance(name, _DecoderKey):
             decoders = [state.get(name) for state in states]
             result[name] = _DecoderInfo(_join(*(item.source for item in decoders if item is not None)),
                                         all(item is not None and item.definite for item in decoders))
         elif isinstance(name, _NativeKey):
             result[name] = _join_native(*(state.get(name) for state in states))
+        elif isinstance(name, _FieldKey):
+            result[name] = _join(*(_field_fact(state, name.cell, name.path) for state in states))
         else:
             result[name] = _join(*(state.get(name, _CLEAN) for state in states))
     return result
@@ -631,7 +672,7 @@ class _Summary:
     returns: tuple[_Fact, ...] = ()
     effects: dict[tuple[int, str], _Fact] = field(default_factory=dict)
     variadic: int | None = None
-    writes: dict[int, _Fact] = field(default_factory=dict)
+    writes: dict[tuple[int, tuple[str, ...]], _Fact] = field(default_factory=dict)
     value_returns: tuple[_ValueInfo | None, ...] = ()
 
 
@@ -674,9 +715,9 @@ def _join_summaries(summaries: list[_Summary]) -> _Summary:
     for summary in summaries:
         for key, fact in summary.effects.items():
             effects[key] = _join(effects.get(key, _CLEAN), widen(fact))
-        for index, fact in summary.writes.items():
+        for (index, path), fact in summary.writes.items():
             index = min(index, variadic) if variadic is not None else index
-            writes[index] = _join(writes.get(index, _CLEAN), widen(fact))
+            writes[index, path] = _join(writes.get((index, path), _CLEAN), widen(fact))
     return _Summary(returns, effects, variadic, writes, tuple(value_returns))
 
 
@@ -699,7 +740,7 @@ class _Analysis:
         self.call_results: dict[int, tuple[_ValueInfo | None, ...]] = {}
         self.value_results: dict[int, tuple[_ValueInfo | None, ...]] = {}
         self.named_returns = ()
-        self.writes: dict[int, _Fact] = {}
+        self.writes: dict[tuple[int, tuple[str, ...]], _Fact] = {}
         self.native_mutations: set[str] = set()
         self.native_escapes: set[str] = set()
         self.uncertain_globals = uncertain_globals if uncertain_globals is not None else set()
@@ -719,15 +760,72 @@ class _Analysis:
     def pointers(self, expr, state, scope):
         expr, _ = self.unparenthesize(expr)
         if re.fullmatch(r'[A-Za-z_]\w*', expr):
-            return state.get(_PointerKey(scope.bindings.get(expr, expr)), frozenset())
+            cell = scope.bindings.get(expr, expr)
+            targets = state.get(_PointerKey(cell), frozenset())
+            return (frozenset(replace(target, whole=False) for target in targets)
+                    if cell in self.native_escapes else targets)
         if expr.startswith('&'):
             target, _ = self.unparenthesize(expr[1:])
-            match = re.fullmatch(r'([A-Za-z_]\w*)(?:\s*\.\s*[A-Za-z_]\w*|\s*\[[^\]]*\])*',
+            match = re.fullmatch(r'([A-Za-z_]\w*)((?:\s*\.\s*[A-Za-z_]\w*)*)',
                                  _masked_source(target))
             if match:
                 cell = scope.bindings.get(match.group(1), match.group(1))
-                return state.get(_PointerKey(cell), frozenset()) or frozenset({_Target(cell)})
+                suffix = tuple(re.findall(r'\.\s*([A-Za-z_]\w*)', match.group(2)))
+                if not suffix:
+                    return frozenset({_Target(cell)})
+                aliases = self.pointers(match.group(1), state, scope) or frozenset({_Target(cell)})
+                return frozenset(_field_target(alias, suffix) for alias in aliases)
+            indexed = re.fullmatch(r'([A-Za-z_]\w*)(?:\s*\.\s*[A-Za-z_]\w*|\s*\[[^\]]*\])+',
+                                   _masked_source(target))
+            if indexed:
+                cell = scope.bindings.get(indexed.group(1), indexed.group(1))
+                aliases = self.pointers(indexed.group(1), state, scope) or frozenset({_Target(cell)})
+                return frozenset(replace(alias, whole=False) for alias in aliases)
         return frozenset()
+
+    def assignment_targets(self, expr, state, scope):
+        """Resolve bounded pointer/selector lvalues without treating values as aliases."""
+        expr, _ = self.unparenthesize(expr)
+        if expr.startswith('*'):
+            pointer, _ = self.unparenthesize(expr[1:])
+            if re.fullmatch(r'[A-Za-z_]\w*', pointer):
+                return self.pointers(pointer, state, scope)
+            if pointer.startswith('*'):
+                outer = self.assignment_targets(pointer, state, scope)
+                if outer is not None:
+                    complete = all(not target.path and state.get(_PointerKey(target.cell)) for target in outer)
+                    return frozenset(replace(inner, whole=inner.whole and target.whole and complete)
+                                     for target in outer if not target.path
+                                     for inner in state.get(_PointerKey(target.cell), ()))
+        selector = re.fullmatch(r'(?:([A-Za-z_]\w*)|\(\s*\*\s*([A-Za-z_]\w*)\s*\))'
+                                r'(?:\s*\.\s*[A-Za-z_]\w*)+', expr)
+        if selector:
+            root = selector.group(1) or selector.group(2)
+            if root in scope.bindings:
+                cell = scope.bindings[root]
+                targets = self.pointers(root, state, scope) or frozenset({_Target(cell)})
+                suffix = tuple(re.findall(r'\.\s*([A-Za-z_]\w*)', expr))
+                return frozenset(_field_target(target, suffix) for target in targets)
+        return None
+
+    def copy_fields(self, expr, state, scope):
+        expr, _ = self.unparenthesize(expr)
+        if re.fullmatch(r'[A-Za-z_]\w*', expr) and expr in scope.bindings:
+            cell = scope.bindings[expr]
+            if state.get(_PointerKey(cell)):
+                return None
+            target = _Target(cell)
+        else:
+            targets = self.assignment_targets(expr, state, scope)
+            if not targets or len(targets) != 1:
+                return None
+            target = next(iter(targets))
+            if not target.whole:
+                return None
+        fields = tuple((key.path[len(target.path):], fact) for key, fact in state.items()
+                       if isinstance(key, _FieldKey) and key.cell == target.cell
+                       and len(key.path) > len(target.path) and key.path[:len(target.path)] == target.path)
+        return _field_base(state, target.cell, target.path), fields
 
     def native_identity(self, root, member, offset, scope):
         if root in scope.bindings or root in self.summaries:
@@ -770,15 +868,81 @@ class _Analysis:
                 self.native_mutations.add(target.cell)
                 self.native_escapes.add(target.cell)
 
+    def invalidate_address_cell(self, expr, state, scope):
+        # Points-to facts may collapse an address through its aggregate. Keep
+        # the exact addressed binding uncertain too: a callee receiving &ptr
+        # can replace ptr without replacing an earlier copied pointer value.
+        expr, _ = self.unparenthesize(expr)
+        if expr.startswith('&'):
+            name, _ = self.unparenthesize(expr[1:])
+            if re.fullmatch(r'[A-Za-z_]\w*', name) and name in scope.bindings:
+                self.invalidate_native_targets((_Target(scope.bindings[name]),), state)
+
     def write_targets(self, targets, fact, state, label):
         # Decode can partially modify an object even when it returns an error.
         # It can also leave omitted fields untouched. Weak aggregate writes
         # preserve both possibilities; a clean document is not a sanitizer.
         fact = _advance(fact, label)
-        for target in targets:
-            state[target.cell] = _join(state.get(target.cell, _CLEAN), fact)
+        pending, seen = list(targets), set()
+        while pending:
+            target = pending.pop()
+            if target in seen:
+                continue
+            seen.add(target)
+            if not target.path:
+                pending.extend(state.get(_PointerKey(target.cell), ()))
+            self.store_target(target, _join(_field_fact(state, target.cell, target.path), fact), state)
             if target.parameter is not None:
-                self.writes[target.parameter] = _join(self.writes.get(target.parameter, _CLEAN), fact)
+                key = (target.parameter, target.path)
+                self.writes[key] = _join(self.writes.get(key, _CLEAN), fact)
+
+    @staticmethod
+    def store_target(target, fact, state):
+        for key in list(state):
+            if (isinstance(key, _FieldKey) and key.cell == target.cell
+                    and key.path[:len(target.path)] == target.path):
+                state.pop(key)
+        state[_FieldKey(target.cell, target.path) if target.path else target.cell] = fact
+
+    def assign_targets(self, targets, fact, info, image, state, label, *, compound=False):
+        # A known scalar cell can be replaced. A field, joined destination or
+        # collapsed heap/pointer alias still needs a weak aggregate write;
+        # clearing it could erase other fields or another possible pointee.
+        strong = (not compound and len(targets) == 1 and all(
+            target.whole and (target.path or not any(alias.cell == target.cell
+                              for alias in state.get(_PointerKey(target.cell), ()))) for target in targets))
+        fact = _advance(fact, label)
+        self.invalidate_native_targets(targets, state)
+        for target in targets:
+            written = _advance(image[0], label) if strong and image is not None else fact
+            if (strong and not target.path and info is not None and info.pointers
+                    and all(pointer.parameter is None for pointer in info.pointers)):
+                written = _CLEAN
+            self.store_target(target, written if strong else
+                              _join(_field_fact(state, target.cell, target.path), fact), state)
+            if strong and image is not None:
+                for path, field_fact in image[1]:
+                    destination = _field_target(target, path)
+                    if destination.path:
+                        state[_FieldKey(destination.cell, destination.path)] = _advance(field_fact, label)
+                    else:
+                        state[destination.cell] = _join(state.get(destination.cell, _CLEAN), field_fact)
+            if target.parameter is not None:
+                key = (target.parameter, target.path)
+                self.writes[key] = _join(self.writes.get(key, _CLEAN), fact)
+            if target.path:
+                continue
+            if strong and info is not None:
+                state[_PointerKey(target.cell)] = info.pointers
+            decoder_key = _DecoderKey(target.cell)
+            previous = state.get(decoder_key)
+            replacement = info.decoder if info is not None else None
+            if strong and replacement is not None:
+                state[decoder_key] = replacement
+            elif previous is not None:
+                state[decoder_key] = _DecoderInfo(
+                    _join(previous.source, fact, replacement.source if replacement is not None else _CLEAN),
+                    False)
 
     def native_call(self, expression, match, state, scope, *, whole=False):
         """Known result shapes and output-parameter effects, never name-only Decode."""
@@ -919,6 +1083,7 @@ class _Analysis:
             for info in metadata:
                 if info is not None:
                     self.invalidate_native_targets(info.pointers, state)
+            self.invalidate_address_cell(expression, state, scope)
         for index, (expression, origin) in enumerate(expressions):
             # Argument calls and ordinary variable reads do not have a total
             # order in Go. A later pointer/capture write cannot grant a
@@ -939,9 +1104,10 @@ class _Analysis:
             # input-dependent sink produces an additional call-site finding.
             dependent = frozenset(trace for trace in fact if trace.parameter is not None)
             self.effect(call_offset, label, self.instantiate(dependent, arguments, name, infos))
-        for index, fact in summary.writes.items():
+        for (index, path), fact in summary.writes.items():
             if index < len(targets):
-                self.write_targets(targets[index], self.instantiate(fact, arguments, name, infos), state, name + '()')
+                destinations = frozenset(_field_target(target, path) for target in targets[index])
+                self.write_targets(destinations, self.instantiate(fact, arguments, name, infos), state, name + '()')
         result_infos = []
         for info in summary.value_returns:
             if info is None:
@@ -949,8 +1115,13 @@ class _Analysis:
                 continue
             decoder = (replace(info.decoder, source=self.instantiate(info.decoder.source, arguments, name, infos))
                        if info.decoder is not None else None)
-            pointers = frozenset().union(*(targets[target.parameter] for target in info.pointers
-                                          if target.parameter is not None and target.parameter < len(targets)))
+            complete = all(target.parameter is not None and target.parameter < len(targets)
+                           and targets[target.parameter] for target in info.pointers)
+            pointers = frozenset(replace(_field_target(actual, target.path),
+                                         whole=_field_target(actual, target.path).whole and target.whole and complete)
+                                 for target in info.pointers
+                                 if target.parameter is not None and target.parameter < len(targets)
+                                 for actual in targets[target.parameter])
             result_infos.append(replace(info, decoder=decoder, pointers=pointers))
         self.call_results[call_offset] = tuple(result_infos)
         return tuple(self.instantiate(fact, arguments, name, infos) for fact in summary.returns)
@@ -1082,8 +1253,10 @@ class _Analysis:
                 end = pairs.get(match.end() - 1)
                 if end is not None:
                     for start, stop in _parts(code[match.end():end]):
+                        argument = expr[match.end() + start:match.end() + stop]
                         self.invalidate_native_targets(
-                            self.pointers(expr[match.end() + start:match.end() + stop], state, scope), state)
+                            self.pointers(argument, state, scope), state)
+                        self.invalidate_address_cell(argument, state, scope)
         for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)\s*\(', code):
             name = match.group(1)
             end = pairs.get(match.end() - 1)
@@ -1129,11 +1302,20 @@ class _Analysis:
             for match in regex.finditer(remaining):
                 source = match.group()
                 facts.append(frozenset({_Trace(source, path=(source,))}))
-        for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)', remaining):
+        for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)((?:\s*\.\s*[A-Za-z_]\w*)*)', remaining):
             name = match.group(1)
             cell = scope.bindings.get(name, name)
-            facts.append(state.get(cell, _CLEAN))
-            facts.extend(state.get(target.cell, _CLEAN) for target in state.get(_PointerKey(cell), ()))
+            path = tuple(re.findall(r'\.\s*([A-Za-z_]\w*)', match.group(2)))
+            facts.append(_field_fact(state, cell, path))
+            pending, seen = list(state.get(_PointerKey(cell), ())), set()
+            while pending:
+                target = pending.pop()
+                if target in seen:
+                    continue
+                seen.add(target)
+                facts.append(_field_fact(state, target.cell, target.path + path))
+                if not target.path:
+                    pending.extend(state.get(_PointerKey(target.cell), ()))
         return _join(*facts)
 
     def simple(self, start: int, end: int, state, scope, declaration_kind: str = '') -> _Flow:
@@ -1164,11 +1346,29 @@ class _Analysis:
                 self.value_returns[index] if index < len(self.value_returns) else None,
                 infos[index] if index < len(infos) else None) for index in range(count))
             return _Flow(None)
-        indirect = re.match(r'\s*\*\s*([A-Za-z_]\w*)\s*=(?!=)', code)
-        if indirect:
-            self.value(self.source[start + indirect.end():end], start + indirect.end(), state, scope)
-            self.invalidate_native_targets(self.pointers(indirect.group(1), state, scope), state)
-            return _Flow(state)
+        assignment = _parts(code, '=')
+        if len(assignment) > 1:
+            equal = assignment[0][1]
+            lhs = code[:equal].rstrip()
+            compound = lhs.endswith('+')
+            if compound:
+                lhs = lhs[:-1].rstrip()
+            targets = self.assignment_targets(lhs, state, scope)
+            if targets is not None and code[equal + 1:equal + 2] != '=':
+                expr_start = start + equal + 1 - len(prefix)
+                expression = self.source[expr_start:end]
+                fact = self.value(expression, expr_start, state, scope)
+                info = self.value_info(expression, expr_start, state, scope)
+                image = self.copy_fields(expression, state, scope)
+                # RHS calls may change the pointer operand. Go does not give
+                # ordinary variable reads a total order against those calls.
+                following = self.assignment_targets(lhs, state, scope) or frozenset()
+                if not targets or not following:
+                    targets = frozenset(replace(target, whole=False) for target in targets | following)
+                else:
+                    targets |= following
+                self.assign_targets(targets, fact, info, image, state, lhs.strip(), compound=compound)
+                return _Flow(state)
         for pattern in ASSIGN_PATTERNS:
             match = pattern.match(code)
             if match is None:
@@ -1192,6 +1392,8 @@ class _Analysis:
                 updates[key] = _advance(fact, target)
                 expression = (self.source[expr_start + pieces[index][0]:expr_start + pieces[index][1]]
                               if index < len(pieces) else '')
+                image = (self.copy_fields(expression, state, scope)
+                         if len(pieces) == 1 and match.group('op') != '+=' else None)
                 info = metadata[index] if index < len(metadata) else _ValueInfo()
                 pointers, decoder, native = ((info.pointers, info.decoder, info.native) if info is not None
                                              else (frozenset(), None, None))
@@ -1199,6 +1401,10 @@ class _Analysis:
                     # A pointer alias observes its pointee at use time. Copying
                     # old pointee facts here would survive a later clean reset.
                     updates[key] = _CLEAN
+                elif image is not None:
+                    updates[key] = _advance(image[0], target)
+                    for path, field_fact in image[1]:
+                        updates[_FieldKey(key, path)] = _advance(field_fact, target)
                 if not pointers and (re.match(r'\s*new\s*\(', expression)
                                      or re.match(r'\s*&\s*[A-Za-z_]\w*\s*\{', expression)):
                     pointers = frozenset({_Target(key)})
@@ -1206,6 +1412,10 @@ class _Analysis:
                 updates[_DecoderKey(key)] = decoder
                 updates[_NativeKey(key)] = native
                 self.native_mutations.add(key)
+            assigned = {key for key in updates if isinstance(key, str)}
+            for key in list(state):
+                if isinstance(key, _FieldKey) and key.cell in assigned:
+                    state.pop(key)
             state.update(updates)
             return _Flow(state)
         declaration = re.match(r'\s*var\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+[^=]+$', code)

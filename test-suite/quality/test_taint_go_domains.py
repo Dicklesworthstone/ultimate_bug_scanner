@@ -937,6 +937,85 @@ class NativeCallableRuntimeTests(unittest.TestCase):
             self.assertEqual(len(findings), len(expected), findings)
 
 
+    def test_compiled_ordinary_destination_writes_match_analyzer_contracts(self):
+        source = textwrap.dedent('''\
+            package main
+            import (
+                "encoding/json"
+                "fmt"
+                "html"
+                "net/http"
+                "net/http/httptest"
+                "net/url"
+                "os"
+            )
+            type Payload struct { SQL string; HTML string }
+            type database struct { Queries []string }
+            func (db *database) Query(query string, args ...any) { db.Queries = append(db.Queries, query) }
+            func assign(out *string, input string) { *out = input }
+            func forward(out *string, input string) { assign(out, input) }
+            func populate(out *Payload, input string) { out.SQL = input }
+            type Base struct { SQL string }
+            type Embedded struct { Base }
+            func h(r *http.Request, w http.ResponseWriter, db *database) {
+                value := "fixed"
+                saved := value
+                forward(&value, r.FormValue("q"))
+                fmt.Fprint(w, value) // raw-output
+                db.Query(saved)
+                out := &value
+                *out = "fixed"
+                fmt.Fprint(w, value)
+                var payload, untouched Payload
+                populate(&payload, r.FormValue("q"))
+                field := &payload.HTML
+                *field = "constant"
+                db.Query(payload.SQL) // field-query
+                db.Query(untouched.SQL)
+                escaped := "fixed"
+                escapedOut := &escaped
+                *escapedOut = html.EscapeString(r.FormValue("q"))
+                fmt.Fprint(w, escaped)
+                db.Query(escaped) // escaped-query
+                db.Query("SELECT $1", payload.SQL)
+                embedded := Embedded{Base: Base{SQL: r.FormValue("q")}}
+                embedded.SQL = "fixed"
+                embedded.Base.SQL = r.FormValue("q")
+                db.Query(embedded.SQL) // promoted-query
+            }
+            func main() {
+                input := "<b>request</b>"
+                req := httptest.NewRequest("GET", "/?q=" + url.QueryEscape(input), nil)
+                output := httptest.NewRecorder()
+                db := &database{}
+                h(req, output, db)
+                observed := map[string]any{"rendered": output.Body.String(), "queries": db.Queries}
+                if err := json.NewEncoder(os.Stdout).Encode(observed); err != nil { panic(err) }
+            }
+        ''')
+        with tempfile.TemporaryDirectory(prefix='ubs-go-native-writes-') as tmp:
+            path = Path(tmp) / 'main.go'
+            path.write_text(source, encoding='utf-8')
+            native = subprocess.run(['go', 'run', str(path)], cwd=tmp, text=True,
+                                    capture_output=True, timeout=180,
+                                    env=dict(os.environ, GOWORK='off', GO111MODULE='off', GOTOOLCHAIN='local'))
+            self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+            self.assertEqual(json.loads(native.stdout), {
+                'rendered': '<b>request</b>fixed&lt;b&gt;request&lt;/b&gt;',
+                'queries': ['fixed', '<b>request</b>', '', '&lt;b&gt;request&lt;/b&gt;',
+                            'SELECT $1', '<b>request</b>'],
+            })
+            findings = list(taint_go.run(RunContext(lang='go', files=[path])))
+            expected = {
+                (number, 'go.taint.' + rule)
+                for number, line in enumerate(source.splitlines(), 1)
+                for marker, rule in [('raw-output', 'xss'), ('field-query', 'sql'),
+                                     ('escaped-query', 'sql'), ('promoted-query', 'sql')]
+                if '// ' + marker in line
+            }
+            self.assertEqual({(row['line'], row['rule']) for row in findings}, expected, findings)
+            self.assertEqual(len(findings), len(expected), findings)
+
     def test_compiled_higher_order_native_calls_match_analyzer_contracts(self):
         source = textwrap.dedent('''\
             package main

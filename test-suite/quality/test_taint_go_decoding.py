@@ -193,6 +193,288 @@ class DecodingFlowTests(packages.PackageTestCase):
                    '// json.NewDecoder(r.Body).Decode(&p)\ndb.Query(p.SQL)')
 
 
+class OrdinaryDestinationWriteTests(packages.PackageTestCase):
+    def check_writes(self, body, sites, helpers=''):
+        self.source('handler.go', 'package app\nimport ("html"; "encoding/json"; "strings")\n'
+                    'func h() {\n' + textwrap.dedent(body) + '\n}\n')
+        self.source('helpers.go', 'package app\ntype Payload struct { SQL string; HTML string }\n'
+                    + textwrap.dedent(helpers))
+        lines = self.sources['handler.go'].read_text().splitlines()
+        expected = []
+        for marker, rule in sites:
+            matches = [number for number, line in enumerate(lines, 1) if '// ' + marker in line]
+            self.assertEqual(len(matches), 1, (marker, lines))
+            expected.append(('handler.go', matches[0], 'go.taint.' + rule))
+        return self.assert_hits(expected)
+
+    def test_pointer_assignment_reaches_scalar_sinks_and_keeps_value_copies(self):
+        self.check_writes('''
+            value := "fixed"
+            saved := value
+            out := &value
+            *out = r.FormValue("q")
+            db.Query(value) // written
+            db.Query(saved)
+        ''', [('written', 'sql')])
+
+    def test_pointer_output_helpers_propagate_across_selected_files(self):
+        self.check_writes('''
+            value := "fixed"
+            forward(&value, r.FormValue("q"))
+            fmt.Fprint(w, value) // output
+            exec.Command("sh", "-c", value) // command
+        ''', [('output', 'xss'), ('command', 'command')], '''
+            func assign(out *string, input string) { *out = input }
+            func forward(out *string, input string) { assign(out, input) }
+        ''')
+
+    def test_selector_writes_reach_local_pointer_and_helper_destinations(self):
+        self.check_writes('''
+            var local, written, untouched Payload
+            local.SQL = r.FormValue("q")
+            db.Query(local.SQL) // local
+            pointer := &Payload{}
+            pointer.SQL = r.FormValue("q")
+            db.Query(pointer.SQL) // pointer
+            assign(&written, r.FormValue("q"))
+            db.Query(written.SQL) // helper
+            db.Query(untouched.SQL)
+        ''', [('local', 'sql'), ('pointer', 'sql'), ('helper', 'sql')], '''
+            func assign(out *Payload, input string) { out.SQL = input }
+        ''')
+
+    def test_field_pointer_writes_preserve_other_fields_and_parentheses(self):
+        self.check_writes('''
+            var value Payload
+            out := &value.SQL
+            (*out) = r.FormValue("q")
+            pointer := &value
+            (*pointer).HTML = "fixed"
+            db.Query(value.SQL) // field
+        ''', [('field', 'sql')])
+
+    def test_pointer_rebinding_and_shadowing_keep_distinct_destinations(self):
+        self.check_writes('''
+            first, second := "fixed", "fixed"
+            out := &first
+            out = &second
+            { shadow := "fixed"; out := &shadow; *out = r.FormValue("shadow") }
+            *out = r.FormValue("q")
+            db.Query(first)
+            db.Query(second) // rebound
+        ''', [('rebound', 'sql')])
+
+    def test_branch_targets_keep_possible_writes_and_do_not_gain_clean_resets(self):
+        self.check_writes('''
+            first, second := "fixed", "fixed"
+            out := &first
+            if choice { out = &second }
+            *out = r.FormValue("q")
+            db.Query(first) // first
+            db.Query(second) // second
+            *out = "fixed"
+            db.Query(first) // possible-old
+        ''', [('first', 'sql'), ('second', 'sql'), ('possible-old', 'sql')])
+
+    def test_exact_scalar_reset_does_not_erase_a_previously_saved_value(self):
+        self.check_writes('''
+            value := r.FormValue("q")
+            saved := value
+            out := &value
+            alias := out
+            *alias = "fixed"
+            db.Query(value)
+            db.Query(saved) // copy
+        ''', [('copy', 'sql')])
+
+    def test_returned_field_pointer_cannot_clear_a_tainted_sibling(self):
+        self.check_writes('''
+            value := Payload{HTML: r.FormValue("q")}
+            out := field(&value)
+            *out = "fixed"
+            fmt.Fprint(w, value.HTML) // sibling
+        ''', [('sibling', 'xss')], '''
+            func field(value *Payload) *string { return &value.SQL }
+        ''')
+
+    def test_collapsed_pointer_to_pointer_does_not_clear_the_old_value(self):
+        self.check_writes('''
+            value := r.FormValue("q")
+            fixed := "fixed"
+            out := &value
+            slot := &out
+            *slot = &fixed
+            db.Query(value) // original
+        ''', [('original', 'sql')])
+
+    def test_compound_writes_keep_the_old_value_and_new_input(self):
+        self.check_writes('''
+            var payload Payload
+            payload.SQL += r.FormValue("q")
+            db.Query(payload.SQL) // appended-field
+            value := r.FormValue("q")
+            out := &value
+            *out += "suffix"
+            db.Query(value) // appended-pointer
+        ''', [('appended-field', 'sql'), ('appended-pointer', 'sql')])
+
+    def test_writes_keep_html_sanitization_specific_to_its_output_domain(self):
+        self.check_writes('''
+            var payload Payload
+            payload.HTML = html.EscapeString(r.FormValue("q"))
+            fmt.Fprint(w, payload.HTML)
+            db.Query(payload.HTML) // query
+            db.Query("SELECT $1", payload.HTML)
+            value := "fixed"
+            out := &value
+            *out = html.EscapeString(r.FormValue("q"))
+            fmt.Fprint(w, value)
+            exec.Command("sh", "-c", value) // command
+        ''', [('query', 'sql'), ('command', 'command')])
+
+    def test_value_parameter_copies_and_fixed_pointer_inputs_stay_clean(self):
+        self.check_writes('''
+            value := "fixed"
+            var payload, fixed Payload
+            scalar(value, r.FormValue("q"))
+            copied(payload, r.FormValue("q"))
+            assign(&fixed, "SELECT 1")
+            db.Query(value)
+            db.Query(payload.SQL)
+            db.Query(fixed.SQL)
+        ''', [], '''
+            func scalar(out string, input string) { out = input }
+            func copied(out Payload, input string) { out.SQL = input }
+            func assign(out *Payload, input string) { out.SQL = input }
+        ''')
+
+    def test_pointer_decoder_replacement_carries_the_new_reader(self):
+        self.check_writes('''
+            decoder := json.NewDecoder(strings.NewReader("{}"))
+            out := &decoder
+            *out = json.NewDecoder(r.Body)
+            var payload Payload
+            err := decoder.Decode(&payload)
+            db.Query(payload.SQL) // decoded
+            db.Query(err.Error())
+        ''', [('decoded', 'sql')])
+
+    def test_unknown_pointer_decoder_replacement_cannot_keep_clean_authority(self):
+        self.check_writes('''
+            decoder := json.NewDecoder(strings.NewReader("{}"))
+            out := &decoder
+            *out = callbacks.Decoder(r.FormValue("q"))
+            var payload Payload
+            err := decoder.Decode(&payload)
+            db.Query(payload.SQL) // possible-output
+            db.Query(err.Error()) // possible-error
+        ''', [('possible-output', 'sql'), ('possible-error', 'sql')])
+
+    def test_unknown_pointer_join_never_proves_a_whole_cell_reset(self):
+        for factory in ('fresh', 'globalPointer'):
+            with self.subTest(factory=factory):
+                self.check_writes('''
+                    value := r.FormValue("q")
+                    out := &value
+                    if choice { out = ''' + factory + '''() }
+                    *out = "fixed"
+                    db.Query(value) // possible-old
+                ''', [('possible-old', 'sql')], '''
+                    var global = "fixed"
+                    func fresh() *string { value := "fixed"; return &value }
+                    func globalPointer() *string { return &global }
+                ''')
+
+    def test_mixed_local_and_parameter_pointer_return_does_not_erase_input(self):
+        self.check_writes('''
+            value := r.FormValue("q")
+            out := choosePointer(&value, choice)
+            *out = "fixed"
+            db.Query(value) // possible-old
+        ''', [('possible-old', 'sql')], '''
+            func choosePointer(value *string, choice bool) *string {
+                if choice { other := "fixed"; return &other }
+                return value
+            }
+        ''')
+
+    def test_pointer_cell_rebinding_and_double_indirection_write_the_actual_pointee(self):
+        self.check_writes('''
+            old, other := "fixed", "fixed"
+            out := &old
+            cell := &out
+            *cell = &other
+            *out = r.FormValue("q")
+            db.Query(old)
+            db.Query(other) // rebound
+            third := "fixed"
+            pointer := &third
+            slot := &pointer
+            **slot = r.FormValue("q")
+            db.Query(third) // indirect
+        ''', [('rebound', 'sql'), ('indirect', 'sql')])
+
+    def test_field_writes_keep_clean_siblings_and_exact_field_resets(self):
+        self.check_writes('''
+            var payload Payload
+            payload.SQL = r.FormValue("q")
+            db.Query(payload.HTML)
+            payload.SQL = "fixed"
+            db.Query(payload.SQL)
+            out := &payload.SQL
+            *out = r.FormValue("q")
+            db.Query(payload.HTML)
+            db.Query(payload.SQL) // written-field
+            var nested Nested
+            nested.Payload.SQL = r.FormValue("q")
+            db.Query(nested.Payload.HTML)
+            db.Query(nested.Payload.SQL) // nested-field
+        ''', [('written-field', 'sql'), ('nested-field', 'sql')], '''
+            type Nested struct { Payload Payload }
+        ''')
+
+    def test_struct_value_copies_snapshot_the_field_facts_before_reset(self):
+        self.check_writes('''
+            var payload Payload
+            before := payload
+            payload.SQL = r.FormValue("q")
+            saved := payload
+            payload = Payload{}
+            db.Query(before.SQL)
+            db.Query(saved.HTML)
+            db.Query(saved.SQL) // saved-field
+            db.Query(payload.SQL)
+        ''', [('saved-field', 'sql')])
+
+    def test_captured_or_addressed_pointer_mutation_keeps_saved_copy_precision(self):
+        for mutation in ('replace(&out)', 'func() { out = fresh() }()'):
+            with self.subTest(mutation=mutation):
+                self.check_writes('''
+                    value := r.FormValue("q")
+                    out := &value
+                    saved := out
+                    ''' + mutation + '''
+                    *out = "fixed"
+                    db.Query(value) // possible-old
+                    *saved = "fixed"
+                    db.Query(value)
+                ''', [('possible-old', 'sql')], '''
+                    func fresh() *string { value := "fixed"; return &value }
+                    func replace(out **string) { *out = fresh() }
+                ''')
+
+    def test_clean_field_facets_cannot_mask_unresolved_aggregate_provenance(self):
+        self.check_writes('''
+            value := Embedded{Base: Base{SQL: r.FormValue("q")}}
+            value.SQL = "fixed"
+            value.Base.SQL = r.FormValue("again")
+            db.Query(value.SQL) // promoted-alias
+        ''', [('promoted-alias', 'sql')], '''
+            type Base struct { SQL string }
+            type Embedded struct { Base }
+        ''')
+
+
 class NativeFunctionValueTests(packages.PackageTestCase):
     def test_deferred_reader_capture_does_not_snapshot_a_clean_error_contract(self):
         self.source('handler.go', '''
@@ -1498,6 +1780,66 @@ class DecodingRunnerTests(unittest.TestCase):
                 func invoke(call func([]byte, any) error, data []byte, dst *Payload) error {
                     return call(data, dst)
                 }
+            '''),
+            ('ordinary-pointer-output', '''
+                package app
+                import ("net/http"; "database/sql")
+                func h(r *http.Request, db *sql.DB) {
+                    value := "fixed"
+                    saved := value
+                    forward(&value, r.FormValue("q"))
+                    db.Query(value) // expect-sql
+                    db.Query(saved)
+                    db.Query("SELECT $1", value)
+                }
+            ''', '''
+                package app
+                func assign(out *string, input string) { *out = input }
+                func forward(out *string, input string) { assign(out, input) }
+            '''),
+            ('ordinary-selector-output', '''
+                package app
+                import ("net/http"; "database/sql")
+                func h(r *http.Request, db *sql.DB) {
+                    var value, untouched Payload
+                    assign(&value, r.FormValue("q"))
+                    value.HTML = "fixed"
+                    db.Query(value.SQL) // expect-sql
+                    db.Query(untouched.SQL)
+                }
+            ''', '''
+                package app
+                type Payload struct { SQL string; HTML string }
+                func assign(out *Payload, input string) { out.SQL = input }
+            '''),
+            ('ordinary-write-sanitizer-domains', '''
+                package app
+                import ("html"; "fmt"; "net/http"; "database/sql")
+                func h(r *http.Request, w http.ResponseWriter, db *sql.DB) {
+                    value := "fixed"
+                    out := &value
+                    *out = html.EscapeString(r.FormValue("q"))
+                    fmt.Fprint(w, value)
+                    db.Query(value) // expect-sql
+                    db.Query("SELECT $1", value)
+                }
+            ''', 'package app\n'),
+            ('ordinary-reset-and-copy-controls', '''
+                package app
+                import ("net/http"; "database/sql")
+                func h(r *http.Request, db *sql.DB) {
+                    value := r.FormValue("q")
+                    out := &value
+                    *out = "fixed"
+                    var payload Payload
+                    copied(payload, r.FormValue("q"))
+                    db.Query(value)
+                    db.Query(payload.SQL)
+                }
+            ''', '''
+                package app
+                type Payload struct { SQL string }
+                func copied(out Payload, input string) { out.SQL = input }
             '''),
         ]
         artifacts = packages.ROOT / 'test-suite/artifacts/go-higher-order'

@@ -3,8 +3,8 @@
 ONE process replacing the legacy ~250-400-spawn scan (modules/ubs-golang.sh,
 v7.1.4): pattern tables (ubs_core.go_patterns.*, ports of the rg pipelines),
 heredoc detector ports (ubs_core.go_detectors.*), the registered Go analyzers
-(taint_go + ctcompare_go; guards_generic/narrowing_go have no legacy Go
-counterpart and stay gated behind --enable-new-analyzers), the consolidated
+(taint_go + ctcompare_go + qualified nil_dereference_go; legacy deep-chain and
+error-guard heuristics stay gated behind --enable-new-analyzers), the consolidated
 ast-grep pack bridge (ubs_core.go_ast over ubs_core.go_rules), the computed
 ratio/fallback checks that legacy expressed as multi-count bash comparisons,
 and the project-inventory checks (go.mod/go.sum/go.work/test-file presence).
@@ -73,7 +73,7 @@ _SECTION_HEADERS = {
     17: "17. RESOURCE LIFECYCLE CORRELATION",
     18: "18. GO TOOLING (OPTIONAL)",
     19: "19. DEPENDENCY & BUILD DRIFT",
-    20: "20. NIL PANICS FROM DEFER ORDERING (AST)",
+    20: "20. NIL DEREFERENCE & DEFER SAFETY",
     21: "21. DATABASE & SQL ROBUSTNESS",
     22: "22. SHUTDOWN & RESOURCE RELEASE (HTTP/NET)",
 }
@@ -95,6 +95,7 @@ _GOOD_NOTES = {
 _RULE_CATEGORY = (
     ("go.taint.", 9),
     ("go.ctcompare.", 9),
+    ("go.narrowing.nil_dereference", 20),
 )
 
 # Inventory records consume the selected source/manifest file list.
@@ -235,16 +236,19 @@ def _record_category(finding: dict) -> int | None:
 def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
                   enable_new: bool = False, prefilter: Any = None,
                   errors: list[str] | None = None) -> None:
-    """Run registered Go analyzers (taint, ctcompare).
+    """Run registered Go analyzers and the qualified local nil-pointer rule.
 
-    ``guards_generic``/``narrowing_go`` have no legacy Go counterpart — they
-    stay off unless --enable-new-analyzers is set, so v2 totals match legacy.
+    The legacy deep-chain/error-guard heuristics remain opt-in. Only the
+    independently qualified nil_dereference_go family gains default coverage.
     """
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import analyzers_for_lang
 
     for analyzer in analyzers_for_lang("go"):
-        if analyzer.layer in ("guards", "narrowing") and not enable_new:
+        if (analyzer.layer in ("guards", "narrowing") and not enable_new
+                and analyzer.name != "nil_dereference_go"):
+            continue
+        if analyzer.name == "nil_dereference_go" and skip and 20 in skip:
             continue
         if prefilter is not None and analyzer.name != "taint_go":
             target_files = prefilter.filter_files_for_analyzer(analyzer.name, files)
@@ -959,6 +963,7 @@ def main(argv: list[str] | None = None) -> int:
         skip=args.skip,
         custom_rules=args.ast_rule_dir,
         extra=(f"new_analyzers={args.enable_new_analyzers};package_inputs={_package_cache_context(files)};"
+               f"skip_type_narrowing={os.environ.get('UBS_SKIP_TYPE_NARROWING', '')};"
                f"custom_rules={hash_rules_dir(args.custom_rules) if args.custom_rules else ''}"),
     )
     cached_findings, files_to_scan = cache.partition_files(files)

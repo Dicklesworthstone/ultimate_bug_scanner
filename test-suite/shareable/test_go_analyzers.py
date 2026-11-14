@@ -11,8 +11,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 import unittest
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parents[2]
@@ -494,6 +497,176 @@ class Integration(unittest.TestCase):
         self.assertEqual({json.loads(s)["tool"] for s in self.log.read_text().splitlines()}, {"gofmt", "vet", "vuln"})
         outcomes = {t["tool"]: t["status"] for t in json.loads(result.stdout)["extras"]["external_tools"]}
         self.assertEqual(outcomes, {"gofmt": "ok", "go vet": "partial", "govulncheck": "ok"})
+
+
+class DefaultNilDereference(unittest.TestCase):
+    """The precise nil rule participates in ordinary reports and policy.
+
+    No optional-analyzer flag or tool stub enables this rule. The same source
+    contains nil-proven dereferences, safe control flow, a nil-safe method and
+    an inline-suppressed dereference so both admission and precision matter.
+    """
+
+    RULE = "go.narrowing.nil_dereference"
+    SOURCE = textwrap.dedent('''\
+        package sample
+
+        type Node struct { Value int }
+
+        func nilField() int {
+            var pointer *Node
+            return pointer.Value // nil-field
+        }
+        func nilValue() int {
+            var pointer *int
+            return *pointer // nil-value
+        }
+        func notice() {}
+        func fallsThrough(pointer *Node) int {
+            if pointer == nil { notice() }
+            return pointer.Value // fallthrough-field
+        }
+        func returningGuard(pointer *Node) int {
+            if pointer == nil { return 0 }
+            return pointer.Value
+        }
+        func repaired() int {
+            var pointer *Node
+            if pointer == nil { pointer = &Node{Value: 1} }
+            return pointer.Value
+        }
+        func (pointer *Node) OrZero() int {
+            if pointer == nil { return 0 }
+            return pointer.Value
+        }
+        func nilSafeMethod() int {
+            var pointer *Node
+            return pointer.OrZero()
+        }
+        func suppressed() int {
+            var pointer *Node
+            return pointer.Value // ubs:ignore[go.narrowing.nil_dereference]
+        }
+    ''')
+
+    def setUp(self) -> None:
+        artifacts = REPO / "test-suite/artifacts/go-nil-public"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.base = Path(tempfile.mkdtemp(prefix=self._testMethodName + "-", dir=artifacts))
+        self.root = self.base / "project"
+        self.root.mkdir()
+        self.file = self.root / "main.go"
+        self.file.write_text(self.SOURCE, encoding="utf-8")
+        self.sequence = 0
+        self.env = dict(os.environ, NO_COLOR="1", CI="1", UBS_NO_AUTO_UPDATE="1",
+                        UBS_ENABLE_AUTO_UPDATE="0", UBS_NO_CACHE="0", PYTHONDONTWRITEBYTECODE="1",
+                        XDG_DATA_HOME=str(self.base / "data"), GOTOOLCHAIN="local",
+                        GOPROXY="off", GOSUMDB="off", GOWORK="off", GOFLAGS="")
+        for key in ("UBS_VERIFIED_ASSET_DIR", "UBS_ALLOW_UNVERIFIED_HELPERS", "UBS_SKIP_TYPE_NARROWING"):
+            self.env.pop(key, None)
+
+    def expected_sites(self):
+        sites = []
+        for marker, token in (("nil-field", "pointer.Value"), ("nil-value", "*pointer"),
+                              ("fallthrough-field", "pointer.Value")):
+            matches = [(number, line) for number, line in enumerate(self.SOURCE.splitlines(), 1)
+                       if line.endswith("// " + marker)]
+            self.assertEqual(len(matches), 1, marker)
+            number, line = matches[0]
+            sites.append((str(self.file), number, line.index(token) + 1, "warning", "golang.defer-nil"))
+        return sorted(sites)
+
+    def scan(self, endpoint: str, output: str, *options: str):
+        self.sequence += 1
+        artifacts = self.base / f"{self.sequence:02}-{endpoint}-{output}"
+        artifacts.mkdir()
+        command = (["bash", str(REPO / "ubs"), "--only=golang", "--no-config"]
+                   if endpoint == "runner" else ["bash", str(REPO / "modules/ubs-golang.sh")])
+        command += ["--ci", f"--format={output}", *options, str(self.root)]
+        environment = dict(self.env, UBS_CACHE_DIR=str(self.base / ("cache-" + endpoint)))
+        started = time.monotonic()
+        result = subprocess.run(command, cwd=self.base, env=environment, capture_output=True,
+                                text=True, timeout=120)
+        (artifacts / "source.go").write_text(self.file.read_text(), encoding="utf-8")
+        (artifacts / "stdout.txt").write_text(result.stdout, encoding="utf-8")
+        (artifacts / "stderr.txt").write_text(result.stderr, encoding="utf-8")
+        identity = {}
+        for name in ("ubs", "modules/ubs-golang.sh", "modules/helpers/ubs_core/go_scan.py",
+                     "modules/helpers/ubs_core/analyzers/narrowing_go.py"):
+            identity[name] = hashlib.sha256((REPO / name).read_bytes()).hexdigest()
+        (artifacts / "receipt.json").write_text(json.dumps({
+            "command": command, "cwd": str(self.base), "exit_code": result.returncode,
+            "elapsed_seconds": time.monotonic() - started, "source_sha256":
+            hashlib.sha256(self.file.read_bytes()).hexdigest(), "assets": identity,
+            "environment": {key: environment[key] for key in (
+                "UBS_NO_CACHE", "UBS_CACHE_DIR", "UBS_NO_AUTO_UPDATE", "GOTOOLCHAIN")},
+        }, indent=2) + "\n", encoding="utf-8")
+        try:
+            document = json.loads(result.stdout)
+        except ValueError:
+            self.fail(f"Invalid {output} report: {result.stdout}\n{result.stderr}")
+        return result, document
+
+    def assert_report(self, result, document, output, expected, *, exit_code=0):
+        self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+        rows = []
+        if output == "json":
+            self.assertEqual(document["status"], "ok", document)
+            counts = document.get("totals", document)
+            self.assertEqual(counts["critical"], 0, counts)
+            self.assertEqual(counts["warning"], len(expected), counts)
+            for finding in document["findings"]:
+                if finding.get("rule_id", finding.get("rule")) == self.RULE:
+                    rows.append((finding.get("file", finding.get("path")), finding["line"],
+                                 finding["col"], finding["severity"], finding["category_id"]))
+        else:
+            for run in document["runs"]:
+                self.assertTrue(all(item.get("executionSuccessful", True)
+                                    for item in run.get("invocations", [])), run)
+                for finding in run.get("results", []):
+                    if finding["ruleId"] == self.RULE:
+                        self.assertEqual(len(finding["locations"]), 1, finding)
+                        location = finding["locations"][0]["physicalLocation"]
+                        uri = location["artifactLocation"]["uri"]
+                        path = Path(unquote(urlsplit(uri).path))
+                        if not path.is_absolute():
+                            path = self.root / path
+                        rows.append((str(path), location["region"]["startLine"],
+                                     location["region"]["startColumn"], finding["level"],
+                                     finding["properties"]["category_id"]))
+        self.assertEqual(sorted(rows), expected, document)
+
+    def test_default_reports_include_only_proven_nil_dereferences(self):
+        expected = self.expected_sites()
+        for endpoint in ("module", "runner"):
+            for output in ("json", "sarif"):
+                with self.subTest(endpoint=endpoint, output=output):
+                    result, document = self.scan(endpoint, output)
+                    self.assert_report(result, document, output, expected)
+            result, document = self.scan(endpoint, "json", "--fail-on-warning")
+            self.assert_report(result, document, "json", expected, exit_code=1)
+
+    def test_category_skip_and_source_repair_invalidate_cached_nil_findings(self):
+        expected = self.expected_sites()
+        for endpoint in ("module", "runner"):
+            with self.subTest(endpoint=endpoint):
+                self.file.write_text(self.SOURCE, encoding="utf-8")
+                for warm in (False, True):
+                    result, document = self.scan(endpoint, "json")
+                    self.assert_report(result, document, "json", expected)
+                    scanner = (next(row for row in document["scanners"] if row["language"] == "golang")
+                               if endpoint == "runner" else document)
+                    profile = scanner["extras"]["profile"]
+                    self.assertEqual(profile["cache_hits"], int(warm), profile)
+                skip = "--skip-golang=20" if endpoint == "runner" else "--skip=20"
+                result, document = self.scan(endpoint, "json", skip)
+                self.assert_report(result, document, "json", [])
+                repaired = self.SOURCE.replace("var pointer *Node", "pointer := &Node{Value: 1}")
+                repaired = repaired.replace("var pointer *int", "value := 1\n    pointer := &value")
+                repaired = repaired.replace("if pointer == nil { notice() }", "if pointer == nil { return 0 }")
+                self.file.write_text(repaired, encoding="utf-8")
+                result, document = self.scan(endpoint, "json")
+                self.assert_report(result, document, "json", [])
 
 
 @unittest.skipUnless(shutil.which("go") and shutil.which("gofmt"), "Go toolchain not available")

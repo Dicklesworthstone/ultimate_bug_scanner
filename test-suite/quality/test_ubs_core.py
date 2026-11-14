@@ -8071,6 +8071,177 @@ class SwiftLexicalFrontendTests(unittest.TestCase):
                     self.assertEqual([r[1] for r in analyzer.scan_text(Path('F.swift'), source, Path('.'))], expected)
 
 
+class GoNilDereferenceTests(unittest.TestCase):
+    """Native Go outcomes qualify the narrow default nil-pointer family."""
+
+    RULE = "go.narrowing.nil_dereference"
+    CASES = (
+        ("zero-field", "func sample() int {\n    var p *Record\n    return p.Value // BUG p.Value\n}\n", True, 0),
+        ("zero-star", "func sample() int {\n    var p *int\n    return *p // BUG *p\n}\n", True, 0),
+        ("explicit-nil", "func sample() int {\n    p := &Record{Value: 7}\n    p = nil\n"
+         "    return p.Value // BUG p.Value\n}\n", True, 0),
+        ("nil-branch", "func read(p *Record) int {\n    if p == nil { note() }\n"
+         "    return p.Value // BUG p.Value\n}\nfunc sample() int { return read(nil) }\n", True, 0),
+        ("conditional-return", "func read(p *Record) int {\n    if p == nil {\n"
+         "        if len(os.Args) == 0 { return 0 }\n    }\n"
+         "    return p.Value // BUG p.Value\n}\nfunc sample() int { return read(nil) }\n", True, 0),
+        ("deferred-return", "func sample() int {\n    var p *Record\n    if p == nil {\n"
+         "        unused := func() { return }\n        _ = unused\n    }\n"
+         "    return p.Value // BUG p.Value\n}\n", True, 0),
+        ("copied-nil", "func sample() int {\n    var p *Record\n    copied := p\n"
+         "    p = &Record{Value: 7}\n    _ = p\n    return copied.Value // BUG copied.Value\n}\n", True, 0),
+        ("field-call", "type Callback struct { Run func() int }\nfunc sample() int {\n"
+         "    var p *Callback\n    return p.Run() // BUG p.Run\n}\n", True, 0),
+        ("returning-guard", "func read(p *Record) int {\n    if p == nil { return 0 }\n"
+         "    return p.Value\n}\nfunc sample() int { return read(nil) }\n", False, 0),
+        ("branch-repair", "func sample() int {\n    var p *Record\n"
+         "    if p == nil { p = &Record{Value: 3} }\n    return p.Value\n}\n", False, 3),
+        ("definite-overwrite", "func sample() int {\n    var p *Record\n"
+         "    p = makePointer()\n    return p.Value\n}\n", False, 7),
+        ("scope-shadow", "func sample() int {\n    var p *Record\n    if p == nil {\n"
+         "        p := &Record{Value: 3}\n        return p.Value\n    }\n    return 0\n}\n", False, 3),
+        ("nil-map-read", "func sample() int {\n    var p map[string]int\n"
+         "    if p == nil { note() }\n    return p[\"value\"]\n}\n", False, 0),
+        ("nil-receiver-method", "func sample() int {\n    var p *Record\n"
+         "    if p == nil { note() }\n    return p.ValueOr()\n}\n", False, 0),
+        ("unknown-parameter", "func read(p *Record) int { return p.Value }\n"
+         "func sample() int { return read(&Record{Value: 7}) }\n", False, 7),
+        ("unreachable", "func sample() int {\n    var p *Record\n"
+         "    if false { return p.Value }\n    return 0\n}\n", False, 0),
+        ("value-struct-chain", "type Envelope struct { A struct { B struct { Value int } } }\n"
+         "func sample() int { var value Envelope; return value.A.B.Value }\n", False, 0),
+        ("captured-repair", "func sample() int {\n    var p *Record\n"
+         "    repair := func() { p = &Record{Value: 3} }\n    repair()\n"
+         "    return p.Value\n}\n", False, 3),
+        ("address-repair", "func repair(slot **Record) { *slot = &Record{Value: 3} }\n"
+         "func sample() int {\n    var p *Record\n    repair(&p)\n    return p.Value\n}\n", False, 3),
+        ("separate-functions", "func first() { var p *Record; if p == nil { note() } }\n"
+         "func read(p Record) int { return p.Value }\n"
+         "func sample() int { first(); return read(Record{Value: 7}) }\n", False, 7),
+        ("address-star", "func sample() any {\n    var p *int\n"
+         "    return &*p // BUG *p\n}\n", True, 0),
+        ("parenthesized-array-length", "func sample() int {\n    var p *[3]int\n"
+         "    return len((*p))\n}\n", False, 3),
+        ("array-field-length", "type ArrayRecord struct { Items [3]int }\n"
+         "func sample() int {\n    var p *ArrayRecord\n    return len(p.Items)\n}\n", False, 3),
+        ("array-field-capacity", "type ArrayRecord struct { Items [3]int }\n"
+         "func sample() int {\n    var p *ArrayRecord\n    return cap(p.Items)\n}\n", False, 3),
+        ("unused-nil-loop", "func sample() int {\n    var p *int\n    _ = p\n"
+         "    for i := 0; i < 3; i++ {}\n    return 7\n}\n", False, 7),
+        ("pointer-free-goto", "func sample() int {\n    goto done\ndone:\n    return 7\n}\n", False, 7),
+        ("shadowed-length-function", "func length(value [3]int) int { return 3 }\nvar len = length\n"
+         "func sample() int {\n    var p *[3]int\n    return len(*p) // BUG *p\n}\n", True, 0),
+        ("shadowed-panic-function", "func logOnly(value any) {}\nvar panic = logOnly\n"
+         "func sample() int {\n    var p *Record\n    panic(\"message\")\n"
+         "    return p.Value // BUG p.Value\n}\n", True, 0),
+        ("shadowed-nil-value", "func sample() int {\n    nil := &Record{Value: 7}\n"
+         "    var p *Record = nil\n    return p.Value\n}\n", False, 7),
+        ("shadowed-true-value", "func sample() int {\n    var p *Record\n"
+         "    true := false\n    if true { return 0 }\n    return p.Value // BUG p.Value\n}\n", True, 0),
+        ("process-exit-guard", "func sample() int {\n    var p *Record\n"
+         "    if p == nil { os.Exit(0) }\n    return p.Value\n}\n", False, None),
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="go-nil-qualification-", dir=artifacts))
+
+    @staticmethod
+    def source(body):
+        return ('package main\nimport ("encoding/json"; "os")\n'
+                'type Record struct { Value int }\n'
+                'func (p *Record) ValueOr() int { if p == nil { return 0 }; return p.Value }\n'
+                'func makePointer() *Record { return &Record{Value: 7} }\n'
+                'func note() {}\n' + body
+                + 'func main() {\n    result := map[string]interface{}{"panicked": false}\n'
+                '    func() {\n        defer func() { if recover() != nil { result["panicked"] = true } }()\n'
+                '        result["value"] = sample()\n    }()\n'
+                '    if err := json.NewEncoder(os.Stdout).Encode(result); err != nil { panic(err) }\n}\n')
+
+    @classmethod
+    def expected(cls, source):
+        expected = []
+        for line, content in enumerate(source.splitlines(), 1):
+            if "// BUG " in content:
+                statement, operand = content.split("// BUG ")
+                expected.append((cls.RULE, line, statement.index(operand.strip()) + 1))
+        return expected
+
+    def test_native_nil_paths_and_default_findings(self):
+        from ubs_core import go_scan
+        from ubs_core.analyzers import guards_generic, narrowing_go
+        from ubs_core.registry import RunContext
+
+        go = shutil.which("go")
+        if go is None:
+            self.skipTest("native Go compiler is required to qualify nil-pointer semantics")
+        env = {**os.environ, "GOTOOLCHAIN": "local", "GO111MODULE": "off", "GOENV": "off"}
+        env["GOCACHE"] = str(self.root / "go-cache")
+        (self.root / "go-cache").mkdir(exist_ok=True)
+        records = []
+        for name, body, panicked, value in self.CASES:
+            with self.subTest(case=name):
+                project = self.root / name
+                project.mkdir(exist_ok=True)
+                path = project / "main.go"
+                source = self.source(body)
+                path.write_text(source, encoding="utf-8")
+                command = [go, "run", str(path)]
+                started = time.monotonic()
+                result = subprocess.run(command, cwd=project, env=env, text=True,
+                                        capture_output=True, timeout=120)
+                (project / "native.stdout.log").write_text(result.stdout, encoding="utf-8")
+                (project / "native.stderr.log").write_text(result.stderr, encoding="utf-8")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if value is None:
+                    # A real os.Exit(0) terminates before main can emit JSON or
+                    # run its deferred recovery; reaching a dereference here
+                    # would instead produce the ordinary panic outcome.
+                    self.assertFalse(panicked, source)
+                    self.assertEqual(result.stdout, "", source)
+                    outcome = {"exited": True}
+                else:
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(outcome["panicked"], panicked, source)
+                    if not panicked:
+                        self.assertEqual(outcome["value"], value, source)
+                sink = io.StringIO()
+                go_scan.run_analyzers([path], sink)
+                findings = [json.loads(line) for line in sink.getvalue().splitlines()]
+                actual = [(f["rule"], f["line"], f["col"]) for f in findings if f["rule"] == self.RULE]
+                expected = self.expected(source)
+                record = {
+                    "case": name, "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "command": command, "native_exit": result.returncode, "native": outcome,
+                    "elapsed_seconds": time.monotonic() - started,
+                    "expected": expected, "actual": actual,
+                    "legacy_narrowing": narrowing_go.scan_text(source),
+                    "legacy_guards": list(guards_generic._make_run(guards_generic.SPEC_BY_LANG["go"])(
+                        RunContext(lang="go", files=[path]))),
+                }
+                (project / "receipt.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+                records.append(record)
+                self.assertEqual(actual, expected, source)
+        (self.root / "summary.json").write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
+
+    def test_pointer_free_function_does_not_exhaust_nil_budget(self):
+        from ubs_core import go_scan
+
+        # This valid, pointer-free function exceeded the new nil analyzer's
+        # work budget at activation, although it contains no rule operand.
+        # Fake pointer text in a string must not turn it into relevant input.
+        source = ('package sample\nfunc quiet() {\n    println("* &")\n'
+                  + "    println(1)\n" * 5000 + "}\n")
+        target = self.root / "pointer-free-budget.go"
+        target.write_text(source, encoding="utf-8")
+        sink = io.StringIO()
+        go_scan.run_analyzers([target], sink)
+        findings = [json.loads(line) for line in sink.getvalue().splitlines()]
+        self.assertEqual([finding for finding in findings if finding["rule"] == self.RULE], [])
+
+
 class CompleteOccurrenceModuleTests(unittest.TestCase):
     """Issue #190: producer locations survive opt-in collection and cache replay."""
 

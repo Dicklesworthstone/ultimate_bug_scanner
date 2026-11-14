@@ -10,6 +10,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Enable a qualified Go nil-pointer rule in ordinary scans. Report actual
+  pointer dereferences reached from zero initialization, explicit nil values or
+  nil-proven branches, with lexical scope, returning guards, pointer repairs and
+  short-circuit conditions respected. Keep nil-safe receiver methods, map reads
+  and unevaluated native expressions clean. Publish exact locations under
+  `go.narrowing.nil_dereference`, including suppression, category selection,
+  warning policy, cache invalidation and JSON/SARIF reports; broader legacy
+  deep-chain and error-guard heuristics remain opt-in.
+
 - Detect request-controlled PHP `Location` destinations with the native
   `php.security.open-redirect` rule and `php.redirect` category. Preserve header
   alternatives across branches and helpers, resolve native callable identity and

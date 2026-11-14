@@ -1,0 +1,325 @@
+# UNAPPLIED CANDIDATE -- NOT ACTIVE SCANNER CODE
+#
+# Bead: ultimate_bug_scanner-set-update-hash-sql
+# Base: 2ebfc78a7248a2743ec1d24e0fe8245f74850634
+# Base detector SHA256: 5bfb309aa938e021f4cfea367772effa81c7a6826405bb702b9674678f9bd18c
+# Reconstructed detector SHA256: 24392614c10eae9a047e4c72b05ccbff11f9bc6f1a69717a0373e92b5f047e98
+# Reconstructed test SHA256: 1144360e117174d2c01c8f1076576019619fedb8de67cfb8baebaf2cf6a8770c
+#
+# The workspace became unavailable after the focused candidate run. This patch
+# preserves the recorded manual diff and independent tests; it is not a claim
+# that public CLI, full-suite, release or independent candidate review passed.
+# The patch was reconstructed against the pinned GitHub source and checked by
+# exact forward/reverse hunk replay. Native git apply and Python execution on
+# this reconstructed artifact could not be rerun after the outage.
+#
+# Independent baseline: ten real SQLite witnesses; nine vulnerable variants
+# returned two rows while the original detector reported complete-clean.
+# A captured-list variant already reported an explicit unsupported boundary.
+# Seven hash-free controls returned one row and remained clean.
+#
+# Candidate: native set/update identity preserves saved methods and receiver
+# aliases. Unresolved hashing/equality effects become explicit SQLFlowLimit,
+# rather than a fabricated SQL finding or a complete-clean result. Existing
+# literal-only, primitive, empty/filtered/exhausted-generator and direct-hash
+# SQL controls remain covered.
+#
+# Observed DSR command (before the workspace outage):
+# python3 test-suite/quality/test_python_sql_value_capture.py \
+#   SQLValueCaptureTests.test_literal_sql_set_update_generators_do_not_abort \
+#   SQLValueCaptureTests.test_set_update_hash_callbacks_never_certify_mutated_sql_clean \
+#   SQLValueCaptureTests.test_set_update_hash_free_controls \
+#   SQLValueCaptureTests.test_set_update_callbacks_cannot_clean_later_sql \
+#   SQLValueCaptureTests.test_literal_sql_opaque_consumers_keep_sql_and_cursor_boundaries
+# Result: 5 methods passed, exit 0, DSR duration 2602 ms.
+# DSR source: 8d4d4befc7d979edcbb6e9d905f6e4bcbb8212fc/src/quality_gates.sh
+# Recorded log: test-suite/artifacts/session-20261114/sql-hash-candidate-unit-2.log
+# Recorded log SHA256: adf6850a4dace9335a57da245f7ff093ca97c07d204be8cd5cd2e4d3f7f4aace
+# Full transient logs were not recovered from the unavailable workspace.
+#
+# REQUIRED BEFORE ACTIVATION:
+# - Repair/test conditional receiver and callable joins, which can lose the
+#   exact set/set-update capability and retain a pre-existing false-clean.
+# - Probe qualified builtins.set and imported constructor aliases.
+# - Independently probe a local SQL-named helper (such as execute) that writes
+#   captured SQL, so sink recognition is never mistaken for a purity proof.
+# - Qualify partially advanced generator cursors; the current lattice has no
+#   exact yielded-prefix position and may conservatively remain incomplete.
+# - Regenerate canonical transitive checksums; run the added real module and
+#   runner JSON/SARIF tests, broader SQL regressions, changed-file self-scan,
+#   prescribed quality gates and independent review. Keep the bead open.
+#
+diff --git a/modules/helpers/ubs_core/py_detectors/sql_injection.py b/modules/helpers/ubs_core/py_detectors/sql_injection.py
+--- a/modules/helpers/ubs_core/py_detectors/sql_injection.py
++++ b/modules/helpers/ubs_core/py_detectors/sql_injection.py
+@@ -3707,6 +3707,13 @@
+ 
+     def visit_Attribute(self, node):
+         self.generic_visit(node)
++        if (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr == 'update'
++                and self.value_kind(node.value)[0] == 'set'):
++            # Capture the actual native receiver before arguments or later
++            # assignments can rebind its name. This is a callable identity,
++            # not a certificate for its hashing/equality effects or contents.
++            self._evaluated_values[node] = self.with_kinds(
++                (None, None, None, False, 'unknown'), 'set-update')
+         if self._short_circuiting and isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+             bindings = self.ownership_bindings()
+             protocols = self.generator_protocol_names()
+@@ -4017,6 +4024,66 @@
+             if not self.hash_safe_shape(shape):
+                 raise SQLFlowLimit('SQL collection key callbacks are unresolved; analysis is incomplete')
+ 
++    def collection_key_effects_unmodeled(self):
++        """Whether visible key protocols need more than their direct SQL scan.
++
++        A literal return or an already analyzed SQL statement cannot assign
++        an enclosing query. Other bodies, including a delegated helper call,
++        need a receiver/callback effect summary before an update is complete.
++        Keep this separate from the stricter construction guard: native set
++        updates historically retain direct SQL findings in key callbacks.
++        """
++        cache = self._ownership_syntax
++        if 'collection_key_effects_unmodeled' not in cache:
++            bindings = self.ownership_bindings()
++            protocols = {'__hash__', '__eq__'}
++            unresolved = bool(protocols & bindings.member_writes
++                              or bindings.reflective_member_writes)
++            for function in bindings.key_callbacks:
++                self.step()
++                if function.name not in protocols:
++                    continue
++                if function.decorator_list:
++                    unresolved = True
++                for statement in function.body:
++                    self.step()
++                    if isinstance(statement, ast.Pass):
++                        continue
++                    if isinstance(statement, ast.Return) and isinstance(statement.value, ast.Constant):
++                        continue
++                    if isinstance(statement, ast.Expr):
++                        if isinstance(statement.value, ast.Constant):
++                            continue
++                        if (isinstance(statement.value, ast.Call)
++                                and sql_sink_name(statement.value, bindings)
++                                and not any(isinstance(child, (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await))
++                                            or isinstance(child, ast.Call) and child is not statement.value
++                                            for child in ast.walk(statement.value))):
++                            continue
++                    unresolved = True
++            cache['collection_key_effects_unmodeled'] = unresolved
++        return cache['collection_key_effects_unmodeled']
++
++    def check_set_update_keys(self, node):
++        """Refuse unresolved key effects without consuming the real cursor."""
++        if (self.value_kind(node.func)[0] != 'set-update'
++                or not self.has_collection_key_callbacks()
++                or not self.collection_key_effects_unmodeled()):
++            return
++        for argument in [*node.args, *(keyword.value for keyword in node.keywords)]:
++            self.step()
++            references = self.generator_refs(self.value_facts(argument))
++            if references:
++                for identity in references:
++                    if self.generator_phases.get(identity) == frozenset({'done'}):
++                        continue
++                    # Hash at actual private emissions, so empty or filtered
++                    # generators cannot execute a fabricated callback. This
++                    # projection never advances an alias of the real cursor.
++                    self.generator_projection(identity, hash_keys=True)
++            else:
++                self.check_collection_keys(self.collection_key_facts(argument))
++
+     def collection_key_facts(self, value, *, mapping=False):
+         """Captured keys of literal inputs; unknown objects keep no proof."""
+         self.step()
+@@ -5498,7 +5565,7 @@
+         probe.sink_lineno = self.sink_lineno
+         return probe
+ 
+-    def generator_projection(self, identity):
++    def generator_projection(self, identity, *, hash_keys=False):
+         """Bounded private projection; never alter the real cursor or store."""
+         probe = self.flow_probe()
+         # Relevance includes every possible remaining yield, even when an
+@@ -5506,7 +5573,7 @@
+         # a probe; the actual cursor stays partial and cannot be restarted.
+         probe.generator_phases[identity] = frozenset({'fresh'})
+         try:
+-            facts = probe.materialize_generators(frozenset({identity}))
++            facts = probe.materialize_generators(frozenset({identity}), hash_keys=hash_keys)
+         except SQLNoNormalReturn as exc:
+             # A hypothetical drain need not return, but an opaque consumer
+             # may not iterate at all. It cannot erase the caller's successor.
+@@ -6676,6 +6743,7 @@
+                     # SQL effects inside a predicate need the same guarded
+                     # closure transfer as explicit calls to cursor.execute.
+                     self.sealed_list_captures(target[1], allow_empty=True)
++            self.check_set_update_keys(node)
+             handled = (list_plan is not None and self.local_list_effect_call(node, list_plan)
+                        or self.sealed_closure_call(node) or self.generator_call(node) or joined is not None)
+             if (self._short_circuiting and not handled and not is_sink
+@@ -6725,6 +6793,14 @@
+                     and not any(isinstance(argument, ast.Starred) for argument in node.args)):
+                 facts = self.value_facts(node.args[0]) if node.args else (None, None, None, False, 'static')
+                 self._evaluated_values[node] = self.with_kinds(facts, 'list', self.fact_kinds(facts)[1])
++            if (not handled and self.ownership_call_target(node) == ('unbound', 'set')
++                    and len(node.args) <= 1 and not node.keywords
++                    and not any(isinstance(argument, ast.Starred) for argument in node.args)
++                    and self.closed_generator_builtin_binding('set')):
++                # Successful native construction proves the receiver type,
++                # not mutable element shapes. Aliases may change its contents
++                # but cannot turn this object into a custom update method.
++                self._evaluated_values[node] = self.with_kinds(self.value_facts(node), 'set')
+             if self.intrinsic_range_call(node):
+                 # range either raises or yields integers; its bounds are not
+                 # SQL values. Their eager side effects have already run.
+diff --git a/test-suite/quality/test_python_sql_value_capture.py b/test-suite/quality/test_python_sql_value_capture.py
+--- a/test-suite/quality/test_python_sql_value_capture.py
++++ b/test-suite/quality/test_python_sql_value_capture.py
+@@ -197,6 +197,60 @@
+     return 'def run(cursor, qs, user, rows):\n' + body
+ 
+ 
++SET_UPDATE_HASH_REPRO = '''def run(cursor, qs, user, rows):
++    query = "SELECT count(*) FROM users WHERE name = 'alice'"
++    class Key:
++        def __hash__(self):
++            nonlocal query
++            query = f"SELECT count(*) FROM users WHERE name = '{user}'"
++            return 0
++    seen = set()
++    seen.update(Key() for _ in (1,))
++    return cursor.execute(query).fetchone()[0]
++'''
++
++
++def set_update_hash_cases():
++    """Runtime effects of hashing, independently of the analyzer's model."""
++    prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
++              '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
++              '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
++              '            return 0\n    seen = set()\n')
++    tail = '    return cursor.execute(query).fetchone()[0]\n'
++    yield 'exact-bead', SET_UPDATE_HASH_REPRO
++    for name, update in (
++            ('eager-list', '    seen.update([Key()])\n'),
++            ('receiver-alias', '    receiver = seen\n    receiver.update(Key() for _ in (1,))\n'),
++            ('saved-method', '    consume = seen.update\n    consume(Key() for _ in (1,))\n'),
++            ('saved-receiver', '    consume = seen.update\n    seen = []\n'
++             '    consume(Key() for _ in (1,))\n'),
++            ('nested-tuple', '    seen.update((Key(),) for _ in (1,))\n'),
++            ('named-generator', '    pending = (Key() for _ in (1,))\n'
++             '    seen.update(pending)\n')):
++        yield name, program(prefix + update + tail)
++    yield 'equality-collision', program(
++        '    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
++        '    class Key:\n        def __hash__(self):\n            return 0\n'
++        '        def __eq__(self, other):\n            nonlocal query\n'
++        '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
++        '            return False\n    seen = set()\n'
++        '    seen.update(Key() for _ in (1, 2))\n' + tail)
++    yield 'captured-mutable-query', program(
++        '    queries = ["SELECT count(*) FROM users WHERE name = \'alice\'"]\n'
++        '    class Key:\n        def __hash__(self):\n'
++        '            queries[0] = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
++        '            return 0\n    seen = set()\n'
++        '    seen.update(Key() for _ in (1,))\n'
++        '    return cursor.execute(queries[0]).fetchone()[0]\n')
++    yield 'delegated-write', program(
++        '    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
++        '    def poison():\n        nonlocal query\n'
++        '        query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
++        '    class Key:\n        def __hash__(self):\n            poison()\n'
++        '            return 0\n    seen = set()\n'
++        '    seen.update(Key() for _ in (1,))\n' + tail)
++
++
+ STRING_JOIN_CASES = (
+     ('string-join-generator-write', '    separator = ""\n    query = "SELECT 1"\n'
+      '    separator.join((query := f"SELECT {user}") for unused in [0])\n'
+@@ -1669,7 +1723,7 @@
+                     folder.mkdir()
+                     path = folder / 'case.py'
+                     path.write_text(source, encoding='utf-8')
+-                    expected = [('case.py', sink_line)]
++                    expected = [] if sink_line is None else [('case.py', sink_line)]
+                     for filename, (body, lines) in (sources or {}).items():
+                         (folder / filename).write_text(body, encoding='utf-8')
+                         expected.extend((filename, line) for line in lines)
+@@ -1867,6 +1921,75 @@
+         self.assertEqual(sqlite_witness(self.artifacts, 'set-update-hash-sink', source)['rows'], 2)
+         self.inspect('set-update-hash-sink', source, ((CRITICAL, 4),))
+ 
++    def test_set_update_hash_callbacks_never_certify_mutated_sql_clean(self):
++        # The bead's exact source yields a plain Key(), with no SQL text in
++        # the yielded object. Hashing that object still writes the later SQL.
++        # Reporting an explicit unsupported protocol is sound until class
++        # callback effects can be followed; a complete empty result is not.
++        for name, source in set_update_hash_cases():
++            with self.subTest(case=name):
++                self.assertEqual(sqlite_witness(self.artifacts, 'update-hash-' + name, source)['rows'], 2)
++                path = self.artifacts / ('update-hash-' + name + '.py')
++                path.write_text(source, encoding='utf-8')
++                expected = [(CRITICAL, len(source.splitlines()))]
++                found = []
++                failure = None
++                started = time.perf_counter()
++                try:
++                    with patch.dict(os.environ, {detector.SANITIZER_ENV: ''}):
++                        found.extend(detector.find([path]))
++                except detector.SQLFlowLimit as exc:
++                    failure = exc
++                actual = sorted((rule, line) for rule, _, line, _, _ in found)
++                (self.artifacts / ('update-hash-' + name + '.json')).write_text(json.dumps({
++                    'case': name, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
++                    'detector_sha256': self.identity, 'python': sys.version,
++                    'elapsed_seconds': time.perf_counter() - started,
++                    'expected_critical': expected, 'actual': actual,
++                    'incomplete_reason': str(failure) if failure else None,
++                    'components': failure.components if failure else [],
++                }, indent=2) + '\n', encoding='utf-8')
++                if failure is None:
++                    self.assertEqual(actual, expected, source)
++                else:
++                    reason = ('(?:key callbacks|generator consumer|list mutation at an aliased target)'
++                              if name == 'captured-mutable-query' else '(?:key callbacks|generator consumer)')
++                    self.assertRegex(str(failure), reason + '.*incomplete')
++                    self.assertTrue(failure.components)
++                    self.assertTrue(all(component['file'] == str(path) for component in failure.components))
++                    self.assertTrue(set(actual).issubset(expected), actual)
++                self.assertTrue(all(found_path == path and col == 1
++                                    for _, found_path, _, col, _ in found))
++
++    def test_set_update_hash_free_controls(self):
++        prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
++                  '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
++                  '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
++                  '            return 0\n    seen = set()\n')
++        for name, update in (
++                ('primitive-list', '    seen.update([None, 1, "field", ("pair", 2)])\n'),
++                ('primitive-generator', '    seen.update(value for value in (None, 1, "field", ("pair", 2)))\n'),
++                ('empty-list', '    seen.update([])\n'),
++                ('empty-generator', '    seen.update(Key() for _ in ())\n'),
++                ('filtered-generator', '    seen.update(Key() for _ in (1,) if False)\n'),
++                ('exhausted-generator', '    pending = (Key() for _ in (1,))\n'
++                 '    alias = pending\n    list(pending)\n    seen.update(alias)\n'),
++                ('nonhashing-list-consumer', '    seen = []\n    seen.extend(Key() for _ in (1,))\n')):
++            source = program(prefix + update + '    return cursor.execute(query).fetchone()[0]\n')
++            with self.subTest(case=name):
++                self.assertEqual(sqlite_witness(self.artifacts, 'update-hash-free-' + name, source)['rows'], 1)
++                self.inspect('update-hash-free-' + name, source, ())
++
++    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
++    def test_real_cli_set_update_hash_callback_boundary(self):
++        self._assert_partial_cli('set-update-hash-boundary', SET_UPDATE_HASH_REPRO, None,
++                                 reason='key callbacks')
++        source = program('    cursor.execute(f"SELECT count(*) FROM users WHERE name = \'{user}\'")\n'
++                         + ''.join(SET_UPDATE_HASH_REPRO.splitlines(keepends=True)[1:]))
++        self.assertEqual(sqlite_witness(self.artifacts, 'update-hash-known-sink', source)['rows'], 2)
++        self._assert_partial_cli('set-update-hash-keeps-finding', source, 2,
++                                 reason='key callbacks')
++
+     @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+     def test_real_cli_literal_sql_set_update_generators(self):
+         source = ('def f(con, a, b):\n    con.execute("select 1")\n'

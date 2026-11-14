@@ -1,0 +1,280 @@
+UNACTIVATED REGRESSION ORACLE ONLY — NO SCANNER FIX OR ACTIVATION
+
+Base: 2ebfc78a7248a2743ec1d24e0fe8245f74850634
+Purpose: preserve seven source-analyzer regression methods that actually ran.
+Observed baseline: six failing methods, one passing method, nine assertion
+failures. The environment disconnected before the process exit was recovered.
+The proposed analyzer patch did not apply. This file changes no active scanner
+behavior and closes no bead. Apply only with a verified implementation; do not
+weaken expectations, add xfails, or count this archive as a functional repair.
+
+Machine-readable baseline:
+{
+  "schema": "ubs.oracle-baseline.v1",
+  "base_commit": "2ebfc78a7248a2743ec1d24e0fe8245f74850634",
+  "kind": "unactivated_regression_oracle",
+  "scanner_fix": false,
+  "scanner_activation": false,
+  "bead_closure": false,
+  "working_directory": "/tmp/ubs-work-d2b4624f7887/test-suite/quality",
+  "command": "PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp python3 -m unittest test_taint_go_decoding.ImportIdentityTests.test_saved_unmarshal_functions_preserve_destination_and_error_positions test_taint_go_decoding.ImportIdentityTests.test_saved_readers_and_factories_keep_native_return_shapes test_taint_go_decoding.ImportIdentityTests.test_saved_dot_import_and_helper_pointer_write test_taint_go_decoding.ImportIdentityTests.test_saved_function_rebinding_does_not_change_existing_alias test_taint_go_decoding.ImportIdentityTests.test_saved_function_branch_keeps_possible_destination_writes test_taint_go_decoding.ImportIdentityTests.test_saved_functions_respect_shadowing_and_file_import_identity test_taint_go_decoding.ImportIdentityTests.test_saved_native_functions_keep_clean_inputs_and_bound_queries_clean",
+  "observed_method_count": 7,
+  "observed_failing_methods": 6,
+  "observed_passing_methods": 1,
+  "observed_assertion_failures": 9,
+  "exit_code": null,
+  "process_completion_observed": false,
+  "interruption": "Execution environment disconnected after baseline output; analyzer edit failed before reading the target.",
+  "methods": [
+    {
+      "name": "test_saved_unmarshal_functions_preserve_destination_and_error_positions",
+      "observed_status": "fail",
+      "observed_assertion_failures": 4
+    },
+    {
+      "name": "test_saved_readers_and_factories_keep_native_return_shapes",
+      "observed_status": "fail",
+      "observed_assertion_failures": 1
+    },
+    {
+      "name": "test_saved_dot_import_and_helper_pointer_write",
+      "observed_status": "fail",
+      "observed_assertion_failures": 1
+    },
+    {
+      "name": "test_saved_function_rebinding_does_not_change_existing_alias",
+      "observed_status": "fail",
+      "observed_assertion_failures": 1
+    },
+    {
+      "name": "test_saved_function_branch_keeps_possible_destination_writes",
+      "observed_status": "fail",
+      "observed_assertion_failures": 1
+    },
+    {
+      "name": "test_saved_functions_respect_shadowing_and_file_import_identity",
+      "observed_status": "fail",
+      "observed_assertion_failures": 1
+    },
+    {
+      "name": "test_saved_native_functions_keep_clean_inputs_and_bound_queries_clean",
+      "observed_status": "pass",
+      "observed_assertion_failures": 0
+    }
+  ],
+  "known_results": [
+    {
+      "method": "test_saved_unmarshal_functions_preserve_destination_and_error_positions",
+      "subcases": [
+        "encoding/json + codec.Unmarshal",
+        "encoding/json + (codec.Unmarshal)",
+        "encoding/xml + codec.Unmarshal",
+        "encoding/xml + (codec.Unmarshal)"
+      ],
+      "expected": [
+        [
+          "handler.go",
+          8,
+          "go.taint.sql"
+        ]
+      ],
+      "observed": [
+        [
+          "handler.go",
+          9,
+          "go.taint.sql"
+        ]
+      ]
+    },
+    {
+      "method": "test_saved_readers_and_factories_keep_native_return_shapes",
+      "expected": [
+        [
+          "handler.go",
+          11,
+          "go.taint.sql"
+        ],
+        [
+          "handler.go",
+          12,
+          "go.taint.sql"
+        ],
+        [
+          "handler.go",
+          13,
+          "go.taint.sql"
+        ]
+      ],
+      "observed": [
+        [
+          "handler.go",
+          11,
+          "go.taint.sql"
+        ],
+        [
+          "handler.go",
+          14,
+          "go.taint.sql"
+        ]
+      ]
+    },
+    {
+      "method": "test_saved_dot_import_and_helper_pointer_write",
+      "expected": [
+        [
+          "handler.go",
+          5,
+          "go.taint.sql"
+        ]
+      ],
+      "observed": []
+    },
+    {
+      "method": "test_saved_native_functions_keep_clean_inputs_and_bound_queries_clean",
+      "expected": [],
+      "observed": []
+    }
+  ],
+  "coverage_limits": [
+    "Source analyzer regression oracles only; the Go snippets are not compiled runtime witnesses.",
+    "No scanner implementation, public module/runner JSON/SARIF validation, full suite or release qualification completed.",
+    "Unresolved lookalike/custom calls retain the existing analyzer's bounded behavior; these controls do not claim general imported-library effect resolution."
+  ],
+  "implementation_constraints": [
+    "Mutable package-global callable cells require mutation summaries before granting native authority.",
+    "Local callable address escape and captured-cell closure reassignment must invalidate definite native authority.",
+    "Unknown branch alternatives must retain possible native destination writes without borrowing clean error/sanitizer contracts."
+  ]
+}
+
+diff --git a/test-suite/quality/test_taint_go_decoding.py b/test-suite/quality/test_taint_go_decoding.py
+--- a/test-suite/quality/test_taint_go_decoding.py
++++ b/test-suite/quality/test_taint_go_decoding.py
+@@ -192,2 +192,127 @@
+ class ImportIdentityTests(packages.PackageTestCase):
++    def test_saved_unmarshal_functions_preserve_destination_and_error_positions(self):
++        for package in ('encoding/json', 'encoding/xml'):
++            for binding in ('codec.Unmarshal', '(codec.Unmarshal)'):
++                with self.subTest(package=package, binding=binding):
++                    self.source('handler.go', 'package app\nimport codec "' + package + '"\n'
++                                'func h() {\nvar p Payload\n'
++                                'decode := ' + binding + '\ncopy := decode\n'
++                                'err := copy([]byte(r.FormValue("body")), &p)\n'
++                                'db.Query(p.SQL)\ndb.Query(err.Error())\n}\n')
++                    self.assert_hits([('handler.go', 8, 'go.taint.sql')])
++
++    def test_saved_readers_and_factories_keep_native_return_shapes(self):
++        self.source('handler.go', '''
++            package app
++            import (stream "io"; codec "encoding/json")
++            func h() {
++                read := stream.ReadAll
++                newDecoder := codec.NewDecoder
++                raw, err := read(r.Body)
++                var first, second Payload
++                newDecoder(r.Body).Decode(&first)
++                dec := newDecoder(r.Body)
++                dec.Decode(&second)
++                db.Query(string(raw))
++                db.Query(first.SQL)
++                db.Query(second.SQL)
++                db.Query(err.Error())
++            }
++        ''')
++        self.assert_hits([('handler.go', line, 'go.taint.sql') for line in (11, 12, 13)])
++
++    def test_saved_dot_import_and_helper_pointer_write(self):
++        self.source('helper.go', '''
++            package app
++            import . "encoding/xml"
++            func decode(raw []byte, target *Payload) {
++                saved := Unmarshal
++                saved(raw, target)
++            }
++        ''')
++        self.source('handler.go', '''
++            package app
++            func h() {
++                var p Payload
++                decode([]byte(r.FormValue("body")), &p)
++                db.Query(p.SQL)
++            }
++        ''')
++        self.assert_hits([('handler.go', 5, 'go.taint.sql')])
++
++    def test_saved_function_rebinding_does_not_change_existing_alias(self):
++        self.source('handler.go', '''
++            package app
++            import codec "encoding/json"
++            func h() {
++                var first, second Payload
++                decode := codec.Unmarshal
++                saved := decode
++                decode = unrelated
++                decode([]byte(r.FormValue("body")), &first)
++                saved([]byte(r.FormValue("body")), &second)
++                db.Query(first.SQL)
++                db.Query(second.SQL)
++            }
++        ''')
++        self.assert_hits([('handler.go', 11, 'go.taint.sql')])
++
++    def test_saved_function_branch_keeps_possible_destination_writes(self):
++        self.source('handler.go', '''
++            package app
++            import codec "encoding/json"
++            func h() {
++                var first, second Payload
++                decode := codec.Unmarshal
++                if choice { decode = unrelated }
++                decode([]byte(r.FormValue("body")), &first)
++                var other func([]byte, any) error
++                if choice { other = codec.Unmarshal }
++                other([]byte(r.FormValue("body")), &second)
++                db.Query(first.SQL)
++                db.Query(second.SQL)
++            }
++        ''')
++        self.assert_hits([('handler.go', 11, 'go.taint.sql'), ('handler.go', 12, 'go.taint.sql')])
++
++    def test_saved_functions_respect_shadowing_and_file_import_identity(self):
++        self.source('a.go', '''
++            package app
++            import codec "example.com/decoder"
++            func a() {
++                var p Payload
++                decode := codec.Unmarshal
++                decode([]byte(r.FormValue("body")), &p)
++                db.Query(p.SQL)
++            }
++        ''')
++        self.source('b.go', '''
++            package app
++            import codec "encoding/json"
++            func b() {
++                var outer, inner Payload
++                decode := codec.Unmarshal
++                { decode := unrelated; decode([]byte(r.FormValue("body")), &inner) }
++                decode([]byte(r.FormValue("body")), &outer)
++                db.Query(inner.SQL)
++                db.Query(outer.SQL)
++            }
++        ''')
++        self.assert_hits([('b.go', 9, 'go.taint.sql')])
++
++    def test_saved_native_functions_keep_clean_inputs_and_bound_queries_clean(self):
++        self.source('handler.go', '''
++            package app
++            import codec "encoding/json"
++            func h() {
++                var clean, input Payload
++                decode := codec.Unmarshal
++                decode([]byte(`{"SQL":"SELECT 1"}`), &clean)
++                decode([]byte(r.FormValue("body")), &input)
++                db.Query(clean.SQL)
++                db.Query("SELECT $1", input.SQL)
++            }
++        ''')
++        self.assert_hits([])
++
+     def test_aliased_json_and_xml_decode_destinations(self):

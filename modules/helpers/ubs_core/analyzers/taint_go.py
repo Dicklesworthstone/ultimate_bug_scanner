@@ -7,6 +7,9 @@ interpreter receiving a value. This is a conservative source analyzer, not a
 Go type checker; arbitrary imported-package calls and dynamically invoked
 closures are not resolved. File-local imports identify standard JSON/XML,
 reader and HTML escape operations, including captured function aliases.
+Selected package helpers transport callable and decoder identities through
+parameters and result slots, with a finite context worklist independent of
+payload traces. Excessive specialization is an explicit incomplete analysis.
 Callable joins retain unknown alternatives instead of borrowing a native
 sanitizer or clean error-result contract. Decoders and Unmarshal
 propagate input through local destination pointers and package helper output
@@ -26,10 +29,12 @@ from pathlib import Path
 from typing import Iterable
 
 from ubs_core.registry import Analyzer, RunContext, register
+from ubs_core.taint_flow import AnalysisLimit
 
 SKIP_DIRS = {'.git', 'vendor', '.cache', 'bin', 'dist', '.idea'}
 EXTS = {'.go'}
 PATH_LIMIT = 6
+NATIVE_CONTEXT_LIMIT = 256
 
 _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
                     'io': 'io', 'io/ioutil': 'ioutil', 'html': 'html',
@@ -217,6 +222,9 @@ class _Trace:
     # Evidence does not change lattice equality: recursive paths must not
     # prevent convergence once the actual source/parameter facts stabilize.
     path: tuple[str, ...] = field(default=(), compare=False)
+    # Decoder handles have a clean ordinary value but retain their reader's
+    # payload. Keep that projection distinct while a helper is symbolic.
+    projection: str = ''
 
 
 _Fact = frozenset[_Trace]
@@ -259,6 +267,26 @@ class _NativeInfo:
 _UNKNOWN_NATIVE = _NativeInfo(unknown=True)
 
 
+@dataclass(frozen=True)
+class _ValueInfo:
+    native: _NativeInfo | None = _UNKNOWN_NATIVE
+    decoder: _DecoderInfo | None = None
+    pointers: frozenset[_Target] = frozenset()
+
+
+def _join_value_info(*values):
+    # None is an unevaluated summary result, not an unknown runtime value.
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    decoders = [value.decoder for value in values]
+    decoder = (_DecoderInfo(_join(*(item.source for item in decoders if item is not None)),
+                            all(item is not None and item.definite for item in decoders))
+               if any(item is not None for item in decoders) else None)
+    return _ValueInfo(_join_native(*(value.native for value in values)), decoder,
+                      frozenset().union(*(value.pointers for value in values)))
+
+
 def _join_native(*values):
     # Missing metadata is fixed-point bottom, such as a forward initializer.
     # An assigned unknown callable is a real alternative and must survive.
@@ -287,7 +315,7 @@ def _advance(fact: _Fact, step: str) -> _Fact:
             path += (step,)
         if len(path) > PATH_LIMIT:
             path = (path[0], *path[-(PATH_LIMIT - 1):])
-        result.append(_Trace(trace.source, trace.parameter, path))
+        result.append(_Trace(trace.source, trace.parameter, path, trace.projection))
     return frozenset(result)
 
 
@@ -604,6 +632,7 @@ class _Summary:
     effects: dict[tuple[int, str], _Fact] = field(default_factory=dict)
     variadic: int | None = None
     writes: dict[int, _Fact] = field(default_factory=dict)
+    value_returns: tuple[_ValueInfo | None, ...] = ()
 
 
 def _join_summaries(summaries: list[_Summary]) -> _Summary:
@@ -621,11 +650,25 @@ def _join_summaries(summaries: list[_Summary]) -> _Summary:
             return fact
         return frozenset(_Trace(trace.source,
                                 min(trace.parameter, variadic) if trace.parameter is not None else None,
-                                trace.path) for trace in fact)
+                                trace.path, trace.projection) for trace in fact)
 
     count = max((len(summary.returns) for summary in summaries), default=0)
     returns = tuple(_join(*(widen(summary.returns[index]) for summary in summaries
                             if index < len(summary.returns))) for index in range(count))
+    value_returns = []
+    for index in range(count):
+        values = []
+        for summary in summaries:
+            if index >= len(summary.value_returns) or summary.value_returns[index] is None:
+                continue
+            value = summary.value_returns[index]
+            decoder = (replace(value.decoder, source=widen(value.decoder.source))
+                       if value.decoder is not None else None)
+            pointers = frozenset(replace(target, parameter=min(target.parameter, variadic))
+                                 if variadic is not None and target.parameter is not None else target
+                                 for target in value.pointers)
+            values.append(replace(value, decoder=decoder, pointers=pointers))
+        value_returns.append(_join_value_info(*values))
     effects = {}
     writes = {}
     for summary in summaries:
@@ -634,7 +677,7 @@ def _join_summaries(summaries: list[_Summary]) -> _Summary:
         for index, fact in summary.writes.items():
             index = min(index, variadic) if variadic is not None else index
             writes[index] = _join(writes.get(index, _CLEAN), widen(fact))
-    return _Summary(returns, effects, variadic, writes)
+    return _Summary(returns, effects, variadic, writes, tuple(value_returns))
 
 
 @dataclass
@@ -646,18 +689,22 @@ class _Flow:
 
 class _Analysis:
     def __init__(self, source: str, code: str, rule: str, summaries: dict[str, _Summary],
-                 imports: _ImportContexts, uncertain_globals=None, global_cells=frozenset()):
+                 imports: _ImportContexts, uncertain_globals=None, global_cells=frozenset(),
+                 resolve_summary=None):
         self.source, self.code, self.rule, self.summaries = source, code, rule, summaries
         self.imports = imports
         self.effects = {}
         self.returns: tuple[_Fact, ...] = ()
+        self.value_returns: tuple[_ValueInfo | None, ...] = ()
+        self.call_results: dict[int, tuple[_ValueInfo | None, ...]] = {}
+        self.value_results: dict[int, tuple[_ValueInfo | None, ...]] = {}
         self.named_returns = ()
         self.writes: dict[int, _Fact] = {}
-        self.decoder_results: dict[int, _DecoderInfo] = {}
         self.native_mutations: set[str] = set()
         self.native_escapes: set[str] = set()
         self.uncertain_globals = uncertain_globals if uncertain_globals is not None else set()
         self.global_cells = global_cells
+        self.resolve_summary = resolve_summary
 
     @staticmethod
     def unparenthesize(expr, offset=0):
@@ -682,19 +729,6 @@ class _Analysis:
                 return state.get(_PointerKey(cell), frozenset()) or frozenset({_Target(cell)})
         return frozenset()
 
-    def decoder(self, expr, offset, state, scope):
-        expr, offset = self.unparenthesize(expr, offset)
-        if re.fullmatch(r'[A-Za-z_]\w*', expr):
-            return state.get(_DecoderKey(scope.bindings.get(expr, expr)))
-        code = _masked_source(expr)
-        call = re.match(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
-        if call and _pairs(code).get(call.end() - 1) == len(expr) - 1:
-            native = self.native_callable(call.group(1), call.group(2), offset, state, scope)
-            if native is not None and native.operations and native.operations <= {
-                    ('json', 'NewDecoder'), ('xml', 'NewDecoder')}:
-                return self.decoder_results.get(offset)
-        return None
-
     def native_identity(self, root, member, offset, scope):
         if root in scope.bindings or root in self.summaries:
             return None
@@ -710,12 +744,21 @@ class _Analysis:
         identity = self.native_identity(root, member, offset, scope)
         return _NativeInfo(frozenset({identity})) if identity is not None else _UNKNOWN_NATIVE
 
-    def native_value(self, expr, offset, state, scope):
+    def value_info(self, expr, offset, state, scope):
         expr, offset = self.unparenthesize(expr, offset)
-        name = re.fullmatch(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?', _masked_source(expr))
+        code = _masked_source(expr)
+        name = re.fullmatch(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?', code)
         if name:
-            return self.native_callable(name.group(1), name.group(2), offset, state, scope)
-        return _UNKNOWN_NATIVE
+            cell = scope.bindings.get(name.group(1), name.group(1))
+            return _ValueInfo(self.native_callable(name.group(1), name.group(2), offset, state, scope),
+                              state.get(_DecoderKey(cell)) if name.group(2) is None else None,
+                              self.pointers(expr, state, scope))
+        call = re.match(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
+        if call and _pairs(code).get(call.end() - 1) == len(expr) - 1:
+            results = self.call_results.get(offset)
+            if results:
+                return results[0]
+        return _ValueInfo(pointers=self.pointers(expr, state, scope))
 
     def invalidate_native_targets(self, targets, state):
         # Code receiving an address can replace the callable or retain that
@@ -741,6 +784,8 @@ class _Analysis:
         """Known result shapes and output-parameter effects, never name-only Decode."""
         expr, code, pairs, offset = expression.text, expression.code, expression.pairs, expression.offset
         root, member = match.group(1), match.group(2)
+        result_offset = offset + match.start(1)
+        self.call_results.pop(result_offset, None)
         end = pairs.get(match.end() - 1)
         if end is None or code[:match.start()].rstrip().endswith('.'):
             return None
@@ -772,6 +817,11 @@ class _Analysis:
         if sanitizer and re.match(r'\s*[.\[]', code[end + 1:]):
             return None
 
+        def finish(stop, facts, decoder=None):
+            self.call_results[result_offset] = tuple(
+                _ValueInfo(decoder=decoder if index == 0 else None) for index in range(len(facts)))
+            return stop, facts
+
         def arguments(start, stop):
             values, targets = [], []
             for left, right in _parts(code[start:stop]):
@@ -795,25 +845,24 @@ class _Analysis:
         fallback = _join(*values, callable_source)
         if constructor:
             if len(values) != 1:
-                return end, (_CLEAN,)
+                return finish(end, (_CLEAN,))
             receiver = _DecoderInfo(_join(values[0], callable_source), not native.unknown)
-            self.decoder_results[offset + match.start(1)] = receiver
             if not chain:
-                return end, (fallback if native.unknown else _CLEAN,)
+                return finish(end, (fallback if native.unknown else _CLEAN,), receiver)
             method = chain.group(1)
             values, targets = arguments(end + chain.end() + 1, outer_end)
         if unmarshal:
             if len(values) == 2:
                 self.write_targets(targets[1], _join(values[0], callable_source), state,
                                    root + '.Unmarshal' if member else root)
-            return end, (fallback if native.unknown else _CLEAN,)
+            return finish(end, (fallback if native.unknown else _CLEAN,))
         if readall:
-            return end, (fallback, fallback if native.unknown else _CLEAN)
+            return finish(end, (fallback, fallback if native.unknown else _CLEAN))
         if sanitizer:
             # Only a definite native escaper grants HTML sanitization; unknown
             # alternatives retain argument effects and captured source data.
             clean = self.rule == 'go.taint.xss' and not native.unknown and len(values) == 1
-            return end, (_CLEAN if clean else fallback,)
+            return finish(end, (_CLEAN if clean else fallback,))
         if method in {'Decode', 'DecodeElement'}:
             if targets:
                 source = (_join(receiver.source, callable_source)
@@ -830,62 +879,118 @@ class _Analysis:
             # A join may also contain a different, unknown implementation.
             result = (_join(*result, *values, callable_source,
                             state.get(scope.bindings.get(root, root), _CLEAN)),)
-        return outer_end, result
+        return finish(outer_end, result)
 
     def effect(self, offset: int, label: str, fact: _Fact):
         if fact:
             key = (offset, label)
             self.effects[key] = _join(self.effects.get(key, _CLEAN), fact)
 
-    def instantiate(self, fact: _Fact, arguments: list[_Fact], name: str) -> _Fact:
+    def instantiate(self, fact: _Fact, arguments: list[_Fact], name: str, infos=()) -> _Fact:
         result = []
         for trace in fact:
             if trace.parameter is None:
                 result.append(_advance(frozenset({trace}), name + '()'))
             elif trace.parameter < len(arguments):
-                bound = _advance(arguments[trace.parameter], name + '()')
+                argument = arguments[trace.parameter]
+                if trace.projection == 'decoder':
+                    info = infos[trace.parameter] if trace.parameter < len(infos) else None
+                    argument = info.decoder.source if info is not None and info.decoder is not None else argument
+                bound = _advance(argument, name + '()')
                 for step in trace.path[1:]:
                     bound = _advance(bound, step)
                 result.append(bound)
         return _join(*result)
 
     def call(self, name: str, expr: str, offset: int, call_offset: int, state, scope) -> tuple[_Fact, ...]:
-        arguments, targets = [], []
-        for start, end in _parts(_masked_source(expr)):
-            arguments.append(self.value(expr[start:end], offset + start, state, scope))
-            targets.append(self.pointers(expr[start:end], state, scope))
-            self.invalidate_native_targets(targets[-1], state)
+        arguments, infos, expressions = [], [], []
+        parts = _parts(_masked_source(expr))
+        for start, end in parts:
+            expression, origin = expr[start:end], offset + start
+            if len(parts) == 1:
+                values = self.values(expression, origin, state, scope)
+                metadata = self.value_results[origin]
+            else:
+                values = (self.value(expression, origin, state, scope),)
+                metadata = (self.value_info(expression, origin, state, scope),)
+            arguments.extend(values)
+            infos.extend(metadata)
+            expressions.extend((expression, origin) for _ in values)
+            for info in metadata:
+                if info is not None:
+                    self.invalidate_native_targets(info.pointers, state)
+        for index, (expression, origin) in enumerate(expressions):
+            # Argument calls and ordinary variable reads do not have a total
+            # order in Go. A later pointer/capture write cannot grant a
+            # definite sanitizer to an earlier native-valued argument.
+            variable, _ = self.unparenthesize(expression, origin)
+            if re.fullmatch(r'[A-Za-z_]\w*', variable):
+                infos[index] = _join_value_info(infos[index], self.value_info(expression, origin, state, scope))
+                arguments[index] = _join(arguments[index], state.get(scope.bindings.get(variable, variable), _CLEAN))
         summary = self.summaries[name]
         if summary.variadic is not None:
             arguments = [*arguments[:summary.variadic], _join(*arguments[summary.variadic:])]
-            targets = [*targets[:summary.variadic], frozenset().union(*targets[summary.variadic:])]
+            infos = [*infos[:summary.variadic], _join_value_info(*infos[summary.variadic:])]
+        if self.resolve_summary is not None:
+            summary = self.resolve_summary(name, infos)
+        targets = [info.pointers if info is not None else frozenset() for info in infos]
         for (_sink_offset, label), fact in summary.effects.items():
             # Concrete sources are reported at the helper itself. Only an
             # input-dependent sink produces an additional call-site finding.
             dependent = frozenset(trace for trace in fact if trace.parameter is not None)
-            self.effect(call_offset, label, self.instantiate(dependent, arguments, name))
+            self.effect(call_offset, label, self.instantiate(dependent, arguments, name, infos))
         for index, fact in summary.writes.items():
             if index < len(targets):
-                self.write_targets(targets[index], self.instantiate(fact, arguments, name), state, name + '()')
-        return tuple(self.instantiate(fact, arguments, name) for fact in summary.returns)
+                self.write_targets(targets[index], self.instantiate(fact, arguments, name, infos), state, name + '()')
+        result_infos = []
+        for info in summary.value_returns:
+            if info is None:
+                result_infos.append(None)
+                continue
+            decoder = (replace(info.decoder, source=self.instantiate(info.decoder.source, arguments, name, infos))
+                       if info.decoder is not None else None)
+            pointers = frozenset().union(*(targets[target.parameter] for target in info.pointers
+                                          if target.parameter is not None and target.parameter < len(targets)))
+            result_infos.append(replace(info, decoder=decoder, pointers=pointers))
+        self.call_results[call_offset] = tuple(result_infos)
+        return tuple(self.instantiate(fact, arguments, name, infos) for fact in summary.returns)
 
     def values(self, expr: str, offset: int, state, scope) -> tuple[_Fact, ...]:
         code = _masked_source(expr)
         parts = _parts(code)
         if len(parts) > 1:
-            return tuple(self.value(expr[start:end], offset + start, state, scope) for start, end in parts)
+            values, infos = [], []
+            for start, end in parts:
+                values.append(self.value(expr[start:end], offset + start, state, scope))
+                infos.append(self.value_info(expr[start:end], offset + start, state, scope))
+            for index, (start, end) in enumerate(parts):
+                variable, _ = self.unparenthesize(expr[start:end])
+                if re.fullmatch(r'[A-Za-z_]\w*', variable):
+                    # Later result expressions may write the same cell. Go
+                    # leaves ordinary reads versus calls partly unordered;
+                    # both assignments and returns retain either identity.
+                    infos[index] = _join_value_info(
+                        infos[index], self.value_info(expr[start:end], offset + start, state, scope))
+                    values[index] = _join(values[index], state.get(scope.bindings.get(variable, variable), _CLEAN))
+            self.value_results[offset] = tuple(infos)
+            return tuple(values)
         native = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
         if native:
             result = self.native_call(_CallExpression(expr, code, _pairs(code), offset), native, state, scope, whole=True)
             if result is not None:
+                self.value_results[offset] = self.call_results[offset + native.start(1)]
                 return result[1]
         call = re.match(r'\s*([A-Za-z_]\w*)\s*\(', code)
         if call and call.group(1) in self.summaries and call.group(1) not in scope.bindings:
             end = _pairs(code).get(call.end() - 1)
             if end is not None and not code[end + 1:].strip():
-                return self.call(call.group(1), expr[call.end():end], offset + call.end(),
-                                 offset + call.start(1), state, scope)
-        return (self.value(expr, offset, state, scope),)
+                values = self.call(call.group(1), expr[call.end():end], offset + call.end(),
+                                   offset + call.start(1), state, scope)
+                self.value_results[offset] = self.call_results[offset + call.start(1)]
+                return values
+        value = self.value(expr, offset, state, scope)
+        self.value_results[offset] = (self.value_info(expr, offset, state, scope),)
+        return (value,)
 
     def value(self, expr: str, offset: int, state, scope) -> _Fact:
         code = _masked_source(expr)
@@ -949,7 +1054,7 @@ class _Analysis:
                             arguments[index] if index < len(arguments) else _CLEAN)
                         closure_state[_NativeKey(key)] = _UNKNOWN_NATIVE
                 nested = _Analysis(self.source, self.code, self.rule, self.summaries, self.imports,
-                                   self.uncertain_globals, self.global_cells)
+                                   self.uncertain_globals, self.global_cells, self.resolve_summary)
                 nested.native_escapes = set(self.native_escapes)
                 nested.block(_Parser(self.code).block(offset + opening + 1, offset + close),
                              closure_state, closure_scope)
@@ -1047,12 +1152,17 @@ class _Analysis:
             expr_start = start + keyword.end()
             if self.code[expr_start:end].strip():
                 values = self.values(self.source[expr_start:end], expr_start, state, scope)
+                infos = self.value_results[expr_start]
             else:
                 values = tuple(state.get(scope.bindings.get(name, name), _CLEAN) for name in self.named_returns)
+                infos = tuple(self.value_info(name, expr_start, state, scope) for name in self.named_returns)
             count = max(len(values), len(self.returns))
             self.returns = tuple(_join(self.returns[index] if index < len(self.returns) else _CLEAN,
                                        values[index] if index < len(values) else _CLEAN)
                                  for index in range(count))
+            self.value_returns = tuple(_join_value_info(
+                self.value_returns[index] if index < len(self.value_returns) else None,
+                infos[index] if index < len(infos) else None) for index in range(count))
             return _Flow(None)
         indirect = re.match(r'\s*\*\s*([A-Za-z_]\w*)\s*=(?!=)', code)
         if indirect:
@@ -1067,12 +1177,7 @@ class _Analysis:
             expr_start = start + match.start('expr') - len(prefix)
             values = self.values(self.source[expr_start:end], expr_start, state, scope)
             pieces = _parts(self.code[expr_start:end])
-            metadata = []
-            for left, right in pieces:
-                expression = self.source[expr_start + left:expr_start + right]
-                metadata.append((self.pointers(expression, state, scope),
-                                 self.decoder(expression, expr_start + left, state, scope),
-                                 self.native_value(expression, expr_start + left, state, scope), expression))
+            metadata = self.value_results[expr_start]
             declaration = match.group('op') == ':=' or bool(re.match(r'\s*(?:var|const)\b', code))
             updates = {}
             for index, target in enumerate(targets):
@@ -1085,8 +1190,11 @@ class _Analysis:
                 if match.group('op') == '+=':
                     fact = _join(state.get(key, _CLEAN), fact)
                 updates[key] = _advance(fact, target)
-                pointers, decoder, native, expression = (metadata[index] if index < len(metadata)
-                                                         else (frozenset(), None, _UNKNOWN_NATIVE, ''))
+                expression = (self.source[expr_start + pieces[index][0]:expr_start + pieces[index][1]]
+                              if index < len(pieces) else '')
+                info = metadata[index] if index < len(metadata) else _ValueInfo()
+                pointers, decoder, native = ((info.pointers, info.decoder, info.native) if info is not None
+                                             else (frozenset(), None, None))
                 if pointers and all(pointer.parameter is None for pointer in pointers):
                     # A pointer alias observes its pointee at use time. Copying
                     # old pointee facts here would survive a later clean reset.
@@ -1184,7 +1292,8 @@ class _Analysis:
 
 def _summaries(source: str, code: str, functions: list[_Function], parser: _Parser, rule: str,
                imports: _ImportContexts, global_nodes=None):
-    summaries = {function.name: _Summary(tuple(_CLEAN for _ in function.results), variadic=function.variadic)
+    summaries = {function.name: _Summary(tuple(_CLEAN for _ in function.results), variadic=function.variadic,
+                                         value_returns=tuple(None for _ in function.results))
                  for function in functions}
     if global_nodes is None:
         global_nodes, cursor = [], 0
@@ -1212,11 +1321,18 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
     declare_globals(global_nodes)
     global_cells = set(globals_scope.bindings.values())
     uncertain_globals = set()
-    global_analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals, global_cells)
     global_state = {}
     by_name = defaultdict(list)
     for function in functions:
         by_name[function.name].append(function)
+    bottoms = {name: _join_summaries([
+        _Summary(tuple(_CLEAN for _ in function.results), variadic=function.variadic,
+                 value_returns=tuple(None for _ in function.results)) for function in variants])
+        for name, variants in by_name.items()}
+    parameter_counts = {name: max(len(function.parameters) for function in variants)
+                        for name, variants in by_name.items()}
+    contexts = {}
+    context_counts = defaultdict(int)
     dependents = defaultdict(set)
     for function in functions:
         for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)\s*\(', code[function.start:function.end]):
@@ -1227,11 +1343,46 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
             if match.group(1) in summaries:
                 dependents[match.group(1)].add('@globals')
     pending, queued = deque(['@globals', *summaries]), {'@globals', *summaries}
+    current = '@globals'
+
+    def enqueue(key):
+        if key not in queued:
+            pending.append(key)
+            queued.add(key)
+
+    def resolve_summary(name, infos):
+        """Specialize identity, never concrete payloads or evidence paths.
+
+        Each parameter ranges over a finite native-operation set, an unknown
+        alternative, and absent/definite/uncertain decoder provenance. Taint
+        and pointees remain symbolic parameters in every cached summary.
+        """
+        dependents[name].add(current)
+        if any(info is None or info.native is None for info in infos):
+            # Forward/recursive results have not reached this call yet. Do
+            # not promote fixed-point bottom to an actual unknown callback.
+            return bottoms[name]
+        signature = tuple((info.native, info.decoder.definite if info.decoder is not None else None)
+                          for info in infos[:parameter_counts[name]])
+        signature += ((_UNKNOWN_NATIVE, None),) * (parameter_counts[name] - len(signature))
+        if all(native == _UNKNOWN_NATIVE and decoder is None for native, decoder in signature):
+            return summaries[name]
+        key = (name, signature)
+        dependents[key].add(current)
+        if key not in contexts:
+            if context_counts[name] >= NATIVE_CONTEXT_LIMIT:
+                raise AnalysisLimit('Go native callable context limit exceeded; analysis is incomplete')
+            context_counts[name] += 1
+            contexts[key] = bottoms[name]
+            enqueue(key)
+        return contexts[key]
+
     while pending:
-        name = pending.popleft()
-        queued.discard(name)
-        if name == '@globals':
-            global_analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals, global_cells)
+        current = pending.popleft()
+        queued.discard(current)
+        if current == '@globals':
+            global_analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals,
+                                        global_cells, resolve_summary)
             updated = global_analysis.block(global_nodes, dict(global_state), globals_scope).normal or {}
             updated = _join_states(global_state, updated)
             newly_uncertain = (global_analysis.native_escapes & global_cells) - uncertain_globals
@@ -1241,47 +1392,55 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                 # Initializers can depend on later variables, including through
                 # local helper calls. Join finite facts and revisit both sides
                 # until stable, not for an arbitrary number of file passes.
-                for caller in ('@globals', *summaries):
-                    if caller not in queued:
-                        pending.append(caller)
-                        queued.add(caller)
+                for caller in ('@globals', *summaries, *contexts):
+                    enqueue(caller)
             continue
+        name, signature = current if isinstance(current, tuple) else (current, None)
         variants = []
         mutations = set()
         for function in by_name[name]:
-            analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals, global_cells)
+            analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals,
+                                 global_cells, resolve_summary)
             state, scope = dict(global_state), globals_scope.child()
             for index, parameter in enumerate(function.parameters):
                 if parameter and parameter != '_':
                     key = scope.declare(parameter, function.start)
                     state[key] = frozenset({_Trace(parameter, index, (parameter,))})
-                    state[_NativeKey(key)] = _UNKNOWN_NATIVE
+                    native, decoder = signature[index] if signature is not None else (_UNKNOWN_NATIVE, None)
+                    state[_NativeKey(key)] = native
+                    if decoder is not None:
+                        state[_DecoderKey(key)] = _DecoderInfo(
+                            frozenset({_Trace(parameter, index, (parameter,), 'decoder')}), decoder)
                     if index in function.reference_parameters:
                         state[_PointerKey(key)] = frozenset({_Target(key, index)})
             for result in function.results:
                 if result:
-                    state[scope.declare(result, function.start)] = _CLEAN
+                    key = scope.declare(result, function.start)
+                    state[key] = _CLEAN
+                    state[_NativeKey(key)] = _UNKNOWN_NATIVE
             analysis.named_returns = function.results
             analysis.block(function.body, state, scope)
             mutations.update(analysis.native_mutations)
-            variants.append(_Summary(analysis.returns, analysis.effects, function.variadic, analysis.writes))
+            variants.append(_Summary(analysis.returns, analysis.effects, function.variadic,
+                                     analysis.writes, analysis.value_returns))
         newly_uncertain = (mutations & global_cells) - uncertain_globals
         if newly_uncertain:
             # Package callbacks are mutable cells. A write in any selected
             # function invalidates initializer-only authority in every caller.
             uncertain_globals.update(newly_uncertain)
-            for caller in ('@globals', *summaries):
-                if caller not in queued:
-                    pending.append(caller)
-                    queued.add(caller)
+            for caller in ('@globals', *summaries, *contexts):
+                enqueue(caller)
         summary = _join_summaries(variants)
-        if summary != summaries[name]:
-            summaries[name] = summary
-            for caller in sorted(dependents[name]):
-                if caller not in queued:
-                    pending.append(caller)
-                    queued.add(caller)
-    return summaries, global_analysis.effects
+        table = contexts if signature is not None else summaries
+        if summary != table[current]:
+            table[current] = summary
+            for caller in sorted(dependents[current], key=repr):
+                enqueue(caller)
+    effects = dict(global_analysis.effects)
+    for summary in contexts.values():
+        for key, fact in summary.effects.items():
+            effects[key] = _join(effects.get(key, _CLEAN), fact)
+    return summaries, effects
 
 
 def _source_hits(source, code, functions, global_nodes, imports):

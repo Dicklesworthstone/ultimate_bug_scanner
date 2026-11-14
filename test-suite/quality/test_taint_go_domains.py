@@ -937,5 +937,93 @@ class NativeCallableRuntimeTests(unittest.TestCase):
             self.assertEqual(len(findings), len(expected), findings)
 
 
+    def test_compiled_higher_order_native_calls_match_analyzer_contracts(self):
+        source = textwrap.dedent('''\
+            package main
+            import (
+                "encoding/json"
+                "encoding/xml"
+                "fmt"
+                "html"
+                "io"
+                "net/http"
+                "net/http/httptest"
+                "net/url"
+                "os"
+                "strings"
+            )
+            type Payload struct { SQL string; HTML string }
+            type database struct { Queries []string }
+            func (db *database) Query(query string, args ...any) { db.Queries = append(db.Queries, query) }
+            func raw(value string) string { return value }
+            func keep(call func(string) string) func(string) string { return call }
+            func apply(call func(string) string, value string) string { return call(value) }
+            func reader() func(io.Reader) ([]byte, error) { return io.ReadAll }
+            func chooseDecoder(useXML bool) func([]byte, any) error {
+                if useXML { return xml.Unmarshal }
+                return json.Unmarshal
+            }
+            func decodeWith(call func([]byte, any) error, data []byte, dst *Payload) error {
+                return call(data, dst)
+            }
+            func decoderWith(makeDecoder func(io.Reader) *json.Decoder, input io.Reader) *json.Decoder {
+                return makeDecoder(input)
+            }
+            func decodeHandle(decoder *json.Decoder, dst *Payload) error { return decoder.Decode(dst) }
+            func handler(r *http.Request, db *database, w http.ResponseWriter) {
+                escape := keep(html.EscapeString)
+                fmt.Fprint(w, apply(escape, r.FormValue("q")))
+                fmt.Fprint(w, apply(raw, r.FormValue("q"))) // raw-output
+                read := reader()
+                data, readErr := read(r.Body)
+                if readErr != nil { db.Query(readErr.Error()); return }
+                decode := chooseDecoder(false)
+                var p Payload
+                if err := decodeWith(decode, data, &p); err != nil { db.Query(err.Error()); return }
+                db.Query(p.SQL) // decoded-query
+                db.Query("SELECT $1", p.SQL)
+                db.Query(apply(escape, p.SQL)) // escaped-query
+                fmt.Fprint(w, apply(escape, p.HTML))
+            }
+            func factoryHandler(r *http.Request, db *database) {
+                decoder := decoderWith(json.NewDecoder, r.Body)
+                var p Payload
+                if err := decodeHandle(decoder, &p); err != nil { db.Query(err.Error()); return }
+                db.Query(p.SQL) // factory-query
+            }
+            func main() {
+                value := "<b>request</b>"
+                body, err := json.Marshal(Payload{SQL: "SELECT request", HTML: value})
+                if err != nil { panic(err) }
+                db, w := &database{}, httptest.NewRecorder()
+                handler(httptest.NewRequest("POST", "/?q=" + url.QueryEscape(value), strings.NewReader(string(body))), db, w)
+                factoryHandler(httptest.NewRequest("POST", "/", strings.NewReader(string(body))), db)
+                observed := map[string]any{"rendered": w.Body.String(), "queries": db.Queries}
+                if err := json.NewEncoder(os.Stdout).Encode(observed); err != nil { panic(err) }
+            }
+        ''')
+        with tempfile.TemporaryDirectory(prefix='ubs-go-higher-native-') as tmp:
+            path = Path(tmp) / 'main.go'
+            path.write_text(source, encoding='utf-8')
+            native = subprocess.run(['go', 'run', str(path)], cwd=tmp, text=True,
+                                    capture_output=True, timeout=180,
+                                    env=dict(os.environ, GOWORK='off', GO111MODULE='off', GOTOOLCHAIN='local'))
+            self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+            self.assertEqual(json.loads(native.stdout), {
+                'rendered': '&lt;b&gt;request&lt;/b&gt;<b>request</b>&lt;b&gt;request&lt;/b&gt;',
+                'queries': ['SELECT request', 'SELECT $1', 'SELECT request', 'SELECT request'],
+            })
+            findings = list(taint_go.run(RunContext(lang='go', files=[path])))
+            expected = {
+                (number, 'go.taint.' + rule)
+                for number, line in enumerate(source.splitlines(), 1)
+                for marker, rule in [('raw-output', 'xss'), ('decoded-query', 'sql'),
+                                     ('escaped-query', 'sql'), ('factory-query', 'sql')]
+                if '// ' + marker in line
+            }
+            self.assertEqual({(row['line'], row['rule']) for row in findings}, expected, findings)
+            self.assertEqual(len(findings), len(expected), findings)
+
+
 if __name__ == "__main__":
     unittest.main()

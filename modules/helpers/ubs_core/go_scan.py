@@ -233,7 +233,8 @@ def _record_category(finding: dict) -> int | None:
 
 
 def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
-                  enable_new: bool = False, prefilter: Any = None) -> None:
+                  enable_new: bool = False, prefilter: Any = None,
+                  errors: list[str] | None = None) -> None:
     """Run registered Go analyzers (taint, ctcompare).
 
     ``guards_generic``/``narrowing_go`` have no legacy Go counterpart — they
@@ -252,19 +253,27 @@ def run_analyzers(files: Sequence[Path], sink, skip: set[int] | None = None,
         if not target_files:
             continue
         ctx = RunContext(lang="go", files=target_files)
-        for finding in analyzer.run(ctx):
-            if skip and _record_category(finding) in skip:
-                continue
-            sink.write(json.dumps({
-                "rule": finding.get("rule", ""),
-                "category_id": finding.get("category_id", "golang.security"),
-                "path": finding.get("path", ""),
-                "line": int(finding.get("line", 0) or 0),
-                "col": int(finding.get("col", 1) or 1),
-                "severity": finding.get("severity", "warning"),
-                "message": finding.get("message", ""),
-                "suppressed": False,
-            }, ensure_ascii=False) + "\n")
+        try:
+            for finding in analyzer.run(ctx):
+                if skip and _record_category(finding) in skip:
+                    continue
+                sink.write(json.dumps({
+                    "rule": finding.get("rule", ""),
+                    "category_id": finding.get("category_id", "golang.security"),
+                    "path": finding.get("path", ""),
+                    "line": int(finding.get("line", 0) or 0),
+                    "col": int(finding.get("col", 1) or 1),
+                    "severity": finding.get("severity", "warning"),
+                    "message": finding.get("message", ""),
+                    "suppressed": False,
+                }, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            if errors is None:
+                raise
+            # Keep completed findings and let sibling analyzers finish, while
+            # making an exhausted budget or failed analyzer an explicit partial
+            # scan. main never caches an answer with collected scan_errors.
+            errors.append(f"{analyzer.name}: {type(exc).__name__}: {str(exc)[:350]}")
 
 
 def _package_cache_context(files: Sequence[Path]) -> str:
@@ -993,7 +1002,8 @@ def main(argv: list[str] | None = None) -> int:
         capturing_sink = CapturingSink()
         counters = scan_patterns(patterns, files_to_scan, capturing_sink, skip, prefilter=prefilter_res)
         run_detectors(files_to_scan, capturing_sink, skip)
-        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers, prefilter=prefilter_res)
+        run_analyzers(files_to_scan, capturing_sink, skip, enable_new=args.enable_new_analyzers,
+                      prefilter=prefilter_res, errors=scan_errors)
         if args.ast_rule_dir:
             from ubs_core.go_ast import scan_all
 

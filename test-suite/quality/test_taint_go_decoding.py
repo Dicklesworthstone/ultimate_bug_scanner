@@ -5,12 +5,16 @@ request payload. Fixtures are parsed as source and never imported or executed.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import textwrap
 import unittest
+from unittest.mock import patch
 import test_taint_go_packages as packages
 
 
@@ -482,6 +486,414 @@ class NativeFunctionValueTests(packages.PackageTestCase):
             }
         ''')
         self.assert_hits([])
+
+
+class HigherOrderNativeFlowTests(packages.PackageTestCase):
+    """Native function values keep their semantics across selected Go helpers.
+
+    Expected sites follow the values actually returned or written by each Go
+    call. Error results, bound SQL arguments and escaped HTML are deliberate
+    controls against replacing missing dataflow with blanket taint propagation.
+    """
+
+    def assert_sites(self, sites):
+        expected = []
+        for name, marker, callee, rule in sites:
+            lines = self.sources[name].read_text(encoding='utf-8').splitlines()
+            matches = [(number, line) for number, line in enumerate(lines, 1)
+                       if '// ' + marker in line]
+            self.assertEqual(len(matches), 1, (name, marker, lines))
+            number, line = matches[0]
+            expected.append((name, number, line.index(callee) + 1, 'go.taint.' + rule))
+        findings = self.scan()
+        actual = [(str(Path(row['path']).relative_to(self.root)), row['line'],
+                   row['col'], row['rule']) for row in findings]
+        self.assertEqual(sorted(actual), sorted(expected), findings)
+
+    def test_unmarshal_parameter_forwarding_writes_only_the_destination(self):
+        for codec in ('encoding/json', 'encoding/xml'):
+            with self.subTest(codec=codec):
+                self.source('handler.go', '''
+                    package app
+                    import codec "''' + codec + '''"
+                    func invoke(decode func([]byte, any) error, data []byte, out *Payload) error {
+                        return decode(data, out)
+                    }
+                    func forward(decode func([]byte, any) error, data []byte, out *Payload) error {
+                        return invoke(decode, data, out)
+                    }
+                    func h() {
+                        var p, unrelated, fixed Payload
+                        err := forward(codec.Unmarshal, []byte(r.FormValue("body")), &p)
+                        db.Query(p.SQL) // decoded-query
+                        db.Query(unrelated.SQL)
+                        db.Query(err.Error())
+                        db.Query("SELECT $1", p.SQL)
+                        fixedErr := forward(codec.Unmarshal, []byte("{}"), &fixed)
+                        db.Query(fixed.SQL)
+                        db.Query(fixedErr.Error())
+                    }
+                ''')
+                self.assert_sites([('handler.go', 'decoded-query', 'db.Query', 'sql')])
+
+    def test_reader_parameter_forwarding_preserves_payload_and_error_slots(self):
+        self.source('handler.go', '''
+            package app
+            import ("io"; "strings")
+            func invoke(read func(io.Reader) ([]byte, error), input io.Reader) ([]byte, error) {
+                return read(input)
+            }
+            func forward(read func(io.Reader) ([]byte, error), input io.Reader) ([]byte, error) {
+                return invoke(read, input)
+            }
+            func h() {
+                data, err := forward(io.ReadAll, r.Body)
+                db.Query(string(data)) // request-bytes
+                db.Query(err.Error())
+                fixed, fixedErr := forward(io.ReadAll, strings.NewReader("SELECT 1"))
+                db.Query(string(fixed))
+                db.Query(fixedErr.Error())
+            }
+        ''')
+        self.assert_sites([('handler.go', 'request-bytes', 'db.Query', 'sql')])
+
+    def test_returned_callable_and_value_keep_distinct_tuple_slots(self):
+        self.source('handler.go', '''
+            package app
+            import ("io"; "strings")
+            func pair(value string) (string, func(io.Reader) ([]byte, error)) {
+                return value, io.ReadAll
+            }
+            func keep(read func(io.Reader) ([]byte, error)) func(io.Reader) ([]byte, error) {
+                return read
+            }
+            func h() {
+                value, reader := pair(r.FormValue("q"))
+                read := keep(reader)
+                db.Query(value) // separate-value
+                fixed, fixedErr := read(strings.NewReader("SELECT 1"))
+                db.Query(string(fixed))
+                db.Query(fixedErr.Error())
+                data, err := read(r.Body)
+                db.Query(string(data)) // returned-reader
+                db.Query(err.Error())
+            }
+        ''')
+        self.assert_sites([('handler.go', 'separate-value', 'db.Query', 'sql'),
+                           ('handler.go', 'returned-reader', 'db.Query', 'sql')])
+
+    def test_factory_parameters_and_returned_decoders_retain_reader_identity(self):
+        for codec in ('encoding/json', 'encoding/xml'):
+            with self.subTest(codec=codec):
+                self.source('handler.go', '''
+                    package app
+                    import (codec "''' + codec + '''"; "io"; "strings")
+                    func makeDecoder(factory func(io.Reader) *codec.Decoder, input io.Reader) *codec.Decoder {
+                        return factory(input)
+                    }
+                    func decode(dec *codec.Decoder, out *Payload) error {
+                        return dec.Decode(out)
+                    }
+                    func h() {
+                        var p, fixed Payload
+                        decoder := makeDecoder(codec.NewDecoder, r.Body)
+                        err := decode(decoder, &p)
+                        db.Query(p.SQL) // returned-decoder
+                        db.Query(err.Error())
+                        known := makeDecoder(codec.NewDecoder, strings.NewReader("{}"))
+                        fixedErr := decode(known, &fixed)
+                        db.Query(fixed.SQL)
+                        db.Query(fixedErr.Error())
+                    }
+                ''')
+                self.assert_sites([('handler.go', 'returned-decoder', 'db.Query', 'sql')])
+
+    def test_returned_functions_keep_the_defining_files_import_authority(self):
+        self.source('factory.go', '''
+            package app
+            import (codec "encoding/json"; html "html")
+            func decoder() func([]byte, any) error { return codec.Unmarshal }
+            func escaper() func(string) string { return html.EscapeString }
+        ''')
+        self.source('handler.go', '''
+            package app
+            import (codec "example.test/codec"; html "example.test/html")
+            func pretendEscape() func(string) string { return html.EscapeString }
+            func h() {
+                decode := decoder()
+                var p Payload
+                err := decode([]byte(r.FormValue("body")), &p)
+                db.Query(p.SQL) // native-returned-write
+                db.Query(err.Error())
+                escape := escaper()
+                fmt.Fprint(w, escape(r.FormValue("q")))
+                unknown := pretendEscape()
+                fmt.Fprint(w, unknown(r.FormValue("q"))) // lookalike-return
+                _ = codec.Unmarshal
+            }
+        ''')
+        self.assert_sites([('handler.go', 'native-returned-write', 'db.Query', 'sql'),
+                           ('handler.go', 'lookalike-return', 'fmt.Fprint', 'xss')])
+
+    def test_native_and_unknown_callback_choices_survive_helper_transport(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "encoding/xml"; callbacks "example.test/callbacks")
+            func invoke(decode func([]byte, any) error, data []byte, out *Payload) error {
+                return decode(data, out)
+            }
+            func keep(decode func([]byte, any) error) func([]byte, any) error {
+                return decode
+            }
+            func h() {
+                decode := json.Unmarshal
+                if xmlBody { decode = xml.Unmarshal }
+                var native, uncertain Payload
+                nativeErr := invoke(decode, []byte(r.FormValue("body")), &native)
+                db.Query(native.SQL) // native-choice
+                db.Query(nativeErr.Error())
+                if custom { decode = callbacks.Unmarshal(r.FormValue("q")) }
+                uncertainDecode := keep(decode)
+                err := invoke(uncertainDecode, []byte("{}"), &uncertain)
+                db.Query(uncertain.SQL) // callback-capture-write
+                db.Query(err.Error()) // callback-capture-error
+            }
+        ''')
+        self.assert_sites([('handler.go', 'native-choice', 'db.Query', 'sql'),
+                           ('handler.go', 'callback-capture-write', 'db.Query', 'sql'),
+                           ('handler.go', 'callback-capture-error', 'db.Query', 'sql')])
+
+    def test_escaper_parameter_contexts_do_not_contaminate_each_other(self):
+        for module, member in (('html', 'EscapeString'), ('html/template', 'HTMLEscapeString'),
+                               ('text/template', 'HTMLEscapeString')):
+            with self.subTest(module=module):
+                self.source('handler.go', '''
+                    package app
+                    import safe "''' + module + '''"
+                    func apply(escape func(string) string, value string) string { return escape(value) }
+                    func raw(value string) string { return value }
+                    func h() {
+                        value := r.FormValue("q")
+                        escaped := apply(safe.''' + member + ''', value)
+                        fmt.Fprint(w, escaped)
+                        db.Query(escaped) // escaped-sql
+                        exec.Command("sh", "-c", escaped) // escaped-command
+                        fmt.Fprint(w, apply(raw, value)) // raw-context
+                        fmt.Fprint(w, apply(safe.''' + member + ''', value))
+                        fmt.Fprint(w, apply(raw, "fixed"))
+                    }
+                ''')
+                self.assert_sites([('handler.go', 'escaped-sql', 'db.Query', 'sql'),
+                                   ('handler.go', 'escaped-command', 'exec.Command', 'command'),
+                                   ('handler.go', 'raw-context', 'fmt.Fprint', 'xss')])
+
+    def test_returned_escaper_choices_require_every_alternative_to_escape(self):
+        self.source('handler.go', '''
+            package app
+            import ("html"; "text/template")
+            func raw(value string) string { return value }
+            func chooseNative(choice bool) func(string) string {
+                if choice { return html.EscapeString }
+                return template.HTMLEscapeString
+            }
+            func chooseUnknown(choice bool) func(string) string {
+                if choice { return html.EscapeString }
+                return raw
+            }
+            func keep(escape func(string) string) func(string) string { return escape }
+            func h() {
+                value := r.FormValue("q")
+                native := keep(chooseNative(choice))
+                fmt.Fprint(w, native(value))
+                unknown := keep(chooseUnknown(choice))
+                fmt.Fprint(w, unknown(value)) // possible-pass-through
+            }
+        ''')
+        self.assert_sites([('handler.go', 'possible-pass-through', 'fmt.Fprint', 'xss')])
+
+    def test_uncertain_escaper_keeps_its_own_source_across_helpers(self):
+        self.source('handler.go', '''
+            package app
+            import ("html"; callbacks "example.test/callbacks")
+            func keep(escape func(string) string) func(string) string { return escape }
+            func apply(escape func(string) string, value string) string { return escape(value) }
+            func h() {
+                escape := html.EscapeString
+                if choice { escape = callbacks.Escaper(r.FormValue("q")) }
+                carried := keep(escape)
+                fmt.Fprint(w, apply(carried, "fixed")) // callback-capture
+                fmt.Fprint(w, apply(html.EscapeString, "fixed"))
+            }
+        ''')
+        self.assert_sites([('handler.go', 'callback-capture', 'fmt.Fprint', 'xss')])
+
+    def test_parameter_overwrite_preserves_only_an_earlier_value_copy(self):
+        self.source('handler.go', '''
+            package app
+            import "html"
+            func raw(value string) string { return value }
+            func saved(escape func(string) string, value string) string {
+                copy := escape
+                escape = raw
+                return copy(value)
+            }
+            func overwritten(escape func(string) string, value string) string {
+                escape = raw
+                return escape(value)
+            }
+            func shadowed(escape func(string) string, value string) string {
+                { escape := raw; _ = escape }
+                return escape(value)
+            }
+            func h() {
+                value := r.FormValue("q")
+                fmt.Fprint(w, saved(html.EscapeString, value))
+                fmt.Fprint(w, overwritten(html.EscapeString, value)) // overwritten-value
+                fmt.Fprint(w, shadowed(html.EscapeString, value))
+            }
+        ''')
+        self.assert_sites([('handler.go', 'overwritten-value', 'fmt.Fprint', 'xss')])
+
+    def test_specialized_escaper_retains_argument_sinks_and_raw_siblings(self):
+        self.source('handler.go', '''
+            package app
+            import "html"
+            func apply(escape func(string) string, value string) string { return escape(value) }
+            func emit(value string) string { fmt.Fprint(w, value); return value }
+            func h() {
+                value := r.FormValue("q")
+                escaped := apply(html.EscapeString, emit(value)) // argument-effect
+                fmt.Fprint(w, escaped)
+                fmt.Fprint(w, escaped + value) // raw-sibling
+            }
+        ''')
+        self.assert_sites([('handler.go', 'argument-effect', 'emit(', 'xss'),
+                           ('handler.go', 'raw-sibling', 'fmt.Fprint', 'xss')])
+
+    def test_recursive_callable_forwarding_converges_without_losing_result_slots(self):
+        self.source('handler.go', '''
+            package app
+            import "io"
+            func keep(read func(io.Reader) ([]byte, error), stop bool) func(io.Reader) ([]byte, error) {
+                if stop { return read }
+                return keep(read, true)
+            }
+            func forward(read func(io.Reader) ([]byte, error), input io.Reader, stop bool) ([]byte, error) {
+                if stop { return read(input) }
+                return forward(read, input, true)
+            }
+            func h() {
+                read := keep(io.ReadAll, false)
+                value, err := forward(read, r.Body, false)
+                db.Query(string(value)) // recursive-reader
+                db.Query(err.Error())
+            }
+        ''')
+        self.assert_sites([('handler.go', 'recursive-reader', 'db.Query', 'sql')])
+
+    def test_returned_callable_observes_other_result_expression_effects(self):
+        self.source('handler.go', '''
+            package app
+            import "html"
+            func raw(value string) string { return value }
+            func replace(pointer *func(string) string) string { *pointer = raw; return "" }
+            func changed() (func(string) string, string) {
+                escape := html.EscapeString
+                return escape, replace(&escape)
+            }
+            func copied() (func(string) string, string) {
+                escape := html.EscapeString
+                saved := escape
+                return saved, replace(&escape)
+            }
+            func h() {
+                uncertain, _ := changed()
+                saved, _ := copied()
+                value := r.FormValue("q")
+                fmt.Fprint(w, uncertain(value)) // result-expression-mutation
+                fmt.Fprint(w, saved(value))
+            }
+        ''')
+        self.assert_sites([('handler.go', 'result-expression-mutation', 'fmt.Fprint', 'xss')])
+
+
+class HigherOrderContextLimitTests(packages.PackageTestCase):
+    def test_exhausted_context_budget_is_partial_and_never_cached_as_complete(self):
+        from ubs_core.findings_merge import to_sarif
+        from ubs_core.taint_flow import AnalysisLimit
+
+        self.source('first/main.go', '''
+            package first
+            func h() {
+                db.Query(r.FormValue("q")) // retained finding
+            }
+        ''')
+        limited = '''
+            package limited
+            import ("html"; "text/template")
+            func apply(escape func(string) string, value string) string { return escape(value) }
+            func h() {
+                _ = apply(html.EscapeString, r.FormValue("q"))
+                _ = apply(template.HTMLEscapeString, r.FormValue("q"))
+            }
+        '''
+        self.source('limited/main.go', limited)
+        listing = self.root / 'files.nul'
+        listing.write_bytes(b'\0'.join(os.fsencode(path) for path in self.sources.values()) + b'\0')
+        sink = self.root / 'findings.ndjson'
+        report = self.root / 'summary.json'
+        stats = self.root / 'cache-stats.json'
+
+        def scan_main():
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                status = packages.go_scan.main([
+                    '--files-from', str(listing), '--sink', str(sink),
+                    '--project-dir', str(self.root), '--json-out', str(report),
+                ])
+            self.assertNotIn('Traceback', output.getvalue())
+            return status, json.loads(report.read_text()), json.loads(stats.read_text())
+
+        environment = dict(UBS_CACHE_DIR=str(self.root / 'cache'), UBS_NO_CACHE='0',
+                           UBS_CACHE_FILE=str(stats), UBS_NO_AUTO_UPDATE='1')
+        with patch.object(packages.taint_go, 'NATIVE_CONTEXT_LIMIT', 1), patch.dict(os.environ, environment):
+            with self.assertRaisesRegex(AnalysisLimit, 'native callable context limit'):
+                self.scan()
+            for attempt in range(2):
+                with self.subTest(attempt=attempt):
+                    status, document, cache = scan_main()
+                    self.assertEqual(status, 2, document)
+                    self.assertEqual(document['status'], 'partial', document)
+                    self.assertEqual(document['module_error'], 'ANALYZER_ERROR', document)
+                    self.assertIn('native callable context limit', document['message'])
+                    taint = [(Path(row['path']), row['line'], row['col'], row['rule'])
+                             for row in document['findings'] if row['rule'].startswith('go.taint.')]
+                    self.assertEqual(taint, [(self.sources['first/main.go'], 3, 5, 'go.taint.sql')])
+                    self.assertEqual((cache['hits'], cache['misses']), (0, 2), cache)
+                    sarif = to_sarif(document)
+                    self.assertTrue(sarif['runs'], sarif)
+                    for run in sarif['runs']:
+                        invocation = run['invocations'][0]
+                        self.assertFalse(invocation['executionSuccessful'])
+                        self.assertEqual(invocation['exitCode'], 2)
+                        self.assertTrue(any('native callable context limit' in item['message']['text']
+                                            for item in invocation['toolExecutionNotifications']))
+
+            # With only one native identity the same real helper can finish;
+            # only that completed answer may become a subsequent cache hit.
+            self.source('limited/main.go', '''
+                package limited
+                import "html"
+                func apply(escape func(string) string, value string) string { return escape(value) }
+                func h() { _ = apply(html.EscapeString, r.FormValue("q")) }
+            ''')
+            status, document, cache = scan_main()
+            self.assertEqual((status, document['status']), (1, 'ok'), document)
+            self.assertNotIn('module_error', document)
+            self.assertEqual((cache['hits'], cache['misses']), (0, 2), cache)
+            status, document, cache = scan_main()
+            self.assertEqual((status, document['status']), (1, 'ok'), document)
+            self.assertEqual((cache['hits'], cache['misses']), (2, 0), cache)
 
 
 class NativeCallableMutationTests(packages.PackageTestCase):
@@ -1006,6 +1418,181 @@ class DecodingRunnerTests(unittest.TestCase):
                     visit(report)
                     self.assertEqual(rules, expected, report)
                     print('GO_DECODE_E2E_PASS', name, format_name, sorted(rules), flush=True)
+
+    def test_higher_order_function_flow_in_public_reports(self):
+        cases = [
+            ('callback-destination', '''
+                package app
+                import ("encoding/json"; "net/http"; "database/sql")
+                func h(r *http.Request, db *sql.DB) {
+                    read := reader()
+                    raw, readErr := read(r.Body)
+                    var p Payload
+                    err := invoke(json.Unmarshal, raw, &p)
+                    db.Query(p.SQL) // expect-sql
+                    if readErr != nil { db.Query(readErr.Error()) }
+                    if err != nil { db.Query(err.Error()) }
+                    db.Query("SELECT $1", p.SQL)
+                }
+            ''', '''
+                package app
+                import "io"
+                type Payload struct { SQL string }
+                func reader() func(io.Reader) ([]byte, error) { return io.ReadAll }
+                func invoke(call func([]byte, any) error, data []byte, dst *Payload) error {
+                    return call(data, dst)
+                }
+            '''),
+            ('decoder-handle', '''
+                package app
+                import ("net/http"; "database/sql")
+                func h(r *http.Request, db *sql.DB) {
+                    decoder := wrap(factory(), r.Body)
+                    var p Payload
+                    err := decodeHandle(decoder, &p)
+                    db.Query(p.SQL) // expect-sql
+                    if err != nil { db.Query(err.Error()) }
+                }
+            ''', '''
+                package app
+                import ("encoding/json"; "io")
+                type Payload struct { SQL string }
+                func factory() func(io.Reader) *json.Decoder { return json.NewDecoder }
+                func wrap(makeDecoder func(io.Reader) *json.Decoder, input io.Reader) *json.Decoder {
+                    return makeDecoder(input)
+                }
+                func decodeHandle(decoder *json.Decoder, dst *Payload) error {
+                    return decoder.Decode(dst)
+                }
+            '''),
+            ('sanitizer-domains', '''
+                package app
+                import ("html"; "fmt"; "os/exec"; "net/http"; "database/sql")
+                func h(r *http.Request, w http.ResponseWriter, db *sql.DB) {
+                    value := r.FormValue("q")
+                    safe := apply(keep(html.EscapeString), value)
+                    fmt.Fprint(w, safe)
+                    db.Query(safe) // expect-sql
+                    exec.Command("sh", "-c", safe) // expect-command
+                    fmt.Fprint(w, apply(raw, value)) // expect-xss
+                }
+            ''', '''
+                package app
+                func raw(value string) string { return value }
+                func keep(call func(string) string) func(string) string { return call }
+                func apply(call func(string) string, value string) string { return call(value) }
+            '''),
+            ('fixed-and-bound-input', '''
+                package app
+                import ("encoding/json"; "net/http"; "database/sql")
+                func h(r *http.Request, db *sql.DB) {
+                    var fixed, input Payload
+                    invoke(json.Unmarshal, []byte(`{"SQL":"SELECT 1"}`), &fixed)
+                    db.Query(fixed.SQL)
+                    invoke(json.Unmarshal, []byte(r.FormValue("body")), &input)
+                    db.Query("SELECT $1", input.SQL)
+                }
+            ''', '''
+                package app
+                type Payload struct { SQL string }
+                func invoke(call func([]byte, any) error, data []byte, dst *Payload) error {
+                    return call(data, dst)
+                }
+            '''),
+        ]
+        artifacts = packages.ROOT / 'test-suite/artifacts/go-higher-order'
+        for name, handler, helper in cases:
+            handler = textwrap.dedent(handler).lstrip('\n')
+            helper = textwrap.dedent(helper).lstrip('\n')
+            expected = sorted(
+                ('handler.go', number, len(line) - len(line.lstrip()) + 1,
+                 'go.taint.' + line.split('// expect-', 1)[1].strip())
+                for number, line in enumerate(handler.splitlines(), 1) if '// expect-' in line
+            )
+            for entrypoint in ('module', 'runner'):
+                for format_name in ('json', 'sarif'):
+                    with self.subTest(case=name, entrypoint=entrypoint, format=format_name), \
+                            tempfile.TemporaryDirectory(prefix='ubs-higher-order-e2e-') as tmp:
+                        project = Path(tmp)
+                        (project / 'handler.go').write_text(handler)
+                        (project / 'helper.go').write_text(helper)
+                        executable = packages.ROOT / ('ubs' if entrypoint == 'runner' else 'modules/ubs-golang.sh')
+                        command = [str(executable), str(project), '--ci', '--format=' + format_name]
+                        if entrypoint == 'runner':
+                            command.append('--only=golang')
+                        result = subprocess.run(command, cwd=tmp, capture_output=True, text=True, timeout=180,
+                                                env=dict(os.environ, UBS_NO_AUTO_UPDATE='1',
+                                                         UBS_CACHE_DIR=str(project / 'cache')))
+                        folder = artifacts / (name + '-' + entrypoint + '-' + format_name)
+                        folder.mkdir(parents=True, exist_ok=True)
+                        (folder / 'stdout.log').write_text(result.stdout)
+                        (folder / 'stderr.log').write_text(result.stderr)
+                        self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
+                        report = json.loads(result.stdout)
+                        actual = []
+                        if format_name == 'json':
+                            self.assertEqual(report['status'], 'ok', report)
+                            for finding in report['findings']:
+                                rule = finding.get('rule_id', finding.get('rule', ''))
+                                if rule.startswith(('go.taint.', 'golang.taint.')):
+                                    actual.append((Path(finding.get('file', finding.get('path', ''))).name,
+                                                   finding['line'], finding['col'],
+                                                   rule.replace('golang.taint.', 'go.taint.', 1)))
+                        else:
+                            for run in report['runs']:
+                                for invocation in run.get('invocations', []):
+                                    self.assertTrue(invocation['executionSuccessful'], invocation)
+                                for finding in run.get('results', []):
+                                    rule = finding.get('ruleId', '')
+                                    if rule.startswith(('go.taint.', 'golang.taint.')):
+                                        location = finding['locations'][0]['physicalLocation']
+                                        actual.append((Path(location['artifactLocation']['uri']).name,
+                                                       location['region']['startLine'],
+                                                       location['region']['startColumn'],
+                                                       rule.replace('golang.taint.', 'go.taint.', 1)))
+                        self.assertEqual(sorted(actual), expected, report)
+                        print('GO_HIGHER_ORDER_E2E_PASS', name, entrypoint, format_name, actual, flush=True)
+
+    def test_native_context_exhaustion_is_publicly_incomplete(self):
+        # Exercise the real production ceiling, without changing analyzer limits
+        # or substituting a failing process for the registered Go analyzer.
+        parameters = ', '.join(name + ' func(string) string' for name in 'abcdefghi')
+        calls = []
+        for choice in range(257):
+            callbacks = ', '.join('html.EscapeString' if choice & (1 << bit) else 'tmpl.HTMLEscapeString'
+                                  for bit in range(9))
+            calls.append('    fmt.Fprint(w, apply(' + callbacks + ', r.FormValue("q")))')
+        source = ('package app\nimport ("html"; tmpl "html/template"; "fmt"; "net/http")\n'
+                  'func apply(' + parameters + ', value string) string { return a(value) }\n'
+                  'func h(r *http.Request, w http.ResponseWriter) {\n' + '\n'.join(calls) + '\n}\n')
+        artifacts = packages.ROOT / 'test-suite/artifacts/go-higher-order-budget'
+        for entrypoint in ('module', 'runner'):
+            with tempfile.TemporaryDirectory(prefix='ubs-native-budget-e2e-') as tmp:
+                project = Path(tmp)
+                (project / 'handler.go').write_text(source)
+                for attempt, format_name in enumerate(('json', 'json', 'sarif')):
+                    with self.subTest(entrypoint=entrypoint, format=format_name, attempt=attempt):
+                        executable = packages.ROOT / ('ubs' if entrypoint == 'runner' else 'modules/ubs-golang.sh')
+                        command = [str(executable), str(project), '--ci', '--format=' + format_name]
+                        if entrypoint == 'runner':
+                            command.append('--only=golang')
+                        result = subprocess.run(command, cwd=tmp, capture_output=True, text=True, timeout=180,
+                                                env=dict(os.environ, UBS_NO_AUTO_UPDATE='1',
+                                                         UBS_CACHE_DIR=str(project / 'cache')))
+                        folder = artifacts / (entrypoint + '-' + str(attempt) + '-' + format_name)
+                        folder.mkdir(parents=True, exist_ok=True)
+                        (folder / 'stdout.log').write_text(result.stdout)
+                        (folder / 'stderr.log').write_text(result.stderr)
+                        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                        report = json.loads(result.stdout)
+                        self.assertIn('native callable context limit exceeded', json.dumps(report), report)
+                        if format_name == 'json':
+                            self.assertEqual(report['status'], 'partial', report)
+                        else:
+                            self.assertTrue(any(not invocation['executionSuccessful']
+                                                for run in report['runs']
+                                                for invocation in run.get('invocations', [])), report)
+                        print('GO_NATIVE_BUDGET_E2E_PASS', entrypoint, format_name, attempt, flush=True)
 
 
 if __name__ == '__main__':

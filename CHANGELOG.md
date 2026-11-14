@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve native Go reader, JSON/XML decoder and HTML escaper behavior through
+  selected package helper parameters and return values. Keep decoded destination
+  writes and payload/error result positions distinct, carry decoder input across
+  helper boundaries, and isolate HTML sanitization from SQL and command checks.
+  Bound identity specialization independently of source traces; report exhausted
+  specialization as incomplete. Retain unknown callbacks, captured sources and
+  possible function-cell mutations, including mutations during return evaluation.
+
 - Preserve Python SQL hashing effects through selected closure helpers and
   returned `set.update` methods. Read helper cells at invocation time, discard
   stale capabilities after definitive safe replacement, and report unresolved

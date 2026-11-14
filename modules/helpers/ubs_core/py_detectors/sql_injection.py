@@ -2794,6 +2794,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self._consuming_iterables = set()
         self._iterated_lists = set()
         self._sealed_closures = {}
+        self._set_update_helpers = set()
         self._closure_groups = {}
         self._closure_list_writes = {}
         self._closure_cell_writes = {}
@@ -3344,11 +3345,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             # Keep the SQL-bearing scope itself on the complete flow path,
             # including its callback, generator and ownership refusals.
             return
-        if (node in bindings.independent_functions
+        protocol_helper = self.set_update_helper(node)
+        if (node in bindings.independent_functions and not protocol_helper
                 and node not in bindings.sql_method_escape_owners
                 and not bindings.dynamic_namespace and not bindings.builtin_namespace):
             return
-        sealed = self.sealed_list_captures(node)
+        sealed = self.sealed_list_captures(node, allow_empty=protocol_helper)
         if not sealed:
             sealed = self.seal_recursive_siblings(node)
         if (not sealed and node in self._closure_list_writes
@@ -3359,7 +3361,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.defer_lists([node])
         self.exclusive_lists.update(sealed)
         self.deferred_list_captures.difference_update(sealed)
-        if sealed:
+        if node in self._sealed_closures:
             # This local callable cannot escape or be replaced, and every
             # invocation is interpreted by sealed_closure_call. Its body is
             # deferred until those calls, with actual lexical/input facts;
@@ -3425,6 +3427,12 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self._pending_raise = enclosing_raise
         # Creating a function does not return the value of its deferred body.
         self._evaluated_values[node] = (None, None, None, False, 'unknown')
+        if self.has_collection_key_callbacks() and isinstance(node.body, ast.Constant):
+            # An exact lambda with a literal body is a callable, not an
+            # unknown mutable heap alias. This shape permits cell replacement;
+            # it grants no generator-consumption or SQL-purity authority.
+            self._evaluated_values[node] = self.with_kinds(
+                self._evaluated_values[node], 'inert-callable')
 
     def visit_ClassDef(self, node):
         for expression in [*node.decorator_list, *node.bases]:
@@ -4128,6 +4136,68 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     previous = self._sink_risks.get(identity)
                     if previous is None or finding[0] == 'critical':
                         self._sink_risks[identity] = finding
+
+    def set_update_helper(self, function):
+        """Select local capability builders, cell writers and live-cell consumers.
+
+        Selection grants no execution proof: the existing sealed-closure
+        checks still prove the actual callable, lexical frame and inputs.
+        """
+        if not self.has_collection_key_callbacks() or not isinstance(function, ast.FunctionDef):
+            return False
+        if function in self._set_update_helpers:
+            return True
+        cache = self._ownership_syntax.setdefault('set_update_helpers', {})
+        if function in cache:
+            structural, cells = cache[function]
+            selected = structural or any(self.set_update_capabilities(
+                self.value_kind(ast.Name(id=name, ctx=ast.Load()))[0]) for name in cells)
+            if selected:
+                self._set_update_helpers.add(function)
+            return selected
+        bindings = self.ownership_bindings()
+        owner = bindings.owner_scopes[function]['parent']
+        if owner is None or not isinstance(owner['node'], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            cache[function] = False, frozenset()
+            return False
+        structural, cells = False, set()
+        for node in self.deferred_nodes(function):
+            self.step()
+            if isinstance(node, (ast.Global, ast.Nonlocal)):
+                # An ordinary SQL-writing callback does not become a set
+                # helper merely because it declares a captured query. A
+                # capability cell may, however, acquire its value after the
+                # helper is defined, so a negative selection is revisitable.
+                cells.update(node.names)
+            elif isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
+                target = bindings.resolve(node)
+                if target in {('unbound', 'set'), ('import', 'builtins.set')}:
+                    structural = True
+                if isinstance(node, ast.Name):
+                    cell = bindings.sql_binding_cell(node.id, bindings.scope_of.get(node))
+                    parent = bindings.parents.get(node)
+                    if (cell is not None and cell['node'] is not function
+                            and (isinstance(parent, ast.Call) and parent.func is node and target is None
+                                 or isinstance(parent, ast.Attribute) and parent.value is node
+                                 and parent.attr == 'update')):
+                        structural = True
+        cache[function] = structural, frozenset(cells)
+        return self.set_update_helper(function)
+
+    def set_update_cell(self, function, name, facts, *, incoming=False):
+        """Transfer refusal capabilities without lending mutable heap ownership."""
+        if not self.set_update_helper(function):
+            return False
+        kind = self.fact_kinds(facts)[0]
+        # Refusal-only capability sets may also contain a list/unknown arm.
+        # They select the boundary above but cannot prove non-aliasing here.
+        if kind in {'set', 'inert-callable'} and not self.generator_refs(facts):
+            return True
+        # A setter that never reads its old cell may replace a list receiver.
+        # This gives the helper no authority to mutate that old list's heap.
+        return incoming and not any(isinstance(node, ast.Name) and node.id == name
+                                    and isinstance(node.ctx, ast.Load)
+                                    for node in self.deferred_nodes(function))
 
     def collection_key_facts(self, value, *, mapping=False):
         """Captured keys of literal inputs; unknown objects keep no proof."""
@@ -5597,6 +5667,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         probe._consuming_iterables = self._consuming_iterables.copy()
         probe._iterated_lists = self._iterated_lists.copy()
         probe._sealed_closures = self._sealed_closures.copy()
+        probe._set_update_helpers = self._set_update_helpers.copy()
         probe._closure_groups = self._closure_groups.copy()
         probe._closure_list_writes = self._closure_list_writes.copy()
         probe._closure_cell_writes = self._closure_cell_writes.copy()
@@ -6189,7 +6260,9 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if (self._generator_scope and self._generator_scope[-1] in self._sealed_closures
                 and self._closure_cell_writes.get(self._generator_scope[-1], frozenset()).intersection(names)
                 and (self.fact_kinds(facts)[0] not in {'number', 'str', 'none', 'scalar'}
-                     or self.generator_refs(facts))):
+                     or self.generator_refs(facts))
+                and not all(self.set_update_cell(self._generator_scope[-1], name, facts)
+                            for name in self._closure_cell_writes[self._generator_scope[-1]].intersection(names))):
             if self.set_update_capabilities(self.fact_kinds(facts)[0]):
                 raise SQLFlowLimit('SQL collection key callbacks through a closure cell are unresolved; analysis is incomplete')
             raise SQLFlowLimit('SQL closure cell alias is unresolved; analysis is incomplete')
@@ -6823,6 +6896,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                         # captured callable default or unsupported signature
                         # can still store set.update in the enclosing cell.
                         raise SQLFlowLimit('SQL collection key callbacks through an unmodeled closure cell are unresolved; analysis is incomplete')
+            target = self.ownership_call_target(node)
+            if (target and target[0] == 'function' and self.set_update_helper(target[1])
+                    and target[1] not in self._sealed_closures):
+                raise SQLFlowLimit('SQL set.update helper binding is unresolved; analysis is incomplete')
             self.check_set_update_keys(node)
             handled = (list_plan is not None and self.local_list_effect_call(node, list_plan)
                        or self.sealed_closure_call(node) or self.generator_call(node) or joined is not None)
@@ -7981,7 +8058,9 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 or any(self.generator_bindings.get(name) for name in free)):
             raise SQLFlowLimit('SQL closure inputs are unresolved; analysis is incomplete')
         if any(self.value_kind(ast.Name(id=name, ctx=ast.Load()))[0]
-               not in {'number', 'str', 'none', 'scalar'} for name in cells):
+               not in {'number', 'str', 'none', 'scalar'}
+               and not self.set_update_cell(function, name,
+                   self.value_facts(ast.Name(id=name, ctx=ast.Load())), incoming=True) for name in cells):
             raise SQLFlowLimit('SQL closure cell alias is unresolved; analysis is incomplete')
         if function in self._recursive_closures:
             return self.recursive_closure_call(node, function, arguments, call_scope)

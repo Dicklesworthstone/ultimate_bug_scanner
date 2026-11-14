@@ -327,6 +327,52 @@ def set_update_hash_cases():
         '    consume(Key() for _ in (1,))\n' + tail)
 
 
+def set_update_helper_cases():
+    """Native witnesses for call-time cells and captured update methods."""
+    prefix = ''.join(SET_UPDATE_HASH_REPRO.splitlines(keepends=True)[1:7])
+    tail = '    return cursor.execute(query).fetchone()[0]\n'
+    for name, body, rows in (
+            ('nonlocal-installed-method', '    update = lambda values: None\n'
+             '    def install():\n        nonlocal update\n        update = set().update\n'
+             '    install()\n    update(Key() for _ in (1,))\n', 2),
+            ('nonlocal-installed-receiver', '    seen = []\n'
+             '    def install():\n        nonlocal seen\n        seen = set()\n'
+             '    install()\n    seen.update(Key() for _ in (1,))\n', 2),
+            ('global-installed-method', '    global update\n    update = lambda values: None\n'
+             '    def install():\n        global update\n        update = set().update\n'
+             '    install()\n    update(Key() for _ in (1,))\n', 2),
+            ('global-installed-receiver', '    global seen\n    seen = []\n'
+             '    def install():\n        global seen\n        seen = set()\n'
+             '    install()\n    seen.update(Key() for _ in (1,))\n', 2),
+            ('closure-reads-installed-method', '    update = lambda values: None\n'
+             '    def drain():\n        update(Key() for _ in (1,))\n'
+             '    update = set().update\n    drain()\n', 2),
+            ('closure-reads-overwritten-method', '    update = set().update\n'
+             '    def drain():\n        update(Key() for _ in (1,))\n'
+             '    update = lambda values: None\n    drain()\n', 1),
+            ('closure-reads-overwritten-receiver', '    class Other:\n'
+             '        def update(self, values):\n            pass\n    seen = set()\n'
+             '    def drain():\n        seen.update(Key() for _ in (1,))\n'
+             '    seen = Other()\n    drain()\n', 1),
+            ('bound-default-method', '    def drain(update=set().update):\n'
+             '        update(Key() for _ in (1,))\n    drain()\n', 2),
+            ('returned-method', '    def make_update():\n        return set().update\n'
+             '    update = make_update()\n    update(Key() for _ in (1,))\n', 2),
+            ('nonlocal-overwritten-method', '    update = set().update\n'
+             '    def replace():\n        nonlocal update\n        update = lambda values: None\n'
+             '    replace()\n    update(Key() for _ in (1,))\n', 1),
+            ('nonlocal-later-installed-then-cleared', '    update = lambda values: None\n'
+             '    def replace():\n        nonlocal update\n        update = lambda values: None\n'
+             '    update = set().update\n    replace()\n    replace()\n'
+             '    update(Key() for _ in (1,))\n', 1),
+            ('unused-cell-writer', '    update = lambda values: None\n'
+             '    def install():\n        nonlocal update\n        update = set().update\n'
+             '    update(Key() for _ in (1,))\n', 1),
+            ('unused-captured-consumer', '    update = set().update\n'
+             '    def drain():\n        update(Key() for _ in (1,))\n', 1)):
+        yield name, program(prefix + body + tail), rows
+
+
 STRING_JOIN_CASES = (
     ('string-join-generator-write', '    separator = ""\n    query = "SELECT 1"\n'
      '    separator.join((query := f"SELECT {user}") for unused in [0])\n'
@@ -2049,6 +2095,84 @@ class SQLValueCaptureTests(unittest.TestCase):
                     self.assertTrue(set(actual).issubset(expected), actual)
                 self.assertTrue(all(found_path == path and col == 1
                                     for _, found_path, _, col, _ in found))
+
+    def test_set_update_helpers_use_call_time_cells(self):
+        for name, source, expected_rows in set_update_helper_cases():
+            with self.subTest(helper=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'update-helper-' + name, source)['rows'],
+                                 expected_rows)
+                if expected_rows == 1:
+                    self.inspect('update-helper-' + name, source, ())
+                    continue
+                path = self.artifacts / ('update-helper-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                found, failure = [], None
+                try:
+                    found.extend(detector.find([path]))
+                except detector.SQLFlowLimit as exc:
+                    failure = exc
+                expected = [(CRITICAL, len(source.splitlines()))]
+                actual = [(rule, line) for rule, _, line, _, _ in found]
+                if failure is None:
+                    self.assertEqual(actual, expected, 'A real callback must not be certified clean')
+                else:
+                    self.assertIn('incomplete', str(failure))
+                    self.assertTrue(set(actual).issubset(expected), actual)
+
+    def test_set_update_helper_cells_do_not_grant_heap_ownership(self):
+        prefix = ''.join(SET_UPDATE_HASH_REPRO.splitlines(keepends=True)[1:7])
+        for name, assignment, actual in (
+                ('list', 'value', 'queries'),
+                ('nested-list', 'value[0]', '[queries]'),
+                ('joined-set-list', 'value', 'set() if user == "never" else queries'),
+                ('joined-method-list', 'value', 'set().update if user == "never" else queries'),
+                ('joined-constructor-list', 'value', 'set if user == "never" else queries'),
+                ('joined-unbound-list', 'value', 'set.update if user == "never" else queries')):
+            source = program(prefix + '    queries = [query]\n    alias = set()\n'
+                             '    def replace(value):\n        nonlocal alias\n'
+                             f'        alias = {assignment}\n    replacement = {actual}\n'
+                             '    replace(replacement)\n'
+                             '    alias[0] = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+                             '    return cursor.execute(queries[0]).fetchone()[0]\n')
+            with self.subTest(heap=name):
+                self.assertEqual(sqlite_witness(self.artifacts, 'update-cell-heap-' + name, source)['rows'], 2)
+                path = self.artifacts / ('update-cell-heap-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
+                    list(detector.find([path]))
+                if name.startswith('joined-'):
+                    clean = program(prefix + '    queries = [query]\n'
+                                    f'    alias = {actual}\n'
+                                    '    def clear():\n        nonlocal alias\n'
+                                    '        alias = lambda values: None\n'
+                                    '    clear()\n    alias(Key() for _ in (1,))\n'
+                                    '    return cursor.execute(queries[0]).fetchone()[0]\n')
+                    label = 'update-cell-cleared-' + name
+                    self.assertEqual(sqlite_witness(self.artifacts, label, clean)['rows'], 1)
+                    self.inspect(label, clean, ())
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_set_update_helper_cells(self):
+        cases = {name: (source, rows) for name, source, rows in set_update_helper_cases()}
+        clean_cases = []
+        # The source regressions above retain their generator inputs. These
+        # public clean controls use eager keys so the separate taint frontend's
+        # generator-resume boundary does not obscure the cell-overwrite proof.
+        for name, overwrite, unchanged in (
+                ('closure-reads-overwritten-method', '    update = lambda values: None\n', '    pass\n'),
+                ('closure-reads-overwritten-receiver', '    seen = Other()\n', '    pass\n'),
+                ('nonlocal-overwritten-method', '        update = lambda values: None\n', '        pass\n')):
+            source = cases[name][0].replace('Key() for _ in (1,)', '[Key()]')
+            self.assertEqual(source.count(overwrite), 1)
+            active = source.replace(overwrite, unchanged, 1)
+            label = name + '-eager'
+            self.assertEqual(sqlite_witness(self.artifacts, label + '-active', active)['rows'], 2)
+            self.assertEqual(sqlite_witness(self.artifacts, label + '-cleared', source)['rows'], 1)
+            clean_cases.append((label, source, ()))
+        for name in ('closure-reads-installed-method', 'returned-method', 'global-installed-method',
+                     'bound-default-method'):
+            self._assert_partial_cli('update-helper-cli-' + name, cases[name][0], None)
+        self.assert_real_cli_capture(clean_cases, wrap=False)
 
     def test_set_update_hash_free_controls(self):
         prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'

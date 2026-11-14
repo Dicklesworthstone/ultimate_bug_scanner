@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve Python SQL hashing effects through selected closure helpers and
+  returned `set.update` methods. Read helper cells at invocation time, discard
+  stale capabilities after definitive safe replacement, and report unresolved
+  global/default bindings as incomplete. Mixed set/list alternatives cannot
+  establish the ownership needed to hide a later query mutation.
+
 - Analyze Ruby token randomness with lexical and binding information. Detect
   weak randomness even in variables named `safe_token` or `secure_token`, keep
   inert text and genuine cryptographic generators clean, and preserve random

@@ -1,0 +1,579 @@
+# UNAPPLIED REVIEW FOLLOW-UP -- NOT ACTIVE SCANNER CODE
+#
+# Bead: ultimate_bug_scanner-set-update-hash-sql
+# This patch applies AFTER the immutable candidate preserved at:
+#   test-suite/patches/python-set-update-hash-candidate.patch
+#   Git blob: 0cbf79a881536634f31c901f1a09065839692b5f
+#   Published by concurrent work in commit 6607e9d49321450df551b8308134e6935bd3af5e.
+# Its prerequisite production base is 2ebfc78a7248a2743ec1d24e0fe8245f74850634.
+# Apply the prerequisite first; this is not a standalone diff against main.
+#
+# QUALIFICATION: NONE OF THIS FOLLOW-UP WAS EXECUTED.
+# The shared executor failed and then reported:
+# "No usable execution environment is available. Wait for an environment to
+# become available before using this tool."
+# GitHub source reads remained available. Exact prerequisite reconstruction and
+# hunk/context replay are mechanical checks, not Python, DSR, CLI or test passes.
+# The prerequisite archive's reported five DSR methods belong to that earlier
+# concurrent candidate. They do not qualify this follow-up.
+#
+# Independently observed BEFORE the outage, with the unmodified pinned detector
+# and real SQLite witnesses in the local Python interpreter (not through DSR):
+#   direct set.update(Key() for ...)       rows=2, findings=[], failure=null
+#   receiver alias                        rows=2, findings=[], failure=null
+#   saved method alias                    rows=2, findings=[], failure=null
+#   unbound set.update(seen, generator)    rows=2, findings=[], failure=null
+#   nested tuple containing Key()         rows=2, findings=[], failure=null
+#   primitive keys                        rows=1, findings=[], failure=null
+#   previously exhausted generator        rows=1, findings=[], failure=null
+# The observed artifact path was test-suite/artifacts/set-update-hash-baseline/
+# baseline.json; transient files could not be recovered after executor loss.
+# These observations establish five false-clean witnesses, not candidate passes.
+#
+# Review corrections proposed here:
+# - SQL sink-name recognition is no callback-purity proof. A zero-argument local
+#   execute() can rewrite captured SQL. Keep only inert pass/docstring/literal
+#   return bodies; decorated/metaclass-owned bodies require identity proof.
+# - Preserve a direct callback SQL finding at its exact line/column while
+#   tightening the enclosing callback status from complete to explicit partial.
+# - A private hash probe uses ACTUAL cursor phases, preserves its independently
+#   reached sink records on refusal, and never publishes its stores/progress.
+# - Opaque admission cannot turn a proven done cursor back into partial.
+# - Possible bound/unbound/imported/conditional set.update origins trigger only
+#   conservative key checks. They grant no native-call or exhaustion authority.
+#   Name-load origins are evaluation-local snapshots, copied/cleared with the
+#   existing value snapshots; unavailable origins retain lexical alternatives.
+#
+# Independent static review of the provisional follow-up found and corrected a
+# global/nonlocal origin omission: writer scopes are now included using the
+# same declared-cell/capture-barrier relation as possible_sql_imports. Indirect
+# cells cannot be narrowed from a local origin snapshot. New native oracles
+# cover both forms; they remain UNEXECUTED.
+#
+# BLOCKERS / LIMITS BEFORE ANY ACTIVATION:
+# - The may-origin fallback does not prune proven-dead IfExp/BoolOp arms.
+#   The dead-conditional-callable and dead-short-circuit-callable controls must
+#   remain complete; their expected precision is NOT established by this patch.
+# - Target-aware tuple/list unpacking is NOT implemented in the origin lookup.
+#   The conditional-unpacked-callable/receiver oracles must pass before
+#   activation. Do not recurse every RHS tuple element: the unrelated-unpacked-
+#   slot clean control pins that distinct target identities must remain apart.
+# - Closure/comprehension reads of definitely overwritten outer cells can
+#   conservatively resurrect older lexical set origins. That precision boundary
+#   and source-history behavior require execution; no full alias coverage claim.
+# - The new origin snapshots are PROVISIONAL. Revisited assignment ASTs in
+#   loops/finally can outlive an older saved conditional alias. The added
+#   loop-revisited-saved-conditional SQLite oracle MUST pass; this follow-up has
+#   not demonstrated that history property. Repair or explicitly refuse any
+#   remaining ambiguity. Do not treat this candidate as fully sound.
+# - Run the complete frozen unsafe and clean controls, including definite
+#   overwritten tuple/list/unrelated targets and saved receiver histories.
+# - Native set-to-set copies can reuse cached hashes; qualify eager-input
+#   precision rather than assume every preexisting element invokes __hash__.
+# - Arbitrary factories, reflection, imported callback effects, custom class
+#   hierarchies and general heap/callable dispatch remain outside this slice.
+# - Run actual module and runner JSON/SARIF tests, broader SQL regressions,
+#   public partial/known-finding checks, source self-scan and prescribed DSR
+#   gates with canonical transitive checksums regenerated before activation.
+# - Keep the bead open. No production detector, version, integrity pin, release
+#   tag, broad-suite result or release qualification is changed by this archive.
+#
+diff --git a/modules/helpers/ubs_core/py_detectors/sql_injection.py b/modules/helpers/ubs_core/py_detectors/sql_injection.py
+--- a/modules/helpers/ubs_core/py_detectors/sql_injection.py
++++ b/modules/helpers/ubs_core/py_detectors/sql_injection.py
+@@ -2770,8 +2770,11 @@
+         # argument/walrus writes must not change a value already captured by
+         # a tuple, SQL call or bound format method. AST objects (not their
+         # recycled numeric ids) key these bounded per-analysis snapshots.
+-        self._evaluated_values = {}
+-        self._evaluated_call_targets = {}
++        self._evaluated_values = {}
++        # Loaded alias origins follow the same evaluation-local lifetime as
++        # value snapshots. They authorize conservative refusal, never calls.
++        self._evaluated_binding_sites = {}
++        self._evaluated_call_targets = {}
+         self._evaluated_comparison_truths = {}
+         self._indexed_receivers = {}
+         # Generator objects carry identity, not their future yielded value.
+@@ -2838,9 +2841,13 @@
+             self._evaluated_values.pop(node, None)
+             if isinstance(node, ast.Call):
+                 self._evaluated_call_targets.pop(node, None)
+-            if isinstance(node, ast.Compare):
+-                self._evaluated_comparison_truths.pop(node, None)
+-            result = super().visit(node)
++            if isinstance(node, ast.Compare):
++                self._evaluated_comparison_truths.pop(node, None)
++            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
++                self._evaluated_binding_sites[node] = (
++                    self._generator_scope[-1] if self._generator_scope else None,
++                    self.binding_sites.get(node.id))
++            result = super().visit(node)
+             if node not in self._evaluated_values:
+                 self._evaluated_values[node] = self.value_facts(node)
+             if (self._sql_callable_escape_sites and node in self._sql_callable_escape_sites
+@@ -4027,11 +4034,10 @@
+     def collection_key_effects_unmodeled(self):
+         """Whether visible key protocols need more than their direct SQL scan.
+ 
+-        A literal return or an already analyzed SQL statement cannot assign
+-        an enclosing query. Other bodies, including a delegated helper call,
+-        need a receiver/callback effect summary before an update is complete.
+-        Keep this separate from the stricter construction guard: native set
+-        updates historically retain direct SQL findings in key callbacks.
++        Only pass, docstrings and literal returns are inert. Recognizing an
++        SQL sink is not a purity proof: a local execute() can write a captured
++        query, and even an external execution may invoke unmodeled callbacks.
++        Direct SQL findings remain visible when those effects are incomplete.
+         """
+         cache = self._ownership_syntax
+         if 'collection_key_effects_unmodeled' not in cache:
+@@ -4043,9 +4049,14 @@
+                 self.step()
+                 if function.name not in protocols:
+                     continue
+-                if function.decorator_list:
+-                    unresolved = True
+-                for statement in function.body:
++                owner = bindings.owner_scopes[function]['parent']
++                owner = owner['node'] if owner is not None else None
++                if (function.decorator_list or isinstance(owner, ast.ClassDef)
++                        and (owner.decorator_list or owner.keywords)):
++                    # A class decorator or metaclass can replace the visible
++                    # method body. Its literal return cannot prove dispatch.
++                    unresolved = True
++                for statement in function.body:
+                     self.step()
+                     if isinstance(statement, ast.Pass):
+                         continue
+@@ -4054,36 +4065,108 @@
+                     if isinstance(statement, ast.Expr):
+                         if isinstance(statement.value, ast.Constant):
+                             continue
+-                        if (isinstance(statement.value, ast.Call)
+-                                and sql_sink_name(statement.value, bindings)
+-                                and not any(isinstance(child, (ast.NamedExpr, ast.Yield, ast.YieldFrom, ast.Await))
+-                                            or isinstance(child, ast.Call) and child is not statement.value
+-                                            for child in ast.walk(statement.value))):
+-                            continue
+                     unresolved = True
+             cache['collection_key_effects_unmodeled'] = unresolved
+         return cache['collection_key_effects_unmodeled']
+ 
+-    def check_set_update_keys(self, node):
+-        """Refuse unresolved key effects without consuming the real cursor."""
+-        if (self.value_kind(node.func)[0] != 'set-update'
+-                or not self.has_collection_key_callbacks()
+-                or not self.collection_key_effects_unmodeled()):
+-            return
+-        for argument in [*node.args, *(keyword.value for keyword in node.keywords)]:
+-            self.step()
+-            references = self.generator_refs(self.value_facts(argument))
+-            if references:
+-                for identity in references:
+-                    if self.generator_phases.get(identity) == frozenset({'done'}):
+-                        continue
+-                    # Hash at actual private emissions, so empty or filtered
+-                    # generators cannot execute a fabricated callback. This
+-                    # projection never advances an alias of the real cursor.
+-                    self.generator_projection(identity, hash_keys=True)
+-            else:
+-                self.check_collection_keys(self.collection_key_facts(argument))
+-
++    def set_update_argument_offsets(self, call):
++        """Find possible native set.update targets for refusal only.
++
++        A may-alias authorizes no receiver, effect or exhaustion proof. Loaded
++        binding sites distinguish saved origins from later overwrites; unknown
++        snapshots retain lexical alternatives instead of certifying a target.
++        """
++        bindings = self.ownership_bindings()
++        constructors = {('unbound', 'set'), ('import', 'builtins.set')}
++        pending, visited, offsets = [(call.func, False)], set(), set()
++        while pending:
++            expression, receiver = pending.pop()
++            if (expression, receiver) in visited:
++                continue
++            self.step()
++            visited.add((expression, receiver))
++            if receiver:
++                if (isinstance(expression, ast.Set)
++                        or self.value_kind(expression)[0] == 'set'
++                        or isinstance(expression, ast.Call)
++                        and bindings.resolve(expression.func) in constructors):
++                    offsets.add(0)
++            elif isinstance(expression, ast.Attribute) and expression.attr == 'update':
++                if bindings.resolve(expression.value) in constructors:
++                    offsets.add(1)
++                else:
++                    pending.append((expression.value, True))
++            if isinstance(expression, ast.Name):
++                scope = bindings.sql_binding_cell(expression.id, bindings.scope_of.get(expression))
++                captured = self._evaluated_binding_sites.get(expression)
++                values = None
++                if (scope is not None and captured and captured[0] is scope['node']
++                        and expression.id not in bindings.indirect_rebindings):
++                    sites = captured[1]
++                    if (sites and None not in sites and all(isinstance(site, (
++                            ast.Assign, ast.AnnAssign, ast.NamedExpr,
++                            ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) for site in sites)):
++                        values = [site.value for site in sites
++                                  if isinstance(site, (ast.Assign, ast.AnnAssign, ast.NamedExpr))
++                                  and site.value is not None]
++                if values is None and scope is not None:
++                    owners = [scope]
++                    if expression.id in bindings.indirect_rebindings:
++                        # Global/nonlocal assignments live in their writer
++                        # scopes, not solely in the declared cell's table.
++                        # As in possible_sql_imports, preserve those possible
++                        # origins without granting any call authority.
++                        for owner in bindings.owner_scopes.values():
++                            self.step()
++                            if (expression.id in owner['capture_barriers']
++                                    and bindings.sql_binding_cell(expression.id, owner) is scope):
++                                owners.append(owner)
++                    values = [candidate[1] for owner in owners
++                              for candidate in owner['names'].get(expression.id, ())
++                              if candidate and candidate[0] == 'alias']
++                pending.extend((value, receiver) for value in values or ())
++            elif isinstance(expression, ast.IfExp):
++                pending.extend((value, receiver) for value in (expression.body, expression.orelse))
++            elif isinstance(expression, ast.BoolOp):
++                pending.extend((value, receiver) for value in expression.values)
++            elif isinstance(expression, ast.NamedExpr):
++                pending.append((expression.value, receiver))
++        return offsets
++
++    def check_set_update_keys(self, node):
++        """Refuse unresolved key effects without consuming the real cursor."""
++        if not self.has_collection_key_callbacks() or not self.collection_key_effects_unmodeled():
++            return
++        offsets = ({0} if self.value_kind(node.func)[0] == 'set-update'
++                   else self.set_update_argument_offsets(node))
++        if not offsets:
++            return
++        # Unbound set.update's first argument is its receiver, not an input
++        # iterable. Its existing keys must not invent additional hash calls.
++        for argument in [*node.args[min(offsets):], *(keyword.value for keyword in node.keywords)]:
++            self.step()
++            references = self.generator_refs(self.value_facts(argument))
++            if references:
++                probe = self.flow_probe()
++                try:
++                    # Use the actual phases. A partial cursor has no proved
++                    # remaining prefix, and an exhausted cursor emits no keys.
++                    probe.materialize_generators(references, hash_keys=True)
++                except SQLNoNormalReturn as exc:
++                    # A speculative drain cannot remove the real successor:
++                    # lexical may-alias recognition is not call authority.
++                    raise SQLFlowLimit('SQL set.update key iteration is unresolved; analysis is incomplete') from exc
++                finally:
++                    # A hash refusal can follow an independently reached SQL
++                    # sink in the yielded expression. Keep that exact evidence
++                    # without exporting the probe's stores or cursor progress.
++                    for identity, finding in probe._sink_risks.items():
++                        previous = self._sink_risks.get(identity)
++                        if previous is None or finding[0] == 'critical':
++                            self._sink_risks[identity] = finding
++            else:
++                self.check_collection_keys(self.collection_key_facts(argument))
++
+     def collection_key_facts(self, value, *, mapping=False):
+         """Captured keys of literal inputs; unknown objects keep no proof."""
+         self.step()
+@@ -4747,10 +4830,11 @@
+             # change a tracked SQL binding. Do not turn routine any()/sum()
+             # idioms into file-wide failures. Its cursor is now unknown:
+             # subsequent modeled consumption must refuse, not restart it.
+-            for identity in references:
+-                self.generator_phases[identity] = frozenset({'partial'})
+-            self._evaluated_values[node] = (None, None, None, False, 'unknown')
+-            return True
++            for identity in references:
++                if self.generator_phases.get(identity) != frozenset({'done'}):
++                    self.generator_phases[identity] = frozenset({'partial'})
++            self._evaluated_values[node] = (None, None, None, False, 'unknown')
++            return True
+         if arguments and not receiver and self.local_generator_consumer(node, arguments):
+             return True
+         raise SQLFlowLimit('SQL unknown generator consumer is unsupported; analysis is incomplete')
+@@ -4963,7 +5047,8 @@
+         for index in (0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14):
+             state[index].clear()
+         probe.restore_sql_state(tuple(state))
+-        probe._evaluated_values.clear()
++        probe._evaluated_values.clear()
++        probe._evaluated_binding_sites.clear()
+         lexical, scope = [], bindings.owner_scopes[function]
+         while scope is not None:
+             lexical.append(scope['node'])
+@@ -5330,7 +5415,8 @@
+         function, actual, borrowed = plan
+         incoming = self.sql_state()
+         probe = self.flow_probe()
+-        probe._evaluated_values.clear()
++        probe._evaluated_values.clear()
++        probe._evaluated_binding_sites.clear()
+         probe._return_slot = '\0sql_return'
+         probe._generator_scope = (*self._generator_scope, function)
+         probe.func_stack.append(function)
+@@ -5520,8 +5606,9 @@
+             self.sanitizers, self.sanitizer_summaries, budget=self._budget,
+             bindings=self.bindings)
+         probe.restore_sql_state(self.sql_state())
+-        probe._evaluated_values = self._evaluated_values.copy()
+-        probe._evaluated_call_targets = self._evaluated_call_targets.copy()
++        probe._evaluated_values = self._evaluated_values.copy()
++        probe._evaluated_binding_sites = self._evaluated_binding_sites.copy()
++        probe._evaluated_call_targets = self._evaluated_call_targets.copy()
+         probe._evaluated_comparison_truths = self._evaluated_comparison_truths.copy()
+         probe._indexed_receivers = self._indexed_receivers.copy()
+         probe._generator_specs = self._generator_specs.copy()
+@@ -7125,7 +7212,8 @@
+         for index in (0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14):
+             state[index].clear()
+         probe.restore_sql_state(tuple(state))
+-        probe._evaluated_values.clear()
++        probe._evaluated_values.clear()
++        probe._evaluated_binding_sites.clear()
+         lexical, scope = [], bindings.owner_scopes[function]
+         while scope is not None:
+             lexical.append(scope['node'])
+@@ -7902,7 +7990,8 @@
+             return self.recursive_closure_call(node, function, arguments, call_scope)
+         incoming = self.sql_state()
+         probe = self.flow_probe()
+-        probe._evaluated_values.clear()
++        probe._evaluated_values.clear()
++        probe._evaluated_binding_sites.clear()
+         # NUL cannot occur in a Python identifier. A private lattice slot
+         # carries the value only on actual return exits, including finally
+         # overrides; it is never copied back into the caller's bindings.
+@@ -8004,7 +8093,8 @@
+                 before = (summary['arguments'].copy(), summary['captures'].copy(),
+                           summary['effects'].copy(), summary['owned'].copy(), summary['returned'])
+                 probe = self.flow_probe()
+-                probe._evaluated_values.clear()
++                probe._evaluated_values.clear()
++                probe._evaluated_binding_sites.clear()
+                 probe._return_slot = '\0sql_return'
+                 probe._generator_scope = call_scope
+                 probe.func_stack = [node for node in call_scope if isinstance(node, ast.FunctionDef)]
+diff --git a/test-suite/quality/test_python_sql_value_capture.py b/test-suite/quality/test_python_sql_value_capture.py
+--- a/test-suite/quality/test_python_sql_value_capture.py
++++ b/test-suite/quality/test_python_sql_value_capture.py
+@@ -225,8 +225,28 @@
+             ('saved-receiver', '    consume = seen.update\n    seen = []\n'
+              '    consume(Key() for _ in (1,))\n'),
+             ('nested-tuple', '    seen.update((Key(),) for _ in (1,))\n'),
+-            ('named-generator', '    pending = (Key() for _ in (1,))\n'
+-             '    seen.update(pending)\n')):
++            ('named-generator', '    pending = (Key() for _ in (1,))\n'
++             '    seen.update(pending)\n'),
++            ('unbound', '    set.update(seen, (Key() for _ in (1,)))\n'),
++            ('saved-unbound', '    consume = set.update\n'
++             '    consume(seen, (Key() for _ in (1,)))\n'),
++            ('qualified-constructor', '    import builtins\n    other = builtins.set()\n'
++             '    other.update(Key() for _ in (1,))\n'),
++            ('imported-constructor', '    from builtins import set as build\n    other = build()\n'
++             '    other.update(Key() for _ in (1,))\n'),
++            ('qualified-unbound', '    import builtins\n'
++             '    builtins.set.update(seen, (Key() for _ in (1,)))\n'),
++            ('conditional-receiver', '    receiver = seen if user else None\n'
++             '    receiver.update(Key() for _ in (1,))\n'),
++            ('conditional-callable', '    consume = seen.update if user else tuple\n'
++             '    consume(Key() for _ in (1,))\n'),
++            ('saved-conditional-receiver', '    receiver = seen if user else None\n'
++             '    consume = receiver.update\n    receiver = []\n'
++             '    consume(Key() for _ in (1,))\n'),
++            ('conditional-unpacked-callable', '    consume, ignored = (seen.update if user else tuple, 0)\n'
++             '    consume(Key() for _ in (1,))\n'),
++            ('conditional-unpacked-receiver', '    receiver, ignored = (seen if user else None, 0)\n'
++             '    receiver.update(Key() for _ in (1,))\n')):
+         yield name, program(prefix + update + tail)
+     yield 'equality-collision', program(
+         '    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+@@ -242,14 +262,43 @@
+         '            return 0\n    seen = set()\n'
+         '    seen.update(Key() for _ in (1,))\n'
+         '    return cursor.execute(queries[0]).fetchone()[0]\n')
+-    yield 'delegated-write', program(
+-        '    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+-        '    def poison():\n        nonlocal query\n'
+-        '        query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+-        '    class Key:\n        def __hash__(self):\n            poison()\n'
+-        '            return 0\n    seen = set()\n'
+-        '    seen.update(Key() for _ in (1,))\n' + tail)
+-
++    yield 'delegated-write', program(
++        '    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
++        '    def poison():\n        nonlocal query\n'
++        '        query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
++        '    class Key:\n        def __hash__(self):\n            poison()\n'
++        '            return 0\n    seen = set()\n'
++        '    seen.update(Key() for _ in (1,))\n' + tail)
++    yield 'sql-named-zeroarg-helper', program(
++        '    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
++        '    def execute():\n        nonlocal query\n'
++        '        query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
++        '    class Key:\n        def __hash__(self):\n            execute()\n'
++        '            return 0\n    seen = set()\n'
++        '    seen.update(Key() for _ in (1,))\n' + tail)
++    # Saved conditional aliases can outlive a later execution of the same
++    # assignment AST. This is a mandatory activation oracle for origin history,
++    # not a claim that the proposed snapshot implementation already passes it.
++    yield 'loop-revisited-saved-conditional', program(prefix
++        + '    class Consumer:\n        def update(self, values):\n'
++        '            for value in values:\n                pass\n'
++        '    receiver = seen\n'
++        '    for index in (0, 1):\n'
++        '        current = receiver.update if user else tuple\n'
++        '        if index == 0:\n            saved = current\n'
++        '        receiver = Consumer()\n'
++        '    saved(Key() for _ in (1,))\n' + tail)
++
++    yield 'global-conditional-receiver', 'receiver = None\n' + program(
++        '    global receiver\n' + prefix
++        + '    receiver = set() if user else None\n'
++        '    receiver.update(Key() for _ in (1,))\n' + tail)
++    yield 'nonlocal-conditional-receiver', program(prefix
++        + '    receiver = None\n'
++        '    def choose():\n        nonlocal receiver\n'
++        '        receiver = set() if user else None\n'
++        '    choose()\n    receiver.update(Key() for _ in (1,))\n' + tail)
++
+ 
+ STRING_JOIN_CASES = (
+     ('string-join-generator-write', '    separator = ""\n    query = "SELECT 1"\n'
+@@ -1918,9 +1967,17 @@
+                          + f'            cursor.execute({unsafe})\n            return 0\n'
+                          '    seen = set()\n    seen.update(Key() for _ in (1,))\n'
+                          '    return cursor.fetchone()[0]\n')
+-        self.assertEqual(sqlite_witness(self.artifacts, 'set-update-hash-sink', source)['rows'], 2)
+-        self.inspect('set-update-hash-sink', source, ((CRITICAL, 4),))
+-
++        self.assertEqual(sqlite_witness(self.artifacts, 'set-update-hash-sink', source)['rows'], 2)
++        path = self.artifacts / 'set-update-hash-sink.py'
++        path.write_text(source, encoding='utf-8')
++        hits = []
++        # Recognizing the direct sink never proves all callback effects.
++        # Keep the exact known finding while making that boundary explicit.
++        with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
++            for rule, found, line, column, code in detector.find([path]):
++                hits.append((rule, found, line, column))
++        self.assertEqual(hits, [(CRITICAL, path, 4, 1)])
++
+     def test_set_update_hash_callbacks_never_certify_mutated_sql_clean(self):
+         # The bead's exact source yields a plain Key(), with no SQL text in
+         # the yielded object. Hashing that object still writes the later SQL.
+@@ -1980,8 +2037,108 @@
+                 self.assertEqual(sqlite_witness(self.artifacts, 'update-hash-free-' + name, source)['rows'], 1)
+                 self.inspect('update-hash-free-' + name, source, ())
+ 
+-    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+-    def test_real_cli_set_update_hash_callback_boundary(self):
++    def test_set_update_review_preserves_inert_protocols_and_nonhashing_targets(self):
++        inert = program(
++            '    class Key:\n        def __hash__(self):\n            return 0\n'
++            '        def __eq__(self, other):\n            return False\n'
++            '    seen = set()\n    seen.update(Key() for _ in (1, 2))\n'
++            '    return cursor.execute("SELECT count(*) FROM users WHERE name = \'alice\'").fetchone()[0]\n')
++        self.assertEqual(sqlite_witness(self.artifacts, 'update-inert-protocols', inert)['rows'], 1)
++        self.inspect('update-inert-protocols', inert, ())
++        prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
++                  '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
++                  '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
++                  '            return 0\n    seen = set()\n')
++        for name, consume in (
++                ('unbound-empty', '    set.update(seen, ())\n'),
++                ('exhausted-reuse', '    pending = (Key() for _ in (1,))\n'
++                 '    tuple(pending)\n    seen.update(pending)\n    tuple(pending)\n'),
++                ('overwritten-callable', '    consume = seen.update\n    consume = tuple\n'
++                 '    consume(Key() for _ in (1,))\n'),
++                ('dead-conditional-callable', '    consume = seen.update if False else tuple\n'
++                 '    consume(Key() for _ in (1,))\n'),
++                ('dead-short-circuit-callable', '    consume = False and seen.update or tuple\n'
++                 '    consume(Key() for _ in (1,))\n'),
++                ('overwritten-conditional-callable', '    consume = seen.update if user else tuple\n'
++                 '    consume = tuple\n    consume(Key() for _ in (1,))\n'),
++                ('overwritten-list-method', '    consume = seen.update\n    items = []\n'
++                 '    consume = items.extend\n    consume(Key() for _ in (1,))\n'),
++                ('overwritten-receiver', '    class Consumer:\n'
++                 '        def update(self, values):\n'
++                 '            for value in values:\n                pass\n'
++                 '    receiver = seen\n    receiver = Consumer()\n'
++                 '    receiver.update(Key() for _ in (1,))\n'),
++                ('unrelated-unpacked-slot', '    class Consumer:\n'
++                 '        def update(self, values):\n'
++                 '            for value in values:\n                pass\n'
++                 '    receiver, unused = (Consumer(), seen)\n'
++                 '    receiver.update(Key() for _ in (1,))\n')):
++            source = program(prefix + consume + '    return cursor.execute(query).fetchone()[0]\n')
++            with self.subTest(control=name):
++                self.assertEqual(sqlite_witness(self.artifacts, 'update-review-' + name, source)['rows'], 1)
++                self.inspect('update-review-' + name, source, ())
++
++    def test_set_update_review_keeps_yielded_sinks_and_never_restarts_partial_cursors(self):
++        prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
++                  '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
++                  '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
++                  '            return 0\n    seen = set()\n')
++        cases = (
++            ('yielded-sink', '    seen.update((cursor.execute('
++             'f"SELECT count(*) FROM users WHERE name = \'{user}\'"), Key())[1] for _ in (1,))\n',
++             'collection key callbacks', [(CRITICAL, 9)]),
++            ('partial-cursor', '    pending = (Key() for _ in (1, 2))\n'
++             '    next(pending)\n    seen.update(pending)\n',
++             'partial generator consumption', []),
++        )
++        for name, update, reason, expected in cases:
++            source = program(prefix + update + '    return cursor.execute(query).fetchone()[0]\n')
++            path = self.artifacts / ('update-review-' + name + '.py')
++            path.write_text(source, encoding='utf-8')
++            hits = []
++            with self.subTest(case=name):
++                self.assertEqual(sqlite_witness(self.artifacts, 'update-review-' + name, source)['rows'], 2)
++                with self.assertRaisesRegex(detector.SQLFlowLimit, reason + '.*incomplete'):
++                    for rule, found, line, column, code in detector.find([path]):
++                        self.assertEqual((found, column), (path, 1))
++                        hits.append((rule, line))
++                self.assertEqual(hits, expected)
++
++    def test_set_update_review_refuses_unproved_callback_class_identity(self):
++        for name, declaration in (
++                ('decorator', '    def identity(cls):\n        return cls\n'
++                 '    @identity\n    class Key:\n'),
++                ('metaclass', '    class Key(metaclass=type):\n')):
++            source = program(declaration
++                             + '        def __hash__(self):\n            return 0\n'
++                             '    seen = set()\n    seen.update(Key() for _ in (1,))\n'
++                             '    return cursor.execute("SELECT count(*) FROM users WHERE name = \'alice\'").fetchone()[0]\n')
++            path = self.artifacts / ('update-class-' + name + '.py')
++            path.write_text(source, encoding='utf-8')
++            with self.subTest(owner=name):
++                self.assertEqual(sqlite_witness(self.artifacts, 'update-class-' + name, source)['rows'], 1)
++                with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
++                    list(detector.find([path]))
++
++    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
++    def test_real_cli_set_update_hash_review(self):
++        cases = dict(set_update_hash_cases())
++        for name in ('unbound', 'qualified-constructor', 'sql-named-zeroarg-helper'):
++            self._assert_partial_cli('set-update-review-' + name, cases[name], None,
++                                     reason='key callbacks')
++        prefix = ('    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
++                  '    class Key:\n        def __hash__(self):\n            nonlocal query\n'
++                  '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
++                  '            return 0\n    seen = set()\n')
++        source = program(prefix
++                         + '    seen.update((cursor.execute('
++                         'f"SELECT count(*) FROM users WHERE name = \'{user}\'"), Key())[1] for _ in (1,))\n'
++                         '    return cursor.execute(query).fetchone()[0]\n')
++        self._assert_partial_cli('set-update-review-yielded-sink', source, 9,
++                                 reason='key callbacks')
++
++    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
++    def test_real_cli_set_update_hash_callback_boundary(self):
+         self._assert_partial_cli('set-update-hash-boundary', SET_UPDATE_HASH_REPRO, None,
+                                  reason='key callbacks')
+         source = program('    cursor.execute(f"SELECT count(*) FROM users WHERE name = \'{user}\'")\n'

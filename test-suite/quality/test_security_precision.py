@@ -73,6 +73,7 @@ from ubs_core.rust_detectors import (  # noqa: E402
 )
 from ubs_core import rust_rules  # noqa: E402
 from ubs_core.swift_detectors import security_randomness as swift_randomness  # noqa: E402
+from ubs_core.ruby_detectors import security_randomness as ruby_randomness  # noqa: E402
 from ubs_core.csharp_detectors import (  # noqa: E402
     archive_extraction as cs_archive, header_injection as cs_header,
     outbound_url as cs_outbound, security_randomness as cs_random,
@@ -80,6 +81,168 @@ from ubs_core.csharp_detectors import (  # noqa: E402
 
 JS_SECURITY = REPO_ROOT / "test-suite" / "js" / "security"
 PY_SECURITY = REPO_ROOT / "test-suite" / "python" / "security"
+
+
+class RubyRandomnessPrecisionTests(unittest.TestCase):
+    """Native entropy sources, executable syntax and local binding controls."""
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix='ruby-randomness-', dir=artifacts))
+
+    def check_source(self, source, expected):
+        name = hashlib.sha256(source.encode()).hexdigest()[:20]
+        path = self.root / (name + '.rb')
+        path.write_text(source, encoding='utf-8')
+        records = list(ruby_randomness.find([path]))
+        (self.root / (name + '.json')).write_text(json.dumps(records, indent=2), encoding='utf-8')
+        self.assertEqual(ruby_randomness.RULE_ID, 'ruby.security.non-crypto-random')
+        self.assertEqual(sorted(record[1] for record in records), expected,
+                         {'source': source, 'records': records})
+
+    def test_reassuring_names_do_not_suppress_native_sources(self):
+        for name in ('safe_token', 'secure_token', 'csrf_token', 'signed_token', 'crypto_secret'):
+            for expression in ('rand(1_000_000)', 'Random.rand(1_000_000)',
+                               'Random.new(7).rand(1_000_000)', 'Kernel.rand(1_000_000)'):
+                with self.subTest(name=name, expression=expression):
+                    self.check_source(f'{name} = {expression}.to_s\n', [1])
+        self.check_source('safe_token = Time.now.to_i.to_s\n', [1])
+
+    def test_cryptographic_call_does_not_hide_weak_siblings(self):
+        for expression in ('SecureRandom.hex(32) + rand(1000).to_s',
+                           '[SecureRandom.hex(32), rand(1000).to_s].join',
+                           "'SecureRandom.hex(32)' + rand(1000).to_s",
+                           '"#{SecureRandom.hex(32)}-#{Kernel.rand(1000)}"'):
+            with self.subTest(expression=expression):
+                self.check_source('token = ' + expression + '\n', [1])
+
+    def test_literal_comment_regex_and_escaped_text_are_inert(self):
+        for expression in ("'rand(1000)'", '"rand(1000)"', '%q(rand(1000))',
+                           '%r(rand\\(1000\\))', '/rand\\(1000\\)/',
+                           r'"\#{rand(1000)}"'):
+            with self.subTest(expression=expression):
+                self.check_source('token = ' + expression + '\n', [])
+        self.check_source('# token = rand(1000)\nvalue = 1\n', [])
+        self.check_source('=begin\ntoken = rand(1000)\n=end\nvalue = 1\n', [])
+        self.check_source("token = <<'TEXT'\nrand(1000)\nTEXT\n", [])
+
+    def test_interpolation_is_executable_in_each_supported_literal(self):
+        for expression in ('"prefix-#{rand(1000)}"', '%Q(prefix-#{rand(1000)})',
+                           '%W(prefix-#{rand(1000)})', '%r(prefix-#{rand(1000)})',
+                           '/prefix-#{rand(1000)}/'):
+            with self.subTest(expression=expression):
+                self.check_source('safe_token = ' + expression + '\n', [1])
+        self.check_source('safe_token = <<~TEXT\nprefix-#{rand(1000)}\nTEXT\n', [2])
+
+    def test_native_cryptographic_size_arguments_are_not_token_material(self):
+        for expression in ('SecureRandom.hex(32 + rand(16))',
+                           'SecureRandom.urlsafe_base64(32 + Random.rand(16))',
+                           'OpenSSL::Random.random_bytes(32 + Kernel.rand(16))',
+                           '::SecureRandom.hex(32 + ::Kernel.rand(16))',
+                           'SecureRandom.hex 32 + rand(16)'):
+            with self.subTest(expression=expression):
+                self.check_source('token = ' + expression + '\n', [])
+        self.check_source('def rand(size)\n  SecureRandom.hex(size)\nend\n'
+                          'token = SecureRandom.hex(32 + Kernel.rand(16))\n', [])
+        self.check_source('token = SecureRandom.hex((secret = Kernel.rand(1000); 32))\n', [1])
+
+    def test_local_names_parameters_and_labels_are_not_calls(self):
+        for source in ('rand = SecureRandom.hex(32)\ntoken = rand\n',
+                       "srand = 'fixed'\ntoken = srand\n",
+                       'def token(rand)\n  rand.to_s\nend\n',
+                       'def token\n  rand = SecureRandom.hex(32)\n  rand\nend\n',
+                       '[SecureRandom.hex(32)].each do |rand|\n  token = rand.to_s\nend\n',
+                       'token = {rand: SecureRandom.hex(32)}\n',
+                       'token = custom.rand(1000)\n'):
+            with self.subTest(source=source):
+                self.check_source(source, [])
+        self.check_source('token = rand\n', [1])
+        self.check_source('rand = SecureRandom.hex(32)\ntoken = rand(1000)\n', [2])
+
+    def test_scoped_method_shadows_and_definition_order(self):
+        definition = 'def rand(size)\n  SecureRandom.hex(size)\nend\n'
+        self.check_source(definition + 'token = rand(32)\n', [])
+        self.check_source('token = rand(1000)\n' + definition, [1])
+        self.check_source(definition + 'token = Kernel.rand(1000)\n', [4])
+        self.check_source('def token\n  rand(32)\nend\n' + definition + 'token\n', [])
+        self.check_source('def token\n  rand(32)\nend\ntoken\n' + definition, [2])
+        self.check_source('class Display\n' + definition + 'end\ntoken = rand(1000)\n', [6])
+        self.check_source('class Display\n' + definition + 'end\n'
+                          'class Tokens\n  def token\n    rand(1000)\n  end\nend\n', [8])
+
+    def test_opaque_early_invocations_cannot_borrow_later_method_definitions(self):
+        definition = 'def rand(size)\n  SecureRandom.hex(size)\nend\n'
+        body = 'def token\n  rand(32)\nend\n'
+        for call in ('method(:token).call\n', 'send(:token)\n', 'public_send(:token)\n',
+                     'callback = method(:token)\ncallback.call\n', 'send(selected_name)\n'):
+            with self.subTest(call=call):
+                self.check_source(body + call + definition, [2])
+                self.check_source(body + call + definition + 'token\n', [2])
+        # Reading a local with the same spelling is not an invocation proof.
+        self.check_source(body + 'invoke_callback\n' + definition + 'token = 1\ntoken\n', [2])
+
+    def test_indirect_early_invocations_do_not_borrow_later_definitions(self):
+        body = 'def token\n  rand(32)\nend\ndef invoke\n  token\nend\n'
+        definition = 'def rand(size)\n  SecureRandom.hex(size)\nend\n'
+        for call in ('invoke()\n', 'invoke\n', 'ignored = invoke\n'):
+            with self.subTest(call=call):
+                self.check_source(body + call + definition + 'token()\n', [2])
+                self.check_source(body + definition + call + 'token()\n', [])
+        # A proven local read cannot invoke the helper before the override.
+        self.check_source(body + 'invoke = 1\nignored = invoke\n'
+                          + definition + 'token()\n', [])
+
+    def test_constant_lookalikes_and_native_root_qualification(self):
+        definition = ('module App\n  class Random\n    def self.rand(size)\n'
+                      '      SecureRandom.hex(size)\n    end\n  end\n')
+        self.check_source(definition + '  token = Random.rand(32)\nend\n', [])
+        self.check_source(definition + '  token = ::Random.rand(1000)\nend\n', [7])
+        self.check_source('Random = custom\ntoken = Random.rand(32)\n', [])
+        self.check_source('OpenSSL = custom\ntoken = OpenSSL::Random.random_bytes(rand(1000))\n', [2])
+        self.check_source('SecureRandom = custom\ntoken = SecureRandom.hex(rand(1000))\n', [2])
+
+    def test_generator_aliases_rebinding_and_scope_isolation(self):
+        self.check_source('rng = Random.new(7)\ncopy = rng\n'
+                          'safe_token = copy.rand(1000)\n', [3])
+        self.check_source('rng = Random.new(7)\ncopy = rng\nrng = custom\n'
+                          'token = copy.rand(1000)\n', [4])
+        self.check_source('rng = Random.new(7)\nrng = custom\ntoken = rng.rand(1000)\n', [])
+        self.check_source('def sample\n  rng = Random.new(7)\nend\n'
+                          'def token(rng)\n  rng.rand(1000)\nend\n', [])
+        self.check_source('token_generator = Random.new(7)\n', [])
+
+    def test_branch_rebinding_preserves_each_reachable_generator(self):
+        self.check_source('rng = Random.new(7)\nif enabled\n  rng = custom\nend\n'
+                          'token = rng.rand(1000)\n', [5])
+        self.check_source('rng = Random.new(7)\nif enabled\n  rng = custom\n'
+                          'else\n  rng = replacement\nend\ntoken = rng.rand(1000)\n', [])
+        self.check_source('if enabled\n  rng = Random.new(7)\nelse\n'
+                          '  rng = custom\nend\ntoken = rng.rand(1000)\n', [6])
+
+    def test_nonsecurity_sampling_and_parser_metadata_remain_clean(self):
+        for name in ('sample', 'public_checksum', 'parser_token_index', 'lexer_token_kind'):
+            with self.subTest(name=name):
+                self.check_source(f'{name} = rand(1000).to_s\n', [])
+        self.check_source('parser_token_index = rand(2)\nsecret = rand(1000)\n', [2])
+
+    def test_only_owned_suppression_comments_hide_findings(self):
+        self.check_source('token = rand(1000) # ubs:ignore[ruby.security.non-crypto-random]\n', [])
+        self.check_source('token = rand(1000) # ubs:ignore[another.rule]\n', [1])
+        self.check_source("token = 'ubs:ignore[ruby.security.non-crypto-random]' + rand(1000).to_s\n", [1])
+
+    def test_unsupported_executable_syntax_is_not_complete_clean(self):
+        source = 'token = proc { rand(1000) }\n'
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            ruby_randomness.analyze(source.splitlines(), [], 'opaque.rb')
+
+    def test_original_randomness_fixture_sites_remain_exact(self):
+        for name, expected in (('security_randomness_buggy', [3, 8, 13, 18, 23]),
+                               ('security_randomness_clean', [])):
+            with self.subTest(name=name):
+                path = REPO_ROOT / 'test-suite' / 'ruby' / name / 'tokens.rb'
+                self.assertEqual(sorted(row[1] for row in ruby_randomness.find([path])), expected)
 
 
 class SwiftPredictableMaterialTests(unittest.TestCase):

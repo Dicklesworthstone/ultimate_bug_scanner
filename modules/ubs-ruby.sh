@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="43b6400430cc9153845d304e0f54a8f89d10d92bdc0be5cc80f9937d04a60c03"
+UBS_LIB_CHECKSUM="c5f17c06d999d6b2ed0e54096d4edf4f8fd6d82b142c59946073b01b78ffcc98"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -82,7 +82,7 @@ cleanup() {
   local p
   for p in "${TEMP_PATHS[@]:-}"; do
     if [[ -n "$p" && "$p" != "/" && "$p" != "." ]]; then
-      rm -rf -- "$p" 2>/dev/null || true
+      ubs_remove_temp -rf -- "$p" 2>/dev/null || true
     fi
   done
 }
@@ -189,6 +189,8 @@ Options:
   -h, --help               Show help
 Env:
   JOBS, NO_COLOR, CI, RB_TIMEOUT, UBS_METRICS_DIR
+  UBS_KEEP_TEMP=1          Retain scanner scratch; installed optional Bundler
+                          analyzers refuse with incomplete coverage.
 Args:
   PROJECT_DIR              Directory to scan (default: ".")
   OUTPUT_FILE              File to save the report (optional)
@@ -533,7 +535,7 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
 
   if [[ -n "$text_out" ]]; then
     cat "$text_out" 2>/dev/null || true
-    rm -f "$text_out" 2>/dev/null || true
+    ubs_remove_temp -f "$text_out" 2>/dev/null || true
   fi
   if [[ -n "$v2_json_out" && "$FORMAT" == "json" ]]; then
     cat "$v2_json_out" 2>/dev/null || true
@@ -550,14 +552,14 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
   fi
 
   if [[ -n "$v2_json_out" ]]; then
-    rm -f "$v2_json_out" 2>/dev/null || true
+    ubs_remove_temp -f "$v2_json_out" 2>/dev/null || true
   fi
   if [[ -n "$REPORT_JSON" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi
-  rm -f "$list_file" "$sink" 2>/dev/null || true
+  ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
   if [[ -n "$ast_rule_dir" ]]; then
-    rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+    ubs_remove_temp -rf -- "$ast_rule_dir" 2>/dev/null || true
   fi
   return "$exit_code"
 }

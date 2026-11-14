@@ -10,6 +10,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Analyze Ruby token randomness with lexical and binding information. Detect
+  weak randomness even in variables named `safe_token` or `secure_token`, keep
+  inert text and genuine cryptographic generators clean, and preserve random
+  generator aliases across branches and method invocation timing.
+
+- Support `UBS_KEEP_TEMP=1` for Ruby module and runner scans, including text,
+  JSON, SARIF and generated rule files. Optional Ruby analyzers that cannot
+  retain their scratch report incomplete coverage before they are launched.
+
 - Prevent stored, deferred and goroutine Go closures from treating a captured
   local function variable as a permanently native sanitizer or reader. Preserve
   immediate calls, aliases declared inside the closure, stable package bindings

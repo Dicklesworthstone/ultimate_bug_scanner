@@ -1054,6 +1054,9 @@ def scan_ruby_tools(files: Sequence[Path], sink: TextIO, project_dir: str,
             outcomes.append({"tool": tool, "status": "skipped", "reason": reason})
         else:
             candidates.append(tool)
+    if bundle and candidates and os.environ.get("UBS_KEEP_TEMP") == "1":
+        errors.append("bundler refused: UBS_KEEP_TEMP=1 cannot retain external Ruby analyzer scratch")
+        return outcomes + [{"tool": tool, "status": "partial"} for tool in candidates]
     if bundle and candidates:
         env["BUNDLE_GEMFILE"] = str(root / "Gemfile")
         args = [item for tool in candidates for item in (tool, RUBY_TOOLS[tool])]
@@ -1085,6 +1088,10 @@ def scan_ruby_tools(files: Sequence[Path], sink: TextIO, project_dir: str,
             command = []
         if not command:
             outcomes.append({"tool": tool, "status": "skipped", "reason": "not installed"})
+            continue
+        if os.environ.get("UBS_KEEP_TEMP") == "1":
+            errors.append(f"{tool} refused: UBS_KEEP_TEMP=1 cannot retain external Ruby analyzer scratch")
+            outcomes.append({"tool": tool, "status": "partial"})
             continue
         if tool == "rubocop":
             batches = [["--format", "json", "--no-parallel", "--force-exclusion", "--", *sources[i:i+50]]

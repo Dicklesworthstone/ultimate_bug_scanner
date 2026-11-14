@@ -666,6 +666,103 @@ class KeepTempCliTests(unittest.TestCase):
                 }
                 self.assertEqual(set(listed), dumped, context)
 
+    def test_ruby_reports_retain_native_findings_and_scratch(self) -> None:
+        rule = "ruby.security.non-crypto-random"
+        cases = (
+            ("unsafe", "safe_token = rand(1_000_000).to_s\n", [(rule, 1)]),
+            ("clean", "require 'securerandom'\nsafe_token = SecureRandom.hex(32 + rand(16))\n", []),
+        )
+        skip = "--skip=" + ",".join(str(index) for index in range(1, 20) if index != 6)
+        for scenario, text, expected in cases:
+            source = self.source("ruby-" + scenario + ".rb", text)
+            for direct in (True, False):
+                for output_format in ("json", "sarif"):
+                    with self.subTest(scenario=scenario, direct=direct, format=output_format):
+                        arguments = [f"--format={output_format}", skip]
+                        if direct:
+                            arguments.extend(("--only=6", "--no-bundler"))
+                        else:
+                            arguments.extend(("--only=ruby", f"--module-dir={ROOT / 'modules'}"))
+                        arguments.append(str(source))
+                        result, observations, run = self.run_scan(
+                            "ruby", source, *arguments, command_mode="--ci", direct_module=direct)
+                        context = f"{run}\n{result.stdout}\n{result.stderr}"
+                        self.assertEqual(result.returncode, 1 if expected else 0, context)
+                        document = json.loads(result.stdout)
+                        if output_format == "json":
+                            self.assertEqual(document["status"], "ok", context)
+                            counts = document if direct else document["totals"]
+                            self.assertEqual({key: counts[key] for key in SEVERITIES},
+                                             {"critical": len(expected), "warning": 0, "info": 0}, context)
+                            actual = sorted((row["rule"] if direct else row["rule_id"], row["line"])
+                                            for row in document.get("findings", []))
+                        else:
+                            actual = sorted((row["ruleId"], row["locations"][0]["physicalLocation"]
+                                             ["region"]["startLine"])
+                                            for scan in document["runs"] for row in scan["results"])
+                            self.assertFalse(any(invocation["executionSuccessful"] is False
+                                                 for scan in document["runs"]
+                                                 for invocation in scan.get("invocations", [])), context)
+                        self.assertEqual(actual, expected, context)
+                        self.assertTrue(observations["created_paths"], context)
+
+    def test_ruby_text_and_rule_listing_retain_generated_files(self) -> None:
+        source = self.source("ruby-text.rb", "safe_token = rand(1_000_000).to_s\n")
+        skip = "--skip=" + ",".join(str(index) for index in range(1, 20) if index != 6)
+        result, observations, run = self.run_scan(
+            "ruby", source, "--format=text", "--only=6", "--no-bundler", skip, str(source),
+            command_mode="--ci", direct_module=True)
+        context = f"{run}\n{result.stdout}\n{result.stderr}"
+        self.assertEqual(result.returncode, 1, context)
+        self.assertIn("Security token generated with non-cryptographic randomness", result.stdout, context)
+        self.assertTrue(observations["created_paths"], context)
+        destination = self.root / "ruby-dumped-rules"
+        result, observations, run = self.run_scan(
+            "ruby", source, "--dump-rules=" + str(destination),
+            command_mode="--list-rules", direct_module=True)
+        context = f"{run}\n{result.stdout}\n{result.stderr}"
+        self.assertEqual(result.returncode, 0, context)
+        listed = result.stdout.splitlines()
+        self.assertTrue(listed, context)
+        dumped = {line.split(":", 1)[1].strip()
+                  for path in destination.rglob("*.yml")
+                  for line in path.read_text(encoding="utf-8").splitlines()
+                  if line.startswith("id:")}
+        self.assertEqual(set(listed), dumped, context)
+        self.assertTrue(observations["created_paths"], context)
+
+    def test_ruby_retention_refuses_optional_analyzers_before_launch(self) -> None:
+        source = self.source("ruby-optional.rb", "safe_token = rand(1_000_000).to_s\n")
+        tools = self.root / "optional-tools"
+        tools.mkdir()
+        marker = self.root / "external-analyzer-launched"
+        for name in ("rubocop", "bundle"):
+            executable = tools / name
+            executable.write_text("#!/usr/bin/env bash\nprintf launched > "
+                                  + repr(str(marker)) + "\nexit 91\n", encoding="utf-8")
+            executable.chmod(0o755)
+        for bundled in (False, True):
+            if bundled:
+                (source.parent / "Gemfile").write_text("source 'https://rubygems.org'\n", encoding="utf-8")
+            with self.subTest(bundled=bundled):
+                result, observations, run = self.run_scan(
+                    "ruby", source, "--format=json", "--only=6,19", "--rb-tools=rubocop", str(source),
+                    command_mode="--ci", direct_module=True,
+                    environment={"PATH": str(tools) + os.pathsep + os.environ["PATH"]})
+                context = f"{run}\n{result.stdout}\n{result.stderr}"
+                self.assertEqual(result.returncode, 2, context)
+                document = json.loads(result.stdout)
+                self.assertEqual(document["status"], "partial", context)
+                self.assertIn("cannot retain external Ruby analyzer scratch", result.stdout, context)
+                self.assertEqual([(row["rule"], row["line"]) for row in document["findings"]],
+                                 [("ruby.security.non-crypto-random", 1)], context)
+                self.assertEqual(document["extras"]["external_tools"],
+                                 [{"tool": "rubocop", "status": "partial"}], context)
+                self.assertFalse(marker.exists(), context)
+                self.assertFalse(any(str(tools / name) in line
+                                     for name in ("rubocop", "bundle")
+                                     for line in observations["executions"]), context)
+
     def test_sql_reports_retain_source_cache_and_partial_findings(self) -> None:
         unsafe = (
             "\\set ON_ERROR_STOP on\n"

@@ -10,6 +10,11 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve taint carried by uncertain Go function values even when their call
+  arguments are clean. Keep captured sources in reader results, decoder state,
+  unmarshal and decoder destination writes, and unknown escaper results, while
+  retaining definite native clean-result contracts and independent saved copies.
+
 - Preserve Drizzle parameter binding when SQL templates are stored, aliased,
   composed, or returned by selected helpers. Keep raw SQL mutations and live
   nested references visible without sanitizing the original request value.

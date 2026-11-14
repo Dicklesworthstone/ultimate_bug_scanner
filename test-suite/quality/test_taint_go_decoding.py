@@ -272,6 +272,97 @@ class NativeFunctionValueTests(packages.PackageTestCase):
         ''')
         self.assert_hits([('handler.go', 7, 'go.taint.sql'), ('handler.go', 8, 'go.taint.sql')])
 
+    def test_unknown_reader_preserves_captured_source_with_clean_arguments(self):
+        self.source('handler.go', '''
+            package app
+            import ("io"; "strings"; callbacks "example.test/callbacks")
+            func h() {
+                read := io.ReadAll
+                saved := read
+                if choice { read = callbacks.Reader(r.FormValue("q")) }
+                raw, err := read(strings.NewReader("fixed"))
+                fmt.Fprint(w, raw)
+                fmt.Fprint(w, err)
+                clean, cleanErr := saved(strings.NewReader("fixed"))
+                fmt.Fprint(w, clean, cleanErr)
+            }
+        ''')
+        self.assert_hits([('handler.go', 8, 'go.taint.xss'), ('handler.go', 9, 'go.taint.xss')])
+
+    def test_unknown_unmarshal_preserves_captured_source_in_writes_and_error(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; callbacks "example.test/callbacks")
+            func h() {
+                decode := json.Unmarshal
+                saved := decode
+                if choice { decode = callbacks.Unmarshal(r.FormValue("q")) }
+                var p Payload
+                err := decode([]byte("{}"), &p)
+                db.Query(p.SQL)
+                db.Query(err.Error())
+                var clean Payload
+                cleanErr := saved([]byte("{}"), &clean)
+                db.Query(clean.SQL)
+                db.Query(cleanErr.Error())
+            }
+        ''')
+        self.assert_hits([('handler.go', 9, 'go.taint.sql'), ('handler.go', 10, 'go.taint.sql')])
+
+    def test_unknown_factory_preserves_captured_source_in_decoder_output(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings"; callbacks "example.test/callbacks")
+            func h() {
+                factory := json.NewDecoder
+                saved := factory
+                if choice { factory = callbacks.Factory(r.FormValue("body")) }
+                decoder := factory(strings.NewReader("{}"))
+                var p Payload
+                decoder.Decode(&p)
+                db.Query(p.SQL)
+                known := saved(strings.NewReader("{}"))
+                var clean Payload
+                known.Decode(&clean)
+                db.Query(clean.SQL)
+            }
+        ''')
+        self.assert_hits([('handler.go', 10, 'go.taint.sql')])
+
+    def test_unknown_decoder_receiver_preserves_its_own_source_in_writes(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings"; callbacks "example.test/callbacks")
+            func h() {
+                decoder := json.NewDecoder(strings.NewReader("{}"))
+                saved := decoder
+                if choice { decoder = callbacks.Decoder(r.FormValue("body")) }
+                var p Payload
+                err := decoder.Decode(&p)
+                db.Query(p.SQL)
+                db.Query(err.Error())
+                var clean Payload
+                cleanErr := saved.Decode(&clean)
+                db.Query(clean.SQL)
+                db.Query(cleanErr.Error())
+            }
+        ''')
+        self.assert_hits([('handler.go', 9, 'go.taint.sql'), ('handler.go', 10, 'go.taint.sql')])
+
+    def test_unknown_escaper_preserves_captured_source_with_a_clean_argument(self):
+        self.source('handler.go', '''
+            package app
+            import ("html"; callbacks "example.test/callbacks")
+            func h() {
+                escape := html.EscapeString
+                saved := escape
+                if choice { escape = callbacks.Escaper(r.FormValue("q")) }
+                fmt.Fprint(w, escape("fixed"))
+                fmt.Fprint(w, saved("fixed"))
+            }
+        ''')
+        self.assert_hits([('handler.go', 7, 'go.taint.xss')])
+
     def test_native_alias_retains_identity_after_original_binding_changes(self):
         self.source('handler.go', '''
             package app

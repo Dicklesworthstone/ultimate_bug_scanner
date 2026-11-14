@@ -744,6 +744,7 @@ class _Analysis:
         if end is None or code[:match.start()].rstrip().endswith('.'):
             return None
         receiver = state.get(_DecoderKey(scope.bindings.get(root, root)))
+        callable_source = state.get(scope.bindings.get(root, root), _CLEAN)
         native = self.native_callable(root, member, offset + match.start(1), state, scope)
         operations = native.operations if native is not None else frozenset()
         constructor = bool(operations) and operations <= {('json', 'NewDecoder'), ('xml', 'NewDecoder')}
@@ -785,30 +786,38 @@ class _Analysis:
             # so retain both identities instead of gaining sanitizer proof.
             native = _join_native(native, self.native_callable(root, member,
                                                                offset + match.start(1), state, scope))
+        # Unknown callbacks can retain request data in the function value even
+        # when every argument is clean. Variable reads can occur on either side
+        # of argument calls, so retain both observed cell facts.
+        callable_source = (_join(callable_source, state.get(scope.bindings.get(root, root), _CLEAN))
+                           if native is not None and native.unknown else _CLEAN)
+        fallback = _join(*values, callable_source)
         if constructor:
             if len(values) != 1:
                 return end, (_CLEAN,)
-            receiver = _DecoderInfo(values[0], not native.unknown)
+            receiver = _DecoderInfo(_join(values[0], callable_source), not native.unknown)
             self.decoder_results[offset + match.start(1)] = receiver
             if not chain:
-                return end, (values[0] if native.unknown else _CLEAN,)
+                return end, (fallback if native.unknown else _CLEAN,)
             method = chain.group(1)
             values, targets = arguments(end + chain.end() + 1, outer_end)
         if unmarshal:
             if len(values) == 2:
-                self.write_targets(targets[1], values[0], state, root + '.Unmarshal' if member else root)
-            return end, (_join(*values) if native.unknown else _CLEAN,)
+                self.write_targets(targets[1], _join(values[0], callable_source), state,
+                                   root + '.Unmarshal' if member else root)
+            return end, (fallback if native.unknown else _CLEAN,)
         if readall:
-            fact = _join(*values)
-            return end, (fact, fact if native.unknown else _CLEAN)
+            return end, (fallback, fallback if native.unknown else _CLEAN)
         if sanitizer:
-            # The callee is captured before its arguments execute. Evaluating
-            # every argument still preserves sinks and mutations inside it.
+            # Only a definite native escaper grants HTML sanitization; unknown
+            # alternatives retain argument effects and captured source data.
             clean = self.rule == 'go.taint.xss' and not native.unknown and len(values) == 1
-            return end, (_CLEAN if clean else _join(*values),)
+            return end, (_CLEAN if clean else fallback,)
         if method in {'Decode', 'DecodeElement'}:
             if targets:
-                self.write_targets(targets[0], receiver.source, state, method)
+                source = (_join(receiver.source, callable_source)
+                          if not receiver.definite else receiver.source)
+                self.write_targets(targets[0], source, state, method)
             result = (_CLEAN,)
         elif method in {'Token', 'RawToken'}:
             result = (receiver.source, _CLEAN)
@@ -818,7 +827,8 @@ class _Analysis:
             result = (_CLEAN,)
         if not receiver.definite:
             # A join may also contain a different, unknown implementation.
-            result = (_join(*result, *values, state.get(scope.bindings.get(root, root), _CLEAN)),)
+            result = (_join(*result, *values, callable_source,
+                            state.get(scope.bindings.get(root, root), _CLEAN)),)
         return outer_end, result
 
     def effect(self, offset: int, label: str, fact: _Fact):

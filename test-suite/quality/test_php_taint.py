@@ -900,7 +900,303 @@ REDIRECT_PARTIAL = (
     Case("redirect_literal_nul_suffix", r'''header('Location: ' . $_GET['next'] . "\0suffix");'''),
 )
 
-CASES = (*CASES, *REDIRECT_CASES)
+# Native environment values can include CGI request metadata and values supplied
+# by the invoking process. PHP's local_only flag is not a content sanitizer.
+# Keep these expectations independent of the engine's source representation.
+ENVIRONMENT_CASES = (
+    Case("environment_getter_security_domains", """
+        $value = getenv('HTTP_X_PAYLOAD');
+        $db = new PDO('sqlite::memory:');
+        $db->query($value); // expect: sql $db->query
+        system($value); // expect: command system
+        eval($value); // expect: code eval
+        include $value; // expect: include include
+        unserialize($value); // expect: deserialize unserialize
+        echo $value; // expect: xss echo
+        header('Location: ' . $value); // expect: redirect header
+    """),
+    Case("environment_superglobal_security_domains", """
+        $value = $_ENV['HTTP_X_PAYLOAD'];
+        $db = new PDO('sqlite::memory:');
+        $db->query($value); // expect: sql $db->query
+        system($value); // expect: command system
+        eval($value); // expect: code eval
+        include $value; // expect: include include
+        unserialize($value); // expect: deserialize unserialize
+        echo $value; // expect: xss echo
+        header('Location: ' . $value); // expect: redirect header
+    """),
+    Case("environment_all_values", """
+        $values = getenv();
+        echo $values['HTTP_X_NAME']; // expect: xss echo
+    """),
+    Case("environment_explicit_null", """
+        $values = getenv(null);
+        system($values['COMMAND']); // expect: command system
+    """),
+    Case("environment_named_null", """
+        $values = getenv(name: null);
+        echo $values['NAME']; // expect: xss echo
+    """),
+    Case("environment_named_omitted_name", """
+        $values = getenv(local_only: true);
+        echo $values['NAME']; // expect: xss echo
+    """),
+    Case("environment_named_parameter_order", """
+        echo getenv(local_only: true, name: 'NAME'); // expect: xss echo
+        echo getenv(name: 'NAME', local_only: false); // expect: xss echo
+    """),
+    Case("environment_local_only_is_not_sanitization", """
+        system(getenv('COMMAND', true)); // expect: command system
+    """),
+    Case("environment_native_function_identity", r"""
+        namespace App;
+        use function getenv as read_environment;
+        echo read_environment('NAME'); // expect: xss echo
+        echo \GETENV('NAME'); // expect: xss echo
+        echo getenv('NAME'); // expect: xss echo
+    """),
+    Case("environment_namespaced_shadow", r"""
+        namespace App;
+        function getenv($name) { return 'fixed'; }
+        echo getenv('NAME');
+        echo \getenv('NAME'); // expect: xss echo
+    """),
+    Case("environment_method_lookalike", """
+        class Settings { function getenv($name) { return 'fixed'; } }
+        $settings = new Settings();
+        echo $settings->getenv('NAME');
+    """),
+    Case("environment_helper_values_and_defaults", """
+        function setting($name = 'NAME') { return getenv($name); }
+        function carry($value) { return ['item' => $value]; }
+        $values = carry(setting());
+        echo $values['item']; // expect: xss echo
+    """),
+    Case("environment_closure_capture", """
+        $value = $_ENV['NAME'];
+        $read = function () use ($value) { return $value; };
+        $value = 'fixed';
+        echo $read(); // expect: xss echo
+    """),
+    Case("environment_array_iteration", """
+        foreach (getenv() as $value) {
+            echo $value; // expect: xss echo
+        }
+        foreach ($_ENV as $value) {
+            system($value); // expect: command system
+        }
+    """),
+    Case("environment_map_copy_and_cell_overwrite", """
+        $original = getenv();
+        $copy = $original;
+        $original['NAME'] = 'fixed';
+        echo $original['NAME'];
+        echo $copy['NAME']; // expect: xss echo
+        echo $original['OTHER']; // expect: xss echo
+    """),
+    Case("environment_superglobal_copy_and_cell_overwrite", """
+        $copy = $_ENV;
+        $_ENV['NAME'] = 'fixed';
+        echo $_ENV['NAME'];
+        echo $copy['NAME']; // expect: xss echo
+        echo $_ENV['OTHER']; // expect: xss echo
+    """),
+    Case("environment_superglobal_reset_keeps_process_source", """
+        $_ENV = [];
+        echo $_ENV['NAME'];
+        echo getenv('NAME'); // expect: xss echo
+    """),
+    Case("environment_literal_value_overwrite", """
+        $value = getenv('NAME');
+        $value = 'fixed';
+        echo $value;
+        $values = getenv();
+        $values = ['NAME' => 'fixed'];
+        echo $values['NAME'];
+    """),
+    Case("environment_metadata_is_not_contents", """
+        echo count(getenv());
+        echo sizeof($_ENV);
+        echo isset($_ENV['NAME']);
+        echo array_key_exists('NAME', $_ENV);
+        echo strlen(getenv('NAME'));
+        echo getenv('NAME') === false;
+    """),
+    Case("environment_context_sanitizers_and_sql_parameters", """
+        $value = getenv('NAME');
+        echo htmlspecialchars($value, ENT_QUOTES);
+        system('printf %s ' . escapeshellarg($value));
+        eval(intval($value));
+        $db = new PDO('sqlite::memory:');
+        $statement = $db->prepare('SELECT ?');
+        $statement->execute([$value]);
+        $db->query('SELECT ' . intval($value));
+        header('Location: https://example.test/?name=' . rawurlencode($value));
+    """),
+    Case("environment_sanitizer_domain_isolation", """
+        $html = htmlspecialchars(getenv('COMMAND'), ENT_QUOTES);
+        system($html); // expect: command system
+        echo $html;
+        $shell = escapeshellarg($_ENV['NAME']);
+        echo $shell; // expect: xss echo
+    """),
+    Case("environment_filter_input_parity", """
+        echo filter_input(INPUT_ENV, 'NAME'); // expect: xss echo
+        echo filter_input(INPUT_ENV, 'COUNT', FILTER_VALIDATE_INT);
+    """),
+    Case("environment_nullable_name_array_values", """
+        $name = $_GET['all'] ? null : 'NAME';
+        $values = array_values(getenv($name));
+        echo $values[0]; // expect: xss echo
+    """),
+    Case("environment_nullable_name_helper_and_copy", """
+        function environment($name) { return getenv($name); }
+        $name = $_GET['all'] ? null : 'NAME';
+        $original = environment($name);
+        $copy = $original;
+        $original = 'fixed';
+        echo implode(',', array_values($copy)); // expect: xss echo
+    """),
+    Case("environment_nullable_name_iteration", """
+        $name = $_GET['all'] ? null : 'NAME';
+        foreach (getenv($name) as $value) {
+            echo $value; // expect: xss echo
+        }
+    """),
+    Case("environment_mixed_helper_return_keeps_array_arm", """
+        function environment($all) {
+            if ($all) { return getenv(); }
+            return 'fixed';
+        }
+        $values = array_values(environment($_GET['all']));
+        echo $values[0]; // expect: xss echo
+    """),
+    Case("environment_repeated_mixed_joins_keep_array_arm", """
+        $values = $_GET['all'] ? getenv() : 'fixed';
+        if ($_GET['again']) { $values = 'other'; }
+        echo implode(',', $values); // expect: xss echo
+        echo count($values);
+        $values = ['NAME' => 'fixed'];
+        echo implode(',', $values);
+    """),
+    Case("environment_mixed_array_does_not_import_scalar_contents", """
+        $values = $_GET['all'] ? ['NAME' => 'fixed'] : getenv('NAME');
+        $copy = array_values($values);
+        echo $copy[0];
+    """),
+    Case("environment_early_return_scalar_and_later_overwrite", """
+        function environment($all) {
+            $value = getenv('NAME');
+            if ($all) { return $value; }
+            $value = 'fixed';
+            return $value;
+        }
+        echo environment($_GET['all']); // expect: xss echo
+    """),
+    Case("environment_early_returns_are_invocation_local", """
+        function environment($all) {
+            if ($all) { return getenv('NAME'); }
+            return 'fixed';
+        }
+        function clean() { environment(true); return 'fixed'; }
+        echo clean();
+        echo environment(false);
+        echo environment(true); // expect: xss echo
+    """),
+    Case("environment_loop_return_preserves_value", """
+        function firstEnvironment() {
+            foreach (getenv() as $value) { return $value; }
+            return 'fixed';
+        }
+        echo firstEnvironment(); // expect: xss echo
+    """),
+    Case("environment_early_return_before_try_survives_finally", """
+        function environment($all) {
+            if ($all) { return getenv('NAME'); }
+            try { return 'later'; } finally { return 'fixed'; }
+        }
+        echo environment($_GET['all']); // expect: xss echo
+    """),
+    Case("environment_finally_return_replaces_try_value", """
+        function clean() {
+            try { return getenv('NAME'); } finally { return 'fixed'; }
+        }
+        echo clean();
+    """),
+)
+
+ENVIRONMENT_PARTIAL = (
+    Case("environment_invalid_name_type", """
+        echo $_GET['name']; // expect: xss echo
+        getenv(['NAME']);
+    """),
+    Case("environment_invalid_flag_type", """
+        echo $_GET['name']; // expect: xss echo
+        getenv('NAME', []);
+    """),
+    Case("environment_excess_arguments", """
+        echo $_GET['name']; // expect: xss echo
+        getenv('NAME', true, 'extra');
+    """),
+    Case("environment_unknown_named_parameter", """
+        echo $_GET['name']; // expect: xss echo
+        getenv(variable: 'NAME');
+    """),
+    Case("environment_duplicate_parameter", """
+        echo $_GET['name']; // expect: xss echo
+        getenv('NAME', name: 'OTHER');
+    """),
+    Case("environment_argument_expansion", """
+        echo $_GET['name']; // expect: xss echo
+        getenv(...$_GET);
+    """),
+    Case("environment_unknown_qualified_function", r"""
+        echo $_GET['name']; // expect: xss echo
+        echo Vendor\getenv('NAME');
+    """),
+    Case("environment_dynamic_callable", """
+        echo $_GET['name']; // expect: xss echo
+        $read = 'getenv';
+        echo $read('NAME');
+    """),
+    Case("environment_partial_return_object_ownership", """
+        function connection($all) {
+            if ($all) { return new PDO('sqlite::memory:'); }
+            return new PDO('sqlite::memory:');
+        }
+        echo getenv('NAME'); // expect: xss echo
+        connection($_GET['all']);
+    """),
+    Case("environment_partial_return_nested_object_ownership", """
+        function connection($all) {
+            if ($all) { return ['db' => new PDO('sqlite::memory:')]; }
+            return [];
+        }
+        echo getenv('NAME'); // expect: xss echo
+        connection($_GET['all']);
+    """),
+    Case("environment_partial_return_reference_effects", """
+        function update(&$value, $all) {
+            if ($all) { $value = getenv('NAME'); return 'fixed'; }
+            return 'fixed';
+        }
+        echo getenv('NAME'); // expect: xss echo
+        $value = 'fixed';
+        update($value, $_GET['all']);
+    """),
+    Case("environment_partial_return_inside_finally_boundary", """
+        function environment($all) {
+            try {
+                if ($all) { return getenv('NAME'); }
+            } finally { return 'fixed'; }
+        }
+        echo getenv('NAME'); // expect: xss echo
+        environment($_GET['all']);
+    """),
+)
+
+CASES = (*CASES, *REDIRECT_CASES, *ENVIRONMENT_CASES)
 
 
 def identities():
@@ -1003,6 +1299,8 @@ for _case in PARTIAL:
 for _case in NAMED_PARTIAL:
     setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
 for _case in REDIRECT_PARTIAL:
+    setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
+for _case in ENVIRONMENT_PARTIAL:
     setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
 
 
@@ -1164,6 +1462,29 @@ class PHPPublicTests(EvidenceTest):
         self.assert_report(*self.execute(directory, cached=True), "json", (clean,))
         target.write_text(case.source, encoding="utf-8")
         self.assert_report(*self.execute(directory, cached=True), "json", (case,))
+
+    def test_public_environment_policy_cache_and_partial_findings(self):
+        unsafe = Case("environment_cached", "echo getenv('NAME'); // expect: xss echo")
+        directory = self.materialize((unsafe,), "environment-cache")
+        target = directory / unsafe.filename
+        self.assert_report(*self.execute(directory, cached=True), "json", (unsafe,))
+        self.assert_report(*self.execute(directory, cached=True), "json", (unsafe,))
+        self.assert_report(*self.execute(directory, extra=("--skip-php=5",), cached=True),
+                           "json", (unsafe,), expected_override=[])
+        self.assert_report(*self.execute(directory, cached=True), "json", (unsafe,))
+        suppressed = Case(unsafe.name, "echo getenv('NAME'); // ubs:ignore[" + RULES["xss"] + "]")
+        target.write_text(suppressed.source, encoding="utf-8")
+        self.assert_report(*self.execute(directory, cached=True), "json", (suppressed,))
+        clean = Case(unsafe.name, "echo htmlspecialchars(getenv('NAME'), ENT_QUOTES);")
+        target.write_text(clean.source, encoding="utf-8")
+        self.assert_report(*self.execute(directory, cached=True), "json", (clean,))
+        target.write_text(unsafe.source, encoding="utf-8")
+        self.assert_report(*self.execute(directory, cached=True), "json", (unsafe,))
+        partial = self.materialize(ENVIRONMENT_PARTIAL[:3], "environment-partial")
+        for mode in ("module-json", "json", "module-sarif", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(partial, mode), mode,
+                                   ENVIRONMENT_PARTIAL[:3], partial=True)
 
     def test_public_budget_failure_is_explicit(self):
         directory = self.materialize((CASES[0],), "budget")

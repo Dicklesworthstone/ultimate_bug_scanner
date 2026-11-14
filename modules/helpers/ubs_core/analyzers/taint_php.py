@@ -127,13 +127,16 @@ def joined(*values: Value) -> Value:
     if any(value.literal != literal for value in values[1:]):
         literal = UNKNOWN
     refs = frozenset(ref for value in values for ref in value.refs)
+    # A scalar alternative does not erase the contents of a possible array.
+    # Keep its element facet through mixed joins without claiming that every
+    # alternative is an array (which would grant invalid call/argument proof).
+    arrays = tuple(value for value in values if value.array or value.items or value.fallback is not None)
+    # GH #195: retain eager dictionary forms until the SQL pass can prove
+    # record-state writes do not export SQL text via generator-key callbacks.
+    keys = {key: None for value in arrays for key, _ in value.items}
+    items = {key: joined(*(dict(value.items).get(key, value.fallback or EMPTY) for value in arrays)) for key in keys}
+    fallback = joined(*(value.fallback or EMPTY for value in arrays)) if arrays else None
     if all(value.array for value in values):
-        # GH #195: retain the eager dictionary forms in this engine until the
-        # SQL pass can prove its record-state writes do not export SQL text.
-        # Generator-key callbacks must remain unresolved in that boundary.
-        keys = {key: None for value in values for key, _ in value.items}
-        items = {key: joined(*(dict(value.items).get(key, value.fallback or EMPTY) for value in values)) for key in keys}
-        fallback = joined(*(value.fallback or EMPTY for value in values))
         return array_value(items, fallback)
     choices = []
     for value in values:
@@ -142,10 +145,11 @@ def joined(*values: Value) -> Value:
                 if len(choices) == MAX_STRING_CHOICES:
                     # Losing the header's name cannot establish a clean
                     # redirect. The selected sink reports that boundary.
-                    return Value(fact, literal=literal, refs=refs, parts=(Part(None, fact),))
+                    return Value(fact, literal=literal, refs=refs, parts=(Part(None, fact),),
+                                 items=tuple(items.items()), fallback=fallback)
                 choices.append(choice)
     return Value(fact, literal=literal, refs=refs, parts=(Part(None, fact),),
-                 string_choices=tuple(choices))
+                 string_choices=tuple(choices), items=tuple(items.items()), fallback=fallback)
 
 
 def tagged(value: Value, *tags: str, remove: frozenset[str] = frozenset()) -> Value:
@@ -230,6 +234,7 @@ class NativeSignature:
 # References: php/php-src PHP-8.4 ext/{standard,pdo,mysqli,filter,json,pcntl}
 # *.stub.php and https://www.php.net/manual/en/functions.arguments.php.
 _NATIVE_FUNCTIONS = {
+    "getenv": NativeSignature(("name", "local_only"), (scalar(None), scalar(False))),
     "header": NativeSignature(("header", "replace", "response_code"), (scalar(True), scalar(0))),
     "http_response_code": NativeSignature(("response_code",), (scalar(0),)),
     "system": NativeSignature(("command", "result_code"), (scalar(None),)),
@@ -334,6 +339,9 @@ class Engine:
         self.closures: dict[int, Function] = {}
         self.context = Context()
         self.call_depth = 0
+        self.partial_returns: list[Value] = []
+        self.return_aliases_unproved = False
+        self.try_depth = 0
         self.html = ""
         self.declaration_probe = False
 
@@ -891,16 +899,42 @@ class Engine:
                 value = self.typed(type_name, function.node.token) if type_name else EMPTY
             self.env[name] = value
         self.call_depth += 1
+        previous_returns = self.partial_returns, self.return_aliases_unproved, self.try_depth
+        self.partial_returns, self.return_aliases_unproved, self.try_depth = [], any(param[2] for param in params), 0
         try:
             _flow, result = self.execute(function.node.children[0])
+            result = joined(*self.partial_returns, result)
             effects = dict(self.env)
         finally:
             self.call_depth -= 1
             self.env, self.context = previous_env, previous_context
+            self.partial_returns, self.return_aliases_unproved, self.try_depth = previous_returns
         for index, (name, _type_name, byref, _default) in enumerate(params):
             if byref and index < len(arg_nodes) and arg_nodes[index] is not None:
                 self.assign(arg_nodes[index], effects.get(name, EMPTY))
         return result
+
+    def retain_partial_return(self, value: Value) -> None:
+        """Keep exited scalar paths separate from the continuing environment."""
+        if not self.call_depth:
+            return
+        if self.try_depth or self.return_aliases_unproved:
+            self.issue("PHP partial-return exception/reference effects are outside the selected subset")
+            return
+        pending = [value]
+        while pending:
+            self.budget.spend()
+            current = pending.pop()
+            if current.refs:
+                # A returning branch's objects may have been removed from
+                # the continuing heap. Reusing those refs would invent an
+                # object snapshot or lose a later finally mutation.
+                self.issue("PHP partial-return object ownership is outside the selected subset")
+                return
+            pending.extend(item for _key, item in current.items)
+            if current.fallback is not None:
+                pending.append(current.fallback)
+        self.partial_returns.append(value)
 
     def fork(self, node: Node, env: dict[str, Value], heap: dict[int, Object]) -> tuple[dict[str, Value], dict[int, Object], str, Value]:
         self.env, self.heap = dict(env), dict(heap)
@@ -1010,20 +1044,29 @@ class Engine:
             self.html = html
             if branch_yes[2] == branch_no[2] and branch_yes[2] != "normal":
                 return branch_yes[2], joined(branch_yes[3], branch_no[3])
+            for branch in (branch_yes, branch_no):
+                if branch[2] == "return":
+                    self.retain_partial_return(branch[3])
         elif kind in ("while", "for", "foreach", "do"):
             self.loop(node)
         elif kind == "try":
-            env, heap = dict(self.env), dict(self.heap)
-            branches = []
-            for child in node.children:
-                if child.kind != "finally":
-                    branches.append(self.fork(child, env, heap))
-            self.merge(tuple(branches))
-            for child in node.children:
-                if child.kind == "finally":
-                    flow, value = self.execute(child)
-                    if flow != "normal":
-                        return flow, value
+            self.try_depth += 1
+            try:
+                env, heap = dict(self.env), dict(self.heap)
+                branches = []
+                for child in node.children:
+                    if child.kind != "finally":
+                        branches.append(self.fork(child, env, heap))
+                self.merge(tuple(branches))
+                for child in node.children:
+                    if child.kind == "finally":
+                        flow, value = self.execute(child)
+                        if flow != "normal":
+                            return flow, value
+                if any(branch[2] == "return" for branch in branches):
+                    self.issue("PHP try-return completion is outside the selected subset")
+            finally:
+                self.try_depth -= 1
         else:
             self.issue("Unsupported PHP statement %s" % kind)
         return "normal", EMPTY
@@ -1052,6 +1095,8 @@ class Engine:
             old_env, old_heap = dict(self.env), dict(self.heap)
             branch = self.fork(body, old_env, old_heap)
             self.merge(((entry_env, entry_heap, "normal", EMPTY), branch))
+            if branch[2] == "return":
+                self.retain_partial_return(branch[3])
             if self.env == old_env and self.heap == old_heap:
                 return
             if branch[2] in ("break", "return", "throw"):
@@ -1123,6 +1168,8 @@ class Engine:
                 return array_value({}, self.source(node.token, node.value))
             if node.value == "$_SERVER":
                 return array_value({}, self.source(node.token, "request server metadata"))
+            if node.value == "$_ENV":
+                return array_value({}, self.source(node.token, "PHP environment value"))
             return EMPTY
         if kind == "name":
             name = node.value
@@ -1476,6 +1523,19 @@ class Engine:
             return EMPTY
         args, arg_nodes = bound
         first = args[0] if args else EMPTY
+        if name == "getenv":
+            # PHP 8 accepts a nullable name and an optional local_only flag.
+            # The flag selects where values come from, not whether their
+            # contents are safe for SQL, shell, HTML or other sink domains.
+            if len(args) > 2 or any(value.array or value.refs for value in args):
+                self.issue("Unsupported PHP getenv argument type or arity")
+                return EMPTY
+            value = self.source(token, "PHP getenv environment value")
+            if not args or first.literal is None:
+                return array_value({}, value)
+            if first.literal is UNKNOWN:
+                return joined(value, array_value({}, value))
+            return value
         if name == "header":
             self.response_header(args, token)
             return EMPTY
@@ -1608,7 +1668,7 @@ class Engine:
             return tagged(first, "html-text", "html-double", "html-single", "html-url")
         if name == "file_get_contents" and first.literal == "php://input":
             return self.source(token, "PHP raw request body")
-        if name in ("isset", "empty", "is_null", "is_array", "is_object", "is_string", "is_int", "is_integer", "is_float", "is_numeric", "is_bool", "ctype_digit", "in_array", "array_key_exists", "key_exists", "count", "sizeof", "strlen", "mb_strlen", "strpos", "str_contains", "str_starts_with", "str_ends_with", "preg_match", "preg_match_all", "assert", "getenv", "time", "date", "random_int", "random_bytes", "session_start", "session_write_close", "setcookie", "error_log", "exit", "die"):
+        if name in ("isset", "empty", "is_null", "is_array", "is_object", "is_string", "is_int", "is_integer", "is_float", "is_numeric", "is_bool", "ctype_digit", "in_array", "array_key_exists", "key_exists", "count", "sizeof", "strlen", "mb_strlen", "strpos", "str_contains", "str_starts_with", "str_ends_with", "preg_match", "preg_match_all", "assert", "time", "date", "random_int", "random_bytes", "session_start", "session_write_close", "setcookie", "error_log", "exit", "die"):
             return EMPTY
         if name == "unset":
             for target in arg_nodes:

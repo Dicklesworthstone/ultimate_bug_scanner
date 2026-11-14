@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track PHP environment values from native `getenv` and `$_ENV` through all
+  seven existing security domains. Support named arguments, nullable/all-value
+  getter forms and selected helper returns; `local_only` does not sanitize
+  contents. Preserve possible map elements across scalar/array joins and simple
+  early returns, while keeping metadata, literal replacements and domain-specific
+  escaping clean. Invalid native calls and unresolved object, reference or
+  exception completion paths remain explicitly incomplete.
+
 - Preserve Python generator laziness when a proven local helper does not read or
   escape the generator argument. Evaluate the outer iterable and ordinary helper
   effects while leaving the unconsumed element, filters and inner iterables

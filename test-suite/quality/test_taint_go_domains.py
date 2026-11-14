@@ -581,9 +581,8 @@ class GoSanitizerImportTests(packages.PackageTestCase):
                 self.check('import safe "html"', declaration + '\n'
                            'fmt.Fprint(w, safe.EscapeString(r.FormValue("q")))', 'xss', 'xss')
 
-    def test_saved_callable_and_selector_suffix_boundaries_are_preserved(self):
-        for expression, setup in (('escape(value)', 'escape := safe.EscapeString'),
-                                  ('obj . safe.EscapeString(value)', ''),
+    def test_selector_suffix_boundaries_are_preserved(self):
+        for expression, setup in (('obj . safe.EscapeString(value)', ''),
                                   ('safe.EscapeString(value)[1:]', '')):
             with self.subTest(expression=expression):
                 self.check('import safe "html"', 'value := r.FormValue("q")\n' + setup + '\n'
@@ -634,6 +633,121 @@ class GoSanitizerImportTests(packages.PackageTestCase):
         self.check(r'import safe "\x68tml"', 'fmt.Fprint(w, safe.EscapeString(r.FormValue("q")))')
 
 
+class SavedNativeValueOracleTests(packages.PackageTestCase):
+    """Independent source oracles for native function values, with exact sinks.
+
+    Capturing a Go function preserves that function's behavior; changing an
+    import alias later in another file cannot change the captured value. A
+    possible pass-through alternative, however, cannot prove HTML escaping.
+    """
+
+    def check_source(self, imports, body, expected, helpers=''):
+        source = 'package app\n' + imports + '\n' + helpers + '\nfunc h() {\n' + body + '\n}\n'
+        self.source('handler.go', source)
+        sites = []
+        for marker, rule in expected:
+            lines = [line for line, text in enumerate(source.splitlines(), 1) if marker in text]
+            self.assertEqual(len(lines), 1, (marker, source))
+            sites.append(('handler.go', lines[0], 'go.taint.' + rule))
+        return self.assert_hits(sites)
+
+    def test_saved_escapers_keep_only_the_html_domain_clean(self):
+        for package, member in (('html', 'EscapeString'), ('html/template', 'HTMLEscapeString'),
+                                ('text/template', 'HTMLEscapeString')):
+            with self.subTest(package=package):
+                self.check_source('import safe "' + package + '"',
+                                  'escape := safe.' + member + '\n'
+                                  'alias := escape\nvalue := alias(r.FormValue("q"))\n'
+                                  'fmt.Fprint(w, value) // escaped output\n'
+                                  'db.Query(value) // sql-site\n'
+                                  'exec.Command("sh", "-c", value) // command-site',
+                                  (('sql-site', 'sql'), ('command-site', 'command')))
+
+    def test_saved_escaper_does_not_hide_argument_effects_or_raw_siblings(self):
+        self.check_source('import "html"',
+                          'escape := html.EscapeString\nvalue := r.FormValue("q")\n'
+                          '_ = escape(render(value)) // effect-site\n'
+                          'fmt.Fprint(w, escape(value) + value) // sibling-site',
+                          (('effect-site', 'xss'), ('sibling-site', 'xss')),
+                          'func render(value string) string { fmt.Fprint(w, value); return value }')
+
+    def test_captured_function_survives_package_name_shadowing(self):
+        self.check_source('import "html"',
+                          'escape := html.EscapeString\n'
+                          'html := fake\n_ = html\nfmt.Fprint(w, escape(r.FormValue("q")))', ())
+
+    def test_callable_reassignment_and_scope_restore_do_not_keep_stale_sanitization(self):
+        self.check_source('import "html"',
+                          'escape := html.EscapeString\nvalue := r.FormValue("q")\n'
+                          '{ escape := passthrough; fmt.Fprint(w, escape(value)) } // shadow-site\n'
+                          'fmt.Fprint(w, escape(value)) // restored outer binding\n'
+                          'escape = passthrough\nfmt.Fprint(w, escape(value)) // overwrite-site',
+                          (('shadow-site', 'xss'), ('overwrite-site', 'xss')),
+                          'func passthrough(value string) string { return value }')
+
+    def test_function_choice_sanitizes_only_when_every_alternative_escapes(self):
+        helpers = 'func passthrough(value string) string { return value }'
+        self.check_source('import ("html"; "text/template")',
+                          'escape := html.EscapeString\n'
+                          'if choice { escape = template.HTMLEscapeString }\n'
+                          'fmt.Fprint(w, escape(r.FormValue("q")))', (), helpers)
+        self.check_source('import "html"',
+                          'escape := html.EscapeString\nif choice { escape = passthrough }\n'
+                          'fmt.Fprint(w, escape(r.FormValue("q"))) // maybe-raw',
+                          (('maybe-raw', 'xss'),), helpers)
+
+    def test_lookalike_and_dot_imports_keep_their_actual_identity(self):
+        self.check_source('import html "example.test/passthrough"',
+                          'escape := html.EscapeString\n'
+                          'fmt.Fprint(w, escape(r.FormValue("q"))) // raw-site',
+                          (('raw-site', 'xss'),))
+        self.check_source('import . "html"',
+                          'escape := EscapeString\nfmt.Fprint(w, escape(r.FormValue("q")))', ())
+
+    def test_saved_decoding_and_reading_preserve_payload_but_not_error_slots(self):
+        for package in ('encoding/json', 'encoding/xml'):
+            with self.subTest(package=package):
+                self.check_source('import (codec "' + package + '"; "io")',
+                                  'read := io.ReadAll\nraw, readErr := read(r.Body)\n'
+                                  'decode := codec.Unmarshal\nvar p Payload\n'
+                                  'decodeErr := decode(raw, &p)\n'
+                                  'db.Query(p.SQL) // payload-site\n'
+                                  'db.Query(readErr.Error())\ndb.Query(decodeErr.Error())\n'
+                                  'db.Query("SELECT $1", p.SQL)',
+                                  (('payload-site', 'sql'),))
+
+    def test_saved_decoder_factory_retains_the_reader(self):
+        for package in ('encoding/json', 'encoding/xml'):
+            with self.subTest(package=package):
+                self.check_source('import codec "' + package + '"',
+                                  'makeDecoder := codec.NewDecoder\n'
+                                  'decoder := makeDecoder(r.Body)\nvar p Payload\n'
+                                  'err := decoder.Decode(&p)\ndb.Query(p.SQL) // payload-site\n'
+                                  'db.Query(err.Error())', (('payload-site', 'sql'),))
+
+    def test_clean_saved_decoder_and_escaped_outputs_stay_clean(self):
+        self.check_source('import ("encoding/json"; "strings"; "html")',
+                          'makeDecoder := json.NewDecoder\n'
+                          'decoder := makeDecoder(strings.NewReader(`{"SQL":"SELECT 1"}`))\n'
+                          'var p Payload\ndecoder.Decode(&p)\ndb.Query(p.SQL)\n'
+                          'escape := html.EscapeString\nfmt.Fprint(w, escape(r.FormValue("q")))', ())
+
+    def test_decoder_choice_keeps_possible_output_parameter_writes(self):
+        self.check_source('import ("encoding/json"; "encoding/xml")',
+                          'decode := json.Unmarshal\nif choice { decode = xml.Unmarshal }\n'
+                          'var p Payload\ndecode([]byte(r.FormValue("body")), &p)\n'
+                          'db.Query(p.SQL) // possible-write', (('possible-write', 'sql'),))
+
+    def test_saved_operations_in_local_helpers_keep_file_authority(self):
+        self.source('helper.go', 'package app\nimport ("encoding/json"; "html")\n'
+                    'func decode(raw []byte, out *Payload) { call := json.Unmarshal; call(raw, out) }\n'
+                    'func escaped(value string) string { call := html.EscapeString; return call(value) }\n')
+        self.check_source('import html "example.test/passthrough"',
+                          'var p Payload\ndecode([]byte(r.FormValue("body")), &p)\n'
+                          'db.Query(p.SQL) // helper-write\n'
+                          'fmt.Fprint(w, escaped(r.FormValue("q")))', (('helper-write', 'sql'),))
+
+
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 for real scanner tests')
 class GoSanitizerRunnerTests(unittest.TestCase):
     def test_actual_json_and_sarif_use_imported_sanitizer_identity(self):
@@ -655,6 +769,19 @@ class GoSanitizerRunnerTests(unittest.TestCase):
             ('argument-effect', 'import safe "html"',
              'func render(value string) string { fmt.Fprint(w, value); return value }',
              '_ = safe.EscapeString(render(r.FormValue("q")))', {'xss'}),
+            ('saved-escape-domains', 'import "html"', '',
+             'escape := html.EscapeString; value := escape(r.FormValue("q")); '
+             'fmt.Fprint(w, value); db.Query(value); exec.Command("sh", "-c", value)', {'sql', 'command'}),
+            ('saved-escape-choice', 'import ("html"; "text/template")', '',
+             'escape := html.EscapeString; if choice { escape = template.HTMLEscapeString }; '
+             'fmt.Fprint(w, escape(r.FormValue("q")))', set()),
+            ('saved-escape-unknown-choice', 'import "html"',
+             'func passthrough(value string) string { return value }',
+             'escape := html.EscapeString; if choice { escape = passthrough }; '
+             'fmt.Fprint(w, escape(r.FormValue("q")))', {'xss'}),
+            ('saved-argument-effect', 'import "html"',
+             'func render(value string) string { fmt.Fprint(w, value); return value }',
+             'escape := html.EscapeString; _ = escape(render(r.FormValue("q")))', {'xss'}),
         ]
         for name, imports, helper, body, expected in cases:
             for output in ('json', 'sarif'):
@@ -681,6 +808,105 @@ class GoSanitizerRunnerTests(unittest.TestCase):
                              if rule.startswith(('go.taint.', 'golang.taint.'))}
                     self.assertEqual(taint, expected, report)
                     print('GO_SANITIZER_E2E_PASS', name, output, sorted(taint), flush=True)
+
+
+@unittest.skipUnless(os.environ.get('UBS_TAINT_NATIVE_GO') == '1',
+                     'set UBS_TAINT_NATIVE_GO=1 to compile the native callable witness')
+class NativeCallableRuntimeTests(unittest.TestCase):
+    def test_compiled_saved_functions_match_analyzer_contracts(self):
+        source = textwrap.dedent('''\
+            package main
+            import (
+                "encoding/json"
+                "encoding/xml"
+                "fmt"
+                "html"
+                "io"
+                "net/http"
+                "net/http/httptest"
+                "net/url"
+                "os"
+                "strings"
+                "text/template"
+            )
+            type Payload struct { SQL string; HTML string }
+            type database struct { Queries []string }
+            func (db *database) Query(query string, args ...any) { db.Queries = append(db.Queries, query) }
+            func raw(value string) string { return value }
+            func escaped(r *http.Request, w http.ResponseWriter, choose bool) {
+                escape := html.EscapeString
+                if choose { escape = template.HTMLEscapeString }
+                fmt.Fprint(w, escape(r.FormValue("q")))
+            }
+            func snapshot(r *http.Request, w http.ResponseWriter) {
+                escape := html.EscapeString
+                saved := escape
+                escape = raw
+                fmt.Fprint(w, saved(r.FormValue("q")))
+                fmt.Fprint(w, escape(r.FormValue("q"))) // raw-output
+            }
+            func unmarshaled(r *http.Request, db *database, w http.ResponseWriter) {
+                read := io.ReadAll
+                decode := json.Unmarshal
+                data, readErr := read(r.Body)
+                if readErr != nil { panic(readErr) }
+                var p Payload
+                decodeErr := decode(data, &p)
+                if decodeErr != nil { panic(decodeErr) }
+                db.Query(p.SQL) // decoded-query
+                db.Query("SELECT $1", p.SQL)
+                escape := html.EscapeString
+                fmt.Fprint(w, escape(p.HTML))
+            }
+            func factory(r *http.Request, db *database) {
+                makeDecoder := xml.NewDecoder
+                decoder := makeDecoder(r.Body)
+                var p Payload
+                if err := decoder.Decode(&p); err != nil { panic(err) }
+                db.Query(p.SQL) // factory-query
+            }
+            func main() {
+                value := "<b>request</b>"
+                req := httptest.NewRequest("GET", "/?q=" + url.QueryEscape(value), nil)
+                a, b, c := httptest.NewRecorder(), httptest.NewRecorder(), httptest.NewRecorder()
+                escaped(req, a, false)
+                escaped(req, b, true)
+                snapshot(req, c)
+                body, err := json.Marshal(Payload{SQL: "SELECT request", HTML: value})
+                if err != nil { panic(err) }
+                db := &database{}
+                rendered := httptest.NewRecorder()
+                unmarshaled(httptest.NewRequest("POST", "/", strings.NewReader(string(body))), db, rendered)
+                factory(httptest.NewRequest("POST", "/", strings.NewReader("<Payload><SQL>SELECT xml</SQL></Payload>")), db)
+                observed := map[string]any{
+                    "html": a.Body.String(), "template": b.Body.String(),
+                    "snapshot": c.Body.String(), "decoded_html": rendered.Body.String(), "queries": db.Queries,
+                }
+                if err := json.NewEncoder(os.Stdout).Encode(observed); err != nil { panic(err) }
+            }
+        ''')
+        with tempfile.TemporaryDirectory(prefix='ubs-go-native-callable-') as tmp:
+            path = Path(tmp) / 'main.go'
+            path.write_text(source, encoding='utf-8')
+            native = subprocess.run(['go', 'run', str(path)], cwd=tmp, text=True,
+                                    capture_output=True, timeout=180,
+                                    env=dict(os.environ, GOWORK='off', GO111MODULE='off', GOTOOLCHAIN='local'))
+            self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+            self.assertEqual(json.loads(native.stdout), {
+                'html': '&lt;b&gt;request&lt;/b&gt;', 'template': '&lt;b&gt;request&lt;/b&gt;',
+                'snapshot': '&lt;b&gt;request&lt;/b&gt;<b>request</b>',
+                'decoded_html': '&lt;b&gt;request&lt;/b&gt;',
+                'queries': ['SELECT request', 'SELECT $1', 'SELECT xml'],
+            })
+            findings = list(taint_go.run(RunContext(lang='go', files=[path])))
+            expected = {
+                (number, 'go.taint.' + rule)
+                for number, line in enumerate(source.splitlines(), 1)
+                for marker, rule in [('raw-output', 'xss'), ('decoded-query', 'sql'), ('factory-query', 'sql')]
+                if '// ' + marker in line
+            }
+            self.assertEqual({(row['line'], row['rule']) for row in findings}, expected, findings)
+            self.assertEqual(len(findings), len(expected), findings)
 
 
 if __name__ == "__main__":

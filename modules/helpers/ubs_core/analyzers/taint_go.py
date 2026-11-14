@@ -6,7 +6,9 @@ loops and package call summaries to convergence. Sanitizers are specific to the
 interpreter receiving a value. This is a conservative source analyzer, not a
 Go type checker; arbitrary imported-package calls and dynamically invoked
 closures are not resolved. File-local imports identify standard JSON/XML,
-reader and HTML escape operations, including aliases. Decoders and Unmarshal
+reader and HTML escape operations, including captured function aliases.
+Callable joins retain unknown alternatives instead of borrowing a native
+sanitizer or clean error-result contract. Decoders and Unmarshal
 propagate input through local destination pointers and package helper output
 parameters, using conservative aggregate writes rather than field-sensitive
 heap models. Only explicitly
@@ -50,10 +52,6 @@ SOURCE_PATTERNS = [
     re.compile(r"bufio\.NewReader\(os\.Stdin\)", re.IGNORECASE),
     re.compile(r"\b(?:r|req|request)\.Body\b"),
 ]
-
-HTML_SANITIZERS = re.compile(
-    r"(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*(EscapeString|HTMLEscapeString))?\s*\("
-)
 
 SINKS = [
     (re.compile(r"(?<![\w.])fmt\.Fprint(?:f|ln)?\s*\("), 'go.taint.xss', 'fmt.Fprintf'),
@@ -247,6 +245,30 @@ class _DecoderInfo:
     definite: bool = True
 
 
+@dataclass(frozen=True)
+class _NativeKey:
+    cell: str
+
+
+@dataclass(frozen=True)
+class _NativeInfo:
+    operations: frozenset[tuple[str, str]] = frozenset()
+    unknown: bool = False
+
+
+_UNKNOWN_NATIVE = _NativeInfo(unknown=True)
+
+
+def _join_native(*values):
+    # Missing metadata is fixed-point bottom, such as a forward initializer.
+    # An assigned unknown callable is a real alternative and must survive.
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return _NativeInfo(frozenset().union(*(value.operations for value in values)),
+                       any(value.unknown for value in values))
+
+
 def _join(*facts: _Fact) -> _Fact:
     result = {}
     for fact in facts:
@@ -281,6 +303,8 @@ def _join_states(*states):
             decoders = [state.get(name) for state in states]
             result[name] = _DecoderInfo(_join(*(item.source for item in decoders if item is not None)),
                                         all(item is not None and item.definite for item in decoders))
+        elif isinstance(name, _NativeKey):
+            result[name] = _join_native(*(state.get(name) for state in states))
         else:
             result[name] = _join(*(state.get(name, _CLEAN) for state in states))
     return result
@@ -622,7 +646,7 @@ class _Flow:
 
 class _Analysis:
     def __init__(self, source: str, code: str, rule: str, summaries: dict[str, _Summary],
-                 imports: _ImportContexts):
+                 imports: _ImportContexts, uncertain_globals=None):
         self.source, self.code, self.rule, self.summaries = source, code, rule, summaries
         self.imports = imports
         self.effects = {}
@@ -630,6 +654,9 @@ class _Analysis:
         self.named_returns = ()
         self.writes: dict[int, _Fact] = {}
         self.decoder_results: dict[int, _DecoderInfo] = {}
+        self.native_mutations: set[str] = set()
+        self.native_escapes: set[str] = set()
+        self.uncertain_globals = uncertain_globals if uncertain_globals is not None else set()
 
     @staticmethod
     def unparenthesize(expr, offset=0):
@@ -661,8 +688,9 @@ class _Analysis:
         code = _masked_source(expr)
         call = re.match(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
         if call and _pairs(code).get(call.end() - 1) == len(expr) - 1:
-            identity = self.native_identity(call.group(1), call.group(2), offset, scope)
-            if identity in {('json', 'NewDecoder'), ('xml', 'NewDecoder')}:
+            native = self.native_callable(call.group(1), call.group(2), offset, state, scope)
+            if native is not None and native.operations and native.operations <= {
+                    ('json', 'NewDecoder'), ('xml', 'NewDecoder')}:
                 return self.decoder_results.get(offset)
         return None
 
@@ -670,6 +698,33 @@ class _Analysis:
         if root in scope.bindings or root in self.summaries:
             return None
         return self.imports.resolve(root, member, offset)
+
+    def native_callable(self, root, member, offset, state, scope):
+        if member is None and root in scope.bindings:
+            cell = scope.bindings[root]
+            value = state.get(_NativeKey(cell))
+            if cell in self.uncertain_globals or cell in self.native_escapes:
+                return _join_native(value, _UNKNOWN_NATIVE)
+            return value
+        identity = self.native_identity(root, member, offset, scope)
+        return _NativeInfo(frozenset({identity})) if identity is not None else _UNKNOWN_NATIVE
+
+    def native_value(self, expr, offset, state, scope):
+        expr, offset = self.unparenthesize(expr, offset)
+        name = re.fullmatch(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?', _masked_source(expr))
+        if name:
+            return self.native_callable(name.group(1), name.group(2), offset, state, scope)
+        return _UNKNOWN_NATIVE
+
+    def invalidate_native_targets(self, targets, state):
+        # Code receiving an address can replace the callable or retain that
+        # address. Keep possible native writes, but never its sanitizer proof.
+        for target in targets:
+            key = _NativeKey(target.cell)
+            if key in state:
+                state[key] = _join_native(state[key], _UNKNOWN_NATIVE)
+                self.native_mutations.add(target.cell)
+                self.native_escapes.add(target.cell)
 
     def write_targets(self, targets, fact, state, label):
         # Decode can partially modify an object even when it returns an error.
@@ -686,13 +741,15 @@ class _Analysis:
         expr, code, pairs, offset = expression.text, expression.code, expression.pairs, expression.offset
         root, member = match.group(1), match.group(2)
         end = pairs.get(match.end() - 1)
-        if end is None:
+        if end is None or code[:match.start()].rstrip().endswith('.'):
             return None
         receiver = state.get(_DecoderKey(scope.bindings.get(root, root)))
-        identity = self.native_identity(root, member, offset + match.start(1), scope)
-        constructor = identity in {('json', 'NewDecoder'), ('xml', 'NewDecoder')}
-        unmarshal = identity in {('json', 'Unmarshal'), ('xml', 'Unmarshal')}
-        readall = identity in {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
+        native = self.native_callable(root, member, offset + match.start(1), state, scope)
+        operations = native.operations if native is not None else frozenset()
+        constructor = bool(operations) and operations <= {('json', 'NewDecoder'), ('xml', 'NewDecoder')}
+        unmarshal = bool(operations) and operations <= {('json', 'Unmarshal'), ('xml', 'Unmarshal')}
+        readall = bool(operations) and operations <= {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
+        sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
         methods = {'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
                    'UseNumber', 'DisallowUnknownFields', 'Buffered'}
         method = member if receiver is not None and member in methods else None
@@ -706,9 +763,11 @@ class _Analysis:
                 outer_end = pairs.get(opening)
                 if outer_end is None:
                     return None
-        if not (constructor or unmarshal or readall or method):
+        if not (constructor or unmarshal or readall or sanitizer or method):
             return None
         if whole and code[outer_end + 1:].strip():
+            return None
+        if sanitizer and re.match(r'\s*[.\[]', code[end + 1:]):
             return None
 
         def arguments(start, stop):
@@ -720,21 +779,33 @@ class _Analysis:
             return values, targets
 
         values, targets = arguments(match.end(), end)
+        if native is not None:
+            # Argument effects can invalidate a captured callable. Ordinary
+            # reads and calls need not have one total evaluation order in Go,
+            # so retain both identities instead of gaining sanitizer proof.
+            native = _join_native(native, self.native_callable(root, member,
+                                                               offset + match.start(1), state, scope))
         if constructor:
             if len(values) != 1:
                 return end, (_CLEAN,)
-            receiver = _DecoderInfo(values[0])
+            receiver = _DecoderInfo(values[0], not native.unknown)
             self.decoder_results[offset + match.start(1)] = receiver
             if not chain:
-                return end, (_CLEAN,)
+                return end, (values[0] if native.unknown else _CLEAN,)
             method = chain.group(1)
             values, targets = arguments(end + chain.end() + 1, outer_end)
         if unmarshal:
             if len(values) == 2:
                 self.write_targets(targets[1], values[0], state, root + '.Unmarshal' if member else root)
-            return end, (_CLEAN,)
+            return end, (_join(*values) if native.unknown else _CLEAN,)
         if readall:
-            return end, (_join(*values), _CLEAN)
+            fact = _join(*values)
+            return end, (fact, fact if native.unknown else _CLEAN)
+        if sanitizer:
+            # The callee is captured before its arguments execute. Evaluating
+            # every argument still preserves sinks and mutations inside it.
+            clean = self.rule == 'go.taint.xss' and not native.unknown and len(values) == 1
+            return end, (_CLEAN if clean else _join(*values),)
         if method in {'Decode', 'DecodeElement'}:
             if targets:
                 self.write_targets(targets[0], receiver.source, state, method)
@@ -772,6 +843,7 @@ class _Analysis:
         for start, end in _parts(_masked_source(expr)):
             arguments.append(self.value(expr[start:end], offset + start, state, scope))
             targets.append(self.pointers(expr[start:end], state, scope))
+            self.invalidate_native_targets(targets[-1], state)
         summary = self.summaries[name]
         if summary.variadic is not None:
             arguments = [*arguments[:summary.variadic], _join(*arguments[summary.variadic:])]
@@ -814,19 +886,6 @@ class _Analysis:
             for pos in range(start, end):
                 masked[pos] = '\n' if code[pos] == '\n' else ' '
 
-        if self.rule == 'go.taint.xss':
-            for match in HTML_SANITIZERS.finditer(code):
-                identity = self.native_identity(match.group(1), match.group(2),
-                                                offset + match.start(1), scope)
-                if (identity not in {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
-                        or code[:match.start()].rstrip().endswith('.')):
-                    continue
-                end = pairs.get(match.end() - 1)
-                if end is not None and not re.match(r'\s*[.\[]', code[end + 1:]):
-                    # Escaping the return cannot undo effects performed while
-                    # computing the argument (including local helper sinks).
-                    self.value(expr[match.end():end], offset + match.end(), state, scope)
-                    cover(match.start(), end + 1)
         for match in re.finditer(r'\bstruct\s*\{', code):
             end = pairs.get(match.end() - 1)
             if end is None:
@@ -864,17 +923,40 @@ class _Analysis:
                                  for start, end in _parts(code[invocation + 1:pairs[invocation]])]
                 for index, parameter in enumerate(parameters):
                     if parameter:
-                        closure_state[closure_scope.declare(parameter, offset + match.start())] = (
+                        key = closure_scope.declare(parameter, offset + match.start())
+                        closure_state[key] = (
                             arguments[index] if index < len(arguments) else _CLEAN)
-                nested = _Analysis(self.source, self.code, self.rule, self.summaries, self.imports)
+                        closure_state[_NativeKey(key)] = _UNKNOWN_NATIVE
+                nested = _Analysis(self.source, self.code, self.rule, self.summaries, self.imports,
+                                   self.uncertain_globals)
+                nested.native_escapes = set(self.native_escapes)
                 nested.block(_Parser(self.code).block(offset + opening + 1, offset + close),
                              closure_state, closure_scope)
+                # Invocation timing and captured writes are not described by
+                # return facts. A possible writer invalidates the old proof.
+                for cell in nested.native_mutations:
+                    if _NativeKey(cell) in state:
+                        self.invalidate_native_targets((_Target(cell),), state)
                 for (sink_offset, label), fact in nested.effects.items():
                     self.effect(sink_offset, label, fact)
                 if immediate:
                     facts.extend(nested.returns)
                     close = pairs[invocation]
                 cover(match.start(), close + 1)
+        for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code):
+            if masked[match.start()].isspace():
+                continue
+            result = self.native_call(_CallExpression(expr, code, pairs, offset), match, state, scope)
+            if result is not None:
+                end, values = result
+                facts.extend(values)
+                cover(match.start(), end + 1)
+            else:
+                end = pairs.get(match.end() - 1)
+                if end is not None:
+                    for start, stop in _parts(code[match.end():end]):
+                        self.invalidate_native_targets(
+                            self.pointers(expr[match.end() + start:match.end() + stop], state, scope), state)
         for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)\s*\(', code):
             name = match.group(1)
             end = pairs.get(match.end() - 1)
@@ -884,14 +966,6 @@ class _Analysis:
             facts.extend(self.call(name, expr[match.end():end], offset + match.end(),
                                    offset + match.start(), state, scope))
             cover(match.start(), end + 1)
-        for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code):
-            if masked[match.start()].isspace():
-                continue
-            result = self.native_call(_CallExpression(expr, code, pairs, offset), match, state, scope)
-            if result is not None:
-                end, values = result
-                facts.extend(values)
-                cover(match.start(), end + 1)
         remaining = ''.join(masked)
         for regex, rule, label in SINKS:
             if rule != self.rule:
@@ -958,6 +1032,11 @@ class _Analysis:
                                        values[index] if index < len(values) else _CLEAN)
                                  for index in range(count))
             return _Flow(None)
+        indirect = re.match(r'\s*\*\s*([A-Za-z_]\w*)\s*=(?!=)', code)
+        if indirect:
+            self.value(self.source[start + indirect.end():end], start + indirect.end(), state, scope)
+            self.invalidate_native_targets(self.pointers(indirect.group(1), state, scope), state)
+            return _Flow(state)
         for pattern in ASSIGN_PATTERNS:
             match = pattern.match(code)
             if match is None:
@@ -970,7 +1049,8 @@ class _Analysis:
             for left, right in pieces:
                 expression = self.source[expr_start + left:expr_start + right]
                 metadata.append((self.pointers(expression, state, scope),
-                                 self.decoder(expression, expr_start + left, state, scope), expression))
+                                 self.decoder(expression, expr_start + left, state, scope),
+                                 self.native_value(expression, expr_start + left, state, scope), expression))
             declaration = match.group('op') == ':=' or bool(re.match(r'\s*(?:var|const)\b', code))
             updates = {}
             for index, target in enumerate(targets):
@@ -983,7 +1063,8 @@ class _Analysis:
                 if match.group('op') == '+=':
                     fact = _join(state.get(key, _CLEAN), fact)
                 updates[key] = _advance(fact, target)
-                pointers, decoder, expression = metadata[index] if index < len(metadata) else (frozenset(), None, '')
+                pointers, decoder, native, expression = (metadata[index] if index < len(metadata)
+                                                         else (frozenset(), None, _UNKNOWN_NATIVE, ''))
                 if pointers and all(pointer.parameter is None for pointer in pointers):
                     # A pointer alias observes its pointee at use time. Copying
                     # old pointee facts here would survive a later clean reset.
@@ -993,12 +1074,16 @@ class _Analysis:
                     pointers = frozenset({_Target(key)})
                 updates[_PointerKey(key)] = pointers
                 updates[_DecoderKey(key)] = decoder
+                updates[_NativeKey(key)] = native
+                self.native_mutations.add(key)
             state.update(updates)
             return _Flow(state)
         declaration = re.match(r'\s*var\s+([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s+[^=]+$', code)
         if declaration:
             for name in declaration.group(1).split(','):
-                state[scope.declare(name.strip(), start)] = _CLEAN
+                key = scope.declare(name.strip(), start)
+                state[key] = _CLEAN
+                state[_NativeKey(key)] = _UNKNOWN_NATIVE
         self.value(self.source[start:end], start, state, scope)
         return _Flow(state)
 
@@ -1103,7 +1188,9 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
     # Pre-bind their stable cells so a forward reference cannot accidentally
     # read a different, unbound name on the first pass.
     declare_globals(global_nodes)
-    global_analysis = _Analysis(source, code, rule, summaries, imports)
+    global_cells = set(globals_scope.bindings.values())
+    uncertain_globals = set()
+    global_analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals)
     global_state = {}
     by_name = defaultdict(list)
     for function in functions:
@@ -1122,10 +1209,12 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
         name = pending.popleft()
         queued.discard(name)
         if name == '@globals':
-            global_analysis = _Analysis(source, code, rule, summaries, imports)
+            global_analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals)
             updated = global_analysis.block(global_nodes, dict(global_state), globals_scope).normal or {}
             updated = _join_states(global_state, updated)
-            if updated != global_state:
+            newly_uncertain = (global_analysis.native_escapes & global_cells) - uncertain_globals
+            uncertain_globals.update(newly_uncertain)
+            if updated != global_state or newly_uncertain:
                 global_state = updated
                 # Initializers can depend on later variables, including through
                 # local helper calls. Join finite facts and revisit both sides
@@ -1136,13 +1225,15 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                         queued.add(caller)
             continue
         variants = []
+        mutations = set()
         for function in by_name[name]:
-            analysis = _Analysis(source, code, rule, summaries, imports)
+            analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals)
             state, scope = dict(global_state), globals_scope.child()
             for index, parameter in enumerate(function.parameters):
                 if parameter and parameter != '_':
                     key = scope.declare(parameter, function.start)
                     state[key] = frozenset({_Trace(parameter, index, (parameter,))})
+                    state[_NativeKey(key)] = _UNKNOWN_NATIVE
                     if index in function.reference_parameters:
                         state[_PointerKey(key)] = frozenset({_Target(key, index)})
             for result in function.results:
@@ -1150,7 +1241,17 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                     state[scope.declare(result, function.start)] = _CLEAN
             analysis.named_returns = function.results
             analysis.block(function.body, state, scope)
+            mutations.update(analysis.native_mutations)
             variants.append(_Summary(analysis.returns, analysis.effects, function.variadic, analysis.writes))
+        newly_uncertain = (mutations & global_cells) - uncertain_globals
+        if newly_uncertain:
+            # Package callbacks are mutable cells. A write in any selected
+            # function invalidates initializer-only authority in every caller.
+            uncertain_globals.update(newly_uncertain)
+            for caller in ('@globals', *summaries):
+                if caller not in queued:
+                    pending.append(caller)
+                    queued.add(caller)
         summary = _join_summaries(variants)
         if summary != summaries[name]:
             summaries[name] = summary

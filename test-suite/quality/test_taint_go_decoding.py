@@ -1098,6 +1098,149 @@ class HigherOrderNativeFlowTests(packages.PackageTestCase):
         ''')
         self.assert_sites([('handler.go', 'result-expression-mutation', 'fmt.Fprint', 'xss')])
 
+    def test_parenthesized_native_unmarshal_keeps_writes_and_error_results(self):
+        for codec in ('encoding/json', 'encoding/xml'):
+            with self.subTest(codec=codec):
+                self.source('handler.go', '''
+                    package app
+                    import codec "''' + codec + '''"
+                    func h() {
+                        var p, fixed Payload
+                        err := ((codec.Unmarshal))([]byte(r.FormValue("body")), &p)
+                        db.Query(p.SQL) // decoded-query
+                        fmt.Fprint(w, p.HTML) // decoded-html
+                        exec.Command("sh", "-c", p.Command) // decoded-command
+                        db.Query(err.Error())
+                        db.Query("SELECT $1", p.SQL)
+                        fixedErr := (codec.Unmarshal)([]byte("{}"), &fixed)
+                        db.Query(fixed.SQL)
+                        db.Query(fixedErr.Error())
+                    }
+                ''')
+                self.assert_sites([('handler.go', 'decoded-query', 'db.Query', 'sql'),
+                                   ('handler.go', 'decoded-html', 'fmt.Fprint', 'xss'),
+                                   ('handler.go', 'decoded-command', 'exec.Command', 'command')])
+
+    def test_parenthesized_saved_readers_keep_payload_and_error_slots(self):
+        self.source('handler.go', '''
+            package app
+            import (stream "io"; "strings")
+            func h() {
+                read := stream.ReadAll
+                saved := read
+                read = customReader
+                value, err := ((saved))(r.Body)
+                db.Query(string(value)) // request-bytes
+                db.Query(err.Error())
+                fixed, fixedErr := (saved)(strings.NewReader("SELECT 1"))
+                db.Query(string(fixed))
+                db.Query(fixedErr.Error())
+            }
+        ''')
+        self.assert_sites([('handler.go', 'request-bytes', 'db.Query', 'sql')])
+
+    def test_parenthesized_decoder_factories_preserve_chained_and_saved_receivers(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings")
+            func h() {
+                var a, b, fixed Payload
+                err := (json.NewDecoder)(r.Body).Decode(&a)
+                db.Query(a.SQL) // chained-decoder
+                db.Query(err.Error())
+                factory := json.NewDecoder
+                decoder := ((factory))(r.Body)
+                decoder.Decode(&b)
+                db.Query(b.SQL) // saved-decoder
+                known := (factory)(strings.NewReader("{}"))
+                known.Decode(&fixed)
+                db.Query(fixed.SQL)
+            }
+        ''')
+        self.assert_sites([('handler.go', 'chained-decoder', 'db.Query', 'sql'),
+                           ('handler.go', 'saved-decoder', 'db.Query', 'sql')])
+
+    def test_parenthesized_helpers_keep_pointer_effects_and_native_contexts(self):
+        self.source('helper.go', '''
+            package app
+            import codec "encoding/json"
+            func decode(data []byte, out *Payload) error { return (codec.Unmarshal)(data, out) }
+            func relay(data []byte, out *Payload) error { return ((decode))(data, out) }
+            func apply(escape func(string) string, value string) string { return (escape)(value) }
+        ''')
+        self.source('handler.go', '''
+            package app
+            import "html"
+            func h() {
+                var p Payload
+                err := ((relay))([]byte(r.FormValue("body")), &p)
+                db.Query(p.SQL) // helper-write
+                db.Query(err.Error())
+                escaped := (apply)(html.EscapeString, r.FormValue("q"))
+                fmt.Fprint(w, escaped)
+                db.Query(escaped) // sanitizer-domain
+            }
+        ''')
+        self.assert_sites([('handler.go', 'helper-write', 'db.Query', 'sql'),
+                           ('handler.go', 'sanitizer-domain', 'db.Query', 'sql')])
+
+    def test_parenthesized_sanitizers_keep_identity_and_argument_effects(self):
+        self.source('handler.go', '''
+            package app
+            import "html"
+            func raw(value string) string { return value }
+            func emit(value string) string { fmt.Fprint(w, value); return value }
+            func h() {
+                value := r.FormValue("q")
+                escape := html.EscapeString
+                saved := escape
+                escape = raw
+                fmt.Fprint(w, (saved)(value))
+                fmt.Fprint(w, ((escape))(value)) // overwritten-callee
+                fmt.Fprint(w, (html.EscapeString)((emit)(value))) // argument-sink
+                db.Query((saved)(value)) // sql-domain
+                exec.Command("sh", "-c", (saved)(value)) // command-domain
+                html := custom
+                fmt.Fprint(w, (html.EscapeString)(value)) // shadowed-package
+            }
+        ''')
+        self.assert_sites([('handler.go', 'overwritten-callee', 'fmt.Fprint', 'xss'),
+                           ('handler.go', 'argument-sink', 'emit)', 'xss'),
+                           ('handler.go', 'sql-domain', 'db.Query', 'sql'),
+                           ('handler.go', 'command-domain', 'exec.Command', 'command'),
+                           ('handler.go', 'shadowed-package', 'fmt.Fprint', 'xss')])
+
+    def test_parenthesized_sink_targets_and_source_getters_keep_locations(self):
+        self.source('handler.go', '''
+            package app
+            func h() {
+                value := (r.FormValue)("q")
+                (db.Query)(value) // query-sink
+                ((fmt.Fprint))(w, value) // html-sink
+                (exec.Command)("sh", "-c", value) // command-sink
+                _ = "(json.Unmarshal)(r.Body, &value)"
+                // (db.Query)(r.FormValue("q"))
+            }
+        ''')
+        self.assert_sites([('handler.go', 'query-sink', 'db.Query', 'sql'),
+                           ('handler.go', 'html-sink', 'fmt.Fprint', 'xss'),
+                           ('handler.go', 'command-sink', 'exec.Command', 'command')])
+
+    def test_parenthesized_lookalike_imports_do_not_borrow_native_contracts(self):
+        self.source('handler.go', '''
+            package app
+            import (codec "example.test/codec"; "example.test/html")
+            func h() {
+                var p Payload
+                err := (codec.Unmarshal)([]byte(r.FormValue("body")), &p)
+                db.Query(p.SQL)
+                db.Query(err.Error()) // unknown-result
+                fmt.Fprint(w, (html.EscapeString)(r.FormValue("q"))) // false-escaper
+            }
+        ''')
+        self.assert_sites([('handler.go', 'unknown-result', 'db.Query', 'sql'),
+                           ('handler.go', 'false-escaper', 'fmt.Fprint', 'xss')])
+
 
 class HigherOrderContextLimitTests(packages.PackageTestCase):
     def test_exhausted_context_budget_is_partial_and_never_cached_as_complete(self):
@@ -1664,6 +1807,21 @@ class DecodingRunnerTests(unittest.TestCase):
             ('saved-clean-input', 'import "encoding/json"', '',
              'decode := json.Unmarshal; var p Payload; decode([]byte(`{"SQL":"SELECT 1"}`), &p); '
              'db.Query(p.SQL)', set()),
+            ('parenthesized-write', 'import "encoding/json"', '',
+             'var p Payload; err := ((json.Unmarshal))([]byte(r.FormValue("body")), &p); '
+             '(db.Query)(p.SQL); db.Query(err.Error()); db.Query("SELECT $1", p.SQL)', {'sql'}),
+            ('parenthesized-reader', 'import "io"', '',
+             'read := io.ReadAll; raw, err := (read)(r.Body); '
+             'db.Query(string(raw)); db.Query(err.Error())', {'sql'}),
+            ('parenthesized-helper', '',
+             'import "encoding/json"\nfunc decode(raw []byte, dst *Payload) error { return (json.Unmarshal)(raw, dst) }',
+             'var p Payload; err := (decode)([]byte(r.FormValue("body")), &p); '
+             'db.Query(p.SQL); db.Query(err.Error())', {'sql'}),
+            ('parenthesized-escape', 'import "html"', '',
+             'escape := html.EscapeString; fmt.Fprint(w, ((escape))(r.FormValue("q")))', set()),
+            ('parenthesized-bound-query', 'import "encoding/json"', '',
+             'var p Payload; (json.Unmarshal)([]byte(r.FormValue("body")), &p); '
+             '(db.Query)("SELECT $1", p.SQL)', set()),
         ]
         artifacts = packages.ROOT / 'test-suite/artifacts/go-decoding'
         for name, imports, helper, body, expected in cases:

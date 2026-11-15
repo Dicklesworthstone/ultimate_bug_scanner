@@ -46,15 +46,15 @@ _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'U
                    'html': {'EscapeString'}, 'template': {'HTMLEscapeString'}}
 
 SOURCE_PATTERNS = [
-    re.compile(r"\.FormValue\(", re.IGNORECASE),
-    re.compile(r"\.PostFormValue\(", re.IGNORECASE),
-    re.compile(r"\.(?:Form|PostForm)\.Get\(", re.IGNORECASE),
-    re.compile(r"\.Header\.Get\(", re.IGNORECASE),
+    re.compile(r"\.FormValue\s*\(", re.IGNORECASE),
+    re.compile(r"\.PostFormValue\s*\(", re.IGNORECASE),
+    re.compile(r"\.(?:Form|PostForm)\.Get\s*\(", re.IGNORECASE),
+    re.compile(r"\.Header\.Get\s*\(", re.IGNORECASE),
     re.compile(r"URL\.Query\(\)\.Get", re.IGNORECASE),
-    re.compile(r"\.PathValue\(", re.IGNORECASE),
-    re.compile(r"mux\.Vars\(", re.IGNORECASE),
-    re.compile(r"chi\.URLParam\(", re.IGNORECASE),
-    re.compile(r"\.(?:QueryParam|FormParam|Param)\(", re.IGNORECASE),
+    re.compile(r"\.PathValue\s*\(", re.IGNORECASE),
+    re.compile(r"mux\.Vars\s*\(", re.IGNORECASE),
+    re.compile(r"chi\.URLParam\s*\(", re.IGNORECASE),
+    re.compile(r"\.(?:QueryParam|FormParam|Param)\s*\(", re.IGNORECASE),
     re.compile(r"os\.Getenv", re.IGNORECASE),
     re.compile(r"bufio\.NewReader\(os\.Stdin\)", re.IGNORECASE),
     re.compile(r"\b(?:r|req|request)\.Body\b"),
@@ -142,6 +142,47 @@ def _pairs(code: str) -> dict[int, int]:
         elif char in ')]}' and stack and stack[-1][0] == {')': '(', ']': '[', '}': '{'}[char]:
             pairs[stack.pop()[1]] = pos
     return pairs
+
+
+def _call_code(code: str) -> str:
+    """Expose transparent named callees without changing source positions.
+
+    ``((decode))(data)`` calls the same binding as ``decode(data)``. Remove
+    only the grouping around an identifier/selector target, preserving every
+    argument delimiter and newline. A call result such as ``factory(decode)``
+    is an evaluated value, not grouping around ``decode``; it must not acquire
+    the argument's native authority.
+    """
+    transitions = list(re.finditer(r'\)\s*\(', code))
+    if not transitions:
+        return code
+    pairs = _pairs(code)
+    opening = {end: start for start, end in pairs.items()}
+    out = list(code)
+    for transition in transitions:
+        end = transition.start()
+        start = opening.get(end)
+        if start is None or code[start] != '(':
+            continue
+        prefix = code[:start].rstrip()
+        if (prefix and (prefix[-1].isalnum() or prefix[-1] in '_.)]}')
+                and not re.search(r'(?<![\w.])(?:go|defer)\s+$', code[:start])):
+            continue
+        left, right = start, end
+        groups = []
+        while left < right and code[left] == '(' and pairs.get(left) == right:
+            groups.append((left, right))
+            left += 1
+            right -= 1
+            while left < right and code[left].isspace():
+                left += 1
+            while left < right and code[right].isspace():
+                right -= 1
+        if not re.fullmatch(r'[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*', code[left:right + 1]):
+            continue
+        for left, right in groups:
+            out[left] = out[right] = ' '
+    return ''.join(out)
 
 
 def _parts(code: str, separator: str = ',') -> list[tuple[int, int]]:
@@ -844,16 +885,16 @@ class _Analysis:
 
     def value_info(self, expr, offset, state, scope):
         expr, offset = self.unparenthesize(expr, offset)
-        code = _masked_source(expr)
+        code = _call_code(_masked_source(expr))
         name = re.fullmatch(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?', code)
         if name:
             cell = scope.bindings.get(name.group(1), name.group(1))
             return _ValueInfo(self.native_callable(name.group(1), name.group(2), offset, state, scope),
                               state.get(_DecoderKey(cell)) if name.group(2) is None else None,
                               self.pointers(expr, state, scope))
-        call = re.match(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
+        call = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
         if call and _pairs(code).get(call.end() - 1) == len(expr) - 1:
-            results = self.call_results.get(offset)
+            results = self.call_results.get(offset + call.start(1))
             if results:
                 return results[0]
         return _ValueInfo(pointers=self.pointers(expr, state, scope))
@@ -1127,7 +1168,7 @@ class _Analysis:
         return tuple(self.instantiate(fact, arguments, name, infos) for fact in summary.returns)
 
     def values(self, expr: str, offset: int, state, scope) -> tuple[_Fact, ...]:
-        code = _masked_source(expr)
+        code = _call_code(_masked_source(expr))
         parts = _parts(code)
         if len(parts) > 1:
             values, infos = [], []
@@ -1164,7 +1205,7 @@ class _Analysis:
         return (value,)
 
     def value(self, expr: str, offset: int, state, scope) -> _Fact:
-        code = _masked_source(expr)
+        code = _call_code(_masked_source(expr))
         pairs = _pairs(code)
         masked = list(code)
         facts = []

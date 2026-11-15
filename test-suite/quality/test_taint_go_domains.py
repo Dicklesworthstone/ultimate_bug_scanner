@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -841,6 +842,88 @@ class GoSanitizerRunnerTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get('UBS_TAINT_NATIVE_GO') == '1',
                      'set UBS_TAINT_NATIVE_GO=1 to compile the native callable witness')
 class NativeCallableRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            version = subprocess.run(['go', 'version'], text=True, capture_output=True, timeout=10)
+        except FileNotFoundError:
+            self.skipTest('Go compiler is not installed')
+        if version.returncode != 0 or not re.match(r'^go version (?:go\d|devel\b)', version.stdout):
+            self.skipTest('go on PATH is not a Go compiler (go version did not identify one)')
+
+    def test_compiled_parenthesized_calls_match_analyzer_contracts(self):
+        source = textwrap.dedent('''\
+            package main
+            import (
+                "encoding/json"
+                "fmt"
+                "html"
+                "io"
+                "net/http"
+                "net/http/httptest"
+                "net/url"
+                "os"
+                "strings"
+            )
+            type Payload struct { SQL string; HTML string }
+            type database struct { Queries []string }
+            func (db *database) Query(query string, args ...any) { db.Queries = append(db.Queries, query) }
+            func raw(value string) string { return value }
+            func decode(data []byte, out *Payload) error { return (json.Unmarshal)(data, out) }
+            func handler(r *http.Request, db *database, w http.ResponseWriter) {
+                read := io.ReadAll
+                data, readErr := ((read))(r.Body)
+                if readErr != nil { db.Query(readErr.Error()); return }
+                var p Payload
+                if err := (decode)(data, &p); err != nil { db.Query(err.Error()); return }
+                (db.Query)(p.SQL) // decoded-query
+                (db.Query)("SELECT $1", p.SQL)
+                (fmt.Fprint)(w, (html.EscapeString)(p.HTML))
+                (fmt.Fprint)(w, p.HTML) // raw-output
+                escape := html.EscapeString
+                saved := escape
+                escape = raw
+                fmt.Fprint(w, (saved)((r.FormValue)("q")))
+                fmt.Fprint(w, ((escape))((r.FormValue)("q"))) // overwritten-output
+            }
+            func factoryHandler(r *http.Request, db *database) {
+                var p Payload
+                if err := (json.NewDecoder)(r.Body).Decode(&p); err != nil { db.Query(err.Error()); return }
+                db.Query(p.SQL) // factory-query
+            }
+            func main() {
+                value := "<b>request</b>"
+                body, err := json.Marshal(Payload{SQL: "SELECT request", HTML: value})
+                if err != nil { panic(err) }
+                db, w := &database{}, httptest.NewRecorder()
+                handler(httptest.NewRequest("POST", "/?q=" + url.QueryEscape(value), strings.NewReader(string(body))), db, w)
+                factoryHandler(httptest.NewRequest("POST", "/", strings.NewReader(string(body))), db)
+                observed := map[string]any{"rendered": w.Body.String(), "queries": db.Queries}
+                if err := json.NewEncoder(os.Stdout).Encode(observed); err != nil { panic(err) }
+            }
+        ''')
+        with tempfile.TemporaryDirectory(prefix='ubs-go-parenthesized-native-') as tmp:
+            path = Path(tmp) / 'main.go'
+            path.write_text(source, encoding='utf-8')
+            native = subprocess.run(['go', 'run', '-work', str(path)], cwd=tmp, text=True,
+                                    capture_output=True, timeout=180,
+                                    env=dict(os.environ, GOWORK='off', GO111MODULE='off',
+                                             GOTOOLCHAIN='local', GOTMPDIR=tmp))
+            self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+            self.assertEqual(json.loads(native.stdout), {
+                'rendered': '&lt;b&gt;request&lt;/b&gt;<b>request</b>&lt;b&gt;request&lt;/b&gt;<b>request</b>',
+                'queries': ['SELECT request', 'SELECT $1', 'SELECT request'],
+            })
+            findings = list(taint_go.run(RunContext(lang='go', files=[path])))
+            expected = {
+                (number, 'go.taint.' + rule)
+                for number, line in enumerate(source.splitlines(), 1)
+                for marker, rule in [('raw-output', 'xss'), ('overwritten-output', 'xss'),
+                                     ('decoded-query', 'sql'), ('factory-query', 'sql')]
+                if '// ' + marker in line
+            }
+            self.assertEqual({(row['line'], row['rule']) for row in findings}, expected, findings)
+            self.assertEqual(len(findings), len(expected), findings)
+
     def test_compiled_saved_functions_match_analyzer_contracts(self):
         source = textwrap.dedent('''\
             package main

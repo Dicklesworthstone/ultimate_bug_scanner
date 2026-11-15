@@ -1,0 +1,13 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ubs_core/analyzers/taint_go.py
+--- a/modules/helpers/ubs_core/analyzers/taint_go.py
++++ b/modules/helpers/ubs_core/analyzers/taint_go.py
+@@ -958,7 +958,8 @@
+         # Parentheses around a known function do not change its identity. A
+         # closing argument list followed by a call is different: f(os.Getenv)
+         # must not be mistaken for a grouped call to os.Getenv itself.
+-        opening = [pos for pos in range(match.start(), match.start(1)) if code[pos] == '(']
++        opening = [pos for pos in range(match.start(), match.start(1))
++                   if code[pos] == '(' and pairs.get(pos, len(code)) < match.end() - 1]
+         callee_end = match.end(2) if member else match.end(1)
+         closing = {pos for pos in range(callee_end, match.end() - 1) if code[pos] == ')'}
+         if {pairs.get(pos) for pos in opening} != closing:

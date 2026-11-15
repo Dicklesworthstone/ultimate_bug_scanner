@@ -1,0 +1,441 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ubs_core/analyzers/taint_go.py
+--- a/modules/helpers/ubs_core/analyzers/taint_go.py
++++ b/modules/helpers/ubs_core/analyzers/taint_go.py
+@@ -6,7 +6,7 @@
+ interpreter receiving a value. This is a conservative source analyzer, not a
+ Go type checker; arbitrary imported-package calls and dynamically invoked
+ closures are not resolved. File-local imports identify standard JSON/XML,
+-reader and HTML escape operations, including captured function aliases.
++reader, environment and HTML escape operations, including captured function aliases.
+ Selected package helpers transport callable and decoder identities through
+ parameters and result slots, with a finite context worklist independent of
+ payload traces. Excessive specialization is an explicit incomplete analysis.
+@@ -40,10 +40,13 @@
+ 
+ _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
+                     'io': 'io', 'io/ioutil': 'ioutil', 'html': 'html',
+-                    'html/template': 'template', 'text/template': 'template'}
++                    'html/template': 'template', 'text/template': 'template', 'os': 'os'}
+ _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
+                    'io': {'ReadAll'}, 'ioutil': {'ReadAll'},
+-                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString'}}
++                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
++                   'os': {'Getenv', 'LookupEnv'}}
++_NATIVE_CALL = re.compile(r'(?<![\w.])\s*(?:\(\s*)*([A-Za-z_]\w*)'
++                          r'(?:\s*\.\s*([A-Za-z_]\w*))?\s*(?:\)\s*)*\(')
+ 
+ SOURCE_PATTERNS = [
+     re.compile(r"\.FormValue\(", re.IGNORECASE),
+@@ -55,7 +58,6 @@
+     re.compile(r"mux\.Vars\(", re.IGNORECASE),
+     re.compile(r"chi\.URLParam\(", re.IGNORECASE),
+     re.compile(r"\.(?:QueryParam|FormParam|Param)\(", re.IGNORECASE),
+-    re.compile(r"os\.Getenv", re.IGNORECASE),
+     re.compile(r"bufio\.NewReader\(os\.Stdin\)", re.IGNORECASE),
+     re.compile(r"\b(?:r|req|request)\.Body\b"),
+ ]
+@@ -851,9 +853,9 @@
+             return _ValueInfo(self.native_callable(name.group(1), name.group(2), offset, state, scope),
+                               state.get(_DecoderKey(cell)) if name.group(2) is None else None,
+                               self.pointers(expr, state, scope))
+-        call = re.match(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
++        call = _NATIVE_CALL.match(code)
+         if call and _pairs(code).get(call.end() - 1) == len(expr) - 1:
+-            results = self.call_results.get(offset)
++            results = self.call_results.get(offset + call.start(1))
+             if results:
+                 return results[0]
+         return _ValueInfo(pointers=self.pointers(expr, state, scope))
+@@ -953,6 +955,14 @@
+         end = pairs.get(match.end() - 1)
+         if end is None or code[:match.start()].rstrip().endswith('.'):
+             return None
++        # Parentheses around a known function do not change its identity. A
++        # closing argument list followed by a call is different: f(os.Getenv)
++        # must not be mistaken for a grouped call to os.Getenv itself.
++        opening = [pos for pos in range(match.start(), match.start(1)) if code[pos] == '(']
++        callee_end = match.end(2) if member else match.end(1)
++        closing = {pos for pos in range(callee_end, match.end() - 1) if code[pos] == ')'}
++        if {pairs.get(pos) for pos in opening} != closing:
++            return None
+         receiver = state.get(_DecoderKey(scope.bindings.get(root, root)))
+         callable_source = state.get(scope.bindings.get(root, root), _CLEAN)
+         native = self.native_callable(root, member, offset + match.start(1), state, scope)
+@@ -961,6 +971,7 @@
+         unmarshal = bool(operations) and operations <= {('json', 'Unmarshal'), ('xml', 'Unmarshal')}
+         readall = bool(operations) and operations <= {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
+         sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
++        environment = operations & {('os', 'Getenv'), ('os', 'LookupEnv')}
+         methods = {'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
+                    'UseNumber', 'DisallowUnknownFields', 'Buffered'}
+         method = member if receiver is not None and member in methods else None
+@@ -974,7 +985,7 @@
+                 outer_end = pairs.get(opening)
+                 if outer_end is None:
+                     return None
+-        if not (constructor or unmarshal or readall or sanitizer or method):
++        if not (constructor or unmarshal or readall or sanitizer or environment or method):
+             return None
+         if whole and code[outer_end + 1:].strip():
+             return None
+@@ -1007,6 +1018,20 @@
+         callable_source = (_join(callable_source, state.get(scope.bindings.get(root, root), _CLEAN))
+                            if native is not None and native.unknown else _CLEAN)
+         fallback = _join(*values, callable_source)
++        if environment:
++            if len(values) != 1:
++                return finish(end, (fallback,))
++            # Reading a native environment value introduces provenance even
++            # when its key is literal. Merely taking the function's address
++            # introduces none. A possible getter branch must also survive a
++            # join with an escaper or an unknown callback of the same type.
++            sources = frozenset(_Trace(package + '.' + operation,
++                                       path=(package + '.' + operation,))
++                                for package, operation in environment)
++            payload = _join(sources, fallback if native.unknown or operations != environment else _CLEAN)
++            if operations == {('os', 'LookupEnv')}:
++                return finish(end, (payload, fallback if native.unknown else _CLEAN))
++            return finish(end, (payload,))
+         if constructor:
+             if len(values) != 1:
+                 return finish(end, (_CLEAN,))
+@@ -1145,7 +1170,7 @@
+                     values[index] = _join(values[index], state.get(scope.bindings.get(variable, variable), _CLEAN))
+             self.value_results[offset] = tuple(infos)
+             return tuple(values)
+-        native = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
++        native = _NATIVE_CALL.match(code)
+         if native:
+             result = self.native_call(_CallExpression(expr, code, _pairs(code), offset), native, state, scope, whole=True)
+             if result is not None:
+@@ -1241,8 +1266,8 @@
+                 if invoked:
+                     close = pairs[invocation]
+                 cover(match.start(), close + 1)
+-        for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code):
+-            if masked[match.start()].isspace():
++        for match in _NATIVE_CALL.finditer(code):
++            if masked[match.start(1)].isspace():
+                 continue
+             result = self.native_call(_CallExpression(expr, code, pairs, offset), match, state, scope)
+             if result is not None:
+diff --git a/test-suite/quality/test_taint_go_domains.py b/test-suite/quality/test_taint_go_domains.py
+--- a/test-suite/quality/test_taint_go_domains.py
++++ b/test-suite/quality/test_taint_go_domains.py
+@@ -540,6 +540,316 @@
+         '''), ["go.taint.xss"])
+ 
+ 
++class GoEnvironmentSourceTests(unittest.TestCase):
++    """Environment values are sources; function identities and presence are not.
++
++    Native import identity, not an identifier spelling, selects the contract.
++    Fixtures are retained for baseline/candidate and public scanner replay.
++    """
++
++    def setUp(self):
++        artifacts = ROOT / 'test-suite' / 'artifacts'
++        artifacts.mkdir(parents=True, exist_ok=True)
++        self.root = Path(tempfile.mkdtemp(prefix='go-environment-', dir=artifacts))
++
++    def check_source(self, imports, body, expected=(), helpers=''):
++        source = 'package app\n' + imports + '\n' + helpers + '\nfunc h() {\n' + body + '\n}\n'
++        path = self.root / 'handler.go'
++        path.write_text(source, encoding='utf-8')
++        findings = list(taint_go.run(RunContext(lang='go', files=[path])))
++        sites = []
++        for marker, rule, sink in expected:
++            lines = [(number, line) for number, line in enumerate(source.splitlines(), 1)
++                     if '// ' + marker in line]
++            self.assertEqual(len(lines), 1, (marker, source))
++            number, line = lines[0]
++            sites.append((number, line.index(sink) + 1, 'go.taint.' + rule))
++        actual = [(finding['line'], finding['col'], finding['rule']) for finding in findings]
++        self.assertEqual(sorted(actual), sorted(sites), (source, findings))
++        return findings
++
++    def test_direct_and_aliased_getenv_reach_every_security_domain(self):
++        for name in ('os', 'environment'):
++            with self.subTest(name=name):
++                self.check_source('import ' + name + ' "os"',
++                                  'value := ' + name + '.Getenv("UBS_INPUT")\n'
++                                  'db.Query(value) // query\n'
++                                  'fmt.Fprint(w, value) // output\n'
++                                  'exec.Command("sh", "-c", value) // command',
++                                  (('query', 'sql', 'db.Query'), ('output', 'xss', 'fmt.Fprint'),
++                                   ('command', 'command', 'exec.Command')))
++
++    def test_lookupenv_preserves_payload_and_presence_result_positions(self):
++        for name in ('os', 'environment'):
++            with self.subTest(name=name):
++                self.check_source('import ' + name + ' "os"',
++                                  'value, present := ' + name + '.LookupEnv("UBS_INPUT")\n'
++                                  'db.Query(value) // query\n'
++                                  'fmt.Fprint(w, present)\n'
++                                  'db.Query(fmt.Sprint(present))',
++                                  (('query', 'sql', 'db.Query'),))
++
++    def test_dot_imports_and_escaped_import_paths_keep_native_authority(self):
++        self.check_source('import . "os"',
++                          'value, present := LookupEnv("UBS_INPUT")\n'
++                          'db.Query(Getenv("UBS_INPUT") + value) // query\nfmt.Fprint(w, present)',
++                          (('query', 'sql', 'db.Query'),))
++        for path in ('`os`', '"\\x6fs"'):
++            with self.subTest(path=path):
++                self.check_source('import environment ' + path,
++                                  'db.Query(environment.Getenv("UBS_INPUT")) // query',
++                                  (('query', 'sql', 'db.Query'),))
++
++    def test_local_helper_returns_keep_lookupenv_result_slots(self):
++        self.check_source('import environment "os"',
++                          'value, present := read("UBS_INPUT")\n'
++                          'db.Query(value) // query\nfmt.Fprint(w, present)',
++                          (('query', 'sql', 'db.Query'),),
++                          'func read(key string) (string, bool) { return environment.LookupEnv(key) }')
++
++    def test_saved_function_identity_survives_rebinding_and_name_shadowing(self):
++        self.check_source('import "os"',
++                          'read := os.Getenv\nsaved := read\nread = constant\n'
++                          'os := unrelated\n_ = os\n'
++                          'db.Query(saved("UBS_INPUT")) // saved\ndb.Query(read("UBS_INPUT"))',
++                          (('saved', 'sql', 'db.Query'),),
++                          'func constant(key string) string { return "SELECT 1" }')
++
++    def test_saved_lookupenv_retains_clean_presence(self):
++        self.check_source('import environment "os"',
++                          'read := environment.LookupEnv\nalias := read\n'
++                          'value, present := alias("UBS_INPUT")\n'
++                          'fmt.Fprint(w, value) // output\nfmt.Fprint(w, present)',
++                          (('output', 'xss', 'fmt.Fprint'),))
++
++    def test_selected_helper_arguments_and_returned_callables_keep_sources(self):
++        self.check_source('import environment "os"',
++                          'read := keep(environment.Getenv)\n'
++                          'db.Query(invoke(read, "UBS_INPUT")) // query\n'
++                          'lookup := lookupReader()\nvalue, present := lookup("UBS_INPUT")\n'
++                          'fmt.Fprint(w, value) // output\nfmt.Fprint(w, present)',
++                          (('query', 'sql', 'db.Query'), ('output', 'xss', 'fmt.Fprint')),
++                          'func keep(read func(string) string) func(string) string { return read }\n'
++                          'func invoke(read func(string) string, key string) string { return read(key) }\n'
++                          'func lookupReader() func(string) (string, bool) { return environment.LookupEnv }')
++
++    def test_function_reference_is_not_environment_contents(self):
++        self.check_source('import "os"',
++                          'get := os.Getenv\nlookup := os.LookupEnv\n'
++                          'fmt.Fprint(w, get)\nfmt.Fprint(w, lookup)\n'
++                          'fmt.Fprint(w, os.Getenv)\nfmt.Fprint(w, os.LookupEnv)')
++
++    def test_lookalike_packages_do_not_invent_environment_sources(self):
++        for name, package in (('os', 'example.test/settings'), ('os', 'example.test/os'),
++                              ('environment', 'example.test/os')):
++            with self.subTest(name=name, package=package):
++                self.check_source('import ' + name + ' "' + package + '"',
++                                  'db.Query(' + name + '.Getenv("UBS_INPUT"))\n'
++                                  'value, present := ' + name + '.LookupEnv("UBS_INPUT")\n'
++                                  'fmt.Fprint(w, value, present)')
++
++    def test_local_and_parameter_shadows_do_not_borrow_os_authority(self):
++        self.check_source('import "os"',
++                          'os := settings\ndb.Query(os.Getenv("UBS_INPUT"))')
++        self.check_source('import "os"', '', helpers=
++                          'func read(os Settings) { db.Query(os.Getenv("UBS_INPUT")) }')
++        self.check_source('import . "os"',
++                          'Getenv := constant\ndb.Query(Getenv("UBS_INPUT"))', helpers=
++                          'func constant(key string) string { return "SELECT 1" }')
++
++    def test_dot_import_ambiguity_does_not_grant_native_contract(self):
++        self.check_source('import (. "os"; . "example.test/settings")',
++                          'value, present := LookupEnv("UBS_INPUT")\n'
++                          'db.Query(Getenv("UBS_INPUT"))\nfmt.Fprint(w, value, present)')
++
++    def test_overwrites_and_real_sink_specific_controls_stay_clean(self):
++        self.check_source('import (environment "os"; "html")',
++                          'value := environment.Getenv("UBS_INPUT")\n'
++                          'db.Query("SELECT $1", value)\n'
++                          'exec.Command("printf", "%s", value)\n'
++                          'escaped := html.EscapeString(value)\nfmt.Fprint(w, escaped)\n'
++                          'db.Query(escaped) // escaped-sql\n'
++                          'value = "SELECT 1"\ndb.Query(value)',
++                          (('escaped-sql', 'sql', 'db.Query'),))
++
++    def test_native_source_alternative_cannot_be_erased_by_an_escaper(self):
++        self.check_source('import (environment "os"; "html")',
++                          'read := environment.Getenv\nif choice { read = html.EscapeString }\n'
++                          'value := read("UBS_INPUT")\n'
++                          'db.Query(value) // query\nfmt.Fprint(w, value) // output',
++                          (('query', 'sql', 'db.Query'), ('output', 'xss', 'fmt.Fprint')))
++
++    def test_native_source_alternative_survives_unknown_function_join(self):
++        self.check_source('import environment "os"',
++                          'read := environment.Getenv\nif choice { read = constant }\n'
++                          'db.Query(read("UBS_INPUT")) // query',
++                          (('query', 'sql', 'db.Query'),),
++                          'func constant(key string) string { return "SELECT 1" }')
++
++    def test_parenthesized_native_and_captured_calls_retain_sources(self):
++        self.check_source('import environment "os"',
++                          'read := environment.Getenv\n'
++                          'db.Query((environment.Getenv)("UBS_INPUT")) // direct\n'
++                          'db.Query(((read))("UBS_INPUT")) // captured\n'
++                          'value, present := (environment.LookupEnv)("UBS_INPUT")\n'
++                          'db.Query(value) // lookup\nfmt.Fprint(w, present)',
++                          (('direct', 'sql', 'db.Query'), ('captured', 'sql', 'db.Query'),
++                           ('lookup', 'sql', 'db.Query')))
++
++    def test_argument_effects_are_preserved_when_only_presence_is_consumed(self):
++        self.check_source('import environment "os"',
++                          'read := environment.LookupEnv\n'
++                          '_, present := read(render(r.FormValue("q"))) // effect\n'
++                          'fmt.Fprint(w, present)', (('effect', 'xss', 'render'),),
++                          'func render(value string) string { fmt.Fprint(w, value); return "UBS_INPUT" }')
++
++    def test_import_identity_is_file_local_across_package_helpers(self):
++        first = self.root / 'first.go'
++        second = self.root / 'second.go'
++        first.write_text('package app\nimport environment "os"\n'
++                         'func source() string { return environment.Getenv("UBS_INPUT") }\n',
++                         encoding='utf-8')
++        second.write_text('package app\nimport environment "example.test/settings"\n'
++                          'func h() {\ndb.Query(source())\n'
++                          'db.Query(environment.Getenv("UBS_INPUT"))\n}\n', encoding='utf-8')
++        findings = list(taint_go.run(RunContext(lang='go', files=[first, second])))
++        self.assertEqual([(row['path'], row['line'], row['col'], row['rule']) for row in findings],
++                         [(str(second), 4, 1, 'go.taint.sql')], findings)
++        self.assertEqual(list(taint_go.run(RunContext(lang='go', files=[second]))), [])
++
++    def test_literals_comments_and_unrelated_field_names_do_not_create_sources(self):
++        self.check_source('import "os"',
++                          '// os.Getenv("UBS_INPUT")\n'
++                          'db.Query(`os.Getenv("UBS_INPUT")`)\n'
++                          'record := struct{Getenv string}{Getenv: "fixed"}\n'
++                          'fmt.Fprint(w, record.Getenv)')
++
++    @unittest.skipUnless(os.environ.get('UBS_TAINT_NATIVE_GO') == '1',
++                         'set UBS_TAINT_NATIVE_GO=1 to compile the environment witness')
++    def test_compiled_environment_values_and_clean_controls_match_runtime(self):
++        from test_keep_temp import prevent_child_deletion
++
++        source = textwrap.dedent('''\
++            package main
++            import (
++                "encoding/json"
++                "fmt"
++                "html"
++                "net/http/httptest"
++                environment "os"
++            )
++            type database struct { Queries []string }
++            func (db *database) Query(query string, args ...any) { db.Queries = append(db.Queries, query) }
++            func reader() func(string) string { return environment.Getenv }
++            func lookup(key string) (string, bool) { return environment.LookupEnv(key) }
++            func constant(key string) string { return "SELECT fixed" }
++            func main() {
++                db, w := &database{}, httptest.NewRecorder()
++                read := reader()
++                saved := read
++                read = constant
++                db.Query(saved("UBS_GO_ENV_VALUE")) // saved-query
++                db.Query(read("UBS_GO_ENV_VALUE"))
++                value, present := lookup("UBS_GO_ENV_VALUE")
++                db.Query(value) // lookup-query
++                db.Query("SELECT $1", value)
++                fmt.Fprint(w, present)
++                fmt.Fprint(w, html.EscapeString(value))
++                fmt.Fprint(w, value) // raw-output
++                value = "fixed"
++                fmt.Fprint(w, value)
++                observed := map[string]any{"rendered": w.Body.String(), "queries": db.Queries}
++                if err := json.NewEncoder(environment.Stdout).Encode(observed); err != nil { panic(err) }
++            }
++        ''')
++        path, executable = self.root / 'main.go', self.root / 'witness'
++        path.write_text(source, encoding='utf-8')
++        environment = dict(os.environ, GOWORK='off', GO111MODULE='off', GOTOOLCHAIN='local',
++                           UBS_GO_ENV_VALUE='<b>external</b>')
++        build = subprocess.run(['go', 'build', '-work', '-o', str(executable), str(path)],
++                               cwd=self.root, text=True, capture_output=True, timeout=180,
++                               env=environment, preexec_fn=prevent_child_deletion)
++        (self.root / 'build.stdout.log').write_text(build.stdout)
++        (self.root / 'build.stderr.log').write_text(build.stderr)
++        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
++        native = subprocess.run([str(executable)], cwd=self.root, text=True, capture_output=True,
++                                timeout=30, env=environment, preexec_fn=prevent_child_deletion)
++        (self.root / 'runtime.stdout.log').write_text(native.stdout)
++        (self.root / 'runtime.stderr.log').write_text(native.stderr)
++        self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
++        self.assertEqual(json.loads(native.stdout), {
++            'rendered': 'true&lt;b&gt;external&lt;/b&gt;<b>external</b>fixed',
++            'queries': ['<b>external</b>', 'SELECT fixed', '<b>external</b>', 'SELECT $1'],
++        })
++        findings = list(taint_go.run(RunContext(lang='go', files=[path])))
++        expected = sorted(
++            (number, line.index(sink) + 1, 'go.taint.' + rule)
++            for number, line in enumerate(source.splitlines(), 1)
++            for marker, rule, sink in [('saved-query', 'sql', 'db.Query'),
++                                       ('lookup-query', 'sql', 'db.Query'),
++                                       ('raw-output', 'xss', 'fmt.Fprint')]
++            if '// ' + marker in line
++        )
++        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings),
++                         expected, findings)
++
++
++@unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1',
++                     'set UBS_TAINT_E2E=1 for real module reports')
++class GoEnvironmentModuleTests(unittest.TestCase):
++    """Category 9 public reports; this does not claim every Go category ran."""
++
++    def test_real_module_reports_preserve_environment_payload_and_clean_presence(self):
++        from test_keep_temp import prevent_child_deletion
++
++        cases = (
++            ('aliased-getenv', 'import environment "os"',
++             'db.Query(environment.Getenv("UBS_INPUT"))', [('go.taint.sql', 4, 1)]),
++            ('saved-lookupenv', 'import environment "os"',
++             'read := environment.LookupEnv\nvalue, present := read("UBS_INPUT")\n'
++             'db.Query(value)\nfmt.Fprint(w, present)', [('go.taint.sql', 6, 1)]),
++            ('bound-query', 'import environment "os"',
++             'value, present := environment.LookupEnv("UBS_INPUT")\n'
++             'db.Query("SELECT $1", value)\nfmt.Fprint(w, present)', []),
++            ('lookalike', 'import os "example.test/settings"', 'db.Query(os.Getenv("UBS_INPUT"))', []),
++            ('local-shadow', 'import "os"', 'os := settings\ndb.Query(os.Getenv("UBS_INPUT"))', []),
++        )
++        artifacts = ROOT / 'test-suite' / 'artifacts'
++        artifacts.mkdir(parents=True, exist_ok=True)
++        skipped = ','.join(str(category) for category in range(1, 23) if category != 9)
++        for name, imports, body, expected in cases:
++            for output in ('json', 'sarif'):
++                with self.subTest(case=name, format=output):
++                    folder = Path(tempfile.mkdtemp(prefix='go-env-public-' + name + '-', dir=artifacts))
++                    path = folder / 'handler.go'
++                    path.write_text('package app\n' + imports + '\nfunc h() {\n' + body + '\n}\n')
++                    command = [str(ROOT / 'modules/ubs-golang.sh'), str(folder), '--ci',
++                               '--format=' + output, '--skip=' + skipped]
++                    result = subprocess.run(command, cwd=folder, capture_output=True, text=True,
++                                            timeout=180, preexec_fn=prevent_child_deletion,
++                                            env=dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1',
++                                                     UBS_CACHE_DIR=str(folder / 'cache')))
++                    (folder / 'stdout.log').write_text(result.stdout)
++                    (folder / 'stderr.log').write_text(result.stderr)
++                    self.assertEqual(result.returncode, 1 if expected else 0, result.stdout + result.stderr)
++                    report = json.loads(result.stdout)
++                    if output == 'json':
++                        self.assertEqual((report['status'], report['files'], report['critical']),
++                                         ('ok', 1, len(expected)), report)
++                        actual = [(row.get('rule', row.get('rule_id')), row['line'], row['col'])
++                                  for row in report['findings'] if row['severity'] == 'critical']
++                    else:
++                        actual = []
++                        for run in report['runs']:
++                            for invocation in run.get('invocations', []):
++                                self.assertTrue(invocation['executionSuccessful'], invocation)
++                            for row in run.get('results', []):
++                                if row['level'] == 'error':
++                                    region = row['locations'][0]['physicalLocation']['region']
++                                    actual.append((row['ruleId'], region['startLine'], region['startColumn']))
++                    self.assertEqual(sorted(actual), sorted(expected), report)
++
++
+ class GoSanitizerImportTests(packages.PackageTestCase):
+     def check(self, imports, body, *rules):
+         self.source('handler.go', 'package app\n' + imports + '\nfunc h() {\n' + body + '\n}\n')

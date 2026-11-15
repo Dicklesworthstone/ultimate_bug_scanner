@@ -1670,7 +1670,8 @@ class _Flow:
                         # A computed property write can replace a method.
                         # Element spreads use the wildcard slot directly and
                         # must not be mistaken for prototype/method writes.
-                        for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'entries', 'map'):
+                        for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
+                                       'splice', 'copyWithin', 'entries', 'map'):
                             slots[method] = _alternatives(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
@@ -2237,7 +2238,7 @@ class _Flow:
         return bool(refs) and not frozenset(fact) and all(
             ref in state.heap and isinstance(ref[0], _Scope)
             and (len(ref) == 2 or isinstance(ref[2], frozenset)
-                 or ref[2] in {'binding-rest', 'arguments-rest', 'commonjs'})
+                 or ref[2] in {'binding-rest', 'arguments-rest', 'commonjs', 'array-splice'})
             for ref in refs)
 
     def plain_data_descriptor_call(self, method, arguments, prepared, state):
@@ -2335,18 +2336,11 @@ class _Flow:
                 return False
         return True
 
-    def array_fill_bound(self, arguments, prepared, index, length):
-        """Resolve pure primitive bounds; keep unknown coercions explicit.
-
-        ECMAScript fill snapshots length before converting start/end. An
-        omitted or undefined end uses that length; null instead converts to 0.
-        Unknown primitive values need only weak writes. Unknown objects can
-        run conversion methods, so absence of taint is not a complete proof.
-        """
+    def array_integer_argument(self, arguments, prepared, index, default):
+        """Resolve pure ToIntegerOrInfinity inputs without executing coercions."""
         actual, uncertain, maybe_missing, kinds = prepared
         if uncertain is not None and index >= uncertain:
             return None, False
-        default = 0 if index == 1 else length
         if (index >= len(actual) or kinds.get(index) == 'undefined'
                 or (actual[index][1] and index not in maybe_missing)):
             return default, True
@@ -2386,20 +2380,173 @@ class _Flow:
                               float('-inf') if special.group(1) == '-' else float('inf'))
         if number is None:
             if re.fullmatch(r'[+-]?\s*(?:0[xX][\da-fA-F]+|0[bB][01]+|0[oO][0-7]+|[0-9][\d_]*)n', raw):
-                return None, False  # BigInt conversion throws; no normal fill proof.
+                return None, False  # BigInt conversion throws; no normal mutation proof.
             quoted = (re.fullmatch(r"'(?:\\[\s\S]|[^'\\])*'", raw) is not None
                       or re.fullmatch(r'"(?:\\[\s\S]|[^"\\])*"', raw) is not None)
             return None, quoted or kinds.get(index) == 'noniterable'
-        if length is None:
-            return None, True
+        return number, True
+
+    @staticmethod
+    def array_relative_index(number, length):
+        if number is None or length is None:
+            return None
         # Clamp before int(): infinities and huge finite numbers need no
         # allocation or exceptional numeric conversion.
         if number >= length:
-            return length, True
+            return length
         if number <= -length:
-            return 0, True
+            return 0
         number = int(number)
-        return (max(length + number, 0) if number < 0 else number), True
+        return max(length + number, 0) if number < 0 else number
+
+    def array_fill_bound(self, arguments, prepared, index, length):
+        # fill snapshots length before converting its bounds. Undefined end
+        # uses that length, while null converts to zero. Unknown primitive
+        # values allow weak writes; unknown objects can run arbitrary code.
+        number, pure = self.array_integer_argument(
+            arguments, prepared, index, 0 if index == 1 else length)
+        return self.array_relative_index(number, length), pure
+
+    def array_mutation_contract(self, ref, state, *, species=False):
+        """Require ordinary indexed properties and, for splice, native species."""
+        slots = state.heap[ref]
+        prototypes = [state.heap.get(('builtin', name), {})
+                      for name in ('Array.prototype', 'Object.prototype')]
+        constrained = any(key in slots for key in (_ARRAY_WRITE_CONTRACT, '__proto__'))
+        constrained = constrained or any(
+            any(key in prototype for key in (_ARRAY_WRITE_CONTRACT, '__proto__', None))
+            or any(self.array_index(key) is not None for key in prototype)
+            for prototype in prototypes)
+        if species:
+            constructor = state.heap.get(('builtin', 'Array'), {})
+            constrained = constrained or 'constructor' in slots or any(
+                'constructor' in prototype for prototype in prototypes) or any(
+                    key != 'prototype' for key in constructor)
+        return not constrained
+
+    def merge_array_mutation(self, ref, slots, length, state, *, definite):
+        """A joined receiver may be unchanged; only one proven target can kill."""
+        previous = state.heap[ref]
+        if not definite:
+            slots = {key: _alternatives(previous.get(key, previous.get(None, _ABSENT)),
+                                        slots.get(key, slots.get(None, _ABSENT)))
+                     for key in previous.keys() | slots.keys()}
+            if state.array_lengths[ref] != length:
+                length = None
+        state.heap[ref], state.array_lengths[ref] = slots, length
+
+    def array_copy_within(self, receiver, arguments, prepared, state):
+        refs = _refs(receiver)
+        for ref in refs:
+            slots, length = state.heap[ref], state.array_lengths[ref]
+            bounds = [self.array_integer_argument(arguments, prepared, index, default)
+                      for index, default in enumerate((0, 0, length))]
+            pure = all(valid for _number, valid in bounds)
+            target, start, end = (self.array_relative_index(number, length) for number, _pure in bounds)
+            if not pure:
+                self.incomplete.add('Array.copyWithin bound coercion requires unsupported value semantics')
+            count = (max(0, min(end - start, length - target))
+                     if None not in (target, start, end, length) else None)
+            if count == 0:
+                continue
+            ordinary = self.array_mutation_contract(ref, state)
+            if not ordinary:
+                self.incomplete.add('Array.copyWithin requires ordinary writable indexed properties')
+            numeric = {key: value for key, value in slots.items() if self.array_index(key) is not None}
+            self.engine.budget.spend(1 + len(numeric))
+            copied = dict(slots)
+            if count is not None and pure and ordinary:
+                # Snapshot the source before writing: both overlap directions
+                # preserve scalar values and shared object identities. A hole
+                # deletes the corresponding destination, rather than tainting it.
+                for key in numeric:
+                    if target <= int(key) < target + count:
+                        copied.pop(key)
+                for key, value in numeric.items():
+                    if start <= int(key) < start + count:
+                        copied[str(target + int(key) - start)] = value
+            else:
+                possible = _join(*numeric.values(), slots.get(None, frozenset()))
+                for key, value in numeric.items():
+                    copied[key] = _alternatives(value, possible)
+                copied[None] = _alternatives(slots.get(None, _ABSENT), possible)
+                if not pure or not ordinary:
+                    length = None
+            definite = len(refs) == 1 and ref not in state.weak_refs and pure and ordinary
+            self.merge_array_mutation(ref, copied, length, state, definite=definite)
+        return receiver
+
+    def array_splice(self, receiver, arguments, prepared, state, location):
+        """Transform selected slots and return a fresh, sparse removed array."""
+        actual, uncertain, _missing, _kinds = prepared
+        inserted = [value for value, _absent in actual[2:]]
+        if uncertain is not None:
+            inserted = [value for value, _absent in actual[min(2, uncertain):]]
+        refs = _refs(receiver)
+        removed_variants, removed_lengths = [], []
+        for ref in refs:
+            slots, length = state.heap[ref], state.array_lengths[ref]
+            first, first_pure = self.array_integer_argument(arguments, prepared, 0, 0)
+            start = self.array_relative_index(first, length)
+            if uncertain is None and len(actual) < 2:
+                count = 0 if not actual else length - start if length is not None and start is not None else None
+                count_pure = True
+            else:
+                raw_count, count_pure = self.array_integer_argument(arguments, prepared, 1, 0)
+                count = (0 if raw_count <= 0 else length - start if raw_count >= length - start
+                         else int(raw_count)) if None not in (raw_count, start, length) else None
+            pure = first_pure and count_pure and uncertain is None
+            if not pure:
+                self.incomplete.add('Array.splice bounds or spread require unsupported value semantics')
+            ordinary = self.array_mutation_contract(ref, state, species=True)
+            if not ordinary:
+                self.incomplete.add('Array.splice requires ordinary indexed properties and native array species')
+            numeric = {key: value for key, value in slots.items() if self.array_index(key) is not None}
+            self.engine.budget.spend(1 + len(numeric) + len(inserted))
+            changed, removed = dict(slots), {}
+            exact = None not in (length, start, count) and pure and ordinary
+            new_length = length + len(inserted) - count if exact else None
+            if new_length is not None and new_length > 4294967295:
+                self.incomplete.add('Array.splice result length exceeds the native array limit')
+                exact, new_length = False, None
+            if exact:
+                # Remove old positions before populating moved ones. Copy from
+                # the snapshot so overlapping shifts cannot overwrite a source.
+                for key in numeric:
+                    if int(key) >= start:
+                        changed.pop(key)
+                for key, value in numeric.items():
+                    index = int(key)
+                    if start <= index < start + count:
+                        removed[str(index - start)] = value
+                    elif start + count <= index < length:
+                        changed[str(index - count + len(inserted))] = value
+                changed.update({str(start + offset): value for offset, value in enumerate(inserted)})
+                if None in slots:
+                    removed[None] = slots[None]
+            else:
+                old_values = _join(*numeric.values(), slots.get(None, frozenset()))
+                possible = _join(old_values, *inserted)
+                for key, value in numeric.items():
+                    changed[key] = _alternatives(value, possible)
+                changed[None] = _alternatives(slots.get(None, _ABSENT), possible)
+                removed[None] = _Fact(old_values, _refs(old_values), absent=True)
+            removed_variants.append(removed)
+            removed_lengths.append(count if exact else None)
+            definite = exact and len(refs) == 1 and ref not in state.weak_refs
+            self.merge_array_mutation(ref, changed, new_length, state, definite=definite)
+        result = (self.scope, location, 'array-splice')
+        previous = state.heap.get(result)
+        if previous is not None:
+            removed_variants.append(previous)
+            removed_lengths.append(None)
+            state.weak_refs.add(result)
+        keys = set().union(*(slots.keys() for slots in removed_variants))
+        state.heap[result] = {key: _alternatives(*(slots.get(key, slots.get(None, _ABSENT))
+                                                 for slots in removed_variants)) for key in keys}
+        state.array_lengths[result] = (removed_lengths[0]
+            if removed_lengths and all(length == removed_lengths[0] for length in removed_lengths) else None)
+        return _Fact(refs=(result,))
 
     def array_fill(self, receiver, arguments, prepared, state):
         """Fill indexed slots without changing length or losing aliases."""
@@ -2485,7 +2632,7 @@ class _Flow:
         if reflect_native and method in {'defineProperty', 'preventExtensions', 'setPrototypeOf'}:
             return 'reflect', receiver, method
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
-        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill'}
+        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
@@ -2505,6 +2652,10 @@ class _Flow:
         values = [value for value, _missing in actual]
         if kind == 'array' and method == 'fill':
             return self.array_fill(receiver, arguments, prepared, state)
+        if kind == 'array' and method == 'copyWithin':
+            return self.array_copy_within(receiver, arguments, prepared, state)
+        if kind == 'array' and method == 'splice':
+            return self.array_splice(receiver, arguments, prepared, state, location)
         if values and (kind == 'reflect' or (kind == 'object' and method in {
                 'defineProperty', 'defineProperties', 'freeze', 'seal', 'preventExtensions', 'setPrototypeOf'})):
             target = _join(*values) if uncertain == 0 else values[0]
@@ -2840,6 +2991,10 @@ class _Flow:
                     self.incomplete.add('Own method requires an unsupported escaped closure environment')
                 return None, receiver
             return candidate, receiver
+        if (report and key in {'splice', 'copyWithin'} and _refs(receiver)
+                and all(ref in state.array_lengths for ref in _refs(receiver))
+                and self.native_target(name, state) is None):
+            self.incomplete.add(f'Array.{key} requires a known native or selected callable')
         if callable_value and report:
             self.incomplete.add('Own method requires an unambiguous callable and ordinary property semantics')
         return None, receiver

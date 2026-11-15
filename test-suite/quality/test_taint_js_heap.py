@@ -1339,6 +1339,201 @@ class HeapTaintTests(unittest.TestCase):
         self.scan('const items = [req.query.html, "safe"]; const alias = items.reverse(); res.send(items[0]);')
         self.scan('const items = [req.query.html, "safe"]; const alias = items.reverse(); res.send(alias[1]);', 'xss')
 
+    def test_splice_insertions_and_shifts_reach_aliases(self):
+        source = ('const items = ["safe", "tail"]; const alias = items;\n'
+                  'alias.splice(0, 1, req.query.html);\n'
+                  'res.send(items[0]);\nres.send(items[1]);')
+        findings = self.scan(source, 'xss')
+        self.assertEqual([finding['line'] for finding in findings], [3])
+        self.assert_runtime_sends(source, ['review-input', 'tail'])
+        self.scan('const items = ["safe", req.query.html]; '
+                  'items.splice(0, 1); res.send(items[0]);', 'xss')
+        self.scan('const items = [req.query.html]; '
+                  'items.splice(0, 0, "first", "second"); '
+                  'res.send(items[0]); res.send(items[1]); res.send(items[2]);', 'xss')
+
+    def test_splice_replacement_and_deletion_clear_only_removed_slots(self):
+        self.scan('const items = [req.query.html]; items.splice(0, 1, "safe"); res.send(items[0]);')
+        self.scan('const items = [req.query.html, req.query.html]; '
+                  'items.splice(0, 1); res.send(items[0]); res.send(items[1]);', 'xss')
+        self.scan('const items = [req.query.html]; items.splice(0); res.send(items[0]);')
+        self.scan('const items = [req.query.html]; items.splice(); res.send(items[0]);', 'xss')
+
+    def test_splice_literal_ranges_match_native_javascript(self):
+        cases = [
+            ('0, 1', ['review-input', 'b', 'c']),
+            ('1, 0', ['a', 'review-input', 'b', 'c']),
+            ('-1, 1', ['a', 'b', 'review-input']),
+            ('-99, Infinity', ['review-input']),
+            ('99, 9', ['a', 'b', 'c', 'review-input']),
+            ('1.9, 1.8', ['a', 'review-input', 'c']),
+            ('null, true', ['review-input', 'b', 'c']),
+            ('NaN, -1', ['review-input', 'a', 'b', 'c']),
+            ('undefined, undefined', ['review-input', 'a', 'b', 'c']),
+            ('-Infinity, 1e309', ['review-input']),
+        ]
+        for bounds, expected in cases:
+            with self.subTest(bounds=bounds):
+                source = ('const items = ["a", "b", "c"];\n'
+                          f'items.splice({bounds}, req.query.html);\n'
+                          + '\n'.join(f'res.send(items[{index}]);' for index in range(len(expected))))
+                findings = self.scan(source, 'xss')
+                self.assertEqual([finding['line'] for finding in findings],
+                                 [3 + expected.index('review-input')])
+                self.assert_runtime_sends(source, expected)
+
+    def test_splice_returns_fresh_removed_array_with_value_snapshots(self):
+        source = ('const items = [req.query.html, "tail"]; const alias = items;\n'
+                  'const removed = items.splice(0, 1, "safe");\n'
+                  'res.send(removed[0]);\nres.send(alias[0]);\n'
+                  'removed[0] = "changed"; res.send(items[0]);')
+        findings = self.scan(source, 'xss')
+        self.assertEqual([finding['line'] for finding in findings], [3])
+        self.assert_runtime_sends(source, ['review-input', 'safe', 'safe'])
+        self.scan('const items = [req.query.html]; res.send(items.splice(0, 1)[0]);', 'xss')
+        self.scan('const items = [req.query.html]; res.send(items.splice(0, 0).length);')
+
+    def test_splice_preserves_sparse_holes_and_named_properties(self):
+        source = ('const items = [, req.query.html, , "tail"]; items.label = "label";\n'
+                  'const removed = items.splice(0, 3);\n'
+                  'res.send(removed[0]); res.send(removed[1]); res.send(removed[2]);\n'
+                  'res.send(items[0]); res.send(items[1]); res.send(items.label);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, [None, 'review-input', None, 'tail', None, 'label'])
+        self.scan('const items = [req.query.html]; items["-1"] = req.query.html; '
+                  'items.splice(0); res.send(items[0]); res.send(items["-1"]);', 'xss')
+
+    def test_splice_retains_inserted_and_removed_object_identity(self):
+        source = ('const value = {html: "safe"}; const items = [value, value];\n'
+                  'const removed = items.splice(0, 1);\n'
+                  'removed[0].html = req.query.html; res.send(items[0].html);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan('const value = {html: "safe"}; const items = []; '
+                  'items.splice(0, 0, value); value.html = req.query.html; res.send(items[0].html);', 'xss')
+
+    def test_splice_helpers_and_sanitizer_domains(self):
+        self.scan('function replace(items, value) { return items.splice(0, 1, value); } '
+                  'const dirty = [req.query.html]; const clean = ["safe"]; '
+                  'const removed = replace(dirty, "safe"); replace(clean, req.query.html); '
+                  'res.send(dirty[0]); res.send(removed[0]); res.send(clean[0]);', 'xss', 'xss')
+        self.scan('const items = ["safe"]; items.splice(0, 1, DOMPurify.sanitize(req.query.html)); '
+                  'res.send(items[0]); eval(items[0]); db.query(items[0]); shell.exec(items[0]);',
+                  'eval', 'sql', 'command')
+
+    def test_splice_captures_receiver_and_method_before_arguments(self):
+        source = ('let items = ["old"]; const original = items; '
+                  'function input() { items = ["new"]; return req.query.html; } '
+                  'items.splice(0, 1, input()); res.send(original[0]); res.send(items[0]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'new'])
+        source = ('const items = ["old"]; function replacement() {} '
+                  'function input() { items.splice = replacement; return req.query.html; } '
+                  'items.splice(0, 1, input()); res.send(items[0]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_splice_and_copy_within_own_methods_keep_selected_bodies(self):
+        for method, arguments in (('splice', '0, 1, req.query.html'), ('copyWithin', '0, 1')):
+            with self.subTest(method=method):
+                self.scan('const items = ["safe", req.query.html]; '
+                          f'items.{method} = function() {{ this[0] = "safe"; return ["safe"]; }}; '
+                          f'const result = items.{method}({arguments}); '
+                          'res.send(items[0]); res.send(result[0]);')
+                self.scan('const items = ["safe"]; '
+                          f'items.{method} = function() {{ this[0] = req.query.html; }}; '
+                          f'items.{method}({arguments}); res.send(items[0]);', 'xss')
+        self.scan('const items = ["safe"]; items.splice = external; delete items.splice; '
+                  'items["splice"](0, 1, req.query.html); res.send(items[0]);', 'xss')
+
+    def test_copy_within_overlap_directions_match_native_javascript(self):
+        cases = [
+            ('[req.query.html, "b", "c"]', '1, 0, 2', ['review-input', 'review-input', 'b']),
+            ('["a", "b", req.query.html]', '0, 1', ['b', 'review-input', 'review-input']),
+            ('["a", req.query.html, "c"]', '-1, 1, 2', ['a', 'review-input', 'review-input']),
+            ('["a", req.query.html, "c"]', '0, -2, -1', ['review-input', 'review-input', 'c']),
+            ('["a", req.query.html, "c"]', '0, 2, 1', ['a', 'review-input', 'c']),
+            ('[req.query.html, "b", "c"]', '1.9, 0.8, 1.8', ['review-input', 'review-input', 'c']),
+        ]
+        for initial, bounds, expected in cases:
+            with self.subTest(initial=initial, bounds=bounds):
+                source = (f'const items = {initial};\nitems.copyWithin({bounds});\n'
+                          + '\n'.join(f'res.send(items[{index}]);' for index in range(3)))
+                findings = self.scan(source, *('xss' for value in expected if value == 'review-input'))
+                self.assertEqual([finding['line'] for finding in findings],
+                                 [3 + index for index, value in enumerate(expected) if value == 'review-input'])
+                self.assert_runtime_sends(source, expected)
+
+    def test_copy_within_cleanup_and_holes_preserve_length(self):
+        self.scan('const items = [req.query.html, "safe"]; '
+                  'items.copyWithin(0, 1); res.send(items[0]); res.send(items.length);')
+        source = ('const items = [req.query.html, , "safe"]; items.copyWithin(0, 1, 2); '
+                  'res.send(items[0]); res.send(items[1]); res.send(items[2]); res.send(items.length);')
+        self.scan(source)
+        self.assert_runtime_sends(source, [None, None, 'safe', 3])
+        self.scan('const items = [req.query.html]; Object.freeze(items); '
+                  'items.copyWithin(0, 0, 0); res.send(items[0]);', 'xss')
+
+    def test_copy_within_returns_receiver_and_retains_object_aliases(self):
+        source = ('const items = [{html: "safe"}, null]; '
+                  'const returned = items.copyWithin(1, 0); '
+                  'returned[0].html = req.query.html; res.send(items[1].html);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan('const items = ["safe", req.query.html]; const alias = items; '
+                  'alias.copyWithin(0, 1); res.send(items[0]); res.send(alias[0]);', 'xss', 'xss')
+
+    def test_copy_within_helpers_keep_sink_specific_sanitization(self):
+        self.scan('function move(items) { return items.copyWithin(0, 1); } '
+                  'const items = ["safe", DOMPurify.sanitize(req.query.html)]; '
+                  'const result = move(items); res.send(items[0]); eval(result[0]);', 'eval')
+
+    def test_splice_and_copy_within_joined_receivers_do_not_prove_cleanup(self):
+        for operation in ('splice(0, 1, "safe")', 'copyWithin(0, 1)'):
+            with self.subTest(operation=operation):
+                self.scan('const a = [req.query.html, "safe"]; const b = [req.query.html, "safe"]; '
+                          f'const items = flag ? a : b; items.{operation}; '
+                          'res.send(a[0]); res.send(b[0]);', 'xss', 'xss')
+                self.scan('const items = [req.query.html, "safe"]; '
+                          f'if (flag) items.{operation}; res.send(items[0]);', 'xss')
+
+    def test_splice_and_copy_within_report_unsupported_coercion(self):
+        for operation, reason in (('splice(offset, 1, "safe")', 'Array.splice'),
+                                  ('splice(0, count, "safe")', 'Array.splice'),
+                                  ('splice(0, 1n, "safe")', 'Array.splice'),
+                                  ('copyWithin(offset, 1)', 'Array.copyWithin'),
+                                  ('copyWithin(0, 1, offset)', 'Array.copyWithin')):
+            with self.subTest(operation=operation):
+                self.assert_fill_partial('const items = [req.query.html, "safe"]; '
+                                         f'try {{ items.{operation}; }} catch (error) {{}} '
+                                         'res.send(items[0]);', 'xss', reason=reason)
+
+    def test_splice_and_copy_within_preserve_descriptor_and_species_limits(self):
+        for operation, reason in (('splice(0, 1, "safe")', 'Array.splice'),
+                                  ('copyWithin(0, 1)', 'Array.copyWithin')):
+            for setup in ('Object.freeze(items);', 'Object.seal(items);',
+                          'Object.defineProperty(items, "0", {value: req.query.html, writable: false});',
+                          'Object.defineProperty(Array.prototype, "0", {get() { return req.query.html; }});',
+                          'external({items});'):
+                with self.subTest(operation=operation, setup=setup):
+                    self.assert_fill_partial('const items = [req.query.html, "safe"]; '
+                                             + setup + f'try {{ items.{operation}; }} catch (error) {{}} '
+                                             'res.send(items[0]);', 'xss', reason=reason)
+        for setup in ('items.constructor = foreign;', 'Array.prototype.constructor = foreign;',
+                      'Object.defineProperty(Array, Symbol.species, {get() { return foreign; }});'):
+            with self.subTest(setup=setup):
+                self.assert_fill_partial('const items = [req.query.html]; ' + setup
+                                         + 'items.splice(0, 1, "safe"); res.send(items[0]);',
+                                         'xss', reason='Array.splice')
+
+    def test_splice_and_copy_within_unknown_overrides_cannot_certify_mutations(self):
+        for method, args in (('splice', '0, 1, req.query.html'), ('copyWithin', '0, 1')):
+            for replacement in (f'items.{method} = external;', f'Array.prototype.{method} = external;'):
+                with self.subTest(method=method, replacement=replacement):
+                    self.assert_fill_partial('const items = ["safe", req.query.html]; '
+                                             + replacement + f'items.{method}({args}); res.send(items[0]);',
+                                             reason=f'Array.{method}')
+
     def test_fill_mutates_alias_and_returns_same_array(self):
         self.scan('const items = ["safe"]; const alias = items; '
                   'const returned = alias.fill(req.query.html); '

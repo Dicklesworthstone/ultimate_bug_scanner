@@ -1,0 +1,310 @@
+UNACTIVATED CHECKPOINT — native pooled Python HTTP client SSRF analysis
+Base: f0f99f9 (ultimate_bug_scanner main at session start)
+Target paths: modules/helpers/ubs_core/analyzers/taint_py.py; test-suite/quality/test_taint_python_http.py
+
+This patch preserves preliminary finite client/pending-request markers and the
+11-method regression oracle exactly as present before the execution environment
+became unavailable. It does NOT implement constructor dispatch, client method
+resolution, destination/base_url transfer, context-manager identity, asynchronous
+resumption, or the complete mutation/escape boundaries. Do not apply as a working
+scanner feature or activate these failing tests without finishing the implementation.
+
+The tests executed against unchanged production f0f99f9 before marker edits:
+11 methods, 31 failing assertions/subcases, DSR exit 1, duration 3571 ms.
+Retained log: test-suite/artifacts/dsr-python-http-pooled-baseline-ocoEQHOd/output.log
+Log SHA256: 6f95ebd71c397583c598eff9accbae27117f541209fc77a3dc60fca4b88eb171
+The preliminary production edits themselves were never executed.
+Exact reconstructed source SHA256:
+39fee0d398ab87a5af3e4f73a7f032392e95e72334ef79bca987a0be133a973a
+Exact reconstructed test SHA256:
+afdbb6a04d1e126882e213f8de86b9f45acaefb58b26ab5970db53aa6387cb39
+Both match hashes recorded after copying the checkout immediately before outage.
+Forward and reverse unified-hunk replay match the fetched immutable baseline.
+
+Continuation must keep client handles/metadata clean; carry only base_url as a
+captured receiver fact through finite _BoundCallable summary slots. Track native
+requests.Session/session and httpx.Client/AsyncClient identity from imports and
+aliases. Fixed absolute HTTPX URLs override base_url; relative/empty URLs inherit
+it. Saved bound methods read live client base_url. Async requests and stream
+contexts execute only at await/task/context entry, with findings at the captured
+request call. Reused _BoundCallable receiver slots can retain facts, aliases and
+finite call-site markers through existing summary substitution. Unsupported
+mutation, custom transports/hooks and opaque storage/escape require explicit
+incomplete outcomes, never complete-clean results. Preserve prior findings.
+
+After implementation, rerun this unchanged oracle plus the independent 34-case
+adversarial corpus and native contracts, real module/runner JSON/SARIF, broader
+Python dataflow/co-routine suites, and canonical checksum/integrity gates. The
+checkpoint changes no production checksum pins and makes no completion claim.
+
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -176,6 +176,25 @@
+     'httpx.request': 1,
+     'httpx.stream': 1,
+ }
++_HTTP_CLIENT_CONSTRUCTORS = {
++    **{f'{module}.{constructor}': 'requests'
++       for module in ('requests', 'requests.sessions')
++       for constructor in ('Session', 'session')},
++    'httpx.Client': 'httpx',
++    'httpx.AsyncClient': 'httpx.async',
++}
++_HTTP_CLIENT_METHODS = {
++    kind: {**{method: 0 for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options')},
++           'request': 1, **({'stream': 1} if kind.startswith('httpx') else {})}
++    for kind in frozenset(_HTTP_CLIENT_CONSTRUCTORS.values())
++}
++_HTTP_CLIENT_MEMBERS = {
++    **{module: frozenset(name.rsplit('.', 1)[1] for name in _HTTP_CLIENT_CONSTRUCTORS
++                         if name.rsplit('.', 1)[0] == module)
++       for module in ('requests', 'requests.sessions', 'httpx')},
++    **{constructor: frozenset(_HTTP_CLIENT_METHODS[kind]) | {'send', '__init__', '__enter__', '__aenter__'}
++       for constructor, kind in _HTTP_CLIENT_CONSTRUCTORS.items()},
++}
+ 
+ 
+ _PARAMETER_MARKERS = {
+@@ -355,6 +374,28 @@
+ 
+ 
+ @dataclass(frozen=True)
++class _HTTPClient:
++    """A native client marker; its base URL lives in bound receiver facts.
++
++    Reuse the existing captured-receiver slots so client metadata is not
++    tainted data and helper summaries never key themselves on concrete URLs.
++    """
++    kind: str
++
++
++@dataclass(frozen=True)
++class _HTTPPending:
++    """A captured request sends only when awaited or entered as a stream."""
++    call: ast.Call
++    asynchronous: bool
++    streaming: bool = False
++
++
++def _http_contract(value, contract):
++    return isinstance(value, _BoundCallable) and isinstance(value.receiver_binding, contract)
++
++
++@dataclass(frozen=True)
+ class _GlobalNamespace:
+     """A real globals() mapping, distinct from a same-spelled user object."""
+     module: ast.Module
+@@ -1026,6 +1067,8 @@
+         raise AnalysisLimit('mutated functools.partial object; analysis is incomplete')
+     choices = []
+     for value in _binding_choices(binding):
++        if _http_contract(value, (_HTTPClient, _HTTPPending)):
++            raise AnalysisLimit('HTTP client mutation or escape is unresolved; analysis is incomplete')
+         if isinstance(value, _CsvReader):
+             raise AnalysisLimit('CSV reader mutation or escape is unresolved; analysis is incomplete')
+         if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance,
+@@ -1043,7 +1086,8 @@
+ _QUALIFIER_WIDTH = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS))
+ _KNOWN_QUALIFIER_PREFIXES = frozenset(
+     '.'.join(qualified.split('.')[:size])
+-    for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_ALL_FRAMEWORK_NAMES, *_REQUEST_TYPES)
++    for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_HTTP_CLIENT_CONSTRUCTORS,
++                      *_ALL_FRAMEWORK_NAMES, *_REQUEST_TYPES)
+     for size in range(1, len(qualified.split('.')) + 1))
+ 
+ 
+diff --git a/test-suite/quality/test_taint_python_http.py b/test-suite/quality/test_taint_python_http.py
+--- a/test-suite/quality/test_taint_python_http.py
++++ b/test-suite/quality/test_taint_python_http.py
+@@ -424,5 +424,190 @@
+                     print(f'[python-http-{tag}] PASS', flush=True)
+ 
+ 
++class PooledHTTPClientTests(SourceTest):
++    """Native pooled clients retain destination identity through local flow."""
++
++    def setUp(self):
++        self.started = time.monotonic()
++        print(f'[{self.id()}] RUN', flush=True)
++
++    def tearDown(self):
++        print(f'[{self.id()}] END ({time.monotonic() - self.started:.3f}s)', flush=True)
++
++    def test_session_constructors_aliases_and_bound_methods(self):
++        for setup, constructor in (
++            ('import requests', 'requests.Session'),
++            ('import requests', 'requests.session'),
++            ('import requests.sessions as pools', 'pools.Session'),
++            ('from requests.sessions import session as make', 'make'),
++            ('from requests import Session as make', 'make'),
++            ('import httpx as transport', 'transport.Client'),
++        ):
++            with self.subTest(constructor=constructor):
++                self.assert_rules(f'{setup}\nclient = {constructor}()\nclient.get(input())\n', 'ssrf')
++                self.assert_rules(f'{setup}\nclient = {constructor}()\nfetch = client.get\n'
++                                  'client = unrelated\nfetch(input())\n', 'ssrf')
++
++    def test_context_managers_and_inline_receivers(self):
++        for module, constructor in (('requests', 'Session'), ('httpx', 'Client')):
++            with self.subTest(module=module):
++                self.assert_rules(f'import {module}\nwith {module}.{constructor}() as client:\n'
++                                  '    client.get(input())\n', 'ssrf')
++                self.assert_rules(f'import {module}\n{module}.{constructor}().get(input())\n', 'ssrf')
++
++    def test_methods_select_the_url_not_metadata(self):
++        for constructor in ('requests.Session', 'httpx.Client'):
++            for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'request'):
++                prefix = '"GET", ' if method == 'request' else ''
++                setup = f'import requests, httpx\nclient = {constructor}()\n'
++                with self.subTest(constructor=constructor, method=method):
++                    self.assert_rules(setup + f'client.{method}({prefix}input())\n', 'ssrf')
++                    self.assert_rules(setup + f'client.{method}({prefix}url=input())\n', 'ssrf')
++                    self.assert_rules(setup + f'client.{method}({prefix}"https://example.invalid", '
++                                      'params={"q": input()}, headers={"X-Data": input()})\n')
++            self.assert_rules(setup + 'client.post("https://example.invalid", data=input())\n')
++            self.assert_rules(setup + 'client.request(*["GET", input()])\n', 'ssrf')
++            self.assert_rules(setup + 'client.request(**{"method": "GET", "url": input()})\n', 'ssrf')
++
++    def test_constructor_metadata_is_not_a_destination(self):
++        self.assert_rules('import httpx\nclient = httpx.Client(headers={"X-Data": input()}, '
++                          'params={"q": input()}, auth=("name", input()))\n'
++                          'client.get("https://example.invalid")\n')
++        self.assert_rules('import httpx\nclient = httpx.Client(base_url=input())\n')
++
++    def test_base_url_is_used_only_by_relative_requests(self):
++        for path in ('/relative', 'relative', '', '//still-relative.example/path'):
++            with self.subTest(path=path):
++                self.assert_rules(f'import httpx\nclient = httpx.Client(base_url=input())\n'
++                                  f'client.get({path!r})\n', 'ssrf')
++        self.assert_rules('import httpx\nclient = httpx.Client(base_url=input())\n'
++                          'client.get("https://example.invalid/fixed")\n')
++        self.assert_rules('import httpx\nclient = httpx.Client(base_url="https://example.invalid")\n'
++                          'client.get(input())\n', 'ssrf')
++
++    def test_client_and_method_summaries(self):
++        self.assert_rules('''
++            import requests
++            def fetch(client, target):
++                return client.get(target)
++            fetch(requests.Session(), input())
++        ''', 'ssrf')
++        self.assert_rules('''
++            import httpx
++            def make(base):
++                return httpx.Client(base_url=base)
++            def fetch(client, target):
++                return client.get(target)
++            fetch(make(input()), '/relative')
++        ''', 'ssrf')
++        self.assert_rules('''
++            import httpx
++            def make(base):
++                return httpx.Client(base_url=base)
++            def fetch(client, target):
++                return client.get(target)
++            fetch(make(input()), 'https://example.invalid/fixed')
++        ''')
++        self.assert_rules('''
++            import requests
++            def make():
++                return requests.Session().get
++            def fetch(call, target):
++                return call(target)
++            fetch(make(), input())
++        ''', 'ssrf')
++
++    def test_non_native_constructors_and_rebinding_do_not_get_contracts(self):
++        for source in (
++            'client = Session()\nclient.get(input())\n',
++            'from other import Session\nclient = Session()\nclient.get(input())\n',
++            'from .httpx import Client\nclient = Client()\nclient.get(input())\n',
++            'import httpx\nhttpx = other\nclient = httpx.Client()\nclient.get(input())\n',
++            'from httpx import Client\nClient = other\nclient = Client()\nclient.get(input())\n',
++            'import requests\nclient = requests.Session()\nclient = other\nclient.get(input())\n',
++        ):
++            with self.subTest(source=source):
++                self.assert_rules(source)
++
++    def test_async_requests_only_execute_when_consumed(self):
++        self.assert_rules('''
++            import httpx
++            async def fetch():
++                async with httpx.AsyncClient() as client:
++                    await client.get(input())
++        ''', 'ssrf')
++        self.assert_rules('''
++            import httpx
++            client = httpx.AsyncClient()
++            pending = client.get(input())
++        ''')
++        self.assert_rules('''
++            import httpx, asyncio
++            client = httpx.AsyncClient()
++            pending = client.get(input())
++            asyncio.run(pending)
++        ''', 'ssrf')
++        self.assert_rules('''
++            import httpx, asyncio
++            async def fetch():
++                client = httpx.AsyncClient()
++                task = asyncio.create_task(client.get(input()))
++        ''', 'ssrf')
++
++    def test_stream_contexts_execute_at_entry(self):
++        self.assert_rules('''
++            import httpx
++            client = httpx.Client()
++            pending = client.stream('GET', input())
++        ''')
++        self.assert_rules('''
++            import httpx
++            client = httpx.Client()
++            with client.stream('GET', input()) as response:
++                pass
++        ''', 'ssrf')
++        self.assert_rules('''
++            import httpx
++            async def fetch():
++                client = httpx.AsyncClient()
++                async with client.stream('GET', input()) as response:
++                    pass
++        ''', 'ssrf')
++
++    def test_async_and_stream_summaries_preserve_pending_requests(self):
++        self.assert_rules('''
++            import httpx
++            def prepare(client, target):
++                return client.get(target)
++            async def fetch():
++                client = httpx.AsyncClient()
++                await prepare(client, input())
++        ''', 'ssrf')
++        self.assert_rules('''
++            import httpx
++            def prepare(target):
++                return httpx.Client().stream('GET', target)
++            with prepare(input()) as response:
++                pass
++        ''', 'ssrf')
++
++    def test_mutated_and_escaped_clients_refuse_complete_clean(self):
++        for body in (
++            'client.base_url = input()\nclient.get("/relative")',
++            'alias = client\nalias.get = replacement\nclient.get(input())',
++            'configure(client)\nclient.get(input())',
++        ):
++            with self.subTest(body=body):
++                with self.assertRaises(taint_py.AnalysisLimit):
++                    self.scan('import httpx\nclient = httpx.Client()\n' + body + '\n')
++        for source in (
++            'import httpx\nhttpx.Client = replacement\nhttpx.Client().get(input())\n',
++            'import requests\nrequests.Session.get = replacement\nrequests.Session().get(input())\n',
++        ):
++            with self.subTest(source=source):
++                with self.assertRaises(taint_py.AnalysisLimit):
++                    self.scan(source)
++
++
+ if __name__ == '__main__':
+     unittest.main()

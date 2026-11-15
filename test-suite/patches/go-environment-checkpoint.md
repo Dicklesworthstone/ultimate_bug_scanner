@@ -100,3 +100,14 @@ Do not activate the first patch alone.
 The prescribed full ShellCheck command was attempted on the unmodified baseline
 and was killed with exit 137 after approximately 14.5 seconds. It did not pass.
 No full-suite, platform, release, tag or broad D6-completion claim is made.
+
+## Additional static review concern
+
+After preserving the patches, review identified a possible scan-cost problem:
+the new `_NATIVE_CALL` expression starts with `s*` and is also used by
+`finditer` over masked source. Long inert whitespace/string spans may cause
+the regex to retry over the same span repeatedly. This is an unexecuted static
+concern, not a measured performance regression. Review the search/match split,
+bound leading-whitespace handling at whole-expression call sites, and exercise
+long-string/source-budget controls before activation. The grouping follow-up
+does not address this separate concern.

@@ -1671,7 +1671,7 @@ class _Flow:
                         # Element spreads use the wildcard slot directly and
                         # must not be mistaken for prototype/method writes.
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
-                                       'splice', 'copyWithin', 'entries', 'map'):
+                                       'splice', 'copyWithin', 'entries', 'map', 'flatMap'):
                             slots[method] = _alternatives(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
@@ -2592,6 +2592,336 @@ class _Flow:
                 slots[None] = _Fact(joined, _refs(joined), absent=True)
         return receiver
 
+    def array_callback(self, callee, element, receiver, this_arg, state, location):
+        """Use ordinary call summaries for a synchronous native callback."""
+        self.engine.import_captures(callee, state, self.rule)
+        self.engine.dependents[(callee, self.rule)][self.scope] = None
+        # Heap scalars do not carry a definite undefined/value distinction.
+        # Keep default effects conditional rather than treating every clean
+        # element as a missing argument. The index and source are supplied.
+        scalar = not _refs(element) or bool(frozenset(element))
+        if scalar and callee.params and callee.params[0][2] is not None:
+            self.incomplete.add('Array.flatMap element default requires a known undefined or present value')
+        prepared = ([(element, scalar), (frozenset(), False), (receiver, False)],
+                    None, {0} if scalar else set(), {1: 'present', 2: 'present'})
+        bound = self.bind(callee, prepared, state, location, receiver=this_arg)
+        returned, effects, normal, thrown, exceptional, incomplete = self.engine.heap_call(
+            callee, self.rule, location, bound, state)
+        self.incomplete.update(incomplete)
+        for (position, label), fact in effects.items():
+            self.effect(position, label, fact)
+        if exceptional is not None:
+            self.throws.append((thrown, exceptional))
+        if not normal:
+            raise _NoNormalCompletion
+        return returned
+
+    def escape_callbacks(self, facts, state):
+        """Opaque calls can retain callable arguments, including nested aliases."""
+        if not self.engine.has_flatmap_calls:
+            return
+        pending = [ref for fact in facts for ref in _refs(fact)]
+        seen = set()
+        while pending:
+            ref = pending.pop()
+            if ref in seen:
+                continue
+            seen.add(ref)
+            slots = state.heap.get(ref, {})
+            self.engine.budget.spend(1 + len(slots))
+            callee = _function_scope(ref)
+            if callee is not None:
+                self.engine.escaped_callbacks.add(callee)
+            for value in slots.values():
+                pending.extend(_refs(value) - seen)
+
+    def flatmap_result_kind(self, callee):
+        """Prove callback result cardinality without assuming every value is scalar.
+
+        Taint facts deliberately forget clean scalar values at joins. A branch
+        returning an array and another returning a string must not therefore
+        become a guaranteed array. Keep this syntactic proof separate from
+        source facts and from their context-cache keys.
+        """
+        cached = self.engine.flatmap_result_kinds
+        if callee in cached:
+            return cached[callee]
+        code, text = callee.code, self.engine.text
+        pairs = _pairs(code, callee.body_start, callee.body_end)
+
+        def expression_kind(start, end):
+            while start < end and text[start].isspace():
+                start += 1
+            while start < end and text[end - 1].isspace():
+                end -= 1
+            while start < end and code[start] == '(' and pairs.get(start) == end - 1:
+                if text[start] == '`':
+                    return 'scalar'
+                start, end = start + 1, end - 1
+                while start < end and text[start].isspace():
+                    start += 1
+                while start < end and text[end - 1].isspace():
+                    end -= 1
+            raw = code[start:end]
+            if re.fullmatch(r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)''',
+                            text[start:end], re.S):
+                return 'scalar'
+            if start == end or re.fullmatch(r'(?:null|true|false|[0-9][\w.]*)', raw):
+                return 'scalar'
+            if raw[:1] in {'[', '{'} and pairs.get(start) == end - 1:
+                return 'array' if raw[0] == '[' else 'scalar'
+            return None
+
+        def returns(statements):
+            kinds, live = set(), True
+            for node in statements:
+                if not live:
+                    break
+                self.engine.budget.spend()
+                if node.kind == 'return':
+                    kinds.add(expression_kind(node.start, node.end))
+                    live = False
+                elif node.kind == 'throw':
+                    live = False
+                elif node.kind == 'block':
+                    nested, live = returns(node.body)
+                    kinds.update(nested)
+                elif node.kind == 'if':
+                    left, left_live = returns(node.body)
+                    right, right_live = returns(node.alternate)
+                    kinds.update(left | right)
+                    live = left_live or right_live
+                elif node.body or node.alternate or node.kind == 'try':
+                    # Loops/finalizers can return or replace prior completion;
+                    # their exact runtime transfer still runs in the heap engine.
+                    kinds.add(None)
+            return kinds, live
+
+        try:
+            if callee.concise:
+                kind = expression_kind(callee.body_start, callee.body_end)
+            else:
+                kinds, live = returns(self.engine.scope_statements(callee))
+                if live:
+                    kinds.add('scalar')  # falling off the body returns undefined
+                kind = next(iter(kinds)) if len(kinds) == 1 else None
+        finally:
+            returns = None  # Do not retain the flow through a recursive closure.
+        cached[callee] = kind
+        return kind
+
+    def flatmap_values(self, value, state, result_kind):
+        """Flatten actual arrays once; ordinary objects remain single values.
+
+        Holes are skipped, including holes in a returned array. Differing
+        extents or optional slots retain all element identities but cannot
+        promise the next output offset.
+        """
+        refs = _refs(value)
+        arrays = {ref for ref in refs if ref in state.array_lengths}
+        if not arrays:
+            if not refs and result_kind != 'scalar':
+                self.incomplete.add('Array.flatMap callback result has an unknown scalar or array shape')
+                return [value], False
+            return [value], True
+        variants = []
+        exact = result_kind == 'array'
+        if not exact:
+            self.incomplete.add('Array.flatMap callback result may combine array and scalar alternatives')
+        for ref in arrays:
+            slots, length = state.heap[ref], state.array_lengths[ref]
+            self.engine.budget.spend(1 + len(slots))
+            if not self.array_mutation_contract(ref, state):
+                self.incomplete.add('Array.flatMap returned array requires ordinary indexed properties')
+                exact = False
+            if length is None or None in slots:
+                self.incomplete.add('Array.flatMap returned array has an unknown extent')
+                exact = False
+            indexed = sorted((int(key), item) for key, item in slots.items()
+                             if self.array_index(key) is not None
+                             and (length is None or int(key) < length))
+            if any(getattr(item, 'absent', False) for _index, item in indexed):
+                exact = False
+            items = [item for _index, item in indexed]
+            if None in slots:
+                items.append(slots[None])
+            variants.append(items)
+        if refs - arrays or frozenset(value):
+            variants.append([_Fact(value, refs - arrays)])
+        sizes = {len(items) for items in variants}
+        if exact and len(sizes) == 1:
+            return [_alternatives(*(items[index] for items in variants))
+                    for index in range(next(iter(sizes)))], True
+        return [_join(*(item for items in variants for item in items))], False
+
+    def array_flatmap(self, receiver, arguments, prepared, state, location, callback=None):
+        """Map live finite array slots into a fresh, one-level flattened array.
+
+        The source length is captured once, while elements are read immediately
+        before each callback. Sparse lengths never turn into dense loops.
+        Callback writes, throws and borrowed object identities use the same
+        bounded heap summaries as ordinary local calls.
+        """
+        actual, uncertain, _missing, _kinds = prepared
+        callee = (_function_target(actual[0][0]) or callback) if actual else None
+        result = (self.scope, location, 'array-flatmap')
+        previous = state.heap.get(result)
+        previous_length = state.array_lengths.get(result)
+        refs = _refs(receiver)
+        if (uncertain is not None or callee is None or callee.generator or callee.asynchronous
+                or self.escaped_callable(callee)):
+            if callee is not None:
+                self.engine.escaped_callbacks.add(callee)
+            self.incomplete.add('Array.flatMap requires a selected synchronous callback')
+            state.heap[result] = dict(previous or {})
+            state.array_lengths[result] = None
+            return _Fact(refs=(result,))
+        if any(not self.array_mutation_contract(ref, state, species=True)
+               or state.array_lengths[ref] is None or None in state.heap[ref] for ref in refs):
+            self.engine.escaped_callbacks.add(callee)
+            self.incomplete.add('Array.flatMap requires finite ordinary arrays and native array species')
+            state.heap[result] = dict(previous or {})
+            state.array_lengths[result] = None
+            return _Fact(refs=(result,))
+        this_arg = actual[1][0] if len(actual) > 1 else frozenset()
+        result_kind = self.flatmap_result_kind(callee)
+        if (not callee.arrow and not _refs(this_arg)
+                and re.search(r'\bthis\b', callee.code[callee.body_start:callee.body_end])):
+            self.incomplete.add('Array.flatMap callback requires a known this receiver')
+            state.heap[result] = dict(previous or {})
+            state.array_lengths[result] = None
+            return _Fact(refs=(result,))
+        if callee.name and not callee.declaration and not callee.arrow:
+            # The general binding model does not create a function
+            # expression's private immutable self-name environment. A
+            # callback that exposes that name can outlive this invocation;
+            # retain its entry evidence and disclose the unsupported binding.
+            self_name = re.compile(r'(?<![\w$.])' + re.escape(callee.name) + r'\b')
+            if any(self.engine.lexical_binding(callee, callee.name, callee.body_start + match.start())[0]
+                   is not callee for match in self_name.finditer(
+                       callee.code[callee.body_start:callee.body_end])):
+                self.incomplete.add('Array.flatMap named callback self-reference requires unsupported lexical binding semantics')
+                self.engine.escaped_callbacks.add(callee)
+        self.engine.dependents[(callee, self.rule)][self.scope] = None
+        if (arguments and callee.parent is self.scope
+                and arguments[0][0] <= callee.start < callee.end <= arguments[0][1]):
+            # A literal callback is not an independent entrypoint. In
+            # particular an empty/sparse array cannot execute its sink body.
+            self.engine.modeled_callbacks.add(callee)
+            if callback is not callee:
+                # Assignments/containers around a literal can publish it as
+                # another entrypoint, even when this native call is empty.
+                self.engine.escaped_callbacks.add(callee)
+        branches = []
+        for ref in refs:
+            branch = state.copy()
+            selected = _Fact(refs=(ref,))
+            limit = branch.array_lengths[ref]
+            cursor, size, slots = 0, 0, {}
+            while cursor < limit:
+                source = branch.heap[ref]
+                self.engine.budget.spend(1 + len(source))
+                if not self.array_mutation_contract(ref, branch) or None in source:
+                    self.incomplete.add('Array.flatMap callback changed the indexed property protocol')
+                    size = None
+                    break
+                length = branch.array_lengths[ref]
+                if length is None:
+                    self.incomplete.add('Array.flatMap callback changed the source to an unknown length')
+                    size = None
+                    break
+                positions = [int(key) for key in source if self.array_index(key) is not None
+                             and cursor <= int(key) < limit
+                             and int(key) < length]
+                if not positions:
+                    break
+                index = min(positions)
+                value = self.property(selected, str(index), branch)
+                definite = ref not in branch.weak_refs and not getattr(value, 'absent', False)
+                bypass = None if definite else branch.copy()
+                try:
+                    mapped = self.array_callback(callee, value, selected, this_arg, branch,
+                                                 (location, 'flatmap-index', index))
+                except _NoNormalCompletion:
+                    if bypass is None:
+                        branch = None
+                        break
+                    branch = bypass
+                else:
+                    values, exact = self.flatmap_values(mapped, branch, result_kind)
+                    if not definite:
+                        branch = _join_states(branch, bypass)
+                    if size is not None and exact and definite:
+                        slots.update({str(size + offset): item for offset, item in enumerate(values)})
+                        size += len(values)
+                    else:
+                        possible = _join(*values)
+                        for key, old in tuple(slots.items()):
+                            if getattr(old, 'absent', False):
+                                slots[key] = _alternatives(old, possible)
+                        slots[None] = _alternatives(slots.get(None, _ABSENT), possible)
+                        size = None
+                cursor = index + 1
+            if branch is not None:
+                if previous is not None:
+                    slots = {key: _alternatives(previous.get(key, previous.get(None, _ABSENT)),
+                                                 slots.get(key, slots.get(None, _ABSENT)))
+                             for key in previous.keys() | slots.keys()}
+                    branch.weak_refs.add(result)
+                    size = size if size == previous_length else None
+                branch.heap[result] = slots
+                branch.array_lengths[result] = size
+                branches.append(branch)
+        merged = _join_states(*branches)
+        if merged is None:
+            raise _NoNormalCompletion
+        self.replace_state(state, merged)
+        return _Fact(refs=(result,))
+
+    def native_array_target(self, receiver, method, state):
+        refs = _refs(receiver)
+        prototype = state.heap.get(('builtin', 'Array.prototype'), {})
+        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin', 'flatMap'}
+                and refs and not frozenset(receiver) and method not in prototype and None not in prototype
+                and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
+            return 'array', receiver, method
+        return None
+
+    def flatmap_postfix(self, fact, cursor, end, state):
+        """Retain evaluated receivers through flatMap calls and their selectors."""
+        code = self.scope.code
+        while cursor < end:
+            selectors, selected_end = self.selectors(cursor, end, stop_at_call=True)
+            for key, computed in selectors:
+                selected = self.value(*computed, state) if computed is not None else frozenset()
+                unknown = not _refs(fact) or bool(frozenset(fact))
+                fact = self.property(fact, key, state)
+                if unknown:
+                    fact = _join(fact, selected)
+            cursor = selected_end
+            match = re.match(r'\s*\.\s*flatMap\s*\(', code[cursor:end])
+            if match is None:
+                break
+            opening = cursor + match.end() - 1
+            closing = self.pairs.get(opening)
+            if closing is None or closing >= end:
+                self.incomplete.add('Array.flatMap postfix call is incomplete')
+                break
+            native = self.native_array_target(fact, 'flatMap', state)
+            arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
+                         if self.engine.code[left:right].strip()]
+            callback = self.callable(*arguments[0], state) if arguments else None
+            values, prepared = self.evaluate_arguments(arguments, state)
+            if native is None:
+                if callback is not None:
+                    self.engine.escaped_callbacks.add(callback)
+                self.incomplete.add('Array.flatMap postfix requires a known native receiver method')
+                fact = self.materialize(_join(fact, *values), state)
+            else:
+                fact = self.array_flatmap(fact, arguments, prepared, state, cursor, callback)
+            cursor = closing + 1
+        return fact, cursor
+
     def native_target(self, name, state):
         """Capture GetValue(callee) before arguments can replace a method."""
         receiver_name, dot, method = name.rpartition('.')
@@ -2631,14 +2961,9 @@ class _Flow:
                           and None not in state.heap.get(('builtin', 'Reflect'), {}))
         if reflect_native and method in {'defineProperty', 'preventExtensions', 'setPrototypeOf'}:
             return 'reflect', receiver, method
-        prototype = state.heap.get(('builtin', 'Array.prototype'), {})
-        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin'}
-                and refs and not frozenset(receiver) and method not in prototype and None not in prototype
-                and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
-            return 'array', receiver, method
-        return None
+        return self.native_array_target(receiver, method, state)
 
-    def mutation_call(self, native, arguments, facts, state, prepared, *, location=None):
+    def mutation_call(self, native, arguments, facts, state, prepared, *, location=None, callback=None):
         """Model captured native functions, preserving the live receiver heap.
 
         Exact lengths widen to unknown at branch/loop disagreement. No length
@@ -2656,6 +2981,8 @@ class _Flow:
             return self.array_copy_within(receiver, arguments, prepared, state)
         if kind == 'array' and method == 'splice':
             return self.array_splice(receiver, arguments, prepared, state, location)
+        if kind == 'array' and method == 'flatMap':
+            return self.array_flatmap(receiver, arguments, prepared, state, location, callback)
         if values and (kind == 'reflect' or (kind == 'object' and method in {
                 'defineProperty', 'defineProperties', 'freeze', 'seal', 'preventExtensions', 'setPrototypeOf'})):
             target = _join(*values) if uncertain == 0 else values[0]
@@ -2991,7 +3318,7 @@ class _Flow:
                     self.incomplete.add('Own method requires an unsupported escaped closure environment')
                 return None, receiver
             return candidate, receiver
-        if (report and key in {'splice', 'copyWithin'} and _refs(receiver)
+        if (report and key in {'splice', 'copyWithin', 'flatMap'} and _refs(receiver)
                 and all(ref in state.array_lengths for ref in _refs(receiver))
                 and self.native_target(name, state) is None):
             self.incomplete.add(f'Array.{key} requires a known native or selected callable')
@@ -3546,6 +3873,15 @@ class _Flow:
         call_code, call_offset = ((code.masked, code.offset) if isinstance(code, _ComponentCode)
                                   else (code, 0))
         cursor = start
+        primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
+        if (primary_end is not None and primary_end < end - 1
+                and re.match(r'\s*\.\s*flatMap\s*\(', code[primary_end + 1:end])):
+            primary = self.value(start, primary_end + 1, state)
+            primary, cursor = self.flatmap_postfix(primary, primary_end + 1, end, state)
+            facts.append(primary)
+            remainder[:cursor - start] = [' '] * (cursor - start)
+            source_remainder[:cursor - start] = [' '] * (cursor - start)
+            sole_local_call = cursor == end
         while cursor < end:
             match = call_pattern.search(call_code, cursor - call_offset, end - call_offset)
             if match is None:
@@ -3564,7 +3900,7 @@ class _Flow:
                        and self.drizzle_tag(match_start, closing + 1, state))
             arguments = (self.template_arguments(opening, closing) if drizzle else
                          [(left, right) for left, right in _chunks(code, opening + 1, closing)
-                          if code[left:right].strip()])
+                          if self.engine.code[left:right].strip()])
             # GetValue(callee) precedes ArgumentListEvaluation. An argument can
             # rebind a function or sanitizer for *later* calls, not this one.
             callee_access = self.access(match_start, opening)
@@ -3610,7 +3946,22 @@ class _Flow:
             if tag_call and not drizzle:
                 arguments = self.template_arguments(opening, closing)
             sink = self.engine.call_sinks.get(match_start)
+            callback = (self.callable(*arguments[0], state)
+                        if native is not None and native[0] == 'array' and native[2] == 'flatMap'
+                        and arguments else None)
+            if arguments and callback is None:
+                unmodeled = self.callable(*arguments[0], state)
+                if (unmodeled is not None and unmodeled.parent is self.scope
+                        and arguments[0][0] <= unmodeled.start < unmodeled.end <= arguments[0][1]):
+                    self.engine.escaped_callbacks.add(unmodeled)
             argument_facts, prepared = self.evaluate_arguments(arguments, state)
+            if native is None and not isinstance(callee, _Scope):
+                # Use the prepared snapshots: a later argument can replace
+                # an earlier callback binding or mutate its spread source.
+                escaped = [value for value, _missing in prepared[0]]
+                if method_receiver is not None:
+                    escaped.append(method_receiver)
+                self.escape_callbacks(escaped, state)
             proof_role, proof_value = 'other', None
             if isinstance(callee, _Scope) and callee.generator:
                 # A generator call creates an iterator; it does not execute
@@ -3694,7 +4045,7 @@ class _Flow:
                         self.apply_writes(writes, callee, bound, state, incoming)
             else:
                 mutation = self.mutation_call(native, arguments, argument_facts, state, prepared,
-                                              location=match_start)
+                                              location=match_start, callback=callback)
                 if native is not None and native[0] == 'sql-factory':
                     proof_role, proof_value = 'factory', mutation
                 call_fact = _join(*argument_facts)
@@ -3789,6 +4140,7 @@ class _Flow:
                 self.throws.append((self.materialize(_join(*argument_facts), state), state.copy()))
             self.sql_call_proof(match_start, closing + 1, proof_role, proof_value, state)
             call_fact, postfix_end = self.sql_postfix(call_fact, closing + 1, end, state)
+            call_fact, postfix_end = self.flatmap_postfix(call_fact, postfix_end, end, state)
             selectors, call_end = self.selectors(postfix_end, end, stop_at_call=True)
             for key, computed in selectors:
                 selected = self.value(*computed, state) if computed is not None else frozenset()
@@ -4294,6 +4646,10 @@ class _Engine:
         # Ordered sets (dict keys), like _HeapCall.readers.
         self.dependents = defaultdict(dict)
         self.heap_calls = {}
+        self.modeled_callbacks = set()
+        self.escaped_callbacks = set()
+        self.flatmap_result_kinds = {}
+        self.has_flatmap_calls = 'flatMap' in self.text
         self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
         self.current_task = None
         self.heap_solve_depth = 0
@@ -5264,7 +5620,10 @@ class _Engine:
             invoked.update(callees[caller])
             pending.extend(callees[caller] - seen)
         for scope in self.scopes:
-            if scope in self.input_kind_scopes and scope in invoked:
+            callback_entry = scope in self.modeled_callbacks and scope in self.escaped_callbacks
+            if scope in self.modeled_callbacks and not callback_entry:
+                continue  # Its native array invocations already contributed their effects.
+            if scope in self.input_kind_scopes and scope in invoked and not callback_entry:
                 # These defaults depend on actual definedness, which a
                 # symbolic parameter trace cannot express. Concrete callers
                 # already publish the effects of their separate contexts.
@@ -5275,7 +5634,7 @@ class _Engine:
                     key = (location, int(end), role)
                     self.sql_proofs[key] = _join(self.sql_proofs.get(key, frozenset()), fact)
                     continue
-                if self.dependents[(scope, rule)]:
+                if self.dependents[(scope, rule)] and not callback_entry:
                     # Known call sites already instantiated captures at
                     # their program points. Rebinding them to end-of-scope
                     # values here would taint calls that happened earlier.
@@ -5327,6 +5686,8 @@ class _Engine:
                 self.final_states.clear()
                 self.dependents.clear()
                 self.heap_calls.clear()
+                self.modeled_callbacks.clear()
+                self.escaped_callbacks.clear()
                 self.widened_calls.clear()
                 self.exact_calls.clear()
                 self.recursive.clear()

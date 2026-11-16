@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Model finite synchronous JavaScript `flatMap` callbacks on ordinary arrays,
+  preserving callback inputs, sparse holes, one-level flattening, live element
+  writes, object aliases, selected helpers and `thisArg`. Keep clean results
+  clean; unresolved callback escapes, return shapes and property/species
+  protocols remain explicitly incomplete.
+
 - Track native Go `os.Getenv` and `os.LookupEnv` through import aliases, saved
   callables, selected helper arguments and results, and bounded scalar pointer
   or immediate-closure writes. Keep presence flags, inert function values,

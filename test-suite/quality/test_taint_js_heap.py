@@ -1644,6 +1644,205 @@ class HeapTaintTests(unittest.TestCase):
                 self.scan('const items = [req.query.html]; ' + override
                           + 'items.fill("safe"); res.send(items[0]);', 'xss')
 
+    def test_flatmap_preserves_source_returns_and_exact_positions(self):
+        source = ('const items = [1]; const out = items.flatMap(value => ["safe", req.query.html]); '
+                  'res.send(out[0]); res.send(out[1]); res.send(out.length);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['safe', 'review-input', 2])
+        self.scan('const items = [req.query.html, "safe"]; '
+                  'const out = items.flatMap(value => [value]); '
+                  'res.send(out[0]); res.send(out[1]);', 'xss')
+
+    def test_flatmap_flattens_once_and_preserves_object_identity(self):
+        source = ('const box = {html: "safe"}; const items = [1]; '
+                  'const out = items.flatMap(value => [[box]]); '
+                  'out[0][0].html = req.query.html; res.send(box.html);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        source = ('const box = {0: req.query.html, length: 1, html: "safe"}; '
+                  'const items = [1]; const out = items.flatMap(value => box); '
+                  'res.send(out[0].html); res.send(out[0][0]); res.send(out[1]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['safe', 'review-input', None])
+
+    def test_flatmap_skips_receiver_and_returned_holes(self):
+        source = ('const items = [, req.query.html, , "safe"]; '
+                  'const out = items.flatMap(value => [, value, ,]); '
+                  'res.send(out[0]); res.send(out[1]); res.send(out[2]); res.send(out.length);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe', None, 2])
+        for initial in ('[]', '[,,]'):
+            self.scan(f'const items = {initial}; let saved = "safe"; '
+                      'const out = items.flatMap(value => { saved = req.query.html; '
+                      'res.send(req.query.html); return [req.query.html]; }); '
+                      'res.send(saved); res.send(out[0]);')
+
+    def test_flatmap_callback_effects_use_live_slots_and_initial_length(self):
+        source = ('const items = [req.query.html, req.query.html]; '
+                  'const out = items.flatMap((value, index, source) => { '
+                  'source[1] = "safe"; source.push(req.query.html); return [value]; }); '
+                  'res.send(out[0]); res.send(out[1]); res.send(out[2]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe', None])
+        source = ('const items = ["safe", ,]; '
+                  'const out = items.flatMap((value, index, source) => { '
+                  'source[1] = req.query.html; return [value]; }); res.send(out[1]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan('const items = ["safe", req.query.html]; '
+                  'const out = items.flatMap((value, index, source) => { '
+                  'source.length = 1; return [value]; }); res.send(out[1]);')
+
+    def test_flatmap_callbacks_keep_captured_and_borrowed_writes(self):
+        source = ('let saved = "safe"; const box = {html: "safe"}; const items = [box]; '
+                  'const out = items.flatMap(value => { value.html = req.query.html; '
+                  'saved = req.query.html; return [value]; }); '
+                  'res.send(box.html); res.send(out[0].html); res.send(saved);')
+        self.scan(source, 'xss', 'xss', 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'review-input', 'review-input'])
+        self.scan('const box = {html: req.query.html}; const items = [box]; '
+                  'items.flatMap(value => { value.html = "safe"; return []; }); res.send(box.html);')
+
+    def test_flatmap_callbacks_preserve_sanitizer_domains_and_clean_results(self):
+        self.scan('const items = [req.query.html]; const out = items.flatMap(value => ["safe"]); '
+                  'res.send(out[0]); eval(out[0]); db.query(out[0]); shell.exec(out[0]);')
+        self.scan('const items = [req.query.html]; '
+                  'const out = items.flatMap(value => [DOMPurify.sanitize(value)]); '
+                  'res.send(out[0]); eval(out[0]); db.query(out[0]); shell.exec(out[0]);',
+                  'eval', 'sql', 'command')
+        self.scan('const items = [req.query.html]; const out = items.flatMap(value => [value]); '
+                  'res.send(out[0]); eval(out[0]); db.query(out[0]); shell.exec(out[0]);',
+                  'xss', 'eval', 'sql', 'command')
+
+    def test_flatmap_named_callbacks_and_selected_helpers(self):
+        source = ('function expand(value) { return [{html: value}]; } '
+                  'function transform(items) { return items.flatMap(expand); } '
+                  'const dirty = transform([req.query.html]); const clean = transform(["safe"]); '
+                  'res.send(dirty[0].html); res.send(clean[0].html);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        self.scan('const callbacks = {expand(value) { return [value]; }}; '
+                  'const items = [req.query.html]; const out = items.flatMap(callbacks.expand); '
+                  'res.send(out[0]);', 'xss')
+
+    def test_flatmap_this_argument_and_index_are_separate_from_element(self):
+        source = ('const items = ["safe"]; const out = items.flatMap(function(value, index, source) { '
+                  'return [this.html, index, source[0]]; }, {html: req.query.html}); '
+                  'res.send(out[0]); res.send(out[1]); res.send(out[2]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 0, 'safe'])
+        self.scan('const items = [req.query.html]; '
+                  'const out = items.flatMap(value => ["safe"], {html: req.query.html}); res.send(out[0]);')
+
+    def test_flatmap_exceptions_keep_effects_and_skip_later_work(self):
+        source = ('const items = [req.query.html]; let saved = "safe"; try { '
+                  'items.flatMap(value => { saved = value; throw "stop"; }); '
+                  'saved = "safe"; } catch (error) { res.send(saved); }')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        source = ('const items = [req.query.html]; try { '
+                  'items.flatMap(value => { throw value; }); res.send(req.query.html); '
+                  '} catch (error) { res.send(error); }')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_flatmap_does_not_enumerate_large_sparse_lengths(self):
+        self.scan('const items = []; items.length = 4294967294; items[4000000000] = req.query.html; '
+                  'const out = items.flatMap(value => [value]); res.send(out[0]); res.send(out[1]);', 'xss')
+
+    def test_flatmap_overrides_keep_selected_function_semantics(self):
+        self.scan('const items = [req.query.html]; items.flatMap = function(callback) { return ["safe"]; }; '
+                  'const out = items.flatMap(value => [req.query.html]); res.send(out[0]);')
+        self.scan('const items = ["safe"]; items.flatMap = function(callback) { return [req.query.html]; }; '
+                  'const out = items.flatMap(value => ["safe"]); res.send(out[0]);', 'xss')
+
+    def test_flatmap_literal_receivers_and_postfix_chains(self):
+        self.scan('res.send([1].flatMap(value => [req.query.html])[0]);', 'xss')
+        self.scan('function make() { return [req.query.html]; } '
+                  'const out = make().flatMap(value => [value]); res.send(out[0]);', 'xss')
+        self.scan('function make() { return [req.query.html]; } '
+                  'res.send(make().flatMap(value => ["safe"])[0]);')
+        source = ('const items = [1]; const out = (items).flatMap(value => [[req.query.html]])'
+                  '[0].flatMap(value => [value]); res.send(out[0]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_flatmap_unsupported_protocols_remain_explicit(self):
+        for setup in ('items.constructor = custom;',
+                      'Object.defineProperty(items, "0", {get() { return req.query.html; }});',
+                      'Object.setPrototypeOf(items, foreign);',
+                      'Array.prototype.flatMap = external;'):
+            with self.subTest(setup=setup):
+                self.assert_fill_partial('res.send(req.query.html); const items = ["safe"]; ' + setup
+                    + 'const out = items.flatMap(value => [value]); res.send(out[0]);',
+                    'xss', reason='flatMap|Object[.]')
+        for callback in ('async value => [value]', 'function* (value) { yield value; }', 'external'):
+            with self.subTest(callback=callback):
+                self.assert_fill_partial('const items = [req.query.html]; '
+                    f'const out = items.flatMap({callback}); res.send(out[0]);', reason='flatMap')
+        self.assert_fill_partial('const items = [...unknown]; '
+            'const out = items.flatMap(value => [req.query.html]); res.send(out[0]);', reason='flatMap')
+        self.assert_fill_partial('res.send(req.query.html); const items = [...unknown]; '
+            'const out = items.flatMap(value => ["safe"]); res.send(out[0]);', 'xss', reason='flatMap')
+
+    def test_flatmap_partial_calls_cannot_hide_escaped_callback_sinks(self):
+        self.scan('function use(items) { items.flatMap(value => { res.send(req.query.html); return []; }); } '
+                  'use([]); use(external);', 'xss')
+
+    def test_flatmap_callback_aliases_in_opaque_arguments_retain_sinks(self):
+        for escape in ('external(saved);', 'external(0, saved);',
+                       'external(0, {callback: saved});', 'external(0, [saved]);'):
+            with self.subTest(escape=escape):
+                self.scan('let saved; [].flatMap(saved = () => { '
+                          'res.send(req.query.html); return []; }); ' + escape, 'xss')
+        self.scan('let saved; [].flatMap(saved = undefined => { '
+                  'res.send(req.query.html); return []; }); external(0, saved);', 'xss')
+        self.scan('[].flatMap(value => { res.send(req.query.html); return []; }); '
+                  'external(0, "safe");')
+
+    def test_flatmap_escaped_callback_observes_later_captured_writes(self):
+        source = ('let saved; let html = "safe"; '
+                  '[1].flatMap(function expand() { saved = expand; res.send(html); return []; }); '
+                  'html = req.query.html; external(0, saved);')
+        self.assert_fill_partial(source, 'xss', reason='flatMap.*self-reference')
+        self.assert_runtime_sends('function external(ignored, callback) { callback(); } ' + source,
+                                  ['safe', 'review-input'])
+
+    def test_flatmap_scalar_literals_are_single_values(self):
+        for result in ('"safe"', "'safe'", '`safe`', '42', 'null', 'true', '({html: "safe"})'):
+            with self.subTest(result=result):
+                self.scan('const items = [req.query.html]; '
+                          f'const out = items.flatMap(value => {result}); '
+                          'res.send(out[0]); res.send(out[1]);')
+        source = ('const items = [req.query.html]; const out = items.flatMap(value => "safe"); '
+                  'res.send(out[0]); res.send(out[1]); res.send(out.length);')
+        self.assert_runtime_sends(source, ['safe', None, 1])
+
+    def test_flatmap_unproved_result_width_keeps_later_source_positions(self):
+        source = ('const flag = false; const items = [1]; '
+                  'const out = items.flatMap(value => flag ? [] : "safe"); '
+                  'out.push(req.query.html); res.send(out[1]);')
+        self.assert_fill_partial(source, 'xss', reason='flatMap.*alternatives')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.assert_fill_partial('const shared = [req.query.html]; const items = [1]; '
+            'const out = items.flatMap(value => shared); res.send(out[0]);',
+            'xss', reason='flatMap.*alternatives')
+        self.assert_fill_partial('const items = [req.query.html]; '
+            'const out = items.flatMap(value => external(value)); res.send(out[0]);',
+            'xss', reason='flatMap.*shape')
+
+    def test_flatmap_uncertain_defaults_and_source_lengths_are_explicit(self):
+        for initial, expected in (('["safe"]', ['safe']), ('[undefined]', ['review-input'])):
+            source = (f'const items = {initial}; '
+                      'const out = items.flatMap((value = req.query.html) => [value]); '
+                      'res.send(out[0]);')
+            with self.subTest(initial=initial):
+                self.assert_fill_partial(source, 'xss', reason='flatMap.*default')
+                self.assert_runtime_sends(source, expected)
+        self.assert_fill_partial('res.send(req.query.html); const items = [1, 2]; '
+            'items.flatMap((value, index, source) => { source.length = unknown; return [value]; });',
+            'xss', reason='flatMap.*length')
+
     def assert_fill_partial(self, source, *rules, reason='Array.fill'):
         with tempfile.TemporaryDirectory(prefix='ubs-fill-partial-') as scratch:
             path = Path(scratch) / 'handler.js'

@@ -1410,14 +1410,19 @@ class _Analysis:
                         closure_state[key] = (
                             arguments[index] if index < len(arguments) else _CLEAN)
                         info = argument_infos[index] if index < len(argument_infos) else None
-                        native = info.native if info is not None else None
-                        # Invoked closure parameters receive function values,
-                        # whose getter identity is separate from input data.
-                        # Preserve source alternatives without expanding other
-                        # closure callback contracts or inventing handle taint.
-                        closure_state[_NativeKey(key)] = (
-                            native if native is not None and native.operations & _ENVIRONMENT_OPERATIONS
-                            else _UNKNOWN_NATIVE)
+                        # Invocation arguments are value snapshots, including
+                        # for go/defer. Keep the same native callback, decoder
+                        # and pointer contracts used by selected named helpers;
+                        # none of these handles is itself request contents.
+                        # Captured outer cells remain independently uncertain
+                        # for delayed execution, as established above.
+                        closure_state[_NativeKey(key)] = info.native if info is not None else _UNKNOWN_NATIVE
+                        if info is not None:
+                            if info.decoder is not None:
+                                closure_state[_DecoderKey(key)] = info.decoder
+                            closure_state[_PointerKey(key)] = info.pointers
+                            if info.pointers and all(target.parameter is None for target in info.pointers):
+                                closure_state[key] = _CLEAN
                 nested = _Analysis(self.source, self.code, self.rule, self.summaries, self.imports,
                                    self.uncertain_globals, self.global_cells, self.resolve_summary)
                 nested.native_escapes = set(self.native_escapes)

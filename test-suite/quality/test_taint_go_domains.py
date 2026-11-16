@@ -1267,6 +1267,53 @@ class SavedNativeValueOracleTests(packages.PackageTestCase):
                                   (('delayed-read', 'xss'),),
                                   'func passthrough(value string) string { return value }')
 
+    def test_invoked_closure_parameters_keep_native_escaper_contracts(self):
+        for package, member in (('html', 'EscapeString'), ('html/template', 'HTMLEscapeString'),
+                                ('text/template', 'HTMLEscapeString')):
+            for scheduling in ('', 'defer ', 'go '):
+                with self.subTest(package=package, scheduling=scheduling):
+                    self.check_source('import safe "' + package + '"',
+                                      scheduling + 'func(escape func(string) string, value string) {\n'
+                                      'fmt.Fprint(w, escape(value))\n'
+                                      'db.Query(escape(value)) // sql-site\n'
+                                      'exec.Command("sh", "-c", escape(value)) // command-site\n'
+                                      '}(safe.' + member + ', r.FormValue("q"))',
+                                      (('sql-site', 'sql'), ('command-site', 'command')))
+
+    def test_closure_callback_unknown_alternatives_never_gain_sanitizer_proof(self):
+        helpers = 'func passthrough(value string) string { return value }'
+        self.check_source('import "html"',
+                          'escape := html.EscapeString\nif choice { escape = passthrough }\n'
+                          'func(clean func(string) string) {\n'
+                          'fmt.Fprint(w, clean(r.FormValue("q"))) // unknown-site\n'
+                          '}(escape)', (('unknown-site', 'xss'),), helpers)
+        self.check_source('import html "example.test/raw"',
+                          'func(clean func(string) string) {\n'
+                          'fmt.Fprint(w, clean(r.FormValue("q"))) // lookalike-site\n'
+                          '}(html.EscapeString)', (('lookalike-site', 'xss'),))
+
+    def test_closure_callback_keeps_argument_effects_and_local_reassignment(self):
+        self.check_source('import "html"',
+                          'func(escape func(string) string, value string) {\n'
+                          '_ = escape(render(value)) // effect-site\n'
+                          'saved := escape\nescape = passthrough\n'
+                          'fmt.Fprint(w, saved(value))\n'
+                          'fmt.Fprint(w, escape(value)) // replaced-site\n'
+                          '}(html.EscapeString, r.FormValue("q"))',
+                          (('effect-site', 'xss'), ('replaced-site', 'xss')),
+                          'func render(value string) string { fmt.Fprint(w, value); return value }\n'
+                          'func passthrough(value string) string { return value }')
+
+    def test_deferred_callback_argument_is_snapshot_not_captured_cell(self):
+        for scheduling in ('defer', 'go'):
+            with self.subTest(scheduling=scheduling):
+                self.check_source('import "html"',
+                                  'escape := html.EscapeString\n' + scheduling + ' func(clean func(string) string) {\n'
+                                  'fmt.Fprint(w, clean(r.FormValue("q")))\n'
+                                  'fmt.Fprint(w, escape(r.FormValue("q"))) // captured-site\n'
+                                  '}(escape)\nescape = passthrough', (('captured-site', 'xss'),),
+                                  'func passthrough(value string) string { return value }')
+
 
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 for real scanner tests')
 class GoSanitizerRunnerTests(unittest.TestCase):
@@ -1340,6 +1387,109 @@ class NativeCallableRuntimeTests(unittest.TestCase):
             self.skipTest('Go compiler is not installed')
         if version.returncode != 0 or not re.match(r'^go version (?:go\d|devel\b)', version.stdout):
             self.skipTest('go on PATH is not a Go compiler (go version did not identify one)')
+
+    def test_compiled_closure_callback_arguments_match_native_contracts(self):
+        from test_keep_temp import prevent_child_deletion
+
+        source = textwrap.dedent('''\
+            package main
+            import (
+                "encoding/json"
+                "encoding/xml"
+                "fmt"
+                "html"
+                "io"
+                "net/http"
+                "net/http/httptest"
+                "net/url"
+                "os"
+                "strings"
+            )
+            type Payload struct { SQL string; HTML string }
+            type database struct { Queries []string }
+            func (db *database) Query(query string, args ...any) { db.Queries = append(db.Queries, query) }
+            func raw(value string) string { return value }
+            func callbackHandler(r *http.Request, db *database, w http.ResponseWriter) {
+                func(read func(io.Reader) ([]byte, error), decode func([]byte, any) error, escape func(string) string) {
+                    payload, readErr := read(r.Body)
+                    if readErr != nil { db.Query(readErr.Error()); return }
+                    var p Payload
+                    if err := decode(payload, &p); err != nil { db.Query(err.Error()); return }
+                    db.Query(p.SQL) // callback-query
+                    db.Query("SELECT $1", p.SQL)
+                    fmt.Fprint(w, escape(p.HTML))
+                    fmt.Fprint(w, p.HTML) // raw-output
+                }(io.ReadAll, json.Unmarshal, html.EscapeString)
+            }
+            func receiverHandler(r *http.Request, db *database) {
+                var p Payload
+                decoder := xml.NewDecoder(r.Body)
+                func(reader *xml.Decoder, out *Payload) {
+                    if err := reader.Decode(out); err != nil { db.Query(err.Error()); return }
+                    db.Query(out.SQL) // receiver-query
+                }(decoder, &p)
+            }
+            func factoryHandler(r *http.Request, db *database) {
+                func(factory func(io.Reader) *json.Decoder) {
+                    decoder := factory(r.Body)
+                    var p Payload
+                    if err := decoder.Decode(&p); err != nil { db.Query(err.Error()); return }
+                    db.Query(p.SQL) // factory-query
+                }(json.NewDecoder)
+            }
+            func deferredHandler(r *http.Request, w http.ResponseWriter) {
+                escape := html.EscapeString
+                defer func(call func(string) string) { fmt.Fprint(w, call(r.FormValue("q"))) }(escape)
+                escape = raw
+            }
+            func main() {
+                value := "<b>request</b>"
+                body, err := json.Marshal(Payload{SQL: "SELECT request", HTML: value})
+                if err != nil { panic(err) }
+                db, w := &database{}, httptest.NewRecorder()
+                callbackHandler(httptest.NewRequest("POST", "/", strings.NewReader(string(body))), db, w)
+                receiverHandler(httptest.NewRequest("POST", "/", strings.NewReader("<Payload><SQL>SELECT xml</SQL></Payload>")), db)
+                factoryHandler(httptest.NewRequest("POST", "/", strings.NewReader(string(body))), db)
+                deferredHandler(httptest.NewRequest("GET", "/?q=" + url.QueryEscape(value), nil), w)
+                observed := map[string]any{"rendered": w.Body.String(), "queries": db.Queries}
+                if err := json.NewEncoder(os.Stdout).Encode(observed); err != nil { panic(err) }
+            }
+        ''')
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        folder = Path(tempfile.mkdtemp(prefix='go-closure-native-', dir=artifacts))
+        path = folder / 'main.go'
+        path.write_text(source, encoding='utf-8')
+        environment = dict(os.environ, GOWORK='off', GO111MODULE='off', GOTOOLCHAIN='local',
+                           GOCACHE=str(folder / 'gocache'), GOTMPDIR=str(folder))
+        executable = folder / 'witness'
+        build = subprocess.run(['go', 'build', '-work', '-o', str(executable), str(path)],
+                               cwd=folder, text=True, capture_output=True, timeout=180,
+                               env=environment, preexec_fn=prevent_child_deletion)
+        (folder / 'build.stdout.log').write_text(build.stdout)
+        (folder / 'build.stderr.log').write_text(build.stderr)
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        native = subprocess.run([str(executable)], cwd=folder, text=True, capture_output=True,
+                                timeout=30, env=environment, preexec_fn=prevent_child_deletion)
+        (folder / 'runtime.stdout.log').write_text(native.stdout)
+        (folder / 'runtime.stderr.log').write_text(native.stderr)
+        self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+        self.assertEqual(json.loads(native.stdout), {
+            'rendered': '&lt;b&gt;request&lt;/b&gt;<b>request</b>&lt;b&gt;request&lt;/b&gt;',
+            'queries': ['SELECT request', 'SELECT $1', 'SELECT xml', 'SELECT request'],
+        })
+        findings = list(taint_go.run(RunContext(lang='go', files=[path])))
+        expected = sorted(
+            (number, line.index(sink) + 1, 'go.taint.' + rule)
+            for number, line in enumerate(source.splitlines(), 1)
+            for marker, rule, sink in [('callback-query', 'sql', 'db.Query'),
+                                       ('receiver-query', 'sql', 'db.Query'),
+                                       ('factory-query', 'sql', 'db.Query'),
+                                       ('raw-output', 'xss', 'fmt.Fprint')]
+            if '// ' + marker in line
+        )
+        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings),
+                         expected, findings)
 
     def test_compiled_parenthesized_calls_match_analyzer_contracts(self):
         source = textwrap.dedent('''\

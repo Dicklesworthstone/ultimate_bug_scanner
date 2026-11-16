@@ -752,6 +752,74 @@ class NativeFunctionValueTests(packages.PackageTestCase):
         ''')
         self.assert_hits([('handler.go', 10, 'go.taint.sql')])
 
+    def test_invoked_closure_native_reader_keeps_payload_and_error_slots(self):
+        for package in ('io', 'io/ioutil'):
+            with self.subTest(package=package):
+                self.source('handler.go', 'package app\nimport reader "' + package + '"\n'
+                            'func h() {\n'
+                            'func(read func(io.Reader) ([]byte, error)) {\n'
+                            'payload, err := read(r.Body)\n'
+                            'db.Query(string(payload))\n'
+                            'db.Query(err.Error())\n'
+                            '}(reader.ReadAll)\n}\n')
+                self.assert_hits([('handler.go', 6, 'go.taint.sql')])
+
+    def test_invoked_closure_decoder_factory_preserves_destination_writes(self):
+        for package in ('encoding/json', 'encoding/xml'):
+            with self.subTest(package=package):
+                self.source('handler.go', 'package app\nimport codec "' + package + '"\n'
+                            'func h() {\n'
+                            'func(factory func(io.Reader) *codec.Decoder) {\n'
+                            'var p Payload\ndecoder := factory(r.Body)\n'
+                            'err := decoder.Decode(&p)\n'
+                            'db.Query(p.SQL)\ndb.Query(err.Error())\n'
+                            'db.Query("SELECT $1", p.SQL)\n'
+                            '}(codec.NewDecoder)\n}\n')
+                self.assert_hits([('handler.go', 8, 'go.taint.sql')])
+
+    def test_invoked_closure_unmarshal_callback_keeps_output_and_error_separate(self):
+        for package in ('encoding/json', 'encoding/xml'):
+            with self.subTest(package=package):
+                self.source('handler.go', 'package app\nimport codec "' + package + '"\n'
+                            'func h() {\n'
+                            'func(decode func([]byte, any) error) {\n'
+                            'var p Payload\n'
+                            'err := decode([]byte(r.FormValue("body")), &p)\n'
+                            'db.Query(p.SQL)\ndb.Query(err.Error())\n'
+                            '}(codec.Unmarshal)\n}\n')
+                self.assert_hits([('handler.go', 7, 'go.taint.sql')])
+
+    def test_invoked_closure_decoder_and_destination_arguments_keep_identity(self):
+        for package in ('encoding/json', 'encoding/xml'):
+            with self.subTest(package=package):
+                self.source('handler.go', 'package app\nimport codec "' + package + '"\n'
+                            'func h() {\nvar p Payload\n'
+                            'decoder := codec.NewDecoder(r.Body)\n'
+                            'func(reader *codec.Decoder, out *Payload) {\n'
+                            'err := reader.Decode(out)\n'
+                            'db.Query(out.SQL)\ndb.Query(err.Error())\n'
+                            '}(decoder, &p)\n}\n')
+                self.assert_hits([('handler.go', 8, 'go.taint.sql')])
+
+    def test_invoked_closure_fixed_decoder_and_reader_arguments_remain_clean(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "io"; "strings")
+            func h() {
+                func(read func(io.Reader) ([]byte, error), makeDecoder func(io.Reader) *json.Decoder) {
+                    raw, err := read(strings.NewReader("SELECT 1"))
+                    db.Query(string(raw))
+                    db.Query(err.Error())
+                    var p Payload
+                    decoder := makeDecoder(strings.NewReader(`{"SQL":"SELECT 1"}`))
+                    failure := decoder.Decode(&p)
+                    db.Query(p.SQL)
+                    db.Query(failure.Error())
+                }(io.ReadAll, json.NewDecoder)
+            }
+        ''')
+        self.assert_hits([])
+
     def test_saved_native_operations_with_fixed_data_stay_clean(self):
         self.source('handler.go', '''
             package app

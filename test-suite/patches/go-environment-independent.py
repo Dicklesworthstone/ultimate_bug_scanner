@@ -3,6 +3,10 @@
 Usage: python3 test-suite/patches/go-environment-independent.py REPOSITORY
 Analyzed Go fixtures are never executed. All fixture files are retained.
 This standalone checkpoint is intentionally outside automatic test discovery.
+
+The original 15 labels remain unchanged. Eight additional grouped-result and
+closure-write cases were reviewed against a603d20 but have not been executed.
+All cases require exact findings and successful analysis; partial is not a pass.
 """
 import json
 from pathlib import Path
@@ -121,6 +125,117 @@ func run() {
   fmt.Fprint(w, environment.Getenv("HTML"))
 }
 ''', [("go.taint.xss", 4)]),
+    "lookup_grouped_result_payload": ('''package app
+import (
+    "fmt"
+    "io"
+    environment "os"
+)
+func run(w io.Writer) {
+    value, present := (environment.LookupEnv("HTML"))
+    fmt.Fprint(w, value)
+    fmt.Fprint(w, present)
+}
+''', [("go.taint.xss", 9)]),
+    "lookup_grouped_result_presence_only": ('''package app
+import (
+    "fmt"
+    "io"
+    environment "os"
+)
+func run(w io.Writer) {
+    _, present := ((environment.LookupEnv("HTML")))
+    fmt.Fprint(w, present)
+}
+''', []),
+    "lookup_grouped_callee_control": ('''package app
+import (
+    "fmt"
+    "io"
+    environment "os"
+)
+func run(w io.Writer) {
+    value, present := (environment.LookupEnv)("HTML")
+    fmt.Fprint(w, value)
+    fmt.Fprint(w, present)
+}
+''', [("go.taint.xss", 9)]),
+    "closure_installs_environment_getter": ('''package app
+import (
+    "fmt"
+    "html"
+    "io"
+    environment "os"
+)
+func run(w io.Writer) {
+    read := html.EscapeString
+    func() {
+        read = environment.Getenv
+    }()
+    fmt.Fprint(w, read("HTML"))
+}
+''', [("go.taint.xss", 13)]),
+    "unused_closure_does_not_install_getter": ('''package app
+import (
+    "fmt"
+    "html"
+    "io"
+    environment "os"
+)
+func run(w io.Writer) {
+    read := html.EscapeString
+    _ = func() {
+        read = environment.Getenv
+    }
+    fmt.Fprint(w, read("HTML"))
+}
+''', []),
+    "closure_keeps_prior_copied_escaper": ('''package app
+import (
+    "fmt"
+    "html"
+    "io"
+    environment "os"
+)
+func run(w io.Writer) {
+    read := html.EscapeString
+    saved := read
+    func() {
+        read = environment.Getenv
+    }()
+    fmt.Fprint(w, saved(environment.Getenv("HTML")))
+    fmt.Fprint(w, read("HTML"))
+}
+''', [("go.taint.xss", 15)]),
+    "closure_mutates_local_copy_only": ('''package app
+import (
+    "fmt"
+    "html"
+    "io"
+    environment "os"
+)
+func run(w io.Writer) {
+    read := html.EscapeString
+    func() {
+        copied := read
+        copied = environment.Getenv
+        _ = copied
+    }()
+    fmt.Fprint(w, read(environment.Getenv("HTML")))
+}
+''', []),
+    "reader_grouped_result_error_control": ('''package app
+import (
+    "fmt"
+    "io"
+    "net/http"
+)
+func run(w io.Writer, r *http.Request) {
+    payload, err := (io.ReadAll(r.Body))
+    fmt.Fprint(w, payload)
+    fmt.Fprint(w, err)
+}
+''', [("go.taint.xss", 9)]),
 }
 
 artifacts = repo / "test-suite/artifacts"

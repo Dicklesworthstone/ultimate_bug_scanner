@@ -10,8 +10,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
  Selected package helpers transport callable and decoder identities through
  parameters and result slots, with a finite context worklist independent of
  payload traces. Excessive specialization is an explicit incomplete analysis.
-@@ -40,10 +40,11 @@
- 
+@@ -41,6 +41,7 @@
  _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
                      'io': 'io', 'io/ioutil': 'ioutil', 'html': 'html',
 -                    'html/template': 'template', 'text/template': 'template'}
@@ -21,9 +20,6 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
 -                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString'}}
 +                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
 +                   'os': {'Getenv', 'LookupEnv'}}
- 
- SOURCE_PATTERNS = [
-     re.compile(r"\.FormValue\s*\(", re.IGNORECASE),
 @@ -55,7 +56,6 @@
      re.compile(r"mux\.Vars\s*\(", re.IGNORECASE),
      re.compile(r"chi\.URLParam\s*\(", re.IGNORECASE),
@@ -32,14 +28,14 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
      re.compile(r"bufio\.NewReader\(os\.Stdin\)", re.IGNORECASE),
      re.compile(r"\b(?:r|req|request)\.Body\b"),
  ]
-@@ -1002,6 +1002,7 @@
+@@ -1001,6 +1001,7 @@
+         constructor = bool(operations) and operations <= {('json', 'NewDecoder'), ('xml', 'NewDecoder')}
          unmarshal = bool(operations) and operations <= {('json', 'Unmarshal'), ('xml', 'Unmarshal')}
          readall = bool(operations) and operations <= {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
          sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
 +        environment = operations & {('os', 'Getenv'), ('os', 'LookupEnv')}
          methods = {'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
                     'UseNumber', 'DisallowUnknownFields', 'Buffered'}
-         method = member if receiver is not None and member in methods else None
 @@ -1015,7 +1016,7 @@
                  outer_end = pairs.get(opening)
                  if outer_end is None:
@@ -49,10 +45,15 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
              return None
          if whole and code[outer_end + 1:].strip():
              return None
-@@ -1048,6 +1049,20 @@
+@@ -1048,6 +1049,25 @@
          callable_source = (_join(callable_source, state.get(scope.bindings.get(root, root), _CLEAN))
                             if native is not None and native.unknown else _CLEAN)
          fallback = _join(*values, callable_source)
++        # Include getter alternatives introduced while evaluating arguments.
++        # The pre-call family flags above remain unchanged for existing
++        # decoder contracts; this branch only adds a possible source.
++        operations = native.operations if native is not None else frozenset()
++        environment = operations & {('os', 'Getenv'), ('os', 'LookupEnv')}
 +        if environment:
 +            if len(values) != 1:
 +                return finish(end, (fallback,))
@@ -70,10 +71,24 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
          if constructor:
              if len(values) != 1:
                  return finish(end, (_CLEAN,))
+@@ -1170,6 +1190,13 @@
+     def values(self, expr: str, offset: int, state, scope) -> tuple[_Fact, ...]:
++        # Result grouping changes no tuple slots. Keep callers' source/cache
++        # origin while the inner expression preserves actual call locations.
++        inner, inner_offset = self.unparenthesize(expr, offset)
++        if inner != expr:
++            values = self.values(inner, inner_offset, state, scope)
++            self.value_results[offset] = self.value_results[inner_offset]
++            return values
+         code = _call_code(_masked_source(expr))
+         parts = _parts(code)
+         if len(parts) > 1:
+             values, infos = [], []
+             for start, end in parts:
 diff --git a/test-suite/quality/test_taint_go_domains.py b/test-suite/quality/test_taint_go_domains.py
 --- a/test-suite/quality/test_taint_go_domains.py
 +++ b/test-suite/quality/test_taint_go_domains.py
-@@ -541,6 +541,337 @@
+@@ -541,6 +541,371 @@
          '''), ["go.taint.xss"])
  
  
@@ -281,6 +296,40 @@ diff --git a/test-suite/quality/test_taint_go_domains.py b/test-suite/quality/te
 +                          'db.Query(`' + 'fixed ' * 25000 + '`)\n'
 +                          'db.Query(((environment.Getenv))("UBS_INPUT")) // query',
 +                          (('query', 'sql', 'db.Query'),))
++
++    def test_grouped_lookup_results_keep_payload_and_presence_slots(self):
++        for expression in ('(environment.LookupEnv("UBS_INPUT"))',
++                           '((saved("UBS_INPUT")))',
++                           '(lookup("UBS_INPUT"))'):
++            with self.subTest(expression=expression):
++                self.check_source('import environment "os"',
++                                  'saved := environment.LookupEnv\n'
++                                  'value, present := ' + expression + '\n'
++                                  'db.Query(value) // query\n'
++                                  'fmt.Fprint(w, present)\n'
++                                  'db.Query(fmt.Sprint(present))',
++                                  (('query', 'sql', 'db.Query'),),
++                                  'func lookup(key string) (string, bool) { '
++                                  'return ((environment.LookupEnv(key))) }')
++
++    def test_grouped_reader_results_keep_payload_and_error_slots(self):
++        self.check_source('import reader "io"',
++                          'payload, err := (reader.ReadAll(r.Body))\n'
++                          'db.Query(string(payload)) // direct\n'
++                          'fmt.Fprint(w, err)\n'
++                          'other, failure := ((collect(r.Body)))\n'
++                          'db.Query(string(other)) // helper\n'
++                          'fmt.Fprint(w, failure)',
++                          (('direct', 'sql', 'db.Query'), ('helper', 'sql', 'db.Query')),
++                          'func collect(body reader.Reader) ([]byte, error) { '
++                          'return ((reader.ReadAll(body))) }')
++
++    def test_immediate_closure_can_install_an_environment_getter(self):
++        self.check_source('import (environment "os"; "html")',
++                          'read := html.EscapeString\n'
++                          'func() { read = environment.Getenv }()\n'
++                          'fmt.Fprint(w, read("UBS_INPUT")) // output',
++                          (('output', 'xss', 'fmt.Fprint'),))
 +
 +    @unittest.skipUnless(os.environ.get('UBS_TAINT_NATIVE_GO') == '1',
 +                         'set UBS_TAINT_NATIVE_GO=1 to compile the environment witness')

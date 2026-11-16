@@ -1,6 +1,87 @@
 # Go native environment-source implementation checkpoint
 
-## November 15 source qualification (base a603d20)
+## Subsequent static review — candidate remains unactivated
+
+This section records unexecuted amendments to the source-qualified candidate in
+commit `e245471af51fb287ee6ac41249ed1ce6d7b84720`. That commit's complete patch and
+evidence remain available in Git history. The current patch still targets
+`a603d20fbb11508c03f916e83e566d106678ee92`; its production analyzer and automatic
+tests are not changed by saving this archive.
+
+The execution environment disconnected during this review's first baseline and
+test-edit attempts, then reported unavailable. No analyzer, native compiler,
+public scanner or quality-gate result was recovered by this review. The earlier
+285 passing source tests below qualify the preceding candidate, **not the new
+amendments or newly added cases**.
+
+### Amendments and retained work
+
+The current patch preserves the preceding native import/getter implementation,
+the newer `_call_code` normalizer, all existing matchers, and the complete
+maintained tests, including per-case retained evidence and the 150 KB masked
+literal regression. It adds:
+
+- A refresh of possible native getter operations after argument evaluation.
+- Whole-expression result-parenthesis forwarding in `values()`, retaining the
+  caller's original `value_results` key and inner call locations.
+- Three maintained regression methods: grouped getter/helper payload/presence,
+  grouped reader/helper payload/error, and an immediate closure installing an
+  environment getter.
+- Eight independent exact-outcome cases covering grouping, reader errors,
+  immediate versus unused closures, copied escapers and inner-copy mutation.
+
+The maintained insertion now contains 22 source methods plus the two optional
+native/public methods. The standalone independent oracle retains its original
+15 labels and evaluator unchanged and now contains 23 cases. All new cases are
+unexecuted; partial analysis does not satisfy an exact-finding case.
+
+The old `_NATIVE_CALL` matcher is still absent. Do not apply the historical
+`go-environment-grouping-followup.patch` to the current candidate.
+
+### Additional activation blocker: captured getter writes
+
+Independent source review found a remaining transfer gap:
+
+```go
+read := html.EscapeString
+func() {
+    read = environment.Getenv
+}()
+fmt.Fprint(w, read("HTML"))
+```
+
+The current closure path invalidates the old callable's authority but does not
+preserve the newly installed getter operation in the outer cell. With a literal
+key, fallback contributes no source. This is a **predicted complete-clean miss
+from static inspection, not an observed execution failure in this review**.
+The refreshed candidate does not repair that closure transfer.
+
+The maintained and independent cases keep the exact desired finding and are not
+xfailed or weakened. Fix the captured-write transfer and preserve unused-closure,
+saved-copy and inner-copy controls before activation. If a selected flow cannot
+be modeled, report an explicit incomplete boundary; do not count that boundary
+as a passing exact-finding test.
+
+### Structural checks and executable continuation
+
+Forward and reverse in-memory text replay against the immutable base matched
+all hunk counts and context lines without fuzzy application. Original oracle
+labels and the evaluator were compared unchanged. These checks verify archive
+construction only; no Python syntax, scanner behavior, native execution or
+performance pass is claimed for the amendments.
+
+Before activation, complete the closure repair and execute the full current
+source and independent oracles, then the existing grouped JSON/XML decoder
+tests, grouped `ReadAll` and selected-helper tuple controls, and source-budget
+checks. The tuple normalization affects shared machinery. Run the required
+native witness, public module/meta-runner formats and canonical quality gates
+on the final source. Preserve the qualification and no-deletion requirements
+below; keep the bead and D6 incomplete until their own acceptance evidence is
+available.
+
+---
+
+## Prior candidate: November 15 source qualification (base a603d20)
 
 This remains an **unactivated source-level candidate**. The replacement
 `go-environment-native-candidate.patch` targets the immutable base named below

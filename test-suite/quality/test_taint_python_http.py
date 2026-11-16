@@ -424,5 +424,231 @@ requests.get(target)
                     print(f'[python-http-{tag}] PASS', flush=True)
 
 
+class PooledHTTPClientTests(SourceTest):
+    """Native pooled clients retain destination identity through local flow."""
+
+    def test_session_constructors_aliases_and_bound_methods(self):
+        for setup, constructor in (
+            ('import requests', 'requests.Session'),
+            ('import requests', 'requests.session'),
+            ('import requests.sessions as pools', 'pools.Session'),
+            ('from requests.sessions import session as make', 'make'),
+            ('from requests import Session as make', 'make'),
+            ('import httpx as transport', 'transport.Client'),
+        ):
+            with self.subTest(constructor=constructor):
+                self.assert_rules(f'{setup}\nclient = {constructor}()\nclient.get(input())\n', 'ssrf')
+                self.assert_rules(f'{setup}\nclient = {constructor}()\nfetch = client.get\n'
+                                  'client = unrelated\nfetch(input())\n', 'ssrf')
+
+    def test_context_managers_and_inline_receivers(self):
+        for module, constructor in (('requests', 'Session'), ('httpx', 'Client')):
+            with self.subTest(module=module):
+                self.assert_rules(f'import {module}\nwith {module}.{constructor}() as client:\n'
+                                  '    client.get(input())\n', 'ssrf')
+                self.assert_rules(f'import {module}\n{module}.{constructor}().get(input())\n', 'ssrf')
+
+    def test_methods_select_the_url_not_metadata(self):
+        for constructor in ('requests.Session', 'httpx.Client'):
+            for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'request'):
+                prefix = '"GET", ' if method == 'request' else ''
+                setup = f'import requests, httpx\nclient = {constructor}()\n'
+                with self.subTest(constructor=constructor, method=method):
+                    self.assert_rules(setup + f'client.{method}({prefix}input())\n', 'ssrf')
+                    self.assert_rules(setup + f'client.{method}({prefix}url=input())\n', 'ssrf')
+                    self.assert_rules(setup + f'client.{method}({prefix}"https://example.invalid", '
+                                      'params={"q": input()}, headers={"X-Data": input()})\n')
+            self.assert_rules(setup + 'client.post("https://example.invalid", data=input())\n')
+            self.assert_rules(setup + 'client.request(*["GET", input()])\n', 'ssrf')
+            self.assert_rules(setup + 'client.request(**{"method": "GET", "url": input()})\n', 'ssrf')
+
+    def test_constructor_metadata_is_not_a_destination(self):
+        self.assert_rules('import httpx\nclient = httpx.Client(headers={"X-Data": input()}, '
+                          'params={"q": input()}, auth=("name", input()))\n'
+                          'client.get("https://example.invalid")\n')
+        self.assert_rules('import httpx\nclient = httpx.Client(base_url=input())\n')
+
+    def test_base_url_is_used_only_by_relative_requests(self):
+        for path in ('/relative', 'relative', '', '//still-relative.example/path'):
+            with self.subTest(path=path):
+                self.assert_rules(f'import httpx\nclient = httpx.Client(base_url=input())\n'
+                                  f'client.get({path!r})\n', 'ssrf')
+        self.assert_rules('import httpx\nclient = httpx.Client(base_url=input())\n'
+                          'client.get("https://example.invalid/fixed")\n')
+        self.assert_rules('import httpx\nclient = httpx.Client(base_url="https://example.invalid")\n'
+                          'client.get(input())\n', 'ssrf')
+
+    def test_client_and_method_summaries(self):
+        self.assert_rules('''
+            import requests
+            def fetch(client, target):
+                return client.get(target)
+            fetch(requests.Session(), input())
+        ''', 'ssrf')
+        self.assert_rules('''
+            import httpx
+            def make(base):
+                return httpx.Client(base_url=base)
+            def fetch(client, target):
+                return client.get(target)
+            fetch(make(input()), '/relative')
+        ''', 'ssrf')
+        self.assert_rules('''
+            import httpx
+            def make(base):
+                return httpx.Client(base_url=base)
+            def fetch(client, target):
+                return client.get(target)
+            fetch(make(input()), 'https://example.invalid/fixed')
+        ''')
+        self.assert_rules('''
+            import requests
+            def make():
+                return requests.Session().get
+            def fetch(call, target):
+                return call(target)
+            fetch(make(), input())
+        ''', 'ssrf')
+
+    def test_host_presence_controls_httpx_absolute_overrides(self):
+        for destination in ('https://user@/relative', 'https://:443/relative',
+                            'https:relative', 'http:/relative', '//host.invalid/relative'):
+            with self.subTest(destination=destination):
+                self.assert_rules(f'import httpx\nclient = httpx.Client(base_url=input())\n'
+                                  f'client.get({destination!r})\n', 'ssrf')
+        self.assert_rules('import httpx\nclient = httpx.Client(base_url=input())\n'
+                          'client.get("https://user@safe.invalid/relative")\n')
+        with self.assertRaises(taint_py.AnalysisLimit):
+            self.scan('import httpx\nclient = httpx.Client(base_url=input())\n'
+                      'client.get(httpx.URL("https://safe.invalid/fixed"))\n')
+
+    def test_non_native_constructors_and_rebinding_do_not_get_contracts(self):
+        for source in (
+            'client = Session()\nclient.get(input())\n',
+            'from other import Session\nclient = Session()\nclient.get(input())\n',
+            'from .httpx import Client\nclient = Client()\nclient.get(input())\n',
+            'import httpx\nhttpx = other\nclient = httpx.Client()\nclient.get(input())\n',
+            'from httpx import Client\nClient = other\nclient = Client()\nclient.get(input())\n',
+            'import requests\nclient = requests.Session()\nclient = other\nclient.get(input())\n',
+        ):
+            with self.subTest(source=source):
+                self.assert_rules(source)
+
+    def test_async_requests_only_execute_when_consumed(self):
+        self.assert_rules('''
+            import httpx
+            async def fetch():
+                async with httpx.AsyncClient() as client:
+                    await client.get(input())
+        ''', 'ssrf')
+        self.assert_rules('''
+            import httpx
+            client = httpx.AsyncClient()
+            pending = client.get(input())
+        ''')
+        self.assert_rules('''
+            import httpx, asyncio
+            client = httpx.AsyncClient()
+            pending = client.get(input())
+            asyncio.run(pending)
+        ''', 'ssrf')
+        self.assert_rules('''
+            import httpx, asyncio
+            async def fetch():
+                client = httpx.AsyncClient()
+                task = asyncio.create_task(client.get(input()))
+        ''', 'ssrf')
+
+    def test_stream_contexts_execute_at_entry(self):
+        self.assert_rules('''
+            import httpx
+            client = httpx.Client()
+            pending = client.stream('GET', input())
+        ''')
+        self.assert_rules('''
+            import httpx
+            client = httpx.Client()
+            with client.stream('GET', input()) as response:
+                pass
+        ''', 'ssrf')
+        self.assert_rules('''
+            import httpx
+            async def fetch():
+                client = httpx.AsyncClient()
+                async with client.stream('GET', input()) as response:
+                    pass
+        ''', 'ssrf')
+
+    def test_async_and_stream_summaries_preserve_pending_requests(self):
+        self.assert_rules('''
+            import httpx
+            def prepare(client, target):
+                return client.get(target)
+            async def fetch():
+                client = httpx.AsyncClient()
+                await prepare(client, input())
+        ''', 'ssrf')
+        self.assert_rules('''
+            import httpx
+            def prepare(target):
+                return httpx.Client().stream('GET', target)
+            with prepare(input()) as response:
+                pass
+        ''', 'ssrf')
+
+    def test_scheduled_http_keeps_other_coroutine_effects(self):
+        self.assert_rules('''
+            import httpx, asyncio
+            async def execute(value):
+                eval(value)
+            async def fetch():
+                client = httpx.AsyncClient()
+                await asyncio.gather(client.get(input()), execute(input()))
+        ''', 'ssrf', 'eval')
+        self.assert_rules('''
+            import httpx, asyncio
+            async def execute(value):
+                eval(value)
+            async def fetch():
+                client = httpx.AsyncClient()
+                await asyncio.gather(client.get('https://example.invalid'), execute(input()))
+        ''', 'eval')
+
+    def test_custom_clients_and_deferred_mutation_remain_explicit(self):
+        for source in (
+            'import httpx\nclient = httpx.Client(auth=custom_auth)\nclient.get("https://safe.invalid")\n',
+            'import httpx\nclient = httpx.Client()\nclient.get("https://safe.invalid", auth=custom_auth)\n',
+            'import httpx\nclient = httpx.Client(transport=custom_transport)\n',
+            'import httpx\nclient = httpx.Client(event_hooks={"request": [change_url]})\n',
+            'import httpx\nclient = httpx.Client()\nclient.send(client.build_request("GET", input()))\n',
+            'import httpx\nclient = httpx.Client()\npending = client.stream("GET", "/relative")\n'
+            'client.base_url = input()\nwith pending:\n    pass\n',
+            'import httpx\nasync def fetch():\n    client = httpx.AsyncClient()\n'
+            '    pending = client.get("/relative")\n    client.base_url = input()\n    await pending\n',
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(source)
+        self.assert_rules('import httpx\nclient = httpx.Client(event_hooks={}, mounts={})\n'
+                          'client.get("https://example.invalid", auth=("user", input()))\n')
+
+    def test_mutated_and_escaped_clients_refuse_complete_clean(self):
+        for body in (
+            'client.base_url = input()\nclient.get("/relative")',
+            'alias = client\nalias.get = replacement\nclient.get(input())',
+            'configure(client)\nclient.get(input())',
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('import httpx\nclient = httpx.Client()\n' + body + '\n')
+        for source in (
+            'import httpx\nhttpx.Client = replacement\nhttpx.Client().get(input())\n',
+            'import requests\nrequests.Session.get = replacement\nrequests.Session().get(input())\n',
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(source)
+
+
 if __name__ == '__main__':
     unittest.main()

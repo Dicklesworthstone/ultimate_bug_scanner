@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import tokenize
+from urllib.parse import urlsplit
 from bisect import bisect_right
 from collections import defaultdict, deque
 from dataclasses import dataclass, field, fields, is_dataclass
@@ -175,6 +176,26 @@ _HTTP_URL_POSITIONS = {
     'requests.api.request': 1,
     'httpx.request': 1,
     'httpx.stream': 1,
+}
+_HTTP_CLIENT_CONSTRUCTORS = {
+    **{f'{module}.{constructor}': 'requests'
+       for module in ('requests', 'requests.sessions')
+       for constructor in ('Session', 'session')},
+    'httpx.Client': 'httpx',
+    'httpx.AsyncClient': 'httpx.async',
+}
+_HTTP_CLIENT_METHODS = {
+    kind: {**{method: 0 for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options')},
+           'request': 1, **({'stream': 1} if kind.startswith('httpx') else {})}
+    for kind in frozenset(_HTTP_CLIENT_CONSTRUCTORS.values())
+}
+_HTTP_CLIENT_MEMBERS = {
+    **{module: frozenset(name.rsplit('.', 1)[1] for name in _HTTP_CLIENT_CONSTRUCTORS
+                         if name.rsplit('.', 1)[0] == module)
+       for module in ('requests', 'requests.sessions', 'httpx')},
+    **{constructor: frozenset(_HTTP_CLIENT_METHODS[kind]) | {
+        'send', '__init__', '__enter__', '__aenter__', 'build_request', 'prepare_request'}
+       for constructor, kind in _HTTP_CLIENT_CONSTRUCTORS.items()},
 }
 
 
@@ -352,6 +373,24 @@ class _BoundCallable:
     # Native method identity and producer authority belong to the captured
     # receiver; a method-name suffix proves neither.
     receiver_binding: object = None
+
+
+@dataclass(frozen=True)
+class _HTTPClient:
+    """Finite native receiver identity; only its captured base carries data."""
+    kind: str
+
+
+@dataclass(frozen=True)
+class _HTTPPending:
+    """A native request whose network effect waits for await/context entry."""
+    call: ast.Call
+    asynchronous: bool
+    streaming: bool = False
+
+
+def _http_contract(value, contract=(_HTTPClient, _HTTPPending)):
+    return isinstance(value, _BoundCallable) and isinstance(value.receiver_binding, contract)
 
 
 @dataclass(frozen=True)
@@ -1026,6 +1065,8 @@ def _without_object_contract(binding):
         raise AnalysisLimit('mutated functools.partial object; analysis is incomplete')
     choices = []
     for value in _binding_choices(binding):
+        if _http_contract(value):
+            raise AnalysisLimit('HTTP client mutation or escape is unresolved; analysis is incomplete')
         if isinstance(value, _CsvReader):
             raise AnalysisLimit('CSV reader mutation or escape is unresolved; analysis is incomplete')
         if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance,
@@ -1043,7 +1084,8 @@ def _without_object_contract(binding):
 _QUALIFIER_WIDTH = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS))
 _KNOWN_QUALIFIER_PREFIXES = frozenset(
     '.'.join(qualified.split('.')[:size])
-    for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_ALL_FRAMEWORK_NAMES, *_REQUEST_TYPES)
+    for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_HTTP_CLIENT_CONSTRUCTORS, 'httpx.URL',
+                      *_ALL_FRAMEWORK_NAMES, *_REQUEST_TYPES)
     for size in range(1, len(qualified.split('.')) + 1))
 
 
@@ -2312,8 +2354,28 @@ class _Flow:
         fact = self.expr(context, state)
         if not state.reachable:
             return None
+        binding = self.expression_bindings.get(context)
+        choices = _binding_choices(binding)
+        native_context = any(_http_contract(value) for value in choices)
+        if native_context:
+            entered = []
+            for value in choices:
+                if not _http_contract(value):
+                    raise AnalysisLimit('ambiguous HTTP context manager; analysis is incomplete')
+                contract = value.receiver_binding
+                asynchronous = (contract.asynchronous if isinstance(contract, _HTTPPending)
+                                else contract.kind == 'httpx.async')
+                if asynchronous != isinstance(node, ast.AsyncWith):
+                    raise AnalysisLimit('HTTP context manager protocol mismatch; analysis is incomplete')
+                if isinstance(contract, _HTTPPending):
+                    self.resume_http(value, state, streaming=True)
+                    entered.append(None)
+                else:
+                    entered.append(value)
+            self.expression_bindings[context] = _join_bindings(*entered)
+            fact = CLEAN
         if item.optional_vars is not None:
-            self.assign(item.optional_vars, fact, state)
+            self.assign(item.optional_vars, fact, state, context if native_context else None)
         outer = self.pending
         self.pending = []
         self.exception_states.append(None)
@@ -2352,6 +2414,8 @@ class _Flow:
     def escape_literal_mapping(self, binding, references, state):
         """Heap aggregates do not retain these finite object contracts."""
         for value in _binding_choices(binding):
+            if _http_contract(value):
+                raise AnalysisLimit('HTTP client storage or escape is unresolved; analysis is incomplete')
             if (isinstance(value, _CsvReader) or isinstance(value, _BoundCallable)
                     and isinstance(value.receiver_binding, _CsvReader)):
                 raise AnalysisLimit('CSV reader storage or escape is unresolved; analysis is incomplete')
@@ -4320,6 +4384,14 @@ class _Flow:
                 if isinstance(target, ast.Subscript):
                     self.expr(target.slice, state)
             namespace = self.expression_bindings.get(target.value)
+            if any(_http_contract(choice) for choice in _binding_choices(namespace)):
+                raise AnalysisLimit('HTTP client mutation is unmodeled; analysis is incomplete')
+            if isinstance(target, ast.Attribute):
+                for choice in _binding_choices(namespace):
+                    name = (choice if isinstance(choice, str) else choice.name
+                            if isinstance(choice, _BoundCallable) and choice.namespace_proven else None)
+                    if target.attr in _HTTP_CLIENT_MEMBERS.get(name, ()):
+                        raise AnalysisLimit('HTTP client API replacement is unmodeled; analysis is incomplete')
             if isinstance(target, ast.Attribute) and any(
                     target.attr in members for members in _SOURCE_MEMBERS.values()):
                 self.require_value(namespace)
@@ -6142,10 +6214,123 @@ class _Flow:
                     values.pop(original, None)
         return join_facts(*results)
 
+    def http_destination(self, node, inputs, position):
+        """Select the URL once, preserving ambiguous expansion operands."""
+        arguments, keywords = inputs.arguments, inputs.keywords
+        star = next((index for index, argument in enumerate(node.args)
+                     if index <= position and isinstance(argument, ast.Starred)), None)
+        if star is not None:
+            return join_facts(*arguments[star:], keywords.get('url', CLEAN),
+                              keywords.get(None, CLEAN)), None
+        if len(arguments) > position:
+            return arguments[position], node.args[position]
+        return join_facts(keywords.get('url', CLEAN), keywords.get(None, CLEAN)), inputs.keyword_nodes.get('url')
+
+    def http_client(self, node, state, name, inputs):
+        """Construct a native handle without tainting it with option data."""
+        kind = _HTTP_CLIENT_CONSTRUCTORS[name]
+        if node.args or None in inputs.keyword_nodes or kind == 'requests' and inputs.keywords:
+            raise AnalysisLimit('HTTP client constructor argument binding is unresolved; analysis is incomplete')
+        for option in ('event_hooks', 'transport', 'mounts'):
+            expression = inputs.keyword_nodes.get(option)
+            if expression is not None and not (
+                    isinstance(expression, ast.Constant) and expression.value is None
+                    or isinstance(expression, ast.Dict) and not expression.keys):
+                raise AnalysisLimit('HTTP client custom transport or hooks are unresolved; analysis is incomplete')
+        self.http_auth(inputs.keyword_nodes.get('auth'))
+        base = inputs.keywords.get('base_url', CLEAN) if kind.startswith('httpx') else CLEAN
+        # Receiver references support aliases and summary mutation checks;
+        # concrete base provenance stays out of callable context keys.
+        self.expression_bindings[node] = _BoundCallable(
+            '@http.client', frozenset({node}), base, True, receiver_binding=_HTTPClient(kind))
+        self.expression_references[node] = frozenset({node})
+        self.possible_exception(state)
+        return CLEAN
+
+    def http_auth(self, expression):
+        """Basic credentials are data; an Auth object may yield another URL."""
+        if expression is None or isinstance(expression, ast.Constant) and expression.value is None:
+            return
+        if isinstance(expression, (ast.Tuple, ast.List)) and len(expression.elts) == 2:
+            return
+        binding = self.expression_bindings.get(expression)
+        self.require_value(binding)
+        if isinstance(binding, _ArgumentVector) and len(binding.operands) == 2:
+            return
+        raise AnalysisLimit('HTTP client custom authentication is unresolved; analysis is incomplete')
+
+    def http_request(self, node, state, target, inputs):
+        contract = target.receiver_binding
+        method = target.name.rsplit('.', 1)[-1]
+        if target.references & state.mutated:
+            raise AnalysisLimit('HTTP client receiver was mutated; analysis is incomplete')
+        if method in {'close', 'aclose'}:
+            self.expression_bindings[node] = None
+            self.possible_exception(state)
+            return CLEAN
+        position = _HTTP_CLIENT_METHODS[contract.kind].get(method)
+        if position is None:
+            raise AnalysisLimit('HTTP client method is unmodeled; analysis is incomplete')
+        self.http_auth(inputs.keyword_nodes.get('auth'))
+        destination, expression = self.http_destination(node, inputs, position)
+        if contract.kind.startswith('httpx'):
+            value = self.expression_bindings.get(expression)
+            self.require_value(value)
+            literals = [_literal_text(choice) for choice in _binding_choices(value)]
+            # HTTPX regards //host/path as relative. Only a proven scheme
+            # and authority override its base; an opaque URL may use either.
+            absolute = bool(literals) and all(
+                text is not None and self.http_absolute_url(text) for text in literals)
+            if not absolute:
+                destination = join_facts(destination, target.receiver)
+        streaming = method == 'stream'
+        asynchronous = contract.kind == 'httpx.async'
+        if streaming or asynchronous:
+            self.expression_bindings[node] = _BoundCallable(
+                '@http.pending', target.references, destination, True,
+                receiver_binding=_HTTPPending(node, asynchronous, streaming))
+            self.expression_references[node] = target.references
+            return CLEAN
+        self.effect('ssrf', node, 'HTTP request URL', destination)
+        self.expression_bindings[node] = None
+        self.expression_references[node] = frozenset({node})
+        self.possible_exception(state)
+        return CLEAN
+
+    @staticmethod
+    def http_absolute_url(text):
+        # A nonempty authority can still have an empty host (user@ or :443).
+        # HTTPX resolves those spellings against its base just like /path.
+        try:
+            parsed = urlsplit(text)
+            return bool(parsed.scheme and parsed.hostname)
+        except ValueError as exc:
+            raise AnalysisLimit('HTTP URL parsing is unresolved; analysis is incomplete') from exc
+
+    def resume_http(self, value, state, *, streaming=False):
+        contract = value.receiver_binding
+        if not isinstance(contract, _HTTPPending) or contract.streaming != streaming:
+            raise AnalysisLimit('HTTP request consumption protocol is unresolved; analysis is incomplete')
+        if value.references & state.mutated:
+            raise AnalysisLimit('HTTP request receiver changed before execution; analysis is incomplete')
+        self.effect('ssrf', contract.call, 'HTTP request URL', value.receiver)
+        self.possible_exception(state)
+        return CLEAN
+
     def invoke(self, node, state, callee, inputs, *, resumed=None):
         target, fallback_name = callee.binding, callee.fallback_name
         receiver, receiver_refs = callee.receiver, callee.references
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
+        if _http_contract(target, _HTTPClient):
+            return self.http_request(node, state, target, inputs)
+        if _http_contract(target, _HTTPPending):
+            raise AnalysisLimit('pending HTTP request called as a function; analysis is incomplete')
+        native_name = (target if isinstance(target, str) else target.name
+                       if isinstance(target, _BoundCallable) and target.namespace_proven else None)
+        if native_name in _HTTP_CLIENT_CONSTRUCTORS:
+            return self.http_client(node, state, native_name, inputs)
+        if native_name == 'httpx.URL':
+            raise AnalysisLimit('HTTPX URL object construction is unmodeled; analysis is incomplete')
         if isinstance(target, ast.ClassDef):
             instance = self.literal_join_instance(node, target, state)
             if instance is None:
@@ -6639,7 +6824,7 @@ class _Flow:
                 or isinstance(value, str) and value in _STDIN_PARSER_CARRIERS
                 or isinstance(value, _BoundCallable) and (
                     value.receiver_binding is not None or value.name in _STDIN_PARSER_CARRIERS)
-                for value in _binding_choices(summary.returned_binding)))
+                for value in _binding_choices(summary.returned_binding) if not _http_contract(value)))
             if not format_frame_inert and isinstance(node, ast.Call):
                 format_frame_inert = self.materialized_generator_call(node, target, state)
                 csv_return = any(isinstance(value, _CsvReader)
@@ -6692,9 +6877,21 @@ class _Flow:
                     self._lookup_refs(references, parameter) for parameter in summary.yielded_references))
                 return substitute(summary.yielded)
             return returned
+        http_pending = [value for expression in (*node.args, *keyword_nodes.values())
+                        for value in _binding_choices(self.expression_bindings.get(expression))
+                        if _http_contract(value, _HTTPPending)]
         deferred = [target for expression in [*node.args, *keyword_nodes.values()]
                     for target in _binding_choices(self.expression_bindings.get(expression))
                     if isinstance(target, _DeferredCall)]
+        if http_pending and name in {'asyncio.run', 'asyncio.create_task', 'asyncio.ensure_future', 'asyncio.gather'}:
+            for value in http_pending:
+                if not value.receiver_binding.asynchronous:
+                    raise AnalysisLimit('synchronous HTTP stream scheduled as a coroutine; analysis is incomplete')
+                self.resume_http(value, state)
+            self.expression_bindings[node] = (None if name == 'asyncio.run' else _join_bindings(*http_pending))
+            self.expression_references[node] = NO_REFERENCES
+            if not deferred:
+                return CLEAN
         for expression in (*node.args, *keyword_nodes.values()):
             for value in _binding_choices(self.expression_bindings.get(expression)):
                 function = value.function if isinstance(value, (_FunctionValue, _ClosureValue)) else value
@@ -6752,8 +6949,10 @@ class _Flow:
                             state.put_cell(ref, end.cells.contents[ref], written=True, weak=True)
             # Awaiting the returned task/gather group resolves these same
             # finite alternatives and observes any later argument mutations.
-            self.expression_bindings[node] = _join_bindings(*deferred)
+            self.expression_bindings[node] = _join_bindings(*deferred, *http_pending)
             self.expression_references[node] = NO_REFERENCES
+            if http_pending:
+                return CLEAN
         # Opaque external calls may return or raise. Known local calls instead
         # contribute exactly their summarized exceptional continuations above.
         # Builtin exception construction stores arguments; it is not an
@@ -6913,7 +7112,13 @@ class _Flow:
             # This effect is summarized even for a symbolic helper parameter.
             for expression in (*node.args, *keyword_nodes.values()):
                 value = self.expression_bindings.get(expression)
-                self.escape_literal_mapping(value, self.expression_references.get(expression, NO_REFERENCES), state)
+                escaping = value
+                if name in {'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr', 'builtins.bool'}:
+                    # Native handle metadata is inert, but this exemption
+                    # must not relax pre-existing CSV/mapping escape checks.
+                    escaping = _join_bindings(*(
+                        choice for choice in _binding_choices(value) if not _http_contract(choice)))
+                self.escape_literal_mapping(escaping, self.expression_references.get(expression, NO_REFERENCES), state)
                 if {'functools', _PARTIAL_CHANGED_MODULE} & _binding_choices(value) and name not in {
                         'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr'}:
                     self.mutate(frozenset({_PARTIAL_MODULE_REF}), CLEAN, state)
@@ -7105,6 +7310,23 @@ class _Flow:
                                             if isinstance(ref, str) and ref.startswith('@global:'))
             for base in _binding_choices(self.expression_bindings.get(node.value)):
                 function = base.function if isinstance(base, (_FunctionValue, _ClosureValue)) else base
+                if _http_contract(base, _HTTPClient):
+                    if base.references & state.mutated:
+                        raise AnalysisLimit('HTTP client receiver was mutated; analysis is incomplete')
+                    kind = base.receiver_binding.kind
+                    if node.attr in _HTTP_CLIENT_METHODS[kind] or node.attr in {'close', 'aclose'}:
+                        candidates.append(_BoundCallable('@http.' + kind + '.' + node.attr,
+                            base.references, base.receiver, True, receiver_binding=base.receiver_binding))
+                    elif node.attr == 'base_url' and kind.startswith('httpx'):
+                        fact = join_facts(fact, base.receiver)
+                        candidates.append(None)
+                    elif node.attr in {'is_closed', 'trust_env'}:
+                        candidates.append(None)
+                    else:
+                        raise AnalysisLimit('HTTP client attribute or prepared request is unmodeled; analysis is incomplete')
+                    continue
+                if _http_contract(base, _HTTPPending):
+                    raise AnalysisLimit('pending HTTP request attribute protocol is unmodeled; analysis is incomplete')
                 if isinstance(base, _CsvReader):
                     if not base.format_safe or receiver_refs & state.mutated:
                         raise AnalysisLimit('CSV reader mutation or producer effects are unresolved; analysis is incomplete')
@@ -7470,7 +7692,12 @@ class _Flow:
                 branch = state.copy()
                 if isinstance(target, _DeferredGenerator):
                     raise AnalysisLimit('synchronous generator used as an awaitable; analysis is incomplete')
-                if isinstance(target, _DeferredCall):
+                if _http_contract(target, _HTTPPending):
+                    if not target.receiver_binding.asynchronous:
+                        raise AnalysisLimit('synchronous HTTP stream used as an awaitable; analysis is incomplete')
+                    fact = self.resume_http(target, branch)
+                    binding, refs = None, NO_REFERENCES
+                elif isinstance(target, _DeferredCall):
                     fact = self.invoke(node, branch, _CallTarget(target.function),
                                        _CallInputs([], {}, {}), resumed=target)
                     binding = self.expression_bindings.get(node)
@@ -9377,7 +9604,7 @@ class _Analysis:
                 slot = '@method:' + name
                 symbolic = frozenset({TaintTrace(slot, parameter=slot, path=(slot,))})
                 qualified = value.name if isinstance(value, _BoundCallable) else None
-                if qualified:
+                if qualified and not _http_contract(value):
                     qualified = _opaque_qualifier(qualified, receiver_unknown=not value.namespace_proven)
                 function = (self.callable_context(name, value.function, captured=captured,
                                                   value_parameters=value_parameters)

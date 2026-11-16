@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Detect attacker-controlled request destinations through native Python
+  `requests.Session` and HTTPX pooled clients, saved methods and selected helper
+  returns. Resolve relative requests against `base_url` while keeping fixed
+  absolute destinations and request metadata clean. Execute async requests only
+  when awaited or scheduled and streams only on context entry. Custom transports,
+  prepared requests, client mutation and unmodeled escapes remain explicitly
+  incomplete instead of silently certifying a clean scan.
+
 - Preserve Go taint through ordinary pointer assignments, explicit struct-field
   writes and selected helper output parameters. Track bounded field paths and
   actual pointer cells so value copies, rebinding, clean sibling fields and

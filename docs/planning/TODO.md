@@ -127,3 +127,32 @@ complete.
 - [ ] Complete Go scratch retention without bypassing the runner's current refusal, then run the unchanged public checks.
 - [ ] Activate only after the required gates; refresh canonical integrity pins, version/release handling and prescribed repository checks.
 - [ ] Close the Bead only on complete cited acceptance evidence; the candidate remains unactivated.
+
+### Pooled Python HTTP clients (`ultimate_bug_scanner-python-pooled-http`)
+
+- [x] Reproduce the original independent 34-case baseline: 14 passed, 20 complete-empty failures.
+- [x] Freeze an additional 24-case oracle with exact unsafe sites and explicit boundaries: baseline 7 passed, 17 failed.
+- [x] Run seven real HTTPX mutation/deferred-execution witnesses without network I/O; all passed.
+- [x] Preserve all 11 original maintained methods, add five location/capture/boundary methods, and route existing HTTP fixtures through retained temporary directories.
+- [x] Add finite native-client/pending markers and initial mutation, escape, call and context hooks in the archived candidate.
+- [x] Recover both source/test edits and independently verify exact forward/reverse replay and immutable blob readback.
+- [ ] Implement the missing `http_call` and `consume_http` methods; the archived source is currently unexecutable.
+- [ ] Complete actual constructor/method identity, URL slots, base handling and helper-factory proof.
+- [ ] Complete await/task/stream consumption without reporting unused handles as reached sinks or freezing mutable receiver state.
+- [ ] Run unchanged maintained/independent/native and public-format suites, then integrity/version/release gates before activation.
+- [ ] Close only after the original acceptance criteria pass; baseline and native-library observations do not establish a candidate pass.
+
+### Native JavaScript array sorting (`ultimate_bug_scanner-array-sort`)
+
+- [x] Confirm reporting-integration Beads already have active fixes; avoid duplicating their implementations.
+- [x] Inspect the current array machinery; native fill/splice/copyWithin are already active.
+- [x] Compare seven scanner fixtures with actual Node behavior; identify four complete-clean misses involving sorting and callback/coercion writes.
+- [x] Preserve 14 proposed regression methods, retained-artifact helper, exact fixture programs, observations and implementation design.
+- [x] Verify the recovered two-hunk patch against the immutable baseline and reverse it exactly.
+- [ ] Implement bounded default native sort mutation, preserving receiver aliases, holes, named properties and sanitizer domains.
+- [ ] Model comparator/coercion effects or explicitly report unsupported analysis; preserve own-method identity and work limits.
+- [ ] Execute the proposed regressions, existing array/heap suites and actual module/runner formats before activating or closing.
+
+Production scanners and discovery tests remain unchanged in these checkpoint
+commits. The interrupted execution environment blocks the remaining qualification;
+all three functional Beads stay open/in progress.

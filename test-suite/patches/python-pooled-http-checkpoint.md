@@ -1,5 +1,113 @@
 # Pooled Python HTTP client SSRF checkpoint
 
+## November 15 continuation on a603d20
+
+This remains an **unfinished, unactivated implementation**. The current
+`python-pooled-http-candidate.patch` targets
+`a603d20fbb11508c03f916e83e566d106678ee92` and replaces the earlier archived
+patch. Production source, automatic discovery tests, version and checksum pins
+remain unchanged.
+
+The executor disconnected after two source edits and the maintained test edit
+succeeded, before constructor/method dispatch could be completed or the candidate
+could be run. The partial source contains calls to `http_call` and
+`consume_http` but neither method is defined. **Do not activate this patch as a
+working scanner.** It preserves the precise interruption point.
+
+### Preserved implementation and tests
+
+- Finite native Requests/HTTPX constructor, client and pending-request markers,
+  with actual import qualifiers and separate receiver facts.
+- Explicit client/API mutation and container/opaque-escape boundaries.
+- Initial context-entry and call-dispatch integration hooks; their transfer
+  methods and deferred-consumption paths remain unfinished.
+- The unchanged original 11-method pooled-client oracle, plus five additional
+  methods for pending aliases/exact sink locations, captured clients, deferred
+  base mutation, harmless options, and unsupported extensions.
+- Existing HTTP test temporary directories use the shared retention helper.
+- The separate 24-case exact/boundary oracle is preserved in
+  `python-http-client-exact.py`. Its fixture labels and sources were fixed
+  before implementation; it supplements the original 34-case adversarial oracle.
+
+### Observed evidence before disconnection
+
+The unchanged baseline analyzer SHA-256 was
+`432418f82a864109b16d8ee04a4452ce4a1b541ba8f9a089255e833ad8c366e7`.
+Runs used CPython 3.12.14. HTTPX 0.28.1 was available; Requests was absent.
+
+| Check | Observed result |
+| --- | --- |
+| Original independent 34-case source oracle | 14 passed, 20 failed; all failures were complete-empty results |
+| Additional 24-case exact/boundary oracle | 7 passed, 17 failed: 12 precise unsafe-flow misses and five missing incomplete-analysis boundaries |
+| Frozen HTTPX native behavior witness | Seven of seven assertions passed, without network I/O |
+| DSR maintained HTTP suite | Started; completion was not observed |
+| Partial candidate / public module and runner checks | Not executed |
+
+The original 34-case oracle permits explicit incomplete analysis for its unsafe
+cases. Therefore a future 34/34 result must still report precise detections and
+incomplete boundaries separately. The extra oracle has 19 exact source cases
+and five explicit boundaries; its unsafe cases require the stated exact sites.
+
+Observed receipt locations in the unavailable workspace:
+
+- `test-suite/artifacts/pooled-http-baseline-review-io8ws6ml/result.json`:
+  exit 1, 0.315 seconds; fixtures `independent-http-adversarial-4m8tno6c`.
+- `test-suite/artifacts/pooled-http-independent-extra-phdn39g6/result.json`:
+  exit 1, 0.243 seconds.
+- `test-suite/artifacts/pooled-http-native-review-sx2_xh5g/result.json`:
+  exit 0, 0.166 seconds. The existing native witness script SHA-256 was
+  `bf73d4c80ea40af5972cb99a95c7b1abd14fd3fc7897e134c356181a1187f56e`.
+- `test-suite/artifacts/dsr-pooled-http-maintained-baseline-zv9TMuwA`:
+  no completed result was observed.
+
+These summaries were returned by tools before disconnection. Full logs were not
+recovered; the identifiers above are not links to currently available receipts.
+
+### Reconstructed checkpoint identity
+
+After the outage, the exact successful manual edits were reconstructed from
+immutable GitHub base files and recorded patch inputs. Two independent reviews
+replayed all eight source hunks and six test hunks forward and backward exactly.
+GitHub readback matched the patch. This verifies recovery, not Python execution;
+no post-edit live-checkout hashes had been captured.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Combined candidate patch | `d8ac4cf5e969621f9bc8225fe60acc4a785cf69d409f37309d2d5f7e7f825f22` |
+| Partial analyzer after applying patch | `4cbb77601a24669afa1744d30dc49df0a6f4825bf390f2672ceee8be605df92c` |
+| Maintained tests after applying patch | `2a71c368021a31969e7c31597884803f815c1045975c6a9104bb0711a13dd80e` |
+| Additional exact/boundary oracle | `bb74a751a36c0e2541cba5558bf4db73dc4226f6e05af2efb0a61fa3d82516ee` |
+
+### Required continuation
+
+1. Resume from the current candidate on its stated base; do not overlay the
+   historical preliminary patch.
+2. Implement native constructor/method dispatch, correct URL argument binding,
+   destination transfer and context-manager identity through helper summaries.
+3. Implement await/scheduling and sync/async stream entry. Unused handles must
+   remain clean. Keep request call-site locations and independent argument effects.
+4. Treat base URLs as live client state. Until mutations are supported, retain
+   explicit incomplete boundaries rather than freezing a stale base. Absolute
+   HTTPX destinations require both scheme and host; `//host/path` remains relative.
+5. Keep summary facts outside finite context keys. Resolve helper-factory frame
+   effects and captured authority; custom auth/transport/hooks and prepared
+   requests must not silently borrow native contracts.
+6. Re-run both unchanged independent corpora and the maintained oracle, with
+   precise findings distinguished from incomplete analysis. Run native Requests
+   and HTTPX witnesses, the broader Python suites, real module/runner JSON/SARIF,
+   selection/suppression/cache checks and canonical integrity/release gates.
+7. Keep `ultimate_bug_scanner-python-pooled-http` and D6 open until the original
+   acceptance criteria are met. No candidate-pass, full-suite or release claim is
+   established by this checkpoint.
+
+---
+
+## Historical preliminary checkpoint
+
+The following records the earlier interrupted attempt. Its patch description and
+candidate hashes are superseded by the current section above.
+
+
 ## State
 
 This is an **unfinished, unactivated implementation**, based on main

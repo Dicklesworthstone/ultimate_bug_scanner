@@ -1,46 +1,7 @@
-UNACTIVATED CHECKPOINT — native pooled Python HTTP client SSRF analysis
-Base: f0f99f9 (ultimate_bug_scanner main at session start)
-Target paths: modules/helpers/ubs_core/analyzers/taint_py.py; test-suite/quality/test_taint_python_http.py
-
-This patch preserves preliminary finite client/pending-request markers and the
-11-method regression oracle exactly as present before the execution environment
-became unavailable. It does NOT implement constructor dispatch, client method
-resolution, destination/base_url transfer, context-manager identity, asynchronous
-resumption, or the complete mutation/escape boundaries. Do not apply as a working
-scanner feature or activate these failing tests without finishing the implementation.
-
-The tests executed against unchanged production f0f99f9 before marker edits:
-11 methods, 31 failing assertions/subcases, DSR exit 1, duration 3571 ms.
-Retained log: test-suite/artifacts/dsr-python-http-pooled-baseline-ocoEQHOd/output.log
-Log SHA256: 6f95ebd71c397583c598eff9accbae27117f541209fc77a3dc60fca4b88eb171
-The preliminary production edits themselves were never executed.
-Exact reconstructed source SHA256:
-39fee0d398ab87a5af3e4f73a7f032392e95e72334ef79bca987a0be133a973a
-Exact reconstructed test SHA256:
-afdbb6a04d1e126882e213f8de86b9f45acaefb58b26ab5970db53aa6387cb39
-Both match hashes recorded after copying the checkout immediately before outage.
-Forward and reverse unified-hunk replay match the fetched immutable baseline.
-
-Continuation must keep client handles/metadata clean; carry only base_url as a
-captured receiver fact through finite _BoundCallable summary slots. Track native
-requests.Session/session and httpx.Client/AsyncClient identity from imports and
-aliases. Fixed absolute HTTPX URLs override base_url; relative/empty URLs inherit
-it. Saved bound methods read live client base_url. Async requests and stream
-contexts execute only at await/task/context entry, with findings at the captured
-request call. Reused _BoundCallable receiver slots can retain facts, aliases and
-finite call-site markers through existing summary substitution. Unsupported
-mutation, custom transports/hooks and opaque storage/escape require explicit
-incomplete outcomes, never complete-clean results. Preserve prior findings.
-
-After implementation, rerun this unchanged oracle plus the independent 34-case
-adversarial corpus and native contracts, real module/runner JSON/SARIF, broader
-Python dataflow/co-routine suites, and canonical checksum/integrity gates. The
-checkpoint changes no production checksum pins and makes no completion claim.
-
 diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
 --- a/modules/helpers/ubs_core/analyzers/taint_py.py
 +++ b/modules/helpers/ubs_core/analyzers/taint_py.py
-@@ -176,6 +176,25 @@
+@@ -176,6 +176,26 @@
      'httpx.request': 1,
      'httpx.stream': 1,
  }
@@ -60,28 +21,31 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
 +    **{module: frozenset(name.rsplit('.', 1)[1] for name in _HTTP_CLIENT_CONSTRUCTORS
 +                         if name.rsplit('.', 1)[0] == module)
 +       for module in ('requests', 'requests.sessions', 'httpx')},
-+    **{constructor: frozenset(_HTTP_CLIENT_METHODS[kind]) | {'send', '__init__', '__enter__', '__aenter__'}
++    **{constructor: frozenset(_HTTP_CLIENT_METHODS[kind]) | {
++           'send', 'build_request', '__init__', '__enter__', '__aenter__'}
 +       for constructor, kind in _HTTP_CLIENT_CONSTRUCTORS.items()},
 +}
  
  
  _PARAMETER_MARKERS = {
-@@ -355,6 +374,28 @@
+@@ -355,18 +375,36 @@
  
  
  @dataclass(frozen=True)
+-class _GlobalNamespace:
+-    """A real globals() mapping, distinct from a same-spelled user object."""
+-    module: ast.Module
+-    member: str | None = None
 +class _HTTPClient:
-+    """A native client marker; its base URL lives in bound receiver facts.
-+
-+    Reuse the existing captured-receiver slots so client metadata is not
-+    tainted data and helper summaries never key themselves on concrete URLs.
-+    """
++    """A proven pooled client; captured receiver facts hold only its base URL."""
 +    kind: str
-+
-+
-+@dataclass(frozen=True)
+ 
+ 
+ @dataclass(frozen=True)
+-class _ClassMethodDescriptor:
+-    function: ast.FunctionDef | ast.AsyncFunctionDef
 +class _HTTPPending:
-+    """A captured request sends only when awaited or entered as a stream."""
++    """A request whose captured destination is used only at consumption."""
 +    call: ast.Call
 +    asynchronous: bool
 +    streaming: bool = False
@@ -89,13 +53,25 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
 +
 +def _http_contract(value, contract):
 +    return isinstance(value, _BoundCallable) and isinstance(value.receiver_binding, contract)
+ 
+ 
+ @dataclass(frozen=True)
++class _GlobalNamespace:
++    """A real globals() mapping, distinct from a same-spelled user object."""
++    module: ast.Module
++    member: str | None = None
 +
 +
 +@dataclass(frozen=True)
- class _GlobalNamespace:
-     """A real globals() mapping, distinct from a same-spelled user object."""
-     module: ast.Module
-@@ -1026,6 +1067,8 @@
++class _ClassMethodDescriptor:
++    function: ast.FunctionDef | ast.AsyncFunctionDef
++
++
++@dataclass(frozen=True)
+ class _BoundClassMethod:
+     """A descriptor lookup captures its function, class and receiver identity.
+ 
+@@ -1026,6 +1064,8 @@
          raise AnalysisLimit('mutated functools.partial object; analysis is incomplete')
      choices = []
      for value in _binding_choices(binding):
@@ -104,7 +80,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
          if isinstance(value, _CsvReader):
              raise AnalysisLimit('CSV reader mutation or escape is unresolved; analysis is incomplete')
          if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance,
-@@ -1043,7 +1086,8 @@
+@@ -1043,7 +1083,8 @@
  _QUALIFIER_WIDTH = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS))
  _KNOWN_QUALIFIER_PREFIXES = frozenset(
      '.'.join(qualified.split('.')[:size])
@@ -114,10 +90,120 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
      for size in range(1, len(qualified.split('.')) + 1))
  
  
+@@ -2312,8 +2353,18 @@
+         fact = self.expr(context, state)
+         if not state.reachable:
+             return None
+-        if item.optional_vars is not None:
+-            self.assign(item.optional_vars, fact, state)
++        binding = self.expression_bindings.get(context)
++        for value in _binding_choices(binding):
++            if _http_contract(value, _HTTPPending):
++                self.consume_http(value, state, asynchronous=isinstance(node, ast.AsyncWith), streaming=True)
++            elif _http_contract(value, _HTTPClient):
++                if (value.receiver_binding.kind == 'httpx.async') != isinstance(node, ast.AsyncWith):
++                    raise AnalysisLimit('HTTP client context protocol is unresolved; analysis is incomplete')
++        if item.optional_vars is not None:
++            # Native client managers return the same client. Other managers
++            # do not acquire their context expression's object identity.
++            client = any(_http_contract(value, _HTTPClient) for value in _binding_choices(binding))
++            self.assign(item.optional_vars, fact, state, context if client else None)
+         outer = self.pending
+         self.pending = []
+         self.exception_states.append(None)
+@@ -2352,6 +2403,8 @@
+     def escape_literal_mapping(self, binding, references, state):
+         """Heap aggregates do not retain these finite object contracts."""
+         for value in _binding_choices(binding):
++            if _http_contract(value, (_HTTPClient, _HTTPPending)):
++                raise AnalysisLimit('HTTP client storage or escape is unresolved; analysis is incomplete')
+             if (isinstance(value, _CsvReader) or isinstance(value, _BoundCallable)
+                     and isinstance(value.receiver_binding, _CsvReader)):
+                 raise AnalysisLimit('CSV reader storage or escape is unresolved; analysis is incomplete')
+@@ -4320,6 +4373,17 @@
+                 if isinstance(target, ast.Subscript):
+                     self.expr(target.slice, state)
+             namespace = self.expression_bindings.get(target.value)
++            self.require_value(namespace)
++            if any(_http_contract(choice, (_HTTPClient, _HTTPPending))
++                   for choice in _binding_choices(namespace)):
++                # A saved method still reads live base_url at request time;
++                # field-insensitive writes cannot certify that URL or API.
++                raise AnalysisLimit('HTTP client member mutation is unresolved; analysis is incomplete')
++            if isinstance(target, ast.Attribute) and any(target.attr in _HTTP_CLIENT_MEMBERS.get(
++                    choice if isinstance(choice, str) else choice.name
++                    if isinstance(choice, _BoundCallable) and choice.namespace_proven else None, ())
++                    for choice in _binding_choices(namespace)):
++                raise AnalysisLimit('HTTP client API mutation is unresolved; analysis is incomplete')
+             if isinstance(target, ast.Attribute) and any(
+                     target.attr in members for members in _SOURCE_MEMBERS.values()):
+                 self.require_value(namespace)
+@@ -6331,6 +6395,9 @@
+                     # own keys are primitive. Retain the possible write.
+                     self.mutate(receiver_refs, arguments[0], state)
+         if isinstance(node, ast.Call):
++            http = self.http_call(node, state, target, name, inputs)
++            if http is not None:
++                return http
+             stdin = self.stdin_call(node, state, target, name, receiver, inputs)
+             if stdin is not None:
+                 return stdin
+
 diff --git a/test-suite/quality/test_taint_python_http.py b/test-suite/quality/test_taint_python_http.py
 --- a/test-suite/quality/test_taint_python_http.py
 +++ b/test-suite/quality/test_taint_python_http.py
-@@ -424,5 +424,190 @@
+@@ -7,13 +7,13 @@
+ import os
+ from pathlib import Path
+ import subprocess
+-import tempfile
+ import textwrap
+ import time
+ import unittest
+ 
+ from test_taint_python_dataflow import ROOT, SourceTest
+ from ubs_core.analyzers import taint_py
++from ubs_core.io import temporary_directory
+ from ubs_core.registry import RunContext
+ 
+ 
+@@ -339,7 +339,7 @@
+         for name in ('py.taint.ssrf', 'python.taint.ssrf'):
+             with self.subTest(rule=name):
+                 self.assert_rules(f'import requests\n# ubs:ignore[{name}]\nrequests.get(input())\n')
+-                with tempfile.TemporaryDirectory(prefix='ubs-http-disabled-') as temporary:
++                with temporary_directory(prefix='ubs-http-disabled-') as temporary:
+                     path = Path(temporary, 'view.py')
+                     path.write_text('import requests\nrequests.get(input())\n', encoding='utf-8')
+                     ctx = RunContext(lang='python', files=[path], profile={'disabled_rules': [name]})
+@@ -347,7 +347,7 @@
+         self.assert_rules('import requests\n# ubs:ignore[python.taint.eval]\nrequests.get(input())\n', 'ssrf')
+ 
+     def test_tabular_entrypoint_keeps_the_same_rule_and_site(self):
+-        with tempfile.TemporaryDirectory(prefix='ubs-http-tabular-') as temporary:
++        with temporary_directory(prefix='ubs-http-tabular-') as temporary:
+             path = Path(temporary, 'view.py')
+             path.write_text('import requests\nrequests.get(input())\n', encoding='utf-8')
+             output = io.StringIO()
+@@ -357,7 +357,7 @@
+             self.assertIn('HTTP request URL', output.getvalue())
+ 
+     def test_cross_file_calls_and_local_module_shadowing(self):
+-        with tempfile.TemporaryDirectory(prefix='ubs-http-modules-') as temporary:
++        with temporary_directory(prefix='ubs-http-modules-') as temporary:
+             root = Path(temporary)
+             main = root / 'app.py'
+             helper = root / 'transport.py'
+@@ -399,7 +399,7 @@
+             ('guard-match', True, self.url_guard_source() +
+              'match {input()}:\n    case HOSTS:\n        pass\n' + guarded_request),
+         )
+-        with tempfile.TemporaryDirectory(prefix='ubs-http-cli-') as temporary:
++        with temporary_directory(prefix='ubs-http-cli-') as temporary:
+             path = Path(temporary, 'view.py')
+             for case_name, unsafe, source in cases:
+                 path.write_text(source, encoding='utf-8')
+@@ -424,5 +424,269 @@
                      print(f'[python-http-{tag}] PASS', flush=True)
  
  
@@ -300,6 +386,85 @@ diff --git a/test-suite/quality/test_taint_python_http.py b/test-suite/quality/t
 +        for source in (
 +            'import httpx\nhttpx.Client = replacement\nhttpx.Client().get(input())\n',
 +            'import requests\nrequests.Session.get = replacement\nrequests.Session().get(input())\n',
++        ):
++            with self.subTest(source=source):
++                with self.assertRaises(taint_py.AnalysisLimit):
++                    self.scan(source)
++
++    def test_pending_alias_keeps_original_request_location(self):
++        found = self.assert_rules('''
++            import httpx
++            async def run():
++                client = httpx.AsyncClient()
++                pending = client.get(input())
++                alias = pending
++                client = unrelated
++                await alias
++        ''', 'ssrf')
++        self.assertEqual([(row['line'], row['col']) for row in found], [(4, 15)])
++
++    def test_returned_client_callback_uses_captured_native_identity(self):
++        found = self.assert_rules('''
++            import httpx
++            def outer():
++                client = httpx.Client()
++                def fetch(target):
++                    return client.get(target)
++                return fetch
++            outer()(input())
++        ''', 'ssrf')
++        self.assertEqual(found[0]['line'], 5)
++        self.assert_rules('''
++            import httpx
++            def outer():
++                client = httpx.Client()
++                def fetch(target):
++                    return client.get('https://safe.invalid', params={'q': target})
++                return fetch
++            outer()(input())
++        ''')
++
++    def test_pending_request_boundaries_do_not_freeze_receiver_authority(self):
++        for source in (
++            '''import httpx
++async def run():
++    client = httpx.AsyncClient(base_url='https://safe.invalid')
++    pending = client.get('/items')
++    client.base_url = input()
++    await pending
++''',
++            '''import httpx
++client = httpx.Client(base_url='https://safe.invalid')
++pending = client.stream('GET', '/items')
++alias = client
++alias.base_url = input()
++with pending:
++    pass
++''',
++        ):
++            with self.subTest(source=source):
++                with self.assertRaises(taint_py.AnalysisLimit):
++                    self.scan(source)
++
++    def test_known_scalar_options_and_unrelated_metadata_remain_clean(self):
++        self.assert_rules('''
++            import httpx
++            client = httpx.Client(timeout=3, verify=True, trust_env=False,
++                                  follow_redirects=False, headers={'X-User': input()})
++            client.get('https://safe.invalid', params={'q': input()})
++        ''')
++        self.assert_rules('''
++            import requests
++            client = requests.Session()
++            client.request(*(input(), 'https://safe.invalid'), data=input())
++        ''')
++
++    def test_unsupported_client_extensions_report_incomplete(self):
++        for source in (
++            'import httpx\nclient = httpx.Client(transport=unknown)\nclient.get("https://safe.invalid")\n',
++            'import httpx\nclient = httpx.Client(event_hooks=hooks)\nclient.get("https://safe.invalid")\n',
++            'import httpx\nclient = httpx.Client(**options)\nclient.get("https://safe.invalid")\n',
++            'import httpx\nclient = httpx.Client()\nrequest = client.build_request("GET", input())\nclient.send(request)\n',
 +        ):
 +            with self.subTest(source=source):
 +                with self.assertRaises(taint_py.AnalysisLimit):

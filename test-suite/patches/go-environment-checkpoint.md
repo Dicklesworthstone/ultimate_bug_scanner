@@ -1,5 +1,148 @@
 # Go native environment-source implementation checkpoint
 
+## November 15 source qualification (base a603d20)
+
+This remains an **unactivated source-level candidate**. The replacement
+`go-environment-native-candidate.patch` targets the immutable base named below
+and contains the tested production/test changes. Forward and reverse hunk replay
+against the reconstructed bytes passed. Its SHA-256 is
+`827b4062685857bc84b77d7e455dcc0e2a24c4004aebe877acf27364491db61c`. Do not apply the older
+`go-environment-grouping-followup.patch` to this replacement: it is retained
+only as history of the earlier matcher.
+
+The source implementation and maintained tests were ported manually to
+`a603d20fbb11508c03f916e83e566d106678ee92` and executed before the workspace
+became unavailable. The existing parenthesis normalizer from that commit
+replaces the earlier archived candidate's proposed matcher, so neither the archived
+leading-whitespace regex nor its grouped-decoder regression is introduced.
+
+The port changes only native standard-library identity and environment result
+transfer in the production analyzer. Exact `os.Getenv` and `os.LookupEnv` calls,
+including aliases and selected helper/captured function values, introduce input
+provenance. The presence result remains clean. Taking a function value, local
+shadowing and nonstandard same-named packages do not invent environment input.
+The existing domain-specific sanitizer and parameter-binding behavior remains
+covered.
+
+### Observed results
+
+| Check | Current incumbent | Candidate |
+| --- | --- | --- |
+| Preserved 18-method maintained source oracle | 16 failing assertions/subcases | All 18 methods pass |
+| Frozen independent source corpus | 4/15 exact cases | 15/15 exact cases |
+| Four Go source suites under DSR | Not rerun as a broad baseline | 295 methods: 285 pass, 10 opt-in skips |
+| New 150 KB masked-literal regression in that cohort | Not run separately | Exact source location preserved; 1.514 seconds |
+
+The independent incumbent's 11 failing cases comprise nine unsafe misses and
+two false positives. These are cases, not a precision/recall corpus claim.
+The 10 skipped methods are five native compiler witnesses and five public
+module/meta-runner methods. A compiler named `go` was not present on the original
+PATH (`/usr/bin/go` was a board game). Compiler installation and public/integrity
+qualification had not completed when the execution environment disconnected.
+
+The successful broad run used the actual DSR
+`src/quality_gates.sh::_qg_run_single_check` executor and CPython 3.12.14.
+A fixture-retention wrapper preserves all TemporaryDirectory files while leaving
+assertions unchanged; the repository's seccomp helper denies deletion in the
+test process and all descendants. Existing grouped JSON/XML decoder tests pass.
+
+The full DSR receipt was read back before the disconnect. It is reproduced
+below. Its log path identifies the lost runtime; full log bytes were not
+recovered, and the recorded log hash is not a newly verified digest of an
+available artifact.
+
+```json
+{
+  "command": "PYTHONDONTWRITEBYTECODE=1 python3 test-suite/artifacts/go-env-session-20261115/run_retained.py test_taint_go_domains test_taint_go_decoding test_taint_go_initializers test_taint_go_packages",
+  "status": "passed",
+  "executed": true,
+  "passed": true,
+  "exit_code": 0,
+  "cwd": "/workspace/scratch/d51c62bc617a/ultimate_bug_scanner",
+  "duration_ms": 28311,
+  "timeout_seconds": 120,
+  "output_preview": "lper_does_not_resolve_to_package_function] RUN\n[test_taint_go_packages.PackageFlowTests.test_shadowed_helper_does_not_resolve_to_package_function] PASS (0.003s)\nok\ntest_source_returned_by_another_file_reaches_sink (test_taint_go_packages.PackageFlowTests.test_source_returned_by_another_file_reaches_sink) ... [test_taint_go_packages.PackageFlowTests.test_source_returned_by_another_file_reaches_sink] RUN\n[test_taint_go_packages.PackageFlowTests.test_source_returned_by_another_file_reaches_sink] PASS (0.005s)\nok\ntest_variants_preserve_parameter_dependent_effects (test_taint_go_packages.PackageFlowTests.test_variants_preserve_parameter_dependent_effects) ... [test_taint_go_packages.PackageFlowTests.test_variants_preserve_parameter_dependent_effects] RUN\n[test_taint_go_packages.PackageFlowTests.test_variants_preserve_parameter_dependent_effects] PASS (0.006s)\nok\n\n----------------------------------------------------------------------\nRan 295 tests in 27.037s\n\nOK (skipped=10)\n\n# exit_code: 0\n",
+  "log_path": "/workspace/scratch/d51c62bc617a/ultimate_bug_scanner/test-suite/artifacts/go-env-session-20261115/go-cohort.log",
+  "log_sha256": "80d5ad2484e66bc245a7e95bc0518942c8cb218cebdee8891c718251d0e6d292"
+}
+```
+
+### Reconstructed source identity
+
+After the executor became unavailable, source and test bytes were reconstructed
+from immutable base files, the preserved test insertion, and the exact recorded
+manual edits. Their line deltas match the observed live diff: production
+`+20/-5` and maintained tests `+331`. No live-checkout file hashes had been
+captured, so the following hashes identify the reconstructed files, not a
+claimed comparison against lost-disk hashes. Uploaded blob bytes were fetched
+back and compared exactly to the reconstruction.
+
+- Analyzer SHA-256: `32eca786a5ed5c1624ad7aca87244579cdc3e224f1b12756a144874ea298c770`.
+- Analyzer Git blob: `d3b4dc983e932868224680ba2715728d91d2f048`.
+- Maintained tests SHA-256: `f15c846665f2c5487f6521212c09304cfb52eff31e91da950b6f87db6057143f`.
+- Maintained tests Git blob: `744ea668a7d8b39a3e497b03b204feb0c1c34532`.
+
+### Exact retention harness used
+
+Save this exact harness at
+`test-suite/artifacts/go-env-session-20261115/run_retained.py` to reproduce
+the recorded command on Python 3.12+. This changes fixture lifetime only;
+it does not skip assertions, substitute scanner outputs or weaken deadlines.
+
+```python
+"""Execute unchanged selected tests while retaining all temporary fixtures."""
+from pathlib import Path
+import os
+import sys
+import tempfile
+import unittest
+
+root = Path(__file__).resolve().parents[3]
+artifacts = Path(__file__).resolve().parent / 'retained'
+artifacts.mkdir(parents=True, exist_ok=True)
+os.environ['TMPDIR'] = str(artifacts)
+os.environ['UBS_KEEP_TEMP'] = '1'
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
+tempfile.tempdir = str(artifacts)
+sys.path.insert(0, str(root / 'test-suite' / 'quality'))
+sys.path.insert(0, str(root / 'modules' / 'helpers'))
+
+original_temporary_directory = tempfile.TemporaryDirectory
+
+
+class RetainedTemporaryDirectory(original_temporary_directory):
+    def __init__(self, *args, **kwargs):
+        kwargs['delete'] = False
+        super().__init__(*args, **kwargs)
+        self._finalizer.detach()
+
+    def cleanup(self):
+        self._finalizer.detach()
+
+
+tempfile.TemporaryDirectory = RetainedTemporaryDirectory
+from test_keep_temp import prevent_child_deletion
+
+prevent_child_deletion()
+print('Retention: fixture cleanup disabled; source assertions unchanged; '
+      'kernel blocks deletion in this test process and every subprocess.', flush=True)
+unittest.main(module=None, argv=[__file__, '-v', *sys.argv[1:]])
+```
+
+### Remaining qualification
+
+No Go module retention changes were made. The module still has cleanup
+commands, and the top-level runner rejects Go under `UBS_KEEP_TEMP=1`.
+The newly preserved native witness and category-scoped JSON/SARIF matrix remain
+unexecuted. Broader repository self-scan/full-suite, native runtime, platform
+and signed release/tag qualification are not established by the source results.
+Keep the environment-source Bead and D6 umbrella open for these boundaries.
+
+The historical checkpoint and unactivated patch details below describe the
+earlier attempt; its matcher must not replace the current structural normalizer.
+
+---
+
 ## State
 
 This is an **unactivated implementation checkpoint**, based on main

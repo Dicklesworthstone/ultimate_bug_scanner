@@ -105,3 +105,25 @@ The user requested implementation of the reality-check plan and all remaining Be
 - [ ] Before each closure: fresh verification against original acceptance, exact source/revision and artifact references; distinguish solo re-verification from independent review; run `br dep cycles` and sync the authoritative JSONL.
 
 _Execution started: 2026-10-06 21:07 UTC. Current task: `ultimate_bug_scanner-mj1j.1`._
+
+## 9. November 15, 2026 source-correctness session
+
+Current base: `a603d20fbb11508c03f916e83e566d106678ee92`. Beads remain authoritative.
+The executor became unavailable during implementation. Completed source probes
+are distinct from feature activation; no unfinished implementation is counted as
+complete.
+
+### Native Go environment sources (`ultimate_bug_scanner-go-environment-native`)
+
+- [x] Read the comprehensive feedback plan, active checklist and authoritative Beads; inspect current implementation before choosing work.
+- [x] Reproduce the fixed source oracle and independent corpus against current main: 16 maintained failing subcases; independent 4/15 with nine unsafe misses and two false positives.
+- [x] Port native `os.Getenv`/`os.LookupEnv` import and saved-callable identity onto the existing structural call normalizer; keep value/presence slots separate.
+- [x] Preserve safe SQL bindings, literal overwrites, sanitizer domains, shadowed APIs and grouping/decoder behavior.
+- [x] Run all 18 maintained source methods and all 15 independent exact cases successfully.
+- [x] Run the four Go source suites through the actual DSR native quality executor: 285 passed, 10 optional native/public checks skipped; a 150 KB masked-literal regression also passed.
+- [x] Recover the exact recorded source/test edits after the outage; verify forward/reverse patch replay and immutable GitHub blob readback.
+- [x] Preserve the corrected candidate and observed DSR receipt in the existing patch/checkpoint files.
+- [ ] Finish the compiled runtime witness and real module/meta-runner JSON/SARIF matrix. The original Bead requires these before activation; no passing result was observed.
+- [ ] Complete Go scratch retention without bypassing the runner's current refusal, then run the unchanged public checks.
+- [ ] Activate only after the required gates; refresh canonical integrity pins, version/release handling and prescribed repository checks.
+- [ ] Close the Bead only on complete cited acceptance evidence; the candidate remains unactivated.

@@ -10,7 +10,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
  Selected package helpers transport callable and decoder identities through
  parameters and result slots, with a finite context worklist independent of
  payload traces. Excessive specialization is an explicit incomplete analysis.
-@@ -40,10 +40,13 @@
+@@ -40,10 +40,11 @@
  
  _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
                      'io': 'io', 'io/ioutil': 'ioutil', 'html': 'html',
@@ -21,47 +21,18 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
 -                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString'}}
 +                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
 +                   'os': {'Getenv', 'LookupEnv'}}
-+_NATIVE_CALL = re.compile(r'(?<![\w.])\s*(?:\(\s*)*([A-Za-z_]\w*)'
-+                          r'(?:\s*\.\s*([A-Za-z_]\w*))?\s*(?:\)\s*)*\(')
  
  SOURCE_PATTERNS = [
-     re.compile(r"\.FormValue\(", re.IGNORECASE),
-@@ -55,7 +58,6 @@
-     re.compile(r"mux\.Vars\(", re.IGNORECASE),
-     re.compile(r"chi\.URLParam\(", re.IGNORECASE),
-     re.compile(r"\.(?:QueryParam|FormParam|Param)\(", re.IGNORECASE),
+     re.compile(r"\.FormValue\s*\(", re.IGNORECASE),
+@@ -55,7 +56,6 @@
+     re.compile(r"mux\.Vars\s*\(", re.IGNORECASE),
+     re.compile(r"chi\.URLParam\s*\(", re.IGNORECASE),
+     re.compile(r"\.(?:QueryParam|FormParam|Param)\s*\(", re.IGNORECASE),
 -    re.compile(r"os\.Getenv", re.IGNORECASE),
      re.compile(r"bufio\.NewReader\(os\.Stdin\)", re.IGNORECASE),
      re.compile(r"\b(?:r|req|request)\.Body\b"),
  ]
-@@ -851,9 +853,9 @@
-             return _ValueInfo(self.native_callable(name.group(1), name.group(2), offset, state, scope),
-                               state.get(_DecoderKey(cell)) if name.group(2) is None else None,
-                               self.pointers(expr, state, scope))
--        call = re.match(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
-+        call = _NATIVE_CALL.match(code)
-         if call and _pairs(code).get(call.end() - 1) == len(expr) - 1:
--            results = self.call_results.get(offset)
-+            results = self.call_results.get(offset + call.start(1))
-             if results:
-                 return results[0]
-         return _ValueInfo(pointers=self.pointers(expr, state, scope))
-@@ -953,6 +955,14 @@
-         end = pairs.get(match.end() - 1)
-         if end is None or code[:match.start()].rstrip().endswith('.'):
-             return None
-+        # Parentheses around a known function do not change its identity. A
-+        # closing argument list followed by a call is different: f(os.Getenv)
-+        # must not be mistaken for a grouped call to os.Getenv itself.
-+        opening = [pos for pos in range(match.start(), match.start(1)) if code[pos] == '(']
-+        callee_end = match.end(2) if member else match.end(1)
-+        closing = {pos for pos in range(callee_end, match.end() - 1) if code[pos] == ')'}
-+        if {pairs.get(pos) for pos in opening} != closing:
-+            return None
-         receiver = state.get(_DecoderKey(scope.bindings.get(root, root)))
-         callable_source = state.get(scope.bindings.get(root, root), _CLEAN)
-         native = self.native_callable(root, member, offset + match.start(1), state, scope)
-@@ -961,6 +971,7 @@
+@@ -1002,6 +1002,7 @@
          unmarshal = bool(operations) and operations <= {('json', 'Unmarshal'), ('xml', 'Unmarshal')}
          readall = bool(operations) and operations <= {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
          sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
@@ -69,7 +40,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
          methods = {'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
                     'UseNumber', 'DisallowUnknownFields', 'Buffered'}
          method = member if receiver is not None and member in methods else None
-@@ -974,7 +985,7 @@
+@@ -1015,7 +1016,7 @@
                  outer_end = pairs.get(opening)
                  if outer_end is None:
                      return None
@@ -78,7 +49,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
              return None
          if whole and code[outer_end + 1:].strip():
              return None
-@@ -1007,6 +1018,20 @@
+@@ -1048,6 +1049,20 @@
          callable_source = (_join(callable_source, state.get(scope.bindings.get(root, root), _CLEAN))
                             if native is not None and native.unknown else _CLEAN)
          fallback = _join(*values, callable_source)
@@ -99,30 +70,10 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
          if constructor:
              if len(values) != 1:
                  return finish(end, (_CLEAN,))
-@@ -1145,7 +1170,7 @@
-                     values[index] = _join(values[index], state.get(scope.bindings.get(variable, variable), _CLEAN))
-             self.value_results[offset] = tuple(infos)
-             return tuple(values)
--        native = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
-+        native = _NATIVE_CALL.match(code)
-         if native:
-             result = self.native_call(_CallExpression(expr, code, _pairs(code), offset), native, state, scope, whole=True)
-             if result is not None:
-@@ -1241,8 +1266,8 @@
-                 if invoked:
-                     close = pairs[invocation]
-                 cover(match.start(), close + 1)
--        for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code):
--            if masked[match.start()].isspace():
-+        for match in _NATIVE_CALL.finditer(code):
-+            if masked[match.start(1)].isspace():
-                 continue
-             result = self.native_call(_CallExpression(expr, code, pairs, offset), match, state, scope)
-             if result is not None:
 diff --git a/test-suite/quality/test_taint_go_domains.py b/test-suite/quality/test_taint_go_domains.py
 --- a/test-suite/quality/test_taint_go_domains.py
 +++ b/test-suite/quality/test_taint_go_domains.py
-@@ -540,6 +540,316 @@
+@@ -541,6 +541,337 @@
          '''), ["go.taint.xss"])
  
  
@@ -134,13 +85,24 @@ diff --git a/test-suite/quality/test_taint_go_domains.py b/test-suite/quality/te
 +    """
 +
 +    def setUp(self):
++        self.started = time.monotonic()
++        result = self._outcome.result
++        self.previous_failures = len(result.failures) + len(result.errors)
++        print(f"[{self.id()}] RUN", flush=True)
 +        artifacts = ROOT / 'test-suite' / 'artifacts'
 +        artifacts.mkdir(parents=True, exist_ok=True)
 +        self.root = Path(tempfile.mkdtemp(prefix='go-environment-', dir=artifacts))
 +
++    def tearDown(self):
++        result = self._outcome.result
++        failed = len(result.failures) + len(result.errors) > self.previous_failures
++        state = 'FAIL' if failed else 'PASS'
++        print(f"[{self.id()}] {state} ({time.monotonic() - self.started:.3f}s)", flush=True)
++
 +    def check_source(self, imports, body, expected=(), helpers=''):
 +        source = 'package app\n' + imports + '\n' + helpers + '\nfunc h() {\n' + body + '\n}\n'
-+        path = self.root / 'handler.go'
++        folder = Path(tempfile.mkdtemp(prefix='source-', dir=self.root))
++        path = folder / 'handler.go'
 +        path.write_text(source, encoding='utf-8')
 +        findings = list(taint_go.run(RunContext(lang='go', files=[path])))
 +        sites = []
@@ -151,6 +113,7 @@ diff --git a/test-suite/quality/test_taint_go_domains.py b/test-suite/quality/te
 +            number, line = lines[0]
 +            sites.append((number, line.index(sink) + 1, 'go.taint.' + rule))
 +        actual = [(finding['line'], finding['col'], finding['rule']) for finding in findings]
++        (folder / 'findings.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
 +        self.assertEqual(sorted(actual), sorted(sites), (source, findings))
 +        return findings
 +
@@ -309,6 +272,15 @@ diff --git a/test-suite/quality/test_taint_go_domains.py b/test-suite/quality/te
 +                          'db.Query(`os.Getenv("UBS_INPUT")`)\n'
 +                          'record := struct{Getenv string}{Getenv: "fixed"}\n'
 +                          'fmt.Fprint(w, record.Getenv)')
++
++    def test_long_masked_literals_preserve_grouped_environment_reads(self):
++        # The archived candidate searched with leading whitespace repetition.
++        # A large inert literal must not turn native-call discovery quadratic
++        # or hide a real source after the masked span.
++        self.check_source('import environment "os"',
++                          'db.Query(`' + 'fixed ' * 25000 + '`)\n'
++                          'db.Query(((environment.Getenv))("UBS_INPUT")) // query',
++                          (('query', 'sql', 'db.Query'),))
 +
 +    @unittest.skipUnless(os.environ.get('UBS_TAINT_NATIVE_GO') == '1',
 +                         'set UBS_TAINT_NATIVE_GO=1 to compile the environment witness')

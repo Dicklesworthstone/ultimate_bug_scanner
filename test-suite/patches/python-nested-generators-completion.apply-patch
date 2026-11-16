@@ -1,0 +1,24 @@
+*** Begin Patch
+*** Update File: test-suite/quality/test_python_completion.py
+@@
+     def test_real_sql_limit_keeps_its_status_through_worker_transport(self):
+         self.source.write_text(
+-            'def report(con):\n    con.execute("select 1")\n'
+-            '    return list(x for x in (y for y in (1, 2)))\n', encoding="utf-8")
++            'async def report(con):\n    con.execute("select 1")\n'
++            '    return list(x async for x in source)\n', encoding="utf-8")
+@@
+-        self.assertIn("nested generator iteration", problems[0].message)
++        self.assertIn("asynchronous generator consumption", problems[0].message)
+@@
+-        base = ('def report(con):\n    con.execute("select 1")\n'
+-                '    return list(x for x in (y for y in (1, 2)))\n')
++        base = ('async def report(con):\n    con.execute("select 1")\n'
++                '    return list(x async for x in source)\n')
+@@
+         (project / "boundary.py").write_text(
+-            'def report(con):\n    con.execute("select 1")\n'
+-            '    return list(x for x in (y for y in (1, 2)))\n'
++            'async def report(con):\n    con.execute("select 1")\n'
++            '    return list(x async for x in source)\n'
+*** End Patch

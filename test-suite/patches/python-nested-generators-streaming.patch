@@ -1,0 +1,340 @@
+UNACTIVATED IMPLEMENTATION CHECKPOINT
+
+Python SQL nested generator composition through ordered yield continuations.
+Production apply_patch failed before reading the target when the execution workspace
+became unavailable. No candidate code or new tests were executed. The namespace,
+finalizer and callback-write guards were added during subsequent static review.
+
+Base detector blob: 885e99149e2dd67313095221f0a6e01e886a5c22
+Base test blob: 16d85079e9c74e415aae9c0a10844f4d0d6e4173
+
+Before activation: review frame/cursor/exception/finalizer semantics; run the new
+SQLite witnesses, full SQL suites and actual module/runner JSON/SARIF matrix;
+retain incomplete outcomes for unsupported effects; update the separate Python
+completion fixture from simple nested iteration to async generation without
+weakening its diagnostic/exit/status assertions; regenerate canonical integrity
+pins. This patch does not qualify the release or close the self-scan umbrella.
+
+diff --git a/modules/helpers/ubs_core/py_detectors/sql_injection.py b/modules/helpers/ubs_core/py_detectors/sql_injection.py
+--- a/modules/helpers/ubs_core/py_detectors/sql_injection.py
++++ b/modules/helpers/ubs_core/py_detectors/sql_injection.py
+@@ -4300,8 +4300,8 @@
+                         part.pop(name, None)
+         return restored
+ 
+-    def visit_ListComp(self, node, *, captured=None, consumer_can_raise=False, hash_keys=False,
+-                       short_circuit=None, reducer=None):
++    def visit_ListComp(self, node, *, captured=None, consumer_can_raise=False, hash_keys=False,
++                       short_circuit=None, reducer=None, on_yield=None):
+         """Evaluate eager comprehensions in loop/filter order and local scope.
+ 
+         Literal lists/tuples have exact iteration counts. Dynamic iterables
+@@ -4326,11 +4326,12 @@
+         local_names = {name for generator in node.generators
+                        for name in binding_target_names(generator.target)}
+         self.bind_value_facts(local_names, (None, None, None, False, 'unknown'))
+-        produced = None
+-        stopped = None
+-
+-        def emit():
+-            nonlocal produced, stopped
++        produced = None
++        stopped = None
++        consumer_raise = None
++
++        def emit():
++            nonlocal produced, stopped, consumer_raise
+             if isinstance(node, ast.DictComp):
+                 self.visit(node.key)
+                 key = self.value_facts(node.key)
+@@ -4377,11 +4378,39 @@
+                     self.generator_phases[node] = frozenset({'partial'})
+                     stopped = self.join_sql_states(stopped, self.sql_state())
+                     self.generator_phases[node] = phase
+-                if truth is not None and truth is not continuing:
+-                    return None
+-            return self.sql_state()
+-
+-        def filtered(index):
++                if truth is not None and truth is not continuing:
++                    return None
++            if on_yield is not None:
++                # A nested generator yields into its consumer before its
++                # next iteration runs. Draining it up front would reorder
++                # SQL stores/sinks and lose early-stop cursor state.
++                suspended = self.sql_state()
++                self.generator_phases[node] = frozenset({'partial'})
++                caller = self.restore_local_facts(self.sql_state(), enclosing, local_names)
++                self.restore_sql_state(caller)
++                inner_raise, self._pending_raise = self._pending_raise, None
++                try:
++                    resumed = on_yield(facts)
++                finally:
++                    # Consumer failures have already left the producer's
++                    # local frame. Do not restore its local names over those
++                    # exception stores during the producer's final unwind.
++                    consumer_raise = self.join_sql_states(consumer_raise, self._pending_raise)
++                    self._pending_raise = inner_raise
++                for state in (resumed, consumer_raise):
++                    if (state is not None
++                            and self.restore_local_facts(state, caller, local_names) != state):
++                        raise SQLFlowLimit('SQL nested generator lexical writes are unsupported; analysis is incomplete')
++                if resumed is None:
++                    self.restore_sql_state(suspended)
++                    return None
++                if resumed[7].get(node) != frozenset({'partial'}):
++                    raise SQLFlowLimit('SQL nested generator cursor mutation is unsupported; analysis is incomplete')
++                self.restore_sql_state(self.restore_local_facts(resumed, suspended, local_names))
++                self.generator_phases[node] = suspended[7][node]
++            return self.sql_state()
++
++        def filtered(index):
+             iterated = self._iterated_lists
+             iterable = node.generators[index].iter
+             if isinstance(iterable, ast.Name) and iterable.id in self.exclusive_lists:
+@@ -4411,11 +4440,33 @@
+             generator = node.generators[index]
+             if index:
+                 self.visit(generator.iter)
+-            entered = self.sql_state()
+-            iterable = generator.iter
+-            if self.generator_refs(self.value_facts(iterable)):
+-                raise SQLFlowLimit('SQL nested generator iteration is unsupported; analysis is incomplete')
+-            if record_reducer:
++            entered = self.sql_state()
++            iterable = generator.iter
++            references = self.generator_refs(self.value_facts(iterable))
++            if references:
++                # These comprehension locals live in a different lexical
++                # frame from a producer created in the enclosing scope.
++                # Until overlapping frames have separate stores, reject
++                # direct and helper-mediated shadowing instead of reading
++                # a consumer's variable as the producer's captured cell.
++                self.check_nested_generator_frames(references)
++                self.check_generator_callback_writes()
++                bindings = self.ownership_bindings()
++                if (bindings.dynamic_namespace or bindings.builtin_namespace
++                        or '__del__' in self.generator_protocol_names()):
++                    raise SQLFlowLimit('SQL nested generator lifetime effects are unresolved; analysis is incomplete')
++
++                def consume(facts):
++                    for target, projected in self.unpacking_bindings(generator.target, facts):
++                        self.store_assignment(target, projected)
++                    return filtered(index)
++
++                try:
++                    self.materialize_generators(references, on_yield=consume)
++                except SQLNoNormalReturn:
++                    return None
++                return self.sql_state()
++            if record_reducer:
+                 kind, element = self.value_kind(iterable)
+                 if not (self.hash_safe_shape(self.element_shape((kind, element)))
+                         or kind == 'range'
+@@ -4466,8 +4517,9 @@
+             # The admitted mutable-record subset also needs the guarded
+             # visitor: filter/operator/property/call callbacks can mutate
+             # SQL even when the final yielded record has primitive fields.
+-            self._short_circuiting = enclosing_short_circuit or short_circuit is not None or record_reducer
+-            result = level(0, self.sql_state())
++            self._short_circuiting = (enclosing_short_circuit or short_circuit is not None
++                                     or record_reducer or on_yield is not None)
++            result = level(0, self.sql_state())
+             result = self.join_sql_states(result, stopped)
+             if result is None:
+                 raise SQLNoNormalReturn()
+@@ -4483,11 +4535,11 @@
+             # Iteration variables are local even on exceptional exits; Python
+             # assignment-expression targets outside them remain enclosing.
+             state = self.restore_local_facts(self.sql_state(), enclosing, local_names)
+-            raised = self.restore_local_facts(self._pending_raise, enclosing, local_names)
+-            self.restore_sql_state(state)
+-            self._pending_raise = self.join_sql_states(enclosing_raise, raised)
+-
+-    visit_SetComp = visit_ListComp
++            raised = self.restore_local_facts(self._pending_raise, enclosing, local_names)
++            self.restore_sql_state(state)
++            self._pending_raise = self.join_sql_states(enclosing_raise, raised, consumer_raise)
++
++    visit_SetComp = visit_ListComp
+     visit_DictComp = visit_ListComp
+ 
+     def visit_GeneratorExp(self, node):
+@@ -4531,8 +4583,26 @@
+                          if child in self._evaluated_values})
+         return not any(node in self.generator_refs(facts) for captured in captures for facts in captured.values())
+ 
+-    def materialize_generators(self, references, *, consumer_can_raise=False, hash_keys=False,
+-                               short_circuit=None, reducer=None):
++    def check_nested_generator_frames(self, references):
++        """Keep producer captures distinct from active comprehension locals."""
++        bindings = self.ownership_bindings()
++        pending, seen = list(references), set()
++        while pending:
++            identity = pending.pop()
++            if identity is None or identity in seen:
++                continue
++            seen.add(identity)
++            for child in ast.walk(identity):
++                self.step()
++                if isinstance(child, ast.Name) and child.id in self._comprehension_locals:
++                    raise SQLFlowLimit('SQL nested generator lexical frames overlap; analysis is incomplete')
++                if isinstance(child, ast.Call):
++                    target = bindings.resolve(child.func)
++                    if target and target[0] == 'function':
++                        pending.append(target[1])
++
++    def materialize_generators(self, references, *, consumer_can_raise=False, hash_keys=False,
++                               short_circuit=None, reducer=None, on_yield=None):
+         """Consume selected same-scope generators using the comprehension engine.
+ 
+         Generator identity and completion are stateful, whereas projected
+@@ -4563,8 +4633,9 @@
+                 elif phase == 'fresh':
+                     self._generator_running.add(identity)
+                     try:
+-                        self.visit_ListComp(identity, captured=captured, consumer_can_raise=consumer_can_raise,
+-                                            hash_keys=hash_keys, short_circuit=short_circuit, reducer=reducer)
++                        self.visit_ListComp(identity, captured=captured, consumer_can_raise=consumer_can_raise,
++                                            hash_keys=hash_keys, short_circuit=short_circuit, reducer=reducer,
++                                            on_yield=on_yield)
+                         value = self.value_facts(identity)
+                         if self.generator_refs(value):
+                             raise SQLFlowLimit('SQL generator-valued projection is unsupported; analysis is incomplete')
+diff --git a/test-suite/quality/test_python_sql_value_capture.py b/test-suite/quality/test_python_sql_value_capture.py
+--- a/test-suite/quality/test_python_sql_value_capture.py
++++ b/test-suite/quality/test_python_sql_value_capture.py
+@@ -2649,7 +2649,132 @@
+                     with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
+                         list(detector.find([path]))
+ 
+-    def test_generator_reducer_callbacks_remain_incomplete(self):
++    def test_nested_generator_scalar_composition(self):
++        cases = (
++            ('constant', '    cursor.execute("SELECT 1")\n'
++             '    return list(x for x in (y for y in (1, 2)))\n', ()),
++            ('three-levels', '    cursor.execute("SELECT 1")\n'
++             '    return tuple(x for x in (y for y in (z for z in (1, 2))))\n', ()),
++            ('sql-value', '    query = "".join(piece for piece in '
++             '(part for part in [f"SELECT {user}"]))\n'
++             '    cursor.execute(query)\n', ((CRITICAL, 3),)),
++            ('sql-clean', '    query = "".join(piece for piece in '
++             '(part for part in ["SELECT 1"]))\n'
++             '    cursor.execute(query)\n', ()),
++            ('eager', '    queries = [selected for selected in '
++             '(item for item in [f"SELECT {user}"])]\n'
++             '    cursor.execute(queries[0])\n', ((CRITICAL, 3),)),
++            ('mapping', '    queries = {0: selected for selected in '
++             '(item for item in [f"SELECT {user}"])}\n'
++             '    cursor.execute(queries[0])\n', ((CRITICAL, 3),)),
++            ('filtered-out', '    query = "SELECT 1"\n'
++             '    list((query := f"SELECT {user}") for selected in '
++             '(item for item in (1, 2)) if False)\n'
++             '    cursor.execute(query)\n', ()),
++        )
++        for name, body, expected in cases:
++            with self.subTest(case=name):
++                self.inspect('nested-generator-' + name, program(body), expected)
++
++    def test_sqlite_nested_generator_effect_order(self):
++        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
++        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
++        cases = (
++            ('result-unsafe', f'    inner = ({unsafe} for marker in (0,))\n'
++             '    query = list(selected for selected in inner)[0]\n', 2, CRITICAL),
++            ('result-safe', f'    inner = ({safe} for marker in (0,))\n'
++             '    query = list(selected for selected in inner)[0]\n', 1, None),
++            ('late-clean', f'    query = {unsafe}\n'
++             '    inner = (query for marker in (0,))\n'
++             '    outer = (selected for selected in inner)\n'
++             f'    query = {safe}\n    query = list(outer)[0]\n', 1, None),
++            ('captured-unsafe', f'    query = {unsafe}\n'
++             '    inner = (item for item in (query,))\n'
++             '    outer = (selected for selected in inner)\n'
++             f'    query = {safe}\n    query = list(outer)[0]\n', 2, CRITICAL),
++            ('interleaved-live-read', f'    query = {safe}\n'
++             '    inner = (query for marker in (0, 1))\n'
++             f'    selected = [(item, (query := {unsafe}))[0] for item in inner]\n'
++             '    query = selected[-1]\n', 2, CRITICAL),
++            ('interleaved-clean-control', f'    query = {safe}\n'
++             '    inner = (query for marker in (0, 1))\n'
++             f'    selected = [(item, (query := {safe}))[0] for item in inner]\n'
++             '    query = selected[-1]\n', 1, None),
++            ('producer-then-consumer-clean', f'    query = {safe}\n'
++             f'    inner = ((query := {unsafe}) for marker in (0, 1))\n'
++             f'    list((query := {safe}) for selected in inner)\n', 1, None),
++            ('producer-then-consumer-unsafe', f'    query = {unsafe}\n'
++             f'    inner = ((query := {safe}) for marker in (0, 1))\n'
++             f'    list((query := {unsafe}) for selected in inner)\n', 2, CRITICAL),
++            ('empty-does-not-write', f'    query = {unsafe}\n'
++             '    inner = (item for item in ())\n'
++             f'    list((query := {safe}) for selected in inner)\n', 2, CRITICAL),
++            ('exhausted-does-not-restart', f'    inner = ({unsafe} for marker in (0,))\n'
++             '    list(selected for selected in inner)\n'
++             f'    query = {unsafe}\n'
++             f'    list((query := {safe}) for selected in inner)\n', 2, CRITICAL),
++            ('short-circuit-prefix', f'    query = {safe}\n'
++             f'    inner = ((query := {unsafe}) for marker in (0, 1))\n'
++             '    any(True for selected in inner)\n', 2, CRITICAL),
++        )
++        for name, body, count, rule in cases:
++            with self.subTest(case=name):
++                source = program(body + '    return cursor.execute(query).fetchone()[0]\n')
++                witness = sqlite_witness(self.artifacts, 'nested-generator-' + name, source)
++                self.assertEqual(witness['rows'], count)
++                expected = () if rule is None else ((rule, len(source.splitlines())),)
++                self.inspect('sqlite-nested-generator-' + name, source, expected)
++
++    def test_nested_generator_cursor_and_scope_boundaries(self):
++        cases = (
++            ('partial-inner', '    pending = (item for item in (1, 2))\n'
++             '    next(pending)\n'
++             '    list(selected for selected in pending)\n'),
++            ('short-circuit-resume', '    pending = (item for item in (1, 2))\n'
++             '    any(True for selected in pending)\n'
++             '    list(pending)\n'),
++            ('same-named-locals', '    list(item for item in (item for item in (1, 2)))\n'),
++            ('captured-shadow', '    query = f"SELECT {user}"\n'
++             '    inner = (query for marker in (1, 2))\n'
++             '    list(query for query in inner)\n'),
++            ('helper-captured-shadow', '    query = f"SELECT {user}"\n'
++             '    def read():\n        return query\n'
++             '    inner = (read() for marker in (1, 2))\n'
++             '    list(query for query in inner)\n'),
++            ('producer-local-write', '    inner = (marker for marker in (1, 2))\n'
++             '    list((marker := user) for selected in inner)\n'),
++            ('opaque-consumer', '    list(consume(selected) for selected in '
++             '(item for item in (1, 2)))\n'),
++            ('cursor-close', '    inner = (item for item in (1, 2))\n'
++             '    list(inner.close() for selected in inner)\n'),
++        )
++        for name, body in cases:
++            with self.subTest(case=name):
++                source = program('    cursor.execute("SELECT 1")\n' + body)
++                path = self.artifacts / ('nested-generator-boundary-' + name + '.py')
++                path.write_text(source, encoding='utf-8')
++                with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
++                    list(detector.find([path]))
++
++    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
++    def test_real_cli_nested_generator_composition(self):
++        cases = (
++            ('nested-cli-clean', 'cursor.execute("SELECT 1")\n'
++             'values = list(x for x in (y for y in (1, 2)))\n', ()),
++            ('nested-cli-sql', 'value = input()\n'
++             'query = list(selected for selected in '
++             '(f"SELECT {value}" for marker in (1,)))[0]\n'
++             'cursor.execute(query)\n', ((CRITICAL, 3),)),
++            ('nested-cli-bound', 'value = input()\n'
++             'params = list(selected for selected in (value for marker in (1,)))\n'
++             'cursor.execute("SELECT ?", tuple(params))\n', ()),
++            ('nested-cli-constant', 'query = list(selected for selected in '
++             '("SELECT 1" for marker in (1,)))[0]\n'
++             'cursor.execute(query)\n', ()),
++        )
++        self.assert_real_cli_capture(cases, wrap=False)
++
++    def test_generator_reducer_callbacks_remain_incomplete(self):
+         for name, source in reducer_callback_programs():
+             with self.subTest(case=name):
+                 self.assertEqual(sqlite_witness(self.artifacts, 'reducer-' + name, source)['rows'], 2)

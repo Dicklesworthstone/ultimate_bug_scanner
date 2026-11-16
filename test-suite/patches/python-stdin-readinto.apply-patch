@@ -1,0 +1,267 @@
+*** Begin Patch
+*** Update File: modules/helpers/ubs_core/analyzers/taint_py.py
+@@
+ _STDIN_ITERATORS = {f'{stream}.__iter__': stream for stream in _STDIN_STREAMS}
++_STDIN_BUFFER_WRITERS = {
++    f'{stream}.{method}': stream
++    for stream in _STDIN_STREAMS if stream.endswith(('.buffer', '.raw'))
++    for method in ('readinto', 'readinto1') if method == 'readinto' or stream.endswith('.buffer')
++}
+ _STDIN_UNMODELED = frozenset(f'{stream}.{method}' for stream in _STDIN_STREAMS
+-                            for method in ('readinto', 'readinto1', 'detach'))
+-_STDIN_API_NAMES = frozenset(_STDIN_READERS) | frozenset(_STDIN_ITERATORS) | _STDIN_UNMODELED
++                            for method in ('detach',))
++_STDIN_API_NAMES = (frozenset(_STDIN_READERS) | frozenset(_STDIN_ITERATORS)
++                    | frozenset(_STDIN_BUFFER_WRITERS) | _STDIN_UNMODELED)
+@@
+-                   'builtins': frozenset({'iter', 'list', 'tuple', 'next'}),
++                   'builtins': frozenset({'iter', 'list', 'tuple', 'next', 'bytearray'}),
+@@
+-                   **{stream: methods | {'__iter__', 'buffer', 'raw'}
++                   **{stream: methods | {'__iter__', 'buffer', 'raw', 'readinto', 'readinto1'}
+                       for stream, methods in _STDIN_METHODS.items()}}
+@@
+ class _CsvReader:
+@@
+     format_safe: bool = True
+ 
+ 
++@dataclass(frozen=True)
++class _ByteBuffer:
++    """Exact native bytearray storage; facts and aliases live in the heap."""
++    empty: bool = False
++    format_safe: bool = True
++
++
+ _LITERAL_MAPPING_GET = '@literal-mapping.get'
+@@
+-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'globals', 'builtins', 'staticmethod', 'classmethod',
++    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
+@@
+         if isinstance(value, _CsvReader):
+             raise AnalysisLimit('CSV reader mutation or escape is unresolved; analysis is incomplete')
++        if isinstance(value, _ByteBuffer):
++            # Content writes cannot change an exact bytearray's native type,
++            # but a resize revokes the constructor's empty-capacity proof.
++            value = _ByteBuffer(format_safe=value.format_safe)
+         if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance,
+@@
+-                                         _CsvReader)) and not value.format_safe
++                                         _CsvReader, _ByteBuffer)) and not value.format_safe
+@@
+             elif isinstance(value, _CsvReader):
+                 value = _CsvReader(value.stream, value.dictionary, value.input_header, False)
++            elif isinstance(value, _ByteBuffer):
++                value = _ByteBuffer(value.empty, False)
+@@
+     def stdin_call(self, node, state, target, name, receiver, inputs):
+         """Finite read/iteration contracts; None leaves ordinary calls alone."""
+         native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
+         arguments, keywords = inputs.arguments, inputs.keywords
++        if native and name in {'bytearray', 'builtins.bytearray'}:
++            positions = self.call_positions(node, arguments, state)
++            if (len(positions) > 1 or keywords or not self.generator_builtins_stable()
++                    or isinstance(target, _BoundCallable) and target.producer_unproved):
++                return None
++            empty = True
++            if positions:
++                operand, _fact, binding, _refs = positions[0]
++                self.require_value(binding)
++                choices = _binding_choices(binding)
++                if (isinstance(operand, (ast.Starred, _ArgumentExpansion)) or not choices
++                        or not all(isinstance(value, ast.Constant)
++                                   and (type(value.value) is bytes
++                                        or type(value.value) in {int, bool} and value.value >= 0)
++                                   for value in choices)):
++                    return None
++                empty = all(not value.value for value in choices)
++            # Literal byte counts/bytes cannot invoke an opaque __index__,
++            # iterator or buffer producer. Other constructor shapes retain
++            # ordinary provenance but do not acquire this storage contract.
++            self.expression_bindings[node] = _ByteBuffer(empty)
++            self.expression_references[node] = frozenset({node})
++            self.possible_exception(state)
++            return join_facts(*arguments)
+         if native and name in _STDIN_EAGER_PARSERS:
+@@
+             if name == '@csv.__next__':
+                 return self.stdin_source(reader)
++        if native and name in _STDIN_BUFFER_WRITERS:
++            positions = self.call_positions(node, arguments, state)
++            if (None in keywords or any(isinstance(operand, (ast.Starred, _ArgumentExpansion))
++                                        for operand, _fact, _value, _refs in positions)):
++                raise AnalysisLimit('stdin buffer mutation argument expansion is unresolved; analysis is incomplete')
++            self.possible_exception(state)
++            if len(positions) != 1 or keywords:
++                return CLEAN  # The native reader takes one positional-only buffer.
++            _operand, _fact, binding, references = positions[0]
++            self.require_value(binding)
++            choices = _binding_choices(binding)
++            if (not choices or not references or not all(isinstance(value, _ByteBuffer)
++                                                        and value.format_safe for value in choices)
++                    or isinstance(target, _BoundCallable) and target.producer_unproved):
++                raise AnalysisLimit('stdin buffer mutation or detachment is unmodeled: '
++                                    'writable buffer identity or producer effects are unresolved; '
++                                    'analysis is incomplete')
++            if not all(value.empty for value in choices):
++                # readinto returns a byte count, while external data enters
++                # the supplied allocation. Weak writes retain aliases and
++                # unchanged suffixes and are exported by helper summaries.
++                self.mutate(references, self.stdin_source(_STDIN_BUFFER_WRITERS[name]), state)
++                self.possible_exception(state)
++            self.expression_bindings[node] = None
++            self.expression_references[node] = NO_REFERENCES
++            return CLEAN
+         if native and name in _STDIN_UNMODELED:
+-            # readinto mutates a caller-owned buffer; detach transfers an
+-            # underlying stream and invalidates its old owner. Neither is a
+-            # read-result contract, so do not silently drop those effects.
++            # detach transfers an underlying stream and invalidates its old
++            # owner; it is not an ordinary read-result contract.
+@@
+-                                          _LiteralMapping, _ArgumentVector, _ProcessInput,
++                                          _LiteralMapping, _ArgumentVector, _ProcessInput, _ByteBuffer,
+@@
+-                                   _ArgumentVector, _LiteralMapping, _CsvReader,
++                                   _ArgumentVector, _LiteralMapping, _CsvReader, _ByteBuffer,
+@@
+-                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, _LiteralJoinInstance, _LiteralMethodInstance,
++                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, _LiteralJoinInstance, _LiteralMethodInstance, _ByteBuffer,
+@@
+-                            _ProcessInput, ast.Constant)
++                            _ProcessInput, _ByteBuffer, ast.Constant)
+@@
+-            elif not isinstance(value, (str, _LiteralMapping, _ProcessInput, _CsvReader, ast.FunctionDef, ast.AsyncFunctionDef,
++            elif not isinstance(value, (str, _LiteralMapping, _ProcessInput, _CsvReader, _ByteBuffer, ast.FunctionDef, ast.AsyncFunctionDef,
+@@
+-                                                     _LiteralMapping, _ProcessInput, _CsvReader))
++                                                     _LiteralMapping, _ProcessInput, _CsvReader, _ByteBuffer))
+@@
+-                                           _LiteralMapping, _ProcessInput, _CsvReader, ast.Constant))
++                                           _LiteralMapping, _ProcessInput, _CsvReader, _ByteBuffer, ast.Constant))
+*** Update File: test-suite/quality/test_taint_python_dataflow.py
+@@
+     def test_unmodeled_mutation_and_generator_protocols_stay_incomplete(self):
+@@
+         with self.assertRaisesRegex(taint_py.AnalysisLimit, 'generator materialization'):
+             self.scan('import sys\neval("".join(line for line in sys.stdin))\n')
+ 
++    def test_binary_readinto_writes_reach_each_sink_domain(self):
++        sinks = (("os.system(value)", 'command'), ("eval(value)", 'eval'),
++                 ("cursor.execute('SELECT ' + value)", 'sql'),
++                 ("HttpResponse(value)", 'xss'), ("requests.get(value)", 'ssrf'))
++        for member in ('stdin', '__stdin__'):
++            for suffix, method in (('.buffer', 'readinto'), ('.buffer', 'readinto1'),
++                                   ('.buffer.raw', 'readinto')):
++                for sink, rule in sinks:
++                    with self.subTest(member=member, suffix=suffix, method=method, sink=sink):
++                        findings = self.assert_rules(
++                            f'import sys, requests\nbuffer = bytearray(4096)\n'
++                            f'sys.{member}{suffix}.{method}(buffer)\n'
++                            f'value = buffer.decode()\n{sink}\n', rule)
++                        self.assertIn(f'sys.{member}{suffix}', findings[0]['message'])
++
++    def test_binary_readinto_preserves_buffer_and_reader_aliases(self):
++        cases = (
++            'alias = buffer\nsys.stdin.buffer.readinto(alias)\neval(buffer.decode())\n',
++            'alias = buffer\nsys.stdin.buffer.readinto(buffer)\neval(alias.decode())\n',
++            'read = sys.stdin.buffer.readinto\nsys = None\nread(buffer)\neval(buffer.decode())\n',
++            'from sys import stdin as stream\nread = stream.buffer.readinto1\n'
++            'stream = None\nread(buffer)\neval(buffer.decode())\n',
++            'arguments = (buffer,)\nsys.stdin.buffer.readinto(*arguments)\neval(buffer.decode())\n',
++            'sys.stdin.buffer.readinto((alias := buffer))\neval(alias.decode())\n',
++        )
++        for source in cases:
++            with self.subTest(source=source):
++                self.assert_rules('import sys\nbuffer = bytearray(16)\n' + source, 'eval')
++        for allocation in ('builtins.bytearray(16)', 'make(16)'):
++            with self.subTest(allocation=allocation):
++                self.assert_rules('import sys, builtins\nfrom builtins import bytearray as make\n'
++                                  f'buffer = {allocation}\nsys.stdin.buffer.readinto(buffer)\n'
++                                  'eval(buffer.decode())\n', 'eval')
++        self.assert_rules('import sys\nmake = bytearray\nbytearray = lambda size: None\n'
++                          'buffer = make(16)\nsys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n', 'eval')
++
++    def test_binary_readinto_exports_mutations_from_fixed_helpers(self):
++        cases = (
++            'def fill(buffer):\n    sys.stdin.buffer.readinto(buffer)\nfill(buffer)\n',
++            'def fill(stream, buffer):\n    stream.readinto(buffer)\nfill(sys.stdin.buffer, buffer)\n',
++            'def fill(read, buffer):\n    read(buffer)\nfill(sys.stdin.buffer.readinto, buffer)\n',
++            'def fill(buffer, read=sys.stdin.buffer.readinto):\n    read(buffer)\nfill(buffer)\n',
++            'def fill():\n    sys.stdin.buffer.readinto(buffer)\nfill()\n',
++            'def fill(buffer):\n    sys.stdin.buffer.readinto(buffer)\n'
++            'def forward(buffer):\n    fill(buffer)\nforward(buffer)\n',
++        )
++        for source in cases:
++            with self.subTest(source=source):
++                self.assert_rules('import sys\nbuffer = bytearray(16)\n' + source
++                                  + 'eval(buffer.decode())\n', 'eval')
++        self.assert_rules('import sys\ndef consume():\n    buffer = bytearray(16)\n'
++                          '    sys.stdin.buffer.readinto(buffer)\n    eval(buffer.decode())\nconsume()\n', 'eval')
++
++    def test_binary_readinto_count_empty_storage_and_unrelated_data_stay_clean(self):
++        for allocation in ('bytearray()', 'bytearray(0)', 'bytearray(False)', 'bytearray(b"")'):
++            with self.subTest(allocation=allocation):
++                self.assert_rules('import sys\n' + f'buffer = {allocation}\n'
++                                  'sys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n')
++        self.assert_rules('import sys\nbuffer = bytearray(16)\n'
++                          'count = sys.stdin.buffer.readinto(buffer)\nHttpResponse(str(count))\n')
++        self.assert_rules('import sys\nbuffer = bytearray(16)\nother = bytearray(b"1")\n'
++                          'sys.stdin.buffer.readinto(buffer)\neval(other.decode())\n')
++        self.assert_rules('import sys\nbuffer = bytearray(b"1")\ncopy = bytes(buffer)\n'
++                          'sys.stdin.buffer.readinto(buffer)\neval(copy.decode())\n')
++        self.assert_rules('import sys\nbuffer = bytearray(16)\nsys.stdin.buffer.readinto(buffer)\n'
++                          'buffer = bytearray(b"1")\neval(buffer.decode())\n')
++
++    def test_binary_readinto_resizing_and_control_flow_keep_possible_writes(self):
++        self.assert_rules('import sys\nbuffer = bytearray()\nalias = buffer\nalias.extend(b" ")\n'
++                          'sys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n', 'eval')
++        self.assert_rules('import sys\nbuffer = bytearray(16)\nif enabled:\n'
++                          '    sys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n', 'eval')
++        self.assert_rules('import sys\nif enabled:\n    buffer = bytearray()\n'
++                          'else:\n    buffer = bytearray(16)\nsys.stdin.buffer.readinto(buffer)\n'
++                          'eval(buffer.decode())\n', 'eval')
++        self.assert_rules('import sys\nbuffer = bytearray(16)\ntry:\n'
++                          '    sys.stdin.buffer.readinto(buffer)\nexcept OSError:\n'
++                          '    eval(buffer.decode())\n', 'eval')
++
++    def test_binary_readinto_respects_bound_data_and_sanitizer_domains(self):
++        prefix = ('import sys, html, shlex\nbuffer = bytearray(16)\n'
++                  'sys.stdin.buffer.readinto(buffer)\nvalue = buffer.decode()\n')
++        self.assert_rules(prefix + "cursor.execute('SELECT ?', (value,))\n")
++        self.assert_rules(prefix + 'HttpResponse(html.escape(value))\n')
++        self.assert_rules(prefix + "os.system('printf %s ' + shlex.quote(value))\n")
++        self.assert_rules(prefix + 'eval(html.escape(value))\n', 'eval')
++
++    def test_binary_readinto_invalid_calls_and_unrelated_names_do_not_write(self):
++        for call in ('sys.stdin.buffer.readinto()', 'sys.stdin.buffer.readinto(b=buffer)',
++                     'sys.stdin.buffer.readinto(buffer, 1)', 'sys.stdin.readinto(buffer)',
++                     'sys.stdin.buffer.raw.readinto1(buffer)', 'sys.stdout.buffer.readinto(buffer)',
++                     'sys.stdin.buffer.READINTO(buffer)'):
++            with self.subTest(call=call):
++                self.assert_rules('import sys\nbuffer = bytearray(16)\n' + call
++                                  + '\neval(buffer.decode())\n')
++        self.assert_rules('from . import sys\nbuffer = bytearray(16)\n'
++                          'sys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n')
++        self.assert_rules('import sys\nread = sys.stdin.buffer.readinto\nread = lambda b: 0\n'
++                          'buffer = bytearray(16)\nread(buffer)\neval(buffer.decode())\n')
++
++    def test_binary_readinto_unknown_buffers_and_mutated_native_apis_stay_incomplete(self):
++        for buffer in ('unknown()', '[]', 'b"fixed"', 'memoryview(bytearray(16))', 'bytearray(size)'):
++            with self.subTest(buffer=buffer), self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin buffer mutation'):
++                self.scan('import sys\nbuffer = ' + buffer + '\nsys.stdin.buffer.readinto(buffer)\n')
++        for setup in ('builtins.bytearray = replacement',
++                      'sys.stdin.buffer.readinto = replacement',
++                      'sys.stdin.buffer.readinto1 = replacement'):
++            with self.subTest(setup=setup), self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdlib source member mutation'):
++                self.scan('import sys, builtins\n' + setup + '\nbuffer = bytearray(16)\n'
++                          'sys.stdin.buffer.readinto(buffer)\n')
++        for call in ('sys.stdin.buffer.readinto(*arguments)', 'sys.stdin.buffer.readinto(buffer, **options)'):
++            with self.subTest(call=call), self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin buffer mutation argument'):
++                self.scan('import sys\nbuffer = bytearray(16)\n' + call + '\n')
++        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin buffer mutation'):
++            self.scan('import sys\ndef make():\n    owned = Owner()\n    return bytearray(16)\n'
++                      'buffer = make()\nsys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n')
++
+     def test_stdin_join_keeps_captured_receiver_producer_obligations(self):
+*** End Patch

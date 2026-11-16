@@ -541,6 +541,497 @@ class GoTaintDomainTests(unittest.TestCase):
         '''), ["go.taint.xss"])
 
 
+class GoEnvironmentSourceTests(unittest.TestCase):
+    """Environment values are sources; function identities and presence are not.
+
+    Native import identity, not an identifier spelling, selects the contract.
+    Fixtures are retained for baseline/candidate and public scanner replay.
+    """
+
+    def setUp(self):
+        self.started = time.monotonic()
+        result = self._outcome.result
+        self.previous_failures = len(result.failures) + len(result.errors)
+        print(f"[{self.id()}] RUN", flush=True)
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='go-environment-', dir=artifacts))
+
+    def tearDown(self):
+        result = self._outcome.result
+        failed = len(result.failures) + len(result.errors) > self.previous_failures
+        state = 'FAIL' if failed else 'PASS'
+        print(f"[{self.id()}] {state} ({time.monotonic() - self.started:.3f}s)", flush=True)
+
+    def check_source(self, imports, body, expected=(), helpers=''):
+        source = 'package app\n' + imports + '\n' + helpers + '\nfunc h() {\n' + body + '\n}\n'
+        folder = Path(tempfile.mkdtemp(prefix='source-', dir=self.root))
+        path = folder / 'handler.go'
+        path.write_text(source, encoding='utf-8')
+        findings = list(taint_go.run(RunContext(lang='go', files=[path])))
+        sites = []
+        for marker, rule, sink in expected:
+            lines = [(number, line) for number, line in enumerate(source.splitlines(), 1)
+                     if '// ' + marker in line]
+            self.assertEqual(len(lines), 1, (marker, source))
+            number, line = lines[0]
+            sites.append((number, line.index(sink) + 1, 'go.taint.' + rule))
+        actual = [(finding['line'], finding['col'], finding['rule']) for finding in findings]
+        (folder / 'findings.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+        self.assertEqual(sorted(actual), sorted(sites), (source, findings))
+        return findings
+
+    def test_direct_and_aliased_getenv_reach_every_security_domain(self):
+        for name in ('os', 'environment'):
+            with self.subTest(name=name):
+                self.check_source('import ' + name + ' "os"',
+                                  'value := ' + name + '.Getenv("UBS_INPUT")\n'
+                                  'db.Query(value) // query\n'
+                                  'fmt.Fprint(w, value) // output\n'
+                                  'exec.Command("sh", "-c", value) // command',
+                                  (('query', 'sql', 'db.Query'), ('output', 'xss', 'fmt.Fprint'),
+                                   ('command', 'command', 'exec.Command')))
+
+    def test_lookupenv_preserves_payload_and_presence_result_positions(self):
+        for name in ('os', 'environment'):
+            with self.subTest(name=name):
+                self.check_source('import ' + name + ' "os"',
+                                  'value, present := ' + name + '.LookupEnv("UBS_INPUT")\n'
+                                  'db.Query(value) // query\n'
+                                  'fmt.Fprint(w, present)\n'
+                                  'db.Query(fmt.Sprint(present))',
+                                  (('query', 'sql', 'db.Query'),))
+
+    def test_dot_imports_and_escaped_import_paths_keep_native_authority(self):
+        self.check_source('import . "os"',
+                          'value, present := LookupEnv("UBS_INPUT")\n'
+                          'db.Query(Getenv("UBS_INPUT") + value) // query\nfmt.Fprint(w, present)',
+                          (('query', 'sql', 'db.Query'),))
+        for path in ('`os`', '"\\x6fs"'):
+            with self.subTest(path=path):
+                self.check_source('import environment ' + path,
+                                  'db.Query(environment.Getenv("UBS_INPUT")) // query',
+                                  (('query', 'sql', 'db.Query'),))
+
+    def test_local_helper_returns_keep_lookupenv_result_slots(self):
+        self.check_source('import environment "os"',
+                          'value, present := read("UBS_INPUT")\n'
+                          'db.Query(value) // query\nfmt.Fprint(w, present)',
+                          (('query', 'sql', 'db.Query'),),
+                          'func read(key string) (string, bool) { return environment.LookupEnv(key) }')
+
+    def test_saved_function_identity_survives_rebinding_and_name_shadowing(self):
+        self.check_source('import "os"',
+                          'read := os.Getenv\nsaved := read\nread = constant\n'
+                          'os := unrelated\n_ = os\n'
+                          'db.Query(saved("UBS_INPUT")) // saved\ndb.Query(read("UBS_INPUT"))',
+                          (('saved', 'sql', 'db.Query'),),
+                          'func constant(key string) string { return "SELECT 1" }')
+
+    def test_saved_lookupenv_retains_clean_presence(self):
+        self.check_source('import environment "os"',
+                          'read := environment.LookupEnv\nalias := read\n'
+                          'value, present := alias("UBS_INPUT")\n'
+                          'fmt.Fprint(w, value) // output\nfmt.Fprint(w, present)',
+                          (('output', 'xss', 'fmt.Fprint'),))
+
+    def test_selected_helper_arguments_and_returned_callables_keep_sources(self):
+        self.check_source('import environment "os"',
+                          'read := keep(environment.Getenv)\n'
+                          'db.Query(invoke(read, "UBS_INPUT")) // query\n'
+                          'lookup := lookupReader()\nvalue, present := lookup("UBS_INPUT")\n'
+                          'fmt.Fprint(w, value) // output\nfmt.Fprint(w, present)',
+                          (('query', 'sql', 'db.Query'), ('output', 'xss', 'fmt.Fprint')),
+                          'func keep(read func(string) string) func(string) string { return read }\n'
+                          'func invoke(read func(string) string, key string) string { return read(key) }\n'
+                          'func lookupReader() func(string) (string, bool) { return environment.LookupEnv }')
+
+    def test_function_reference_is_not_environment_contents(self):
+        self.check_source('import "os"',
+                          'get := os.Getenv\nlookup := os.LookupEnv\n'
+                          'fmt.Fprint(w, get)\nfmt.Fprint(w, lookup)\n'
+                          'fmt.Fprint(w, os.Getenv)\nfmt.Fprint(w, os.LookupEnv)')
+
+    def test_lookalike_packages_do_not_invent_environment_sources(self):
+        for name, package in (('os', 'example.test/settings'), ('os', 'example.test/os'),
+                              ('environment', 'example.test/os')):
+            with self.subTest(name=name, package=package):
+                self.check_source('import ' + name + ' "' + package + '"',
+                                  'db.Query(' + name + '.Getenv("UBS_INPUT"))\n'
+                                  'value, present := ' + name + '.LookupEnv("UBS_INPUT")\n'
+                                  'fmt.Fprint(w, value, present)')
+
+    def test_local_and_parameter_shadows_do_not_borrow_os_authority(self):
+        self.check_source('import "os"',
+                          'os := settings\ndb.Query(os.Getenv("UBS_INPUT"))')
+        self.check_source('import "os"', '', helpers=
+                          'func read(os Settings) { db.Query(os.Getenv("UBS_INPUT")) }')
+        self.check_source('import . "os"',
+                          'Getenv := constant\ndb.Query(Getenv("UBS_INPUT"))', helpers=
+                          'func constant(key string) string { return "SELECT 1" }')
+
+    def test_dot_import_ambiguity_does_not_grant_native_contract(self):
+        self.check_source('import (. "os"; . "example.test/settings")',
+                          'value, present := LookupEnv("UBS_INPUT")\n'
+                          'db.Query(Getenv("UBS_INPUT"))\nfmt.Fprint(w, value, present)')
+
+    def test_overwrites_and_real_sink_specific_controls_stay_clean(self):
+        self.check_source('import (environment "os"; "html")',
+                          'value := environment.Getenv("UBS_INPUT")\n'
+                          'db.Query("SELECT $1", value)\n'
+                          'exec.Command("printf", "%s", value)\n'
+                          'escaped := html.EscapeString(value)\nfmt.Fprint(w, escaped)\n'
+                          'db.Query(escaped) // escaped-sql\n'
+                          'value = "SELECT 1"\ndb.Query(value)',
+                          (('escaped-sql', 'sql', 'db.Query'),))
+
+    def test_native_source_alternative_cannot_be_erased_by_an_escaper(self):
+        self.check_source('import (environment "os"; "html")',
+                          'read := environment.Getenv\nif choice { read = html.EscapeString }\n'
+                          'value := read("UBS_INPUT")\n'
+                          'db.Query(value) // query\nfmt.Fprint(w, value) // output',
+                          (('query', 'sql', 'db.Query'), ('output', 'xss', 'fmt.Fprint')))
+
+    def test_native_source_alternative_survives_unknown_function_join(self):
+        self.check_source('import environment "os"',
+                          'read := environment.Getenv\nif choice { read = constant }\n'
+                          'db.Query(read("UBS_INPUT")) // query',
+                          (('query', 'sql', 'db.Query'),),
+                          'func constant(key string) string { return "SELECT 1" }')
+
+    def test_parenthesized_native_and_captured_calls_retain_sources(self):
+        self.check_source('import environment "os"',
+                          'read := environment.Getenv\n'
+                          'db.Query((environment.Getenv)("UBS_INPUT")) // direct\n'
+                          'db.Query(((read))("UBS_INPUT")) // captured\n'
+                          'value, present := (environment.LookupEnv)("UBS_INPUT")\n'
+                          'db.Query(value) // lookup\nfmt.Fprint(w, present)',
+                          (('direct', 'sql', 'db.Query'), ('captured', 'sql', 'db.Query'),
+                           ('lookup', 'sql', 'db.Query')))
+
+    def test_argument_effects_are_preserved_when_only_presence_is_consumed(self):
+        self.check_source('import environment "os"',
+                          'read := environment.LookupEnv\n'
+                          '_, present := read(render(r.FormValue("q"))) // effect\n'
+                          'fmt.Fprint(w, present)', (('effect', 'xss', 'render'),),
+                          'func render(value string) string { fmt.Fprint(w, value); return "UBS_INPUT" }')
+
+    def test_import_identity_is_file_local_across_package_helpers(self):
+        first = self.root / 'first.go'
+        second = self.root / 'second.go'
+        first.write_text('package app\nimport environment "os"\n'
+                         'func source() string { return environment.Getenv("UBS_INPUT") }\n',
+                         encoding='utf-8')
+        second.write_text('package app\nimport environment "example.test/settings"\n'
+                          'func h() {\ndb.Query(source())\n'
+                          'db.Query(environment.Getenv("UBS_INPUT"))\n}\n', encoding='utf-8')
+        findings = list(taint_go.run(RunContext(lang='go', files=[first, second])))
+        self.assertEqual([(row['path'], row['line'], row['col'], row['rule']) for row in findings],
+                         [(str(second), 4, 1, 'go.taint.sql')], findings)
+        self.assertEqual(list(taint_go.run(RunContext(lang='go', files=[second]))), [])
+
+    def test_literals_comments_and_unrelated_field_names_do_not_create_sources(self):
+        self.check_source('import "os"',
+                          '// os.Getenv("UBS_INPUT")\n'
+                          'db.Query(`os.Getenv("UBS_INPUT")`)\n'
+                          'record := struct{Getenv string}{Getenv: "fixed"}\n'
+                          'fmt.Fprint(w, record.Getenv)')
+
+    def test_long_masked_literals_preserve_grouped_environment_reads(self):
+        # A large inert literal must not turn native-call discovery quadratic
+        # or hide a real source after the masked span.
+        self.check_source('import environment "os"',
+                          'db.Query(`' + 'fixed ' * 25000 + '`)\n'
+                          'db.Query(((environment.Getenv))("UBS_INPUT")) // query',
+                          (('query', 'sql', 'db.Query'),))
+
+    def test_grouped_lookup_results_keep_payload_and_presence_slots(self):
+        for expression in ('(environment.LookupEnv("UBS_INPUT"))',
+                           '((saved("UBS_INPUT")))',
+                           '(lookup("UBS_INPUT"))'):
+            with self.subTest(expression=expression):
+                self.check_source('import environment "os"',
+                                  'saved := environment.LookupEnv\n'
+                                  'value, present := ' + expression + '\n'
+                                  'db.Query(value) // query\n'
+                                  'fmt.Fprint(w, present)\n'
+                                  'db.Query(fmt.Sprint(present))',
+                                  (('query', 'sql', 'db.Query'),),
+                                  'func lookup(key string) (string, bool) { '
+                                  'return ((environment.LookupEnv(key))) }')
+
+    def test_grouped_reader_results_keep_payload_and_error_slots(self):
+        self.check_source('import reader "io"',
+                          'payload, err := (reader.ReadAll(r.Body))\n'
+                          'db.Query(string(payload)) // direct\n'
+                          'fmt.Fprint(w, err)\n'
+                          'other, failure := ((collect(r.Body)))\n'
+                          'db.Query(string(other)) // helper\n'
+                          'fmt.Fprint(w, failure)',
+                          (('direct', 'sql', 'db.Query'), ('helper', 'sql', 'db.Query')),
+                          'func collect(body reader.Reader) ([]byte, error) { '
+                          'return ((reader.ReadAll(body))) }')
+
+    def test_immediate_closure_can_install_an_environment_getter(self):
+        self.check_source('import (environment "os"; "html")',
+                          'read := html.EscapeString\n'
+                          'func() { read = environment.Getenv }()\n'
+                          'fmt.Fprint(w, read("UBS_INPUT")) // output',
+                          (('output', 'xss', 'fmt.Fprint'),))
+
+    def test_argument_effects_keep_new_possible_environment_getters(self):
+        self.check_source('import (environment "os"; "html")',
+                          'read := html.EscapeString\n'
+                          'fmt.Fprint(w, read(func() string { '
+                          'read = environment.Getenv; return "UBS_INPUT" }())) // output',
+                          (('output', 'xss', 'fmt.Fprint'),))
+
+    def test_immediate_closure_arguments_keep_getter_identity_without_handle_taint(self):
+        self.check_source('import environment "os"',
+                          'func(read func(string) string) {\n'
+                          'db.Query(read("QUERY")) // query\n'
+                          'fmt.Fprint(w, read)\n'
+                          '}(environment.Getenv)',
+                          (('query', 'sql', 'db.Query'),))
+        self.check_source('import environment "os"',
+                          'func(read func(string) (string, bool)) {\n'
+                          'value, present := read("QUERY")\n'
+                          'db.Query(value) // query\n'
+                          'fmt.Fprint(w, present, read)\n'
+                          '}(environment.LookupEnv)',
+                          (('query', 'sql', 'db.Query'),))
+
+    def test_argument_closure_getter_replacement_is_explicitly_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        helpers = 'func constant(key string) string { return "SELECT 1" }'
+        with self.assertRaisesRegex(AnalysisLimit, 'environment callable replacement during argument evaluation'):
+            self.check_source('import "os"',
+                              'read := os.Getenv\n'
+                              'db.Query(read(func() string { read = constant; return "Q" }()))',
+                              helpers=helpers)
+        self.check_source('import "os"',
+                          'read := os.Getenv\nfunc() { read = constant }()\n'
+                          'db.Query(read("Q"))', helpers=helpers)
+        self.check_source('import "os"',
+                          'read := os.Getenv\nsaved := read\n'
+                          'db.Query(saved(func() string { read = constant; return "Q" }())) // query',
+                          (('query', 'sql', 'db.Query'),), helpers=helpers)
+
+    def test_pointer_assignment_keeps_getters_separate_from_inert_handles(self):
+        self.check_source('import "os"',
+                          'read := constant\nptr := &read\n*ptr = os.Getenv\n'
+                          'fmt.Fprint(w, read)\ndb.Query(read("QUERY")) // query\n'
+                          '*ptr = constant\ndb.Query(read("QUERY"))',
+                          (('query', 'sql', 'db.Query'),),
+                          'func constant(key string) string { return "SELECT 1" }')
+        self.check_source('import "os"',
+                          'read := constant\nptr := &read\n*ptr = os.LookupEnv\n'
+                          'value, present := read("QUERY")\n'
+                          'db.Query(value) // query\nfmt.Fprint(w, present, read)',
+                          (('query', 'sql', 'db.Query'),),
+                          'func constant(key string) (string, bool) { return "SELECT 1", true }')
+
+    def test_helper_output_parameters_keep_possible_getter_identities(self):
+        self.check_source('import "os"',
+                          'read := constant\nforward(&read)\n'
+                          'fmt.Fprint(w, read)\ndb.Query(read("QUERY")) // query',
+                          (('query', 'sql', 'db.Query'),),
+                          'func constant(key string) string { return "SELECT 1" }\n'
+                          'func install(read *func(string) string) { *read = os.Getenv }\n'
+                          'func forward(read *func(string) string) { install(read) }')
+        self.check_source('import "os"',
+                          'read := constant\ninstall(&read)\n'
+                          'value, present := read("QUERY")\n'
+                          'db.Query(value) // query\nfmt.Fprint(w, present, read)',
+                          (('query', 'sql', 'db.Query'),),
+                          'func constant(key string) (string, bool) { return "SELECT 1", true }\n'
+                          'func install(read *func(string) (string, bool)) {\n'
+                          '  if choice { *read = os.LookupEnv }\n}')
+
+    def test_immediate_closure_cell_writes_preserve_getters_and_clean_overwrites(self):
+        self.check_source('import "os"',
+                          'read := constant\nfunc() { read = os.Getenv }()\n'
+                          'db.Query(read("QUERY")) // query\n'
+                          'func() { read = constant }()\n'
+                          'db.Query(read("QUERY"))\nfmt.Fprint(w, read)',
+                          (('query', 'sql', 'db.Query'),),
+                          'func constant(key string) string { return "SELECT 1" }')
+
+    def test_getter_containers_refuse_unmodeled_callable_storage(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        containers = (
+            'readers := []func(string) string{os.Getenv}\ndb.Query(readers[0]("Q"))',
+            'readers := map[string]func(string) string{"read": os.Getenv}\n'
+            'db.Query(readers["read"]("Q"))',
+            'reader := struct{ Read func(string) string }{Read: os.Getenv}\n'
+            'db.Query(reader.Read("Q"))',
+            'saved := os.Getenv\nreaders := []func(string) string{saved}\n'
+            'db.Query(readers[0]("Q"))',
+            'readers := []func(string) string{source()}\ndb.Query(readers[0]("Q"))',
+            'readers := []func(string) string{}\nreaders = append(readers, os.Getenv)\n'
+            'db.Query(readers[0]("Q"))',
+            'readers := []func(string) string{}\nreaders = keep(append(readers, source()))\n'
+            'db.Query(readers[0]("Q"))',
+            'readers := []func(string) string{constant}\nreaders[0] = os.Getenv\n'
+            'db.Query(readers[0]("Q"))',
+            'readers := map[string]func(string) string{}\nreaders["read"] = os.Getenv\n'
+            'db.Query(readers["read"]("Q"))',
+            'saved := os.Getenv\nreaders := []func(string) string{constant}\nreaders[0] = saved\n'
+            'db.Query(readers[0]("Q"))',
+            'readers := []func(string) string{constant}\nreaders[0] = source()\n'
+            'db.Query(readers[0]("Q"))',
+            'readers := []func(string) string{constant}\nptr := &readers[0]\n*ptr = os.Getenv\n'
+            'db.Query(readers[0]("Q"))',
+            'readers := []func(string) string{constant}\ninstall(&readers[0])\n'
+            'db.Query(readers[0]("Q"))',
+            'var reader Reader\nreader.Read = os.Getenv\ndb.Query(reader.Read("Q"))',
+            'var reader Reader\ninstall(&reader.Read)\ndb.Query(reader.Read("Q"))',
+        )
+        helpers = ('func constant(key string) string { return "SELECT 1" }\n'
+                   'func source() func(string) string { return os.Getenv }\n'
+                   'func install(read *func(string) string) { *read = os.Getenv }')
+        for body in containers:
+            with self.subTest(body=body), self.assertRaisesRegex(
+                    AnalysisLimit, 'environment callable.*(?:storage|transport)'):
+                self.check_source('import "os"', body, helpers=helpers)
+
+    def test_eager_environment_contents_and_constant_function_containers_remain_supported(self):
+        self.check_source('import "os"',
+                          'values := []string{os.Getenv("Q")}\ndb.Query(values[0]) // query\n'
+                          'readers := []func(string) string{constant}\n'
+                          'db.Query(readers[0]("Q"))\n'
+                          'values = append(values, os.Getenv("Q"))\ndb.Query(values[1]) // appended',
+                          (('query', 'sql', 'db.Query'), ('appended', 'sql', 'db.Query')),
+                          'func constant(key string) string { return "SELECT 1" }')
+
+    @unittest.skipUnless(os.environ.get('UBS_TAINT_NATIVE_GO') == '1',
+                         'set UBS_TAINT_NATIVE_GO=1 to compile the environment witness')
+    def test_compiled_environment_values_and_clean_controls_match_runtime(self):
+        from test_keep_temp import prevent_child_deletion
+
+        source = textwrap.dedent('''\
+            package main
+            import (
+                "encoding/json"
+                "fmt"
+                "html"
+                "net/http/httptest"
+                environment "os"
+            )
+            type database struct { Queries []string }
+            func (db *database) Query(query string, args ...any) { db.Queries = append(db.Queries, query) }
+            func reader() func(string) string { return environment.Getenv }
+            func lookup(key string) (string, bool) { return environment.LookupEnv(key) }
+            func constant(key string) string { return "SELECT fixed" }
+            func main() {
+                db, w := &database{}, httptest.NewRecorder()
+                read := reader()
+                saved := read
+                read = constant
+                db.Query(saved("UBS_GO_ENV_VALUE")) // saved-query
+                db.Query(read("UBS_GO_ENV_VALUE"))
+                value, present := lookup("UBS_GO_ENV_VALUE")
+                db.Query(value) // lookup-query
+                db.Query("SELECT $1", value)
+                fmt.Fprint(w, present)
+                fmt.Fprint(w, html.EscapeString(value))
+                fmt.Fprint(w, value) // raw-output
+                value = "fixed"
+                fmt.Fprint(w, value)
+                observed := map[string]any{"rendered": w.Body.String(), "queries": db.Queries}
+                if err := json.NewEncoder(environment.Stdout).Encode(observed); err != nil { panic(err) }
+            }
+        ''')
+        path, executable = self.root / 'main.go', self.root / 'witness'
+        path.write_text(source, encoding='utf-8')
+        environment = dict(os.environ, GOWORK='off', GO111MODULE='off', GOTOOLCHAIN='local',
+                           UBS_GO_ENV_VALUE='<b>external</b>')
+        build = subprocess.run(['go', 'build', '-work', '-o', str(executable), str(path)],
+                               cwd=self.root, text=True, capture_output=True, timeout=180,
+                               env=environment, preexec_fn=prevent_child_deletion)
+        (self.root / 'build.stdout.log').write_text(build.stdout)
+        (self.root / 'build.stderr.log').write_text(build.stderr)
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        native = subprocess.run([str(executable)], cwd=self.root, text=True, capture_output=True,
+                                timeout=30, env=environment, preexec_fn=prevent_child_deletion)
+        (self.root / 'runtime.stdout.log').write_text(native.stdout)
+        (self.root / 'runtime.stderr.log').write_text(native.stderr)
+        self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+        self.assertEqual(json.loads(native.stdout), {
+            'rendered': 'true&lt;b&gt;external&lt;/b&gt;<b>external</b>fixed',
+            'queries': ['<b>external</b>', 'SELECT fixed', '<b>external</b>', 'SELECT $1'],
+        })
+        findings = list(taint_go.run(RunContext(lang='go', files=[path])))
+        expected = sorted(
+            (number, line.index(sink) + 1, 'go.taint.' + rule)
+            for number, line in enumerate(source.splitlines(), 1)
+            for marker, rule, sink in [('saved-query', 'sql', 'db.Query'),
+                                       ('lookup-query', 'sql', 'db.Query'),
+                                       ('raw-output', 'xss', 'fmt.Fprint')]
+            if '// ' + marker in line
+        )
+        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings),
+                         expected, findings)
+
+
+@unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1',
+                     'set UBS_TAINT_E2E=1 for real module reports')
+class GoEnvironmentModuleTests(unittest.TestCase):
+    """Category 9 public reports; this does not claim every Go category ran."""
+
+    def test_real_module_reports_preserve_environment_payload_and_clean_presence(self):
+        from test_keep_temp import prevent_child_deletion
+
+        cases = (
+            ('aliased-getenv', 'import environment "os"',
+             'db.Query(environment.Getenv("UBS_INPUT"))', [('go.taint.sql', 4, 1)]),
+            ('saved-lookupenv', 'import environment "os"',
+             'read := environment.LookupEnv\nvalue, present := read("UBS_INPUT")\n'
+             'db.Query(value)\nfmt.Fprint(w, present)', [('go.taint.sql', 6, 1)]),
+            ('bound-query', 'import environment "os"',
+             'value, present := environment.LookupEnv("UBS_INPUT")\n'
+             'db.Query("SELECT $1", value)\nfmt.Fprint(w, present)', []),
+            ('lookalike', 'import os "example.test/settings"', 'db.Query(os.Getenv("UBS_INPUT"))', []),
+            ('local-shadow', 'import "os"', 'os := settings\ndb.Query(os.Getenv("UBS_INPUT"))', []),
+        )
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        skipped = ','.join(str(category) for category in range(1, 23) if category != 9)
+        for name, imports, body, expected in cases:
+            for output in ('json', 'sarif'):
+                with self.subTest(case=name, format=output):
+                    folder = Path(tempfile.mkdtemp(prefix='go-env-public-' + name + '-', dir=artifacts))
+                    path = folder / 'handler.go'
+                    path.write_text('package app\n' + imports + '\nfunc h() {\n' + body + '\n}\n')
+                    command = [str(ROOT / 'modules/ubs-golang.sh'), str(folder), '--ci',
+                               '--format=' + output, '--skip=' + skipped]
+                    result = subprocess.run(command, cwd=folder, capture_output=True, text=True,
+                                            timeout=180, preexec_fn=prevent_child_deletion,
+                                            env=dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1',
+                                                     UBS_CACHE_DIR=str(folder / 'cache')))
+                    (folder / 'stdout.log').write_text(result.stdout)
+                    (folder / 'stderr.log').write_text(result.stderr)
+                    self.assertEqual(result.returncode, 1 if expected else 0, result.stdout + result.stderr)
+                    report = json.loads(result.stdout)
+                    if output == 'json':
+                        self.assertEqual((report['status'], report['files'], report['critical']),
+                                         ('ok', 1, len(expected)), report)
+                        actual = [(row.get('rule', row.get('rule_id')), row['line'], row['col'])
+                                  for row in report['findings'] if row['severity'] == 'critical']
+                    else:
+                        actual = []
+                        for run in report['runs']:
+                            for invocation in run.get('invocations', []):
+                                self.assertTrue(invocation['executionSuccessful'], invocation)
+                            for row in run.get('results', []):
+                                if row['level'] == 'error':
+                                    region = row['locations'][0]['physicalLocation']['region']
+                                    actual.append((row['ruleId'], region['startLine'], region['startColumn']))
+                    self.assertEqual(sorted(actual), sorted(expected), report)
+
+
 class GoSanitizerImportTests(packages.PackageTestCase):
     def check(self, imports, body, *rules):
         self.source('handler.go', 'package app\n' + imports + '\nfunc h() {\n' + body + '\n}\n')

@@ -6,7 +6,7 @@ loops and package call summaries to convergence. Sanitizers are specific to the
 interpreter receiving a value. This is a conservative source analyzer, not a
 Go type checker; arbitrary imported-package calls and dynamically invoked
 closures are not resolved. File-local imports identify standard JSON/XML,
-reader and HTML escape operations, including captured function aliases.
+reader, environment and HTML escape operations, including captured function aliases.
 Selected package helpers transport callable and decoder identities through
 parameters and result slots, with a finite context worklist independent of
 payload traces. Excessive specialization is an explicit incomplete analysis.
@@ -40,10 +40,12 @@ FIELD_PATH_LIMIT = 8
 
 _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
                     'io': 'io', 'io/ioutil': 'ioutil', 'html': 'html',
-                    'html/template': 'template', 'text/template': 'template'}
+                    'html/template': 'template', 'text/template': 'template', 'os': 'os'}
 _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
                    'io': {'ReadAll'}, 'ioutil': {'ReadAll'},
-                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString'}}
+                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
+                   'os': {'Getenv', 'LookupEnv'}}
+_ENVIRONMENT_OPERATIONS = frozenset({('os', 'Getenv'), ('os', 'LookupEnv')})
 
 SOURCE_PATTERNS = [
     re.compile(r"\.FormValue\s*\(", re.IGNORECASE),
@@ -55,7 +57,6 @@ SOURCE_PATTERNS = [
     re.compile(r"mux\.Vars\s*\(", re.IGNORECASE),
     re.compile(r"chi\.URLParam\s*\(", re.IGNORECASE),
     re.compile(r"\.(?:QueryParam|FormParam|Param)\s*\(", re.IGNORECASE),
-    re.compile(r"os\.Getenv", re.IGNORECASE),
     re.compile(r"bufio\.NewReader\(os\.Stdin\)", re.IGNORECASE),
     re.compile(r"\b(?:r|req|request)\.Body\b"),
 ]
@@ -280,6 +281,7 @@ class _Target:
     parameter: int | None = None
     whole: bool = True
     path: tuple[str, ...] = ()
+    indexed: bool = False
 
 
 @dataclass(frozen=True)
@@ -715,6 +717,7 @@ class _Summary:
     variadic: int | None = None
     writes: dict[tuple[int, tuple[str, ...]], _Fact] = field(default_factory=dict)
     value_returns: tuple[_ValueInfo | None, ...] = ()
+    native_writes: dict[tuple[int, tuple[str, ...]], _NativeInfo | None] = field(default_factory=dict)
 
 
 def _join_summaries(summaries: list[_Summary]) -> _Summary:
@@ -753,13 +756,17 @@ def _join_summaries(summaries: list[_Summary]) -> _Summary:
         value_returns.append(_join_value_info(*values))
     effects = {}
     writes = {}
+    native_writes = {}
     for summary in summaries:
         for key, fact in summary.effects.items():
             effects[key] = _join(effects.get(key, _CLEAN), widen(fact))
         for (index, path), fact in summary.writes.items():
             index = min(index, variadic) if variadic is not None else index
             writes[index, path] = _join(writes.get((index, path), _CLEAN), widen(fact))
-    return _Summary(returns, effects, variadic, writes, tuple(value_returns))
+        for (index, path), native in summary.native_writes.items():
+            index = min(index, variadic) if variadic is not None else index
+            native_writes[index, path] = _join_native(native_writes.get((index, path)), native)
+    return _Summary(returns, effects, variadic, writes, tuple(value_returns), native_writes)
 
 
 @dataclass
@@ -782,6 +789,8 @@ class _Analysis:
         self.value_results: dict[int, tuple[_ValueInfo | None, ...]] = {}
         self.named_returns = ()
         self.writes: dict[tuple[int, tuple[str, ...]], _Fact] = {}
+        self.native_writes: dict[tuple[int, tuple[str, ...]], _NativeInfo | None] = {}
+        self.native_cell_writes: dict[str, _NativeInfo | None] = {}
         self.native_mutations: set[str] = set()
         self.native_escapes: set[str] = set()
         self.uncertain_globals = uncertain_globals if uncertain_globals is not None else set()
@@ -821,7 +830,7 @@ class _Analysis:
             if indexed:
                 cell = scope.bindings.get(indexed.group(1), indexed.group(1))
                 aliases = self.pointers(indexed.group(1), state, scope) or frozenset({_Target(cell)})
-                return frozenset(replace(alias, whole=False) for alias in aliases)
+                return frozenset(replace(alias, whole=False, indexed=True) for alias in aliases)
         return frozenset()
 
     def assignment_targets(self, expr, state, scope):
@@ -835,7 +844,8 @@ class _Analysis:
                 outer = self.assignment_targets(pointer, state, scope)
                 if outer is not None:
                     complete = all(not target.path and state.get(_PointerKey(target.cell)) for target in outer)
-                    return frozenset(replace(inner, whole=inner.whole and target.whole and complete)
+                    return frozenset(replace(inner, whole=inner.whole and target.whole and complete,
+                                             indexed=inner.indexed or target.indexed)
                                      for target in outer if not target.path
                                      for inner in state.get(_PointerKey(target.cell), ()))
         selector = re.fullmatch(r'(?:([A-Za-z_]\w*)|\(\s*\*\s*([A-Za-z_]\w*)\s*\))'
@@ -847,6 +857,13 @@ class _Analysis:
                 targets = self.pointers(root, state, scope) or frozenset({_Target(cell)})
                 suffix = tuple(re.findall(r'\.\s*([A-Za-z_]\w*)', expr))
                 return frozenset(_field_target(target, suffix) for target in targets)
+        if '[' in expr:
+            # Index identities are deliberately collapsed to their aggregate.
+            # Keep that boundary distinct from an uncertain scalar pointer so
+            # native callable writes cannot masquerade as scalar metadata.
+            indexed = self.pointers('&' + expr, state, scope)
+            if indexed:
+                return indexed
         return None
 
     def copy_fields(self, expr, state, scope):
@@ -882,6 +899,56 @@ class _Analysis:
             return value
         identity = self.native_identity(root, member, offset, scope)
         return _NativeInfo(frozenset({identity})) if identity is not None else _UNKNOWN_NATIVE
+
+    def check_environment_storage(self, code, offset, state, scope):
+        # Scalar native identities and selected helper results are modeled.
+        # Composite values are not a callable heap: losing a getter inside a
+        # slice/map/struct must not turn a former source into a clean result.
+        # Eager calls store ordinary contents and keep the existing data flow.
+        aggregate = '{' in code and not re.match(r'\s*func\s*\(', code)
+        append = (re.match(r'\s*append\s*\(', code)
+                  and 'append' not in scope.bindings and 'append' not in self.summaries)
+        if not (aggregate or append):
+            return
+        # A function body nested in an argument is executable code, not
+        # aggregate contents. Its own evaluator checks any stored handles.
+        # A function type after []/map or a struct field name is not a body.
+        if 'func' in code:
+            parser = _Parser(code)
+            masked, covered_until = list(code), 0
+            for closure in re.finditer(r'\bfunc\s*\(', code):
+                if closure.start() < covered_until:
+                    continue
+                previous = closure.start() - 1
+                while previous >= 0 and code[previous].isspace():
+                    previous -= 1
+                if previous >= 0 and code[previous] not in '(:,={':
+                    continue
+                parameter_end = parser.pairs.get(closure.end() - 1)
+                opening = parser.body_open(parameter_end + 1, len(code)) if parameter_end is not None else None
+                closing = parser.pairs.get(opening) if opening is not None else None
+                if closing is not None:
+                    masked[closure.start():closing + 1] = ' ' * (closing + 1 - closure.start())
+                    covered_until = closing + 1
+            code = ''.join(masked)
+        names = re.finditer(r'(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?', code)
+        for match in names:
+            previous = match.start() - 1
+            while previous >= 0 and code[previous].isspace():
+                previous -= 1
+            if previous >= 0 and code[previous] == '.':
+                continue
+            root, member = match.group(1), match.group(2)
+            following = match.end()
+            while following < len(code) and code[following].isspace():
+                following += 1
+            if following < len(code) and code[following] == '(':
+                summary = self.summaries.get(root) if member is None and root not in scope.bindings else None
+                natives = (info.native for info in summary.value_returns if info is not None) if summary else ()
+            else:
+                natives = (self.native_callable(root, member, offset + match.start(), state, scope),)
+            if any(native is not None and native.operations & _ENVIRONMENT_OPERATIONS for native in natives):
+                raise AnalysisLimit('Go environment callable aggregate storage is unsupported; analysis is incomplete')
 
     def value_info(self, expr, offset, state, scope):
         expr, offset = self.unparenthesize(expr, offset)
@@ -971,8 +1038,17 @@ class _Analysis:
             if target.parameter is not None:
                 key = (target.parameter, target.path)
                 self.writes[key] = _join(self.writes.get(key, _CLEAN), fact)
-            if target.path:
+                native = info.native if info is not None else None
+                self.native_writes[key] = _join_native(self.native_writes.get(key), native)
+            if target.path or target.indexed:
+                if info is not None and info.native is not None and info.native.operations & _ENVIRONMENT_OPERATIONS:
+                    raise AnalysisLimit('Go environment callable field/index storage is unsupported; analysis is incomplete')
                 continue
+            native_key = _NativeKey(target.cell)
+            native = info.native if info is not None else None
+            state[native_key] = native if strong else _join_native(state.get(native_key), native)
+            self.native_cell_writes[target.cell] = _join_native(
+                self.native_cell_writes.get(target.cell), native)
             if strong and info is not None:
                 state[_PointerKey(target.cell)] = info.pointers
             decoder_key = _DecoderKey(target.cell)
@@ -1002,6 +1078,7 @@ class _Analysis:
         unmarshal = bool(operations) and operations <= {('json', 'Unmarshal'), ('xml', 'Unmarshal')}
         readall = bool(operations) and operations <= {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
         sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
+        environment = operations & _ENVIRONMENT_OPERATIONS
         methods = {'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
                    'UseNumber', 'DisallowUnknownFields', 'Buffered'}
         method = member if receiver is not None and member in methods else None
@@ -1015,7 +1092,7 @@ class _Analysis:
                 outer_end = pairs.get(opening)
                 if outer_end is None:
                     return None
-        if not (constructor or unmarshal or readall or sanitizer or method):
+        if not (constructor or unmarshal or readall or sanitizer or environment or method):
             return None
         if whole and code[outer_end + 1:].strip():
             return None
@@ -1048,6 +1125,25 @@ class _Analysis:
         callable_source = (_join(callable_source, state.get(scope.bindings.get(root, root), _CLEAN))
                            if native is not None and native.unknown else _CLEAN)
         fallback = _join(*values, callable_source)
+        # Argument evaluation may install another possible getter. Keep the
+        # pre-call family flags for existing decoder contracts, but do not
+        # lose a source introduced by that captured-cell write.
+        operations = native.operations if native is not None else frozenset()
+        environment = operations & _ENVIRONMENT_OPERATIONS
+        if environment:
+            if len(values) != 1:
+                return finish(end, (fallback,))
+            # Reading a native environment value introduces provenance even
+            # when its key is literal. Merely taking the function's address
+            # introduces none. A possible getter branch must also survive a
+            # join with an escaper or an unknown callback of the same type.
+            sources = frozenset(_Trace(package + '.' + operation,
+                                       path=(package + '.' + operation,))
+                                for package, operation in environment)
+            payload = _join(sources, fallback if native.unknown or operations != environment else _CLEAN)
+            if operations == {('os', 'LookupEnv')}:
+                return finish(end, (payload, fallback if native.unknown else _CLEAN))
+            return finish(end, (payload,))
         if constructor:
             if len(values) != 1:
                 return finish(end, (_CLEAN,))
@@ -1149,6 +1245,27 @@ class _Analysis:
             if index < len(targets):
                 destinations = frozenset(_field_target(target, path) for target in targets[index])
                 self.write_targets(destinations, self.instantiate(fact, arguments, name, infos), state, name + '()')
+        for (index, path), native in summary.native_writes.items():
+            if index >= len(targets):
+                continue
+            for actual in targets[index]:
+                target = _field_target(actual, path)
+                if target.path or target.indexed:
+                    if native is not None and native.operations & _ENVIRONMENT_OPERATIONS:
+                        raise AnalysisLimit('Go environment callable field/index storage is unsupported; analysis is incomplete')
+                    continue
+                # Output-parameter summaries are may-writes: another branch or
+                # aliased parameter can leave the old callable in place. Keep
+                # both identities without confusing a function with its data.
+                key = _NativeKey(target.cell)
+                state[key] = _join_native(state.get(key), native)
+                self.native_mutations.add(target.cell)
+                self.native_cell_writes[target.cell] = _join_native(
+                    self.native_cell_writes.get(target.cell), native)
+                if target.parameter is not None:
+                    destination = (target.parameter, target.path)
+                    self.native_writes[destination] = _join_native(
+                        self.native_writes.get(destination), native)
         result_infos = []
         for info in summary.value_returns:
             if info is None:
@@ -1159,7 +1276,8 @@ class _Analysis:
             complete = all(target.parameter is not None and target.parameter < len(targets)
                            and targets[target.parameter] for target in info.pointers)
             pointers = frozenset(replace(_field_target(actual, target.path),
-                                         whole=_field_target(actual, target.path).whole and target.whole and complete)
+                                         whole=_field_target(actual, target.path).whole and target.whole and complete,
+                                         indexed=actual.indexed or target.indexed)
                                  for target in info.pointers
                                  if target.parameter is not None and target.parameter < len(targets)
                                  for actual in targets[target.parameter])
@@ -1168,6 +1286,13 @@ class _Analysis:
         return tuple(self.instantiate(fact, arguments, name, infos) for fact in summary.returns)
 
     def values(self, expr: str, offset: int, state, scope) -> tuple[_Fact, ...]:
+        # Parentheses around a result preserve all tuple slots. Keep the
+        # caller's metadata key while inner calls retain their source offsets.
+        inner, inner_offset = self.unparenthesize(expr, offset)
+        if inner != expr:
+            values = self.values(inner, inner_offset, state, scope)
+            self.value_results[offset] = self.value_results[inner_offset]
+            return values
         code = _call_code(_masked_source(expr))
         parts = _parts(code)
         if len(parts) > 1:
@@ -1206,6 +1331,7 @@ class _Analysis:
 
     def value(self, expr: str, offset: int, state, scope) -> _Fact:
         code = _call_code(_masked_source(expr))
+        self.check_environment_storage(code, offset, state, scope)
         pairs = _pairs(code)
         masked = list(code)
         facts = []
@@ -1246,11 +1372,30 @@ class _Analysis:
                 invoked = invocation < len(code) and code[invocation] == '(' and invocation in pairs
                 delayed = re.search(r'\b(?:go|defer)\s*$', code[:match.start()]) is not None
                 immediate = invoked and not delayed
-                arguments = []
+                enclosing_getters = {}
+                if immediate:
+                    for enclosing in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)\s*\(', code):
+                        if enclosing.start() >= match.start():
+                            break
+                        if pairs.get(enclosing.end() - 1, -1) <= close:
+                            continue
+                        name = enclosing.group(1)
+                        native = self.native_callable(name, None, offset + enclosing.start(1), state, scope)
+                        if native is not None and native.operations & _ENVIRONMENT_OPERATIONS:
+                            enclosing_getters[scope.bindings.get(name, name)] = native.operations & _ENVIRONMENT_OPERATIONS
+                arguments, argument_infos, argument_expressions = [], [], []
                 if invoked:
-                    arguments = [self.value(expr[invocation + 1 + start:invocation + 1 + end],
-                                            offset + invocation + 1 + start, state, scope)
-                                 for start, end in _parts(code[invocation + 1:pairs[invocation]])]
+                    for start, end in _parts(code[invocation + 1:pairs[invocation]]):
+                        argument = expr[invocation + 1 + start:invocation + 1 + end]
+                        origin = offset + invocation + 1 + start
+                        arguments.append(self.value(argument, origin, state, scope))
+                        argument_infos.append(self.value_info(argument, origin, state, scope))
+                        argument_expressions.append((argument, origin))
+                    for index, (argument, origin) in enumerate(argument_expressions):
+                        variable, _ = self.unparenthesize(argument)
+                        if re.fullmatch(r'[A-Za-z_]\w*', variable):
+                            argument_infos[index] = _join_value_info(
+                                argument_infos[index], self.value_info(argument, origin, state, scope))
                 closure_state = dict(state)
                 if not immediate:
                     for key, native in closure_state.items():
@@ -1264,20 +1409,51 @@ class _Analysis:
                         key = closure_scope.declare(parameter, offset + match.start())
                         closure_state[key] = (
                             arguments[index] if index < len(arguments) else _CLEAN)
-                        closure_state[_NativeKey(key)] = _UNKNOWN_NATIVE
+                        info = argument_infos[index] if index < len(argument_infos) else None
+                        native = info.native if info is not None else None
+                        # Invoked closure parameters receive function values,
+                        # whose getter identity is separate from input data.
+                        # Preserve source alternatives without expanding other
+                        # closure callback contracts or inventing handle taint.
+                        closure_state[_NativeKey(key)] = (
+                            native if native is not None and native.operations & _ENVIRONMENT_OPERATIONS
+                            else _UNKNOWN_NATIVE)
                 nested = _Analysis(self.source, self.code, self.rule, self.summaries, self.imports,
                                    self.uncertain_globals, self.global_cells, self.resolve_summary)
                 nested.native_escapes = set(self.native_escapes)
-                nested.block(_Parser(self.code).block(offset + opening + 1, offset + close),
-                             closure_state, closure_scope)
+                closure_flow = nested.block(_Parser(self.code).block(offset + opening + 1, offset + close),
+                                            closure_state, closure_scope)
+                if immediate:
+                    for cell in nested.native_mutations & enclosing_getters.keys():
+                        replacement = (closure_flow.normal.get(_NativeKey(cell))
+                                       if closure_flow.normal is not None
+                                       else nested.native_cell_writes.get(cell))
+                        retained = replacement.operations if replacement is not None else frozenset()
+                        if enclosing_getters[cell] - retained:
+                            # Closure bodies precede outer calls in this
+                            # evaluator. A replacement cannot erase the old
+                            # callee; assigning the same getter preserves it.
+                            raise AnalysisLimit('Go environment callable replacement during argument evaluation '
+                                                'is unsupported; analysis is incomplete')
                 # Invocation timing and captured writes are not described by
                 # return facts. A possible writer invalidates the old proof.
                 for cell in nested.native_mutations:
                     if _NativeKey(cell) in state:
                         self.invalidate_native_targets((_Target(cell),), state)
+                        if immediate:
+                            native = (closure_flow.normal.get(_NativeKey(cell))
+                                      if closure_flow.normal is not None
+                                      else nested.native_cell_writes.get(cell))
+                            state[_NativeKey(cell)] = (native if closure_flow.normal is not None
+                                                       else _join_native(state.get(_NativeKey(cell)), native))
+                            self.native_cell_writes[cell] = _join_native(
+                                self.native_cell_writes.get(cell), native)
                 for (sink_offset, label), fact in nested.effects.items():
                     self.effect(sink_offset, label, fact)
                 if immediate:
+                    if any(info is not None and info.native is not None
+                           and info.native.operations & _ENVIRONMENT_OPERATIONS for info in nested.value_returns):
+                        raise AnalysisLimit('Go environment callable closure-result transport is unsupported; analysis is incomplete')
                     facts.extend(nested.returns)
                 if invoked:
                     close = pairs[invocation]
@@ -1293,6 +1469,9 @@ class _Analysis:
             else:
                 end = pairs.get(match.end() - 1)
                 if end is not None:
+                    if match.group(1) == 'append' and match.group(2) is None:
+                        self.check_environment_storage(code[match.start():end + 1],
+                                                       offset + match.start(), state, scope)
                     for start, stop in _parts(code[match.end():end]):
                         argument = expr[match.end() + start:match.end() + stop]
                         self.invalidate_native_targets(
@@ -1453,6 +1632,7 @@ class _Analysis:
                 updates[_DecoderKey(key)] = decoder
                 updates[_NativeKey(key)] = native
                 self.native_mutations.add(key)
+                self.native_cell_writes[key] = _join_native(self.native_cell_writes.get(key), native)
             assigned = {key for key in updates if isinstance(key, str)}
             for key in list(state):
                 if isinstance(key, _FieldKey) and key.cell in assigned:
@@ -1673,7 +1853,7 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
             analysis.block(function.body, state, scope)
             mutations.update(analysis.native_mutations)
             variants.append(_Summary(analysis.returns, analysis.effects, function.variadic,
-                                     analysis.writes, analysis.value_returns))
+                                     analysis.writes, analysis.value_returns, analysis.native_writes))
         newly_uncertain = (mutations & global_cells) - uncertain_globals
         if newly_uncertain:
             # Package callbacks are mutable cells. A write in any selected

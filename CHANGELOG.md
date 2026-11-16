@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track native Go `os.Getenv` and `os.LookupEnv` through import aliases, saved
+  callables, selected helper arguments and results, and bounded scalar pointer
+  or immediate-closure writes. Keep presence flags, inert function values,
+  local lookalikes and sink-specific safe forms clean. Unmodeled callable
+  container storage and argument-time replacement remain explicitly incomplete.
+
 - Detect attacker-controlled request destinations through native Python
   `requests.Session` and HTTPX pooled clients, saved methods and selected helper
   returns. Resolve relative requests against `base_url` while keeping fixed

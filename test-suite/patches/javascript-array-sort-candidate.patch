@@ -1,3 +1,207 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -1671,7 +1671,7 @@
+                         # Element spreads use the wildcard slot directly and
+                         # must not be mistaken for prototype/method writes.
+                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
+-                                       'splice', 'copyWithin', 'entries', 'map', 'flatMap'):
++                                       'splice', 'copyWithin', 'sort', 'entries', 'map', 'flatMap'):
+                             slots[method] = _alternatives(slots.get(method, _ABSENT), present)
+                 elif self.array_index(key) is not None and length is not None:
+                     state.array_lengths[ref] = max(length, int(key) + 1)
+@@ -2476,6 +2476,69 @@
+             self.merge_array_mutation(ref, copied, length, state, definite=definite)
+         return receiver
+ 
++    def array_sort(self, receiver, arguments, prepared, state, callback=None):
++        """Permute finite indexed values in place without materializing holes.
++
++        The exact scalar ordering is not part of the taint lattice. Each
++        occupied result slot therefore receives every possible input value;
++        named properties and borrowed object identities remain separate.
++        Only ordinary default comparisons prove that trailing holes survive.
++        """
++        actual, uncertain, maybe_missing, kinds = prepared
++        default = (uncertain != 0 and (not actual or kinds.get(0) == 'undefined'
++                   or (actual[0][1] and 0 not in maybe_missing)))
++        comparator = (_function_target(actual[0][0]) or callback) if actual and uncertain != 0 else None
++        if not default and comparator is None:
++            # IsCallable runs even with no elements. An unproven or invalid
++            # comparator cannot borrow the no-comparison fast path.
++            self.incomplete.add('Array.sort comparator requires a selected callable or undefined')
++        if (comparator is not None and arguments and comparator.parent is self.scope
++                and arguments[0][0] <= comparator.start < comparator.end <= arguments[0][1]):
++            self.engine.modeled_callbacks.add(comparator)
++            if callback is not comparator:
++                self.engine.escaped_callbacks.add(comparator)
++        refs = _refs(receiver)
++        for ref in refs:
++            slots, length = state.heap[ref], state.array_lengths[ref]
++            numeric = {key: value for key, value in slots.items()
++                       if self.array_index(key) is not None and (length is None or int(key) < length)}
++            self.engine.budget.spend(1 + len(slots))
++            ordinary = self.array_mutation_contract(ref, state)
++            if not ordinary:
++                self.incomplete.add('Array.sort requires ordinary writable indexed properties')
++            # An optional clean value has the same empty provenance as a
++            # hole. Count both toward the possible prefix, then use presence
++            # below only to prove its minimum occupied length.
++            present = list(numeric.values())
++            known = length is not None and None not in slots
++            if not known:
++                self.incomplete.add('Array.sort requires known indexed presence and extent')
++            compare = not known or len(present) > 1
++            pure = default or comparator is not None
++            if compare and not default:
++                pure = False
++                self.incomplete.add('Array.sort comparator effects require unsupported invocation semantics')
++                if comparator is not None:
++                    self.engine.escaped_callbacks.add(comparator)
++            if compare and default and any(_refs(value) for value in present):
++                pure = False
++                self.incomplete.add('Array.sort element coercion requires unsupported value semantics')
++            possible = _alternatives(*present, slots.get(None, frozenset()))
++            changed = {key: value for key, value in slots.items() if self.array_index(key) is None}
++            if known:
++                # Optional elements contribute an upper bound. Every concrete
++                # execution still compacts its present values into a prefix.
++                minimum = sum(not getattr(value, 'absent', False) for value in present)
++                self.engine.budget.spend(len(present))
++                for index in range(len(present)):
++                    changed[str(index)] = _Fact(possible, _refs(possible), absent=index >= minimum)
++            else:
++                changed.update({key: _alternatives(value, possible) for key, value in numeric.items()})
++                changed[None] = _alternatives(slots.get(None, _ABSENT), possible)
++            definite = known and ordinary and pure and len(refs) == 1 and ref not in state.weak_refs
++            self.merge_array_mutation(ref, changed, length, state, definite=definite)
++        return receiver
++
+     def array_splice(self, receiver, arguments, prepared, state, location):
+         """Transform selected slots and return a fresh, sparse removed array."""
+         actual, uncertain, _missing, _kinds = prepared
+@@ -2618,7 +2681,7 @@
+ 
+     def escape_callbacks(self, facts, state):
+         """Opaque calls can retain callable arguments, including nested aliases."""
+-        if not self.engine.has_flatmap_calls:
++        if not self.engine.has_array_callbacks:
+             return
+         pending = [ref for fact in facts for ref in _refs(fact)]
+         seen = set()
+@@ -2881,14 +2944,14 @@
+     def native_array_target(self, receiver, method, state):
+         refs = _refs(receiver)
+         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
+-        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin', 'flatMap'}
++        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin', 'sort', 'flatMap'}
+                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
+                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
+             return 'array', receiver, method
+         return None
+ 
+-    def flatmap_postfix(self, fact, cursor, end, state):
+-        """Retain evaluated receivers through flatMap calls and their selectors."""
++    def array_postfix(self, fact, cursor, end, state):
++        """Retain evaluated receivers through native array calls and selectors."""
+         code = self.scope.code
+         while cursor < end:
+             selectors, selected_end = self.selectors(cursor, end, stop_at_call=True)
+@@ -2899,15 +2962,16 @@
+                 if unknown:
+                     fact = _join(fact, selected)
+             cursor = selected_end
+-            match = re.match(r'\s*\.\s*flatMap\s*\(', code[cursor:end])
++            match = re.match(r'\s*\.\s*(flatMap|sort)\s*\(', code[cursor:end])
+             if match is None:
+                 break
+             opening = cursor + match.end() - 1
+             closing = self.pairs.get(opening)
+             if closing is None or closing >= end:
+-                self.incomplete.add('Array.flatMap postfix call is incomplete')
+-                break
+-            native = self.native_array_target(fact, 'flatMap', state)
++                self.incomplete.add(f'Array.{match.group(1)} postfix call is incomplete')
++                break
++            method = match.group(1)
++            native = self.native_array_target(fact, method, state)
+             arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
+                          if self.engine.code[left:right].strip()]
+             callback = self.callable(*arguments[0], state) if arguments else None
+@@ -2915,10 +2979,11 @@
+             if native is None:
+                 if callback is not None:
+                     self.engine.escaped_callbacks.add(callback)
+-                self.incomplete.add('Array.flatMap postfix requires a known native receiver method')
+-                fact = self.materialize(_join(fact, *values), state)
+-            else:
+-                fact = self.array_flatmap(fact, arguments, prepared, state, cursor, callback)
++                self.incomplete.add(f'Array.{method} postfix requires a known native receiver method')
++                fact = self.materialize(_join(fact, *values), state)
++            else:
++                fact = self.mutation_call(native, arguments, values, state, prepared,
++                                          location=cursor, callback=callback)
+             cursor = closing + 1
+         return fact, cursor
+ 
+@@ -2981,6 +3046,8 @@
+             return self.array_copy_within(receiver, arguments, prepared, state)
+         if kind == 'array' and method == 'splice':
+             return self.array_splice(receiver, arguments, prepared, state, location)
++        if kind == 'array' and method == 'sort':
++            return self.array_sort(receiver, arguments, prepared, state, callback)
+         if kind == 'array' and method == 'flatMap':
+             return self.array_flatmap(receiver, arguments, prepared, state, location, callback)
+         if values and (kind == 'reflect' or (kind == 'object' and method in {
+@@ -3318,7 +3385,7 @@
+                     self.incomplete.add('Own method requires an unsupported escaped closure environment')
+                 return None, receiver
+             return candidate, receiver
+-        if (report and key in {'splice', 'copyWithin', 'flatMap'} and _refs(receiver)
++        if (report and key in {'splice', 'copyWithin', 'sort', 'flatMap'} and _refs(receiver)
+                 and all(ref in state.array_lengths for ref in _refs(receiver))
+                 and self.native_target(name, state) is None):
+             self.incomplete.add(f'Array.{key} requires a known native or selected callable')
+@@ -3875,9 +3942,9 @@
+         cursor = start
+         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
+         if (primary_end is not None and primary_end < end - 1
+-                and re.match(r'\s*\.\s*flatMap\s*\(', code[primary_end + 1:end])):
+-            primary = self.value(start, primary_end + 1, state)
+-            primary, cursor = self.flatmap_postfix(primary, primary_end + 1, end, state)
++                and re.match(r'\s*\.\s*(?:flatMap|sort)\s*\(', code[primary_end + 1:end])):
++            primary = self.value(start, primary_end + 1, state)
++            primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)
+             facts.append(primary)
+             remainder[:cursor - start] = [' '] * (cursor - start)
+             source_remainder[:cursor - start] = [' '] * (cursor - start)
+@@ -3947,7 +4014,7 @@
+                 arguments = self.template_arguments(opening, closing)
+             sink = self.engine.call_sinks.get(match_start)
+             callback = (self.callable(*arguments[0], state)
+-                        if native is not None and native[0] == 'array' and native[2] == 'flatMap'
++                        if native is not None and native[0] == 'array' and native[2] in {'sort', 'flatMap'}
+                         and arguments else None)
+             if arguments and callback is None:
+                 unmodeled = self.callable(*arguments[0], state)
+@@ -4140,7 +4207,7 @@
+                 self.throws.append((self.materialize(_join(*argument_facts), state), state.copy()))
+             self.sql_call_proof(match_start, closing + 1, proof_role, proof_value, state)
+             call_fact, postfix_end = self.sql_postfix(call_fact, closing + 1, end, state)
+-            call_fact, postfix_end = self.flatmap_postfix(call_fact, postfix_end, end, state)
++            call_fact, postfix_end = self.array_postfix(call_fact, postfix_end, end, state)
+             selectors, call_end = self.selectors(postfix_end, end, stop_at_call=True)
+             for key, computed in selectors:
+                 selected = self.value(*computed, state) if computed is not None else frozenset()
+@@ -4649,7 +4716,7 @@
+         self.modeled_callbacks = set()
+         self.escaped_callbacks = set()
+         self.flatmap_result_kinds = {}
+-        self.has_flatmap_calls = 'flatMap' in self.text
++        self.has_array_callbacks = 'flatMap' in self.text or 'sort' in self.text
+         self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
+         self.current_task = None
+         self.heap_solve_depth = 0
 diff --git a/test-suite/quality/test_taint_js_heap.py b/test-suite/quality/test_taint_js_heap.py
 --- a/test-suite/quality/test_taint_js_heap.py
 +++ b/test-suite/quality/test_taint_js_heap.py
@@ -9,7 +213,7 @@ diff --git a/test-suite/quality/test_taint_js_heap.py b/test-suite/quality/test_
  import itertools
  import json
  import os
-@@ -1534,6 +1535,165 @@
+@@ -1534,6 +1535,217 @@
                                               + replacement + f'items.{method}({args}); res.send(items[0]);',
                                               reason=f'Array.{method}')
  
@@ -171,6 +375,58 @@ diff --git a/test-suite/quality/test_taint_js_heap.py b/test-suite/quality/test_
 +    def test_sort_sparse_maximum_length_never_expands_holes(self):
 +        self.scan_sort('const items=[req.query.html]; items.length=4294967295; '
 +                       'items.sort(); res.send(items[0]); res.send(items[4294967294]);', 'xss')
++
++    def test_sort_literal_receivers_and_returned_array_chains(self):
++        for source in (
++            'res.send(["zz-clean",req.query.html].sort()[0]);',
++            'const items=["zz-clean",req.query.html]; (items).sort(); res.send(items[0]);',
++            'function make(){return ["zz-clean",req.query.html];} res.send(make().sort()[0]);',
++            'const items=["zz-clean",req.query.html]; res.send(items.sort().sort()[0]);',
++            'const items=["zz-clean",req.query.html]; '
++            'res.send(items.flatMap(value=>[value]).sort()[0]);',
++        ):
++            with self.subTest(source=source):
++                self.scan_sort(source, 'xss')
++                self.assert_runtime_sends(source, ['review-input'])
++        self.scan_sort('res.send(["safe"].sort().flatMap(value=>[value])[0]);')
++
++    def test_sort_skipped_callback_sinks_and_unproven_empty_comparators(self):
++        for elements in ('[]', '["safe"]', '[,"safe"]'):
++            with self.subTest(elements=elements):
++                source = (f'const items={elements}; '
++                          'items.sort((a,b)=>{res.send(req.query.html);return 0;});')
++                self.scan_sort(source)
++                self.assert_runtime_sends(source, [])
++        for comparator in ('null', 'external', 'req.query.compare'):
++            with self.subTest(comparator=comparator):
++                self.scan_sort('const items=[]; try{items.sort(' + comparator + ');}catch(error){} '
++                               'res.send(req.query.html);', 'xss', partial='Array.sort.*comparator')
++
++    def test_sort_unknown_extent_and_inherited_indices_remain_incomplete(self):
++        for setup in ('items.length=unknown;', 'Array.prototype[0]=req.query.html;',
++                      'Object.prototype[0]=req.query.html;'):
++            with self.subTest(setup=setup):
++                self.scan_sort('const items=[,"safe",req.query.html]; ' + setup
++                               + 'items.sort(); res.send(items[2]);', 'xss', partial='Array.sort')
++
++    def test_sort_captures_method_identity_and_undefined_arguments(self):
++        source = ('const items=["zz-clean",req.query.html]; const skip=undefined; '
++                  'items.sort(skip, (items.sort=function(){return "clean";})); '
++                  'res.send(items[0]); res.send(items.sort());')
++        self.scan_sort(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input', 'clean'])
++        self.scan_sort('const items=["zz-clean",req.query.html]; '
++                       'items.sort(...[undefined]); res.send(items[0]);', 'xss')
++
++    def test_sort_optional_clean_slots_still_contribute_to_possible_extent(self):
++        source = ('const items=[,"bb",req.query.html]; if(flag){items[0]="aa";} '
++                  'items.sort(); res.send(items[2]);')
++        self.scan_sort(source, 'xss')
++        self.assert_runtime_sends('const flag=true; ' + source, ['review-input'])
++        source = ('const items=["aa","bb",req.query.html]; if(flag){delete items[0];} '
++                  'items.sort(); res.send(items[2]);')
++        self.scan_sort(source, 'xss')
++        self.assert_runtime_sends('const flag=false; ' + source, ['review-input'])
 +
      def test_fill_mutates_alias_and_returns_same_array(self):
          self.scan('const items = ["safe"]; const alias = items; '

@@ -1,0 +1,196 @@
+*** Begin Patch
+*** Update File: modules/ubs-golang.sh
+@@
+-    rm -rf "$ast_rule_dir" 2>/dev/null || true
++    ubs_remove_temp -rf "$ast_rule_dir" 2>/dev/null || true
+@@
+-  rm -rf "$ast_rule_dir" 2>/dev/null || true
++  ubs_remove_temp -rf "$ast_rule_dir" 2>/dev/null || true
+@@
+         if num == 17 and not run_life:
+             emit("Info (0 found)")
+-            emit("    Go toolchain unavailable — Install Go to run the AST helper")
++            if os.environ.get("UBS_KEEP_TEMP") == "1":
++                emit("    Go lifecycle helper refused: UBS_KEEP_TEMP=1 cannot retain compiler scratch")
++            else:
++                emit("    Go toolchain unavailable — Install Go to run the AST helper")
+@@
+   if [[ "$RUN_GO_TOOLS" -eq 1 ]]; then
+     scan_args+=(--go-tools "--test-pkgs=$GOTEST_PKGS" "--go-timeout=$GO_TIMEOUT")
+   fi
++  if [[ "${UBS_KEEP_TEMP:-0}" == "1" && ",$v2_skip," != *",17,"* ]]; then
++    scan_args+=(--lifecycle-refused)
++  fi
+@@
+-    rm -f "$v2_json_out" 2>/dev/null || true
++    ubs_remove_temp -f "$v2_json_out" 2>/dev/null || true
+@@
+-    if [[ ",$v2_skip," != *",17,"* && -n "$go_life_helper" && -f "$go_life_helper" ]] && command -v go >/dev/null 2>&1; then
++    if [[ "${UBS_KEEP_TEMP:-0}" != "1" && ",$v2_skip," != *",17,"* && -n "$go_life_helper" && -f "$go_life_helper" ]] && command -v go >/dev/null 2>&1; then
+@@
+-      rm -f "$text_out" 2>/dev/null || true
++      ubs_remove_temp -f "$text_out" 2>/dev/null || true
+@@
+-  rm -f "$list_file" "$sink" "$tally_file" "${life_raw:-}" 2>/dev/null || true
++  ubs_remove_temp -f "$list_file" "$sink" "$tally_file" "${life_raw:-}" 2>/dev/null || true
+@@
+-    rm -rf -- "$ast_rule_dir" 2>/dev/null || true
++    ubs_remove_temp -rf -- "$ast_rule_dir" 2>/dev/null || true
+*** Update File: modules/helpers/ubs_core/go_scan.py
+@@
+     parser.add_argument("--go-tools", action="store_true", help="run optional Go analyzers")
++    parser.add_argument("--lifecycle-refused", action="store_true", help=argparse.SUPPRESS)
+@@
+     scan_errors: list[str] = []
++    if args.lifecycle_refused:
++        # The legacy lifecycle helper uses `go run`, whose compiler manages
++        # temporary files independently of scanner retention. The module
++        # explicitly signals this unavailable phase; direct static-core callers
++        # do not request the shell module's compiled bridge. Report the
++        # unperformed layer in every format, including warm-cache scans.
++        scan_errors.append(
++            "Go lifecycle helper refused: UBS_KEEP_TEMP=1 cannot retain compiler scratch; "
++            "select --skip=17 for static checks without the compiled helper"
++        )
+*** Update File: modules/helpers/ubs_core/external_tools.py
+@@
+         for tool, executable in (("gofmt", "gofmt"), ("go vet", "go"), ("govulncheck", "govulncheck")):
+             installed = shutil.which(executable)
+             outcome = {"tool": tool, "root": str(root)}
+             if not installed:
+                 outcomes.append({**outcome, "status": "skipped", "reason": "not installed"})
+                 continue
++            if tool != "gofmt" and os.environ.get("UBS_KEEP_TEMP") == "1":
++                reason = f"{tool} refused: UBS_KEEP_TEMP=1 cannot retain external Go analyzer scratch"
++                errors.append(reason)
++                outcomes.append({**outcome, "status": "partial", "reason": reason})
++                continue
+             before = len(errors)
+*** Update File: ubs
+@@
+-  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP scans;
++  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go scans;
+@@
+-    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP; unsupported languages and update/service modes refuse with exit 2. Requested external tools that cannot retain scratch report incomplete coverage. Use TMPDIR to choose storage."},
++    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go; unsupported languages and update/service modes refuse with exit 2. Requested external tools that cannot retain scratch report incomplete coverage. Go's compiled lifecycle helper requires --skip=17 for a complete static scan. Use TMPDIR to choose storage."},
+@@
+-      rust|python|js|bash|hcl|csharp|kotlin|cpp|sql|ruby|php) ;;
++      rust|python|js|bash|hcl|csharp|kotlin|cpp|sql|ruby|php|golang) ;;
+@@
+-        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php."
++        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang."
+@@
+-          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php" \
++          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang" \
+*** Update File: README.md
+@@
+-  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL; see below
++  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go; see below
+@@
+-C/C++, and PostgreSQL SQL scans. Set `TMPDIR`
++C/C++, PostgreSQL SQL, Ruby, PHP, and Go scans. Set `TMPDIR`
+@@
+-optional auditors. Build and auditor processes manage their own temporary files
++optional auditors. For Go, select `--skip=17` to omit the compiled lifecycle
++helper; otherwise its unavailable coverage produces a partial report while
++preserving static findings. Requested `go vet` and `govulncheck` likewise report
++incomplete coverage in retention mode; read-only `gofmt` remains available.
++Build and auditor processes manage their own temporary files
+*** Update File: test-suite/quality/test_keep_temp.py
+@@
+-    def test_unsupported_java_refuses_before_module_execution(self) -> None:
++    def test_go_security_reports_retain_scratch_and_refused_helper_is_partial(self) -> None:
++        unsafe = ('package sample\nimport "os"\nfunc run() {\n'
++                  'db.Query(os.Getenv("QUERY"))\n}\n')
++        clean = 'package sample\nfunc run() {\ndb.Query("SELECT 1")\n}\n'
++        for scenario in ("unsafe", "clean", "compiled-helper-refused"):
++            target = self.source(scenario + ".go", clean if scenario == "clean" else unsafe)
++            kept = {9, 17} if scenario == "compiled-helper-refused" else {9}
++            skip = "--skip=" + ",".join(str(number) for number in range(1, 23) if number not in kept)
++            expected = [] if scenario == "clean" else [("go.taint.sql", target.name, 4)]
++            for direct in (True, False):
++                for output_format in ("json", "sarif"):
++                    with self.subTest(scenario=scenario, direct=direct, format=output_format):
++                        arguments = [f"--format={output_format}", "--fail-on-warning", skip]
++                        if not direct:
++                            arguments.extend(("--only=golang", f"--module-dir={ROOT / 'modules'}"))
++                        arguments.append(str(target))
++                        result, observations, run = self.run_scan(
++                            "golang", target, *arguments, command_mode="--ci", direct_module=direct)
++                        context = f"{run}\n{result.stdout}\n{result.stderr}"
++                        partial = scenario == "compiled-helper-refused"
++                        self.assertEqual(result.returncode, 2 if partial else 0 if not expected else 1,
++                                         context)
++                        document = json.loads(result.stdout)
++                        if output_format == "json":
++                            actual = sorted((row["rule"] if direct else row["rule_id"],
++                                             Path(row["path"] if direct else row["file"]).name,
++                                             row["line"]) for row in document.get("findings", []))
++                            self.assertEqual(document["status"], "partial" if partial else "ok", context)
++                            counts = document if direct else document["totals"]
++                            self.assertEqual({key: counts[key] for key in SEVERITIES},
++                                             {"critical": len(expected), "warning": 0, "info": 0}, context)
++                        else:
++                            actual = sorted((row["ruleId"],
++                                             Path(row["locations"][0]["physicalLocation"]
++                                                  ["artifactLocation"]["uri"]).name,
++                                             row["locations"][0]["physicalLocation"]["region"]["startLine"])
++                                            for scan in document["runs"] for row in scan["results"])
++                            unsuccessful = any(invocation["executionSuccessful"] is False
++                                               for scan in document["runs"]
++                                               for invocation in scan.get("invocations", []))
++                            self.assertEqual(unsuccessful, partial, context)
++                        self.assertEqual(actual, expected, context)
++                        if partial:
++                            self.assertIn("cannot retain compiler scratch", result.stdout + result.stderr,
++                                          context)
++                        self.assertTrue(observations["created_paths"], context)
++
++    def test_go_text_and_rule_listing_retain_generated_files(self) -> None:
++        target = self.source("go-text.go", 'package sample\nimport "os"\n'
++                            'func run() {\ndb.Query(os.Getenv("QUERY"))\n}\n')
++        skip = "--skip=" + ",".join(str(number) for number in range(1, 23) if number != 9)
++        result, observations, run = self.run_scan(
++            "golang", target, "--format=text", "--fail-on-warning", skip, str(target),
++            command_mode="--ci", direct_module=True)
++        context = f"{run}\n{result.stdout}\n{result.stderr}"
++        self.assertEqual(result.returncode, 1, context)
++        self.assertIn("go.taint.sql", result.stdout, context)
++        self.assertTrue(observations["created_paths"], context)
++        destination = self.root / "go-dumped-rules"
++        result, observations, run = self.run_scan(
++            "golang", target, "--dump-rules=" + str(destination),
++            command_mode="--list-rules", direct_module=True)
++        context = f"{run}\n{result.stdout}\n{result.stderr}"
++        self.assertEqual(result.returncode, 0, context)
++        listed = result.stdout.splitlines()
++        dumped = {line.split(":", 1)[1].strip()
++                  for path in destination.rglob("*.yml")
++                  for line in path.read_text(encoding="utf-8").splitlines()
++                  if line.startswith("id:")}
++        self.assertTrue(listed, context)
++        self.assertEqual(set(listed), dumped, context)
++        self.assertTrue(observations["created_paths"], context)
++
++    def test_unsupported_java_refuses_before_module_execution(self) -> None:
+*** Update File: test-suite/shareable/test_go_analyzers.py
+@@
+-    def test_package_patterns_are_argv_not_shell_code(self) -> None:
++    def test_retention_refuses_compilers_without_hiding_read_only_formatting(self) -> None:
++        with patch.dict(os.environ, {"UBS_KEEP_TEMP": "1"}), \
++                patch.object(tools.shutil, "which", side_effect=lambda name: name), \
++                patch.object(tools, "run_command_stream") as compiler, \
++                patch.object(tools, "run_command", return_value=subprocess.CompletedProcess(
++                    ["gofmt"], 0, str(self.file) + "\n", "")) as formatter:
++            outcomes = tools.scan_go_tools([self.file], self.sink, str(self.root), "./...", 1, self.errors)
++        compiler.assert_not_called()
++        formatter.assert_called_once()
++        self.assertEqual(formatter.call_args.args[1], ["gofmt", "-s", "-l", "--", str(self.file)])
++        self.assertEqual([(row["tool"], row["status"]) for row in outcomes],
++                         [("gofmt", "ok"), ("go vet", "partial"), ("govulncheck", "partial")])
++        self.assertEqual(len(self.errors), 2)
++        self.assertTrue(all("cannot retain external Go analyzer scratch" in row for row in self.errors))
++        self.assertEqual([row["rule"] for row in self.rows()], ["go.gofmt.format"])
++
++    def test_package_patterns_are_argv_not_shell_code(self) -> None:
+*** End Patch

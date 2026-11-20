@@ -1485,7 +1485,7 @@ Environment Variables:
                            Numeric 0/1 leaves project severity unchanged; strict|loose overrides it
   UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
   UBS_ALLOW_NO_SCAN        Exit 0 instead of 3 when nothing was scanned (set to 1)
-  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL; see below
+  UBS_KEEP_TEMP=1          Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go; see below
 
 Arguments:
   PROJECT_DIR              Directory to scan (default: current directory)
@@ -1522,7 +1522,7 @@ Use `--no-cargo` for static analysis alone.
 Set `UBS_KEEP_TEMP=1` to retain scanner-owned workspaces, rule files, captured
 tool output, merge staging, and spill databases after successful, failed, or
 interrupted Rust, Python, JavaScript/TypeScript, Bash, Terraform HCL, C#, Kotlin,
-C/C++, and PostgreSQL SQL scans. Set `TMPDIR`
+C/C++, PostgreSQL SQL, Ruby, PHP, and Go scans. Set `TMPDIR`
 to an existing writable directory to choose where scratch accumulates; retained
 files can contain source code and findings, so use private storage. The caller
 manages its later removal. Retention does not change detectors, severity, module
@@ -1535,7 +1535,11 @@ This mode requires Bash >= 5.1 in its modern compatibility mode and supports
 static analysis. Older Bash creates and unlinks heredoc backing files internally.
 Select `--no-cargo` for Rust projects with
 enabled Cargo phases and `--no-uv` for direct Python scans that would run
-optional auditors. Build and auditor processes manage their own temporary files
+optional auditors. For Go, select `--skip=17` to omit the compiled lifecycle
+helper; otherwise its unavailable coverage produces a partial report while
+preserving static findings. Requested `go vet` and `govulncheck` likewise report
+incomplete coverage in retention mode; read-only `gofmt` remains available.
+Build and auditor processes manage their own temporary files
 and are refused rather than silently skipped. Other languages, service and
 doctor commands, forced updates, and automatic tool installation are outside
 this contract and refuse with exit 2. Install required tools before scanning.

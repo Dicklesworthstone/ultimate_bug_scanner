@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve native Go callback results through immediate and parenthesized
+  function-literal calls, named returns and tuple arguments. Keep environment
+  getters, payload/error slots, HTML-specific sanitizers, decoder identities and
+  enclosing pointer writes distinct. Escaped closure-local pointers remain
+  explicitly incomplete. Go scans now support retained scratch; unavailable
+  compiled lifecycle and optional compiler phases report incomplete coverage.
+
 - Track native JavaScript `Array.sort()` mutations through receiver aliases,
   returned arrays and selected helpers. Preserve sparse extents, optional slots,
   named properties and sanitizer domains. Custom comparator, object-coercion and

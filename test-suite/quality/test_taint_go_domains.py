@@ -858,6 +858,113 @@ class GoEnvironmentSourceTests(unittest.TestCase):
                           (('query', 'sql', 'db.Query'),),
                           'func constant(key string) string { return "SELECT 1" }')
 
+    def test_immediate_closure_results_preserve_environment_callable_identity(self):
+        for getter in ('Getenv', 'LookupEnv'):
+            with self.subTest(getter=getter):
+                result_type = 'string' if getter == 'Getenv' else '(string, bool)'
+                assignment = 'value := read("QUERY")' if getter == 'Getenv' else (
+                    'value, present := read("QUERY")\nfmt.Fprint(w, present)')
+                self.check_source('import environment "os"',
+                                  'read := func() func(string) ' + result_type + ' { '
+                                  'return environment.' + getter + ' }()\n'
+                                  'fmt.Fprint(w, read)\n' + assignment + '\n'
+                                  'db.Query(value) // query',
+                                  (('query', 'sql', 'db.Query'),))
+
+    def test_immediate_closure_tuple_keeps_payload_and_presence_separate(self):
+        for expression in (
+                'func() (string, bool) { return os.LookupEnv("QUERY") }()',
+                '(func() (string, bool) { return os.LookupEnv("QUERY") }())',
+                'func() (string, bool) { return lookup("QUERY") }()'):
+            with self.subTest(expression=expression):
+                self.check_source('import "os"',
+                                  'value, present := ' + expression + '\n'
+                                  'db.Query(value) // query\n'
+                                  'fmt.Fprint(w, present)\ndb.Query(fmt.Sprint(present))',
+                                  (('query', 'sql', 'db.Query'),),
+                                  'func lookup(key string) (string, bool) { return os.LookupEnv(key) }')
+
+    def test_immediate_closure_named_results_keep_values_and_callable_metadata(self):
+        self.check_source('import "os"',
+                          'read, present := func() (getter func(string) string, found bool) {\n'
+                          'getter = os.Getenv; found = true; return\n}()\n'
+                          'db.Query(read("QUERY")) // query\nfmt.Fprint(w, read, present)\n'
+                          'value, exists := func() (value string, exists bool) {\n'
+                          'value, exists = os.LookupEnv("QUERY"); return\n}()\n'
+                          'db.Query(value) // second\nfmt.Fprint(w, exists)',
+                          (('query', 'sql', 'db.Query'), ('second', 'sql', 'db.Query')))
+
+    def test_immediate_closure_tuple_arguments_keep_every_value_and_native_slot(self):
+        self.check_source('import "os"',
+                          'value := func(ok bool, read func(string) string) string {\n'
+                          'return read("QUERY")\n'
+                          '}(func() (bool, func(string) string) { return true, os.Getenv }())\n'
+                          'db.Query(value) // query',
+                          (('query', 'sql', 'db.Query'),))
+        self.check_source('import "os"',
+                          'value := func(ok bool, query string) string { return query }(\n'
+                          'func() (bool, string) { return true, os.Getenv("QUERY") }())\n'
+                          'db.Query(value) // query',
+                          (('query', 'sql', 'db.Query'),))
+        self.check_source('import "os"',
+                          'value, present := func(read func(string) (string, bool), ok bool) (string, bool) {\n'
+                          'return read("QUERY")\n'
+                          '}(func() (func(string) (string, bool), bool) { return os.LookupEnv, true }())\n'
+                          'db.Query(value) // query\nfmt.Fprint(w, present)',
+                          (('query', 'sql', 'db.Query'),))
+
+    def test_grouped_closure_callees_preserve_payload_and_callable_results(self):
+        for grouping in (('(', ')'), ('((', '))')):
+            with self.subTest(grouping=grouping):
+                left, right = grouping
+                self.check_source('import "os"',
+                                  'read := ' + left + 'func() func(string) string { return os.Getenv }'
+                                  + right + '()\n'
+                                  'db.Query(read("QUERY")) // query\n'
+                                  'value := ' + left + 'func() string { return os.Getenv("QUERY") }'
+                                  + right + '()\n'
+                                  'db.Query(value) // second\n'
+                                  'clean := ' + left + 'func() string { return "SELECT 1" }'
+                                  + right + '()\ndb.Query(clean)',
+                                  (('query', 'sql', 'db.Query'), ('second', 'sql', 'db.Query')))
+
+    def test_immediate_closure_result_joins_preserve_unknown_alternatives(self):
+        self.check_source('import ("os"; "html")',
+                          'read := func() func(string) string {\n'
+                          'if choice { return os.Getenv }; return constant\n}()\n'
+                          'db.Query(read("QUERY")) // query\n'
+                          'escape := func() func(string) string {\n'
+                          'if choice { return html.EscapeString }; return unknown\n}()\n'
+                          'fmt.Fprint(w, escape(r.FormValue("html"))) // output',
+                          (('query', 'sql', 'db.Query'), ('output', 'xss', 'fmt.Fprint')),
+                          'func constant(key string) string { return "SELECT 1" }')
+
+    def test_immediate_closure_result_escaper_keeps_security_domains(self):
+        self.check_source('import "html"',
+                          'escape, ready := func() (func(string) string, bool) {\n'
+                          'return html.EscapeString, true\n}()\n'
+                          'value := escape(r.FormValue("value"))\n'
+                          'fmt.Fprint(w, value, ready, escape)\n'
+                          'db.Query(value) // query\n'
+                          'exec.Command("sh", "-c", value) // command',
+                          (('query', 'sql', 'db.Query'), ('command', 'command', 'exec.Command')))
+
+    def test_immediate_closure_result_does_not_borrow_other_expression_authority(self):
+        self.check_source('import "html"',
+                          'escape := unknown(func() func(string) string { return html.EscapeString }())\n'
+                          'fmt.Fprint(w, escape(r.FormValue("html"))) // output\n'
+                          'read := func() string { return "SELECT 1" }()\ndb.Query(read)',
+                          (('output', 'xss', 'fmt.Fprint'),))
+
+    def test_immediate_closure_getter_in_aggregate_remains_explicitly_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        with self.assertRaisesRegex(AnalysisLimit, 'environment callable.*transport'):
+            self.check_source('import "os"',
+                              'readers := []func(string) string{'
+                              'func() func(string) string { return os.Getenv }()}\n'
+                              'db.Query(readers[0]("QUERY"))')
+
     def test_getter_containers_refuse_unmodeled_callable_storage(self):
         from ubs_core.taint_flow import AnalysisLimit
 
@@ -980,6 +1087,90 @@ class GoEnvironmentSourceTests(unittest.TestCase):
                      'set UBS_TAINT_E2E=1 for real module reports')
 class GoEnvironmentModuleTests(unittest.TestCase):
     """Category 9 public reports; this does not claim every Go category ran."""
+
+    def test_closure_results_public_reports_keep_slots_domains_and_boundaries(self):
+        from test_keep_temp import prevent_child_deletion
+
+        cases = (
+            ('getter', 'import "os"',
+             'read := func() func(string) string { return os.Getenv }()\n'
+             'db.Query(read("QUERY"))\nfmt.Fprint(w, read)', [('go.taint.sql', 5, 1)], False),
+            ('lookup', 'import "os"',
+             'value, present := func() (string, bool) { return os.LookupEnv("QUERY") }()\n'
+             'fmt.Fprint(w, present)\ndb.Query(value)', [('go.taint.sql', 6, 1)], False),
+            ('presence-clean', 'import "os"',
+             'value, present := func() (string, bool) { return os.LookupEnv("QUERY") }()\n'
+             'fmt.Fprint(w, present)\ndb.Query("SELECT $1", value)', [], False),
+            ('decoder', 'import "encoding/json"',
+             'decoder := func() *json.Decoder { return json.NewDecoder(r.Body) }()\n'
+             'var p Payload\nerr := decoder.Decode(&p)\ndb.Query(p.SQL)\nfmt.Fprint(w, err)',
+             [('go.taint.sql', 7, 1)], False),
+            ('escape-domain', 'import "html"',
+             'escape := func() func(string) string { return html.EscapeString }()\n'
+             'value := escape(r.FormValue("q"))\nfmt.Fprint(w, value)\ndb.Query(value)',
+             [('go.taint.sql', 7, 1)], False),
+            ('local-pointer', '',
+             'out := func() *Payload { var p Payload; p.SQL = r.FormValue("q"); return &p }()\n'
+             'db.Query(out.SQL)', [], True),
+        )
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='go-closure-public-', dir=artifacts))
+        skipped = ','.join(str(category) for category in range(1, 23) if category != 9)
+        for name, imports, body, expected, partial in cases:
+            folder = root / name
+            folder.mkdir()
+            path = folder / 'handler.go'
+            path.write_text('package app\n' + imports + '\nfunc h() {\n' + body + '\n}\n')
+            (folder / 'unselected.go').write_text('package app\nfunc unused() { db.Query(r.FormValue("q")) }\n')
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, format=output):
+                        command = [str(ROOT / ('ubs' if meta else 'modules/ubs-golang.sh')),
+                                   str(path), '--ci', '--no-color', '--format=' + output, '--skip=' + skipped]
+                        if meta:
+                            command.append('--only=golang')
+                        result = subprocess.run(command, cwd=folder, capture_output=True, text=True,
+                                                timeout=45, preexec_fn=prevent_child_deletion,
+                                                env=dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1',
+                                                         UBS_NO_CACHE='1', UBS_CACHE_DIR=str(folder / 'cache')))
+                        prefix = folder / f'{meta}-{output}'
+                        prefix.with_suffix('.stdout.log').write_text(result.stdout)
+                        prefix.with_suffix('.stderr.log').write_text(result.stderr)
+                        self.assertEqual(result.returncode, 2 if partial else 1 if expected else 0,
+                                         (command, result.stdout, result.stderr))
+                        report = json.loads(result.stdout)
+                        if output == 'json':
+                            self.assertEqual(report['status'], 'partial' if partial else 'ok', report)
+                            totals = report['totals'] if meta else report
+                            self.assertEqual([totals[key] for key in ('files', 'critical', 'warning', 'info')],
+                                             [1, len(expected), 0, 0], report)
+                            records = report['findings']
+                            actual = [(row['rule_id' if meta else 'rule'], row['line'], row['col'])
+                                      for row in records]
+                            for row in records:
+                                self.assertEqual(Path(row['file' if meta else 'path']).name, path.name, row)
+                                self.assertEqual(row['severity'], 'critical', row)
+                                self.assertFalse(row.get('suppressed', False), row)
+                        else:
+                            self.assertEqual(report['version'], '2.1.0', report)
+                            actual = []
+                            for run in report['runs']:
+                                for row in run.get('results', []):
+                                    location = row['locations'][0]['physicalLocation']
+                                    region = location['region']
+                                    actual.append((row['ruleId'], region['startLine'], region['startColumn']))
+                                    self.assertEqual(Path(location['artifactLocation']['uri']).name, path.name, row)
+                                    self.assertEqual(row['level'], 'error', row)
+                            failed = [invocation for run in report['runs']
+                                      for invocation in run.get('invocations', [])
+                                      if invocation.get('executionSuccessful') is False]
+                            self.assertEqual(bool(failed), partial, report)
+                            for invocation in failed:
+                                self.assertEqual(invocation['exitCode'], 2, invocation)
+                        self.assertEqual(sorted(actual), sorted(expected), report)
+                        if partial:
+                            self.assertIn('closure-local pointer result transport', result.stdout + result.stderr)
 
     def test_real_module_reports_preserve_environment_payload_and_clean_presence(self):
         from test_keep_temp import prevent_child_deletion

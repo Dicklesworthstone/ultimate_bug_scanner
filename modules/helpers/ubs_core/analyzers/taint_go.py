@@ -146,11 +146,11 @@ def _pairs(code: str) -> dict[int, int]:
 
 
 def _call_code(code: str) -> str:
-    """Expose transparent named callees without changing source positions.
+    """Expose transparent named/literal callees without changing positions.
 
     ``((decode))(data)`` calls the same binding as ``decode(data)``. Remove
-    only the grouping around an identifier/selector target, preserving every
-    argument delimiter and newline. A call result such as ``factory(decode)``
+    only grouping around an identifier/selector or complete function literal,
+    preserving every argument delimiter and newline. A result such as ``factory(decode)``
     is an evaluated value, not grouping around ``decode``; it must not acquire
     the argument's native authority.
     """
@@ -179,7 +179,18 @@ def _call_code(code: str) -> str:
                 left += 1
             while left < right and code[right].isspace():
                 right -= 1
-        if not re.fullmatch(r'[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*', code[left:right + 1]):
+        named = re.fullmatch(r'[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*', code[left:right + 1])
+        literal = re.match(r'func\s*\(', code[left:right + 1])
+        literal_body = None
+        if literal:
+            parameter_end = pairs.get(left + literal.end() - 1)
+            cursor = parameter_end + 1 if parameter_end is not None else right
+            while cursor < right:
+                if code[cursor] == '{':
+                    literal_body = cursor
+                    break
+                cursor = pairs.get(cursor, cursor) + 1 if code[cursor] in '([' else cursor + 1
+        if not named and (literal_body is None or pairs.get(literal_body) != right):
             continue
         for left, right in groups:
             out[left] = out[right] = ' '
@@ -787,6 +798,7 @@ class _Analysis:
         self.value_returns: tuple[_ValueInfo | None, ...] = ()
         self.call_results: dict[int, tuple[_ValueInfo | None, ...]] = {}
         self.value_results: dict[int, tuple[_ValueInfo | None, ...]] = {}
+        self.closure_results: dict[int, tuple[tuple[_Fact, ...], tuple[_ValueInfo | None, ...]]] = {}
         self.named_returns = ()
         self.writes: dict[tuple[int, tuple[str, ...]], _Fact] = {}
         self.native_writes: dict[tuple[int, tuple[str, ...]], _NativeInfo | None] = {}
@@ -952,6 +964,9 @@ class _Analysis:
 
     def value_info(self, expr, offset, state, scope):
         expr, offset = self.unparenthesize(expr, offset)
+        closure = self.closure_results.get(offset)
+        if closure is not None:
+            return closure[1][0] if closure[1] else _ValueInfo()
         code = _call_code(_masked_source(expr))
         name = re.fullmatch(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?', code)
         if name:
@@ -1326,10 +1341,16 @@ class _Analysis:
                 self.value_results[offset] = self.call_results[offset + call.start(1)]
                 return values
         value = self.value(expr, offset, state, scope)
+        closure = self.closure_results.get(offset)
+        if closure is not None:
+            self.value_results[offset] = closure[1]
+            return closure[0]
         self.value_results[offset] = (self.value_info(expr, offset, state, scope),)
         return (value,)
 
     def value(self, expr: str, offset: int, state, scope) -> _Fact:
+        expr, offset = self.unparenthesize(expr, offset)
+        self.closure_results.pop(offset, None)
         code = _call_code(_masked_source(expr))
         self.check_environment_storage(code, offset, state, scope)
         pairs = _pairs(code)
@@ -1358,6 +1379,14 @@ class _Analysis:
         for match in re.finditer(r'\bfunc\s*\(', code):
             if masked[match.start()].isspace():
                 continue
+            previous = match.start() - 1
+            while previous >= 0 and code[previous].isspace():
+                previous -= 1
+            if (previous >= 0 and code[previous] not in '(:,={'
+                    and re.search(r'\b(?:go|defer)\s*$', code[:match.start()]) is None):
+                # Function types in slices/maps/fields do not own the next
+                # composite literal's brace or invoke their contained values.
+                continue
             param_end = pairs.get(match.end() - 1)
             if param_end is None:
                 continue
@@ -1385,12 +1414,19 @@ class _Analysis:
                             enclosing_getters[scope.bindings.get(name, name)] = native.operations & _ENVIRONMENT_OPERATIONS
                 arguments, argument_infos, argument_expressions = [], [], []
                 if invoked:
-                    for start, end in _parts(code[invocation + 1:pairs[invocation]]):
+                    parts = _parts(code[invocation + 1:pairs[invocation]])
+                    for start, end in parts:
                         argument = expr[invocation + 1 + start:invocation + 1 + end]
                         origin = offset + invocation + 1 + start
-                        arguments.append(self.value(argument, origin, state, scope))
-                        argument_infos.append(self.value_info(argument, origin, state, scope))
-                        argument_expressions.append((argument, origin))
+                        if len(parts) == 1:
+                            values = self.values(argument, origin, state, scope)
+                            metadata = self.value_results[origin]
+                        else:
+                            values = (self.value(argument, origin, state, scope),)
+                            metadata = (self.value_info(argument, origin, state, scope),)
+                        arguments.extend(values)
+                        argument_infos.extend(metadata)
+                        argument_expressions.extend((argument, origin) for _ in values)
                     for index, (argument, origin) in enumerate(argument_expressions):
                         variable, _ = self.unparenthesize(argument)
                         if re.fullmatch(r'[A-Za-z_]\w*', variable):
@@ -1426,6 +1462,15 @@ class _Analysis:
                 nested = _Analysis(self.source, self.code, self.rule, self.summaries, self.imports,
                                    self.uncertain_globals, self.global_cells, self.resolve_summary)
                 nested.native_escapes = set(self.native_escapes)
+                result = code[param_end + 1:opening].strip()
+                nested.named_returns = (_parameter_names(result[1:-1])
+                                        if result.startswith('(') and result.endswith(')')
+                                        else ('',) if result else ())
+                for name in nested.named_returns:
+                    if name:
+                        key = closure_scope.declare(name, offset + match.start())
+                        closure_state[key] = _CLEAN
+                        closure_state[_NativeKey(key)] = _UNKNOWN_NATIVE
                 closure_flow = nested.block(_Parser(self.code).block(offset + opening + 1, offset + close),
                                             closure_state, closure_scope)
                 if immediate:
@@ -1456,7 +1501,28 @@ class _Analysis:
                 for (sink_offset, label), fact in nested.effects.items():
                     self.effect(sink_offset, label, fact)
                 if immediate:
-                    if any(info is not None and info.native is not None
+                    whole = (not code[:match.start()].strip()
+                             and not code[pairs[invocation] + 1:].strip())
+                    if whole:
+                        # A direct invocation has the same distinct result
+                        # slots as a selected named helper. Preserve callable
+                        # and decoder contracts without treating handles or
+                        # clean presence/error results as input contents.
+                        # Local pointee cells do not outlive this evaluator;
+                        # exporting them needs a separate escaped-heap model.
+                        if any(info is not None and any(target.cell not in state for target in info.pointers)
+                               for info in nested.value_returns):
+                            raise AnalysisLimit('Go closure-local pointer result transport is unsupported; '
+                                                'analysis is incomplete')
+                        for index, info in enumerate(nested.value_returns):
+                            if info is not None and info.pointers and index < len(nested.returns):
+                                # A returned outer alias may already have been
+                                # written inside the closure. Publishing only
+                                # its identity would drop the observed content
+                                # when assignment clears the handle's own fact.
+                                self.write_targets(info.pointers, nested.returns[index], state, 'closure result')
+                        self.closure_results[offset] = (nested.returns, nested.value_returns)
+                    elif any(info is not None and info.native is not None
                            and info.native.operations & _ENVIRONMENT_OPERATIONS for info in nested.value_returns):
                         raise AnalysisLimit('Go environment callable closure-result transport is unsupported; analysis is incomplete')
                     facts.extend(nested.returns)
@@ -1561,7 +1627,11 @@ class _Analysis:
                 values = self.values(self.source[expr_start:end], expr_start, state, scope)
                 infos = self.value_results[expr_start]
             else:
-                values = tuple(state.get(scope.bindings.get(name, name), _CLEAN) for name in self.named_returns)
+                # A named pointer result observes its pointee at return time,
+                # just like an explicit `return result` expression. Reading
+                # only the handle cell loses writes reached through aliases.
+                values = tuple(self.value(name, expr_start, state, scope) if name else _CLEAN
+                               for name in self.named_returns)
                 infos = tuple(self.value_info(name, expr_start, state, scope) for name in self.named_returns)
             count = max(len(values), len(self.returns))
             self.returns = tuple(_join(self.returns[index] if index < len(self.returns) else _CLEAN,

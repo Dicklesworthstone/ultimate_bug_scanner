@@ -1019,6 +1019,79 @@ class KeepTempCliTests(unittest.TestCase):
         self.assertEqual(set(listed), dumped, context)
         self.assertTrue(observations["created_paths"], context)
 
+    def test_go_security_reports_retain_scratch_and_refused_helper_is_partial(self) -> None:
+        unsafe = ('package sample\nimport "os"\nfunc run() {\n'
+                  'db.Query(os.Getenv("QUERY"))\n}\n')
+        clean = 'package sample\nfunc run() {\ndb.Query("SELECT 1")\n}\n'
+        for scenario in ("unsafe", "clean", "compiled-helper-refused"):
+            target = self.source(scenario + ".go", clean if scenario == "clean" else unsafe)
+            kept = {9, 17} if scenario == "compiled-helper-refused" else {9}
+            skip = "--skip=" + ",".join(str(number) for number in range(1, 23) if number not in kept)
+            expected = [] if scenario == "clean" else [("go.taint.sql", target.name, 4)]
+            for direct in (True, False):
+                for output_format in ("json", "sarif"):
+                    with self.subTest(scenario=scenario, direct=direct, format=output_format):
+                        arguments = [f"--format={output_format}", "--fail-on-warning", skip]
+                        if not direct:
+                            arguments.extend(("--only=golang", f"--module-dir={ROOT / 'modules'}"))
+                        arguments.append(str(target))
+                        result, observations, run = self.run_scan(
+                            "golang", target, *arguments, command_mode="--ci", direct_module=direct)
+                        context = f"{run}\n{result.stdout}\n{result.stderr}"
+                        partial = scenario == "compiled-helper-refused"
+                        self.assertEqual(result.returncode, 2 if partial else 0 if not expected else 1,
+                                         context)
+                        document = json.loads(result.stdout)
+                        if output_format == "json":
+                            actual = sorted((row["rule"] if direct else row["rule_id"],
+                                             Path(row["path"] if direct else row["file"]).name,
+                                             row["line"]) for row in document.get("findings", []))
+                            self.assertEqual(document["status"], "partial" if partial else "ok", context)
+                            counts = document if direct else document["totals"]
+                            self.assertEqual({key: counts[key] for key in SEVERITIES},
+                                             {"critical": len(expected), "warning": 0, "info": 0}, context)
+                        else:
+                            actual = sorted((row["ruleId"],
+                                             Path(row["locations"][0]["physicalLocation"]
+                                                  ["artifactLocation"]["uri"]).name,
+                                             row["locations"][0]["physicalLocation"]["region"]["startLine"])
+                                            for scan in document["runs"] for row in scan["results"])
+                            unsuccessful = any(invocation["executionSuccessful"] is False
+                                               for scan in document["runs"]
+                                               for invocation in scan.get("invocations", []))
+                            self.assertEqual(unsuccessful, partial, context)
+                        self.assertEqual(actual, expected, context)
+                        if partial:
+                            self.assertIn("cannot retain compiler scratch", result.stdout + result.stderr,
+                                          context)
+                        self.assertTrue(observations["created_paths"], context)
+
+    def test_go_text_and_rule_listing_retain_generated_files(self) -> None:
+        target = self.source("go-text.go", 'package sample\nimport "os"\n'
+                            'func run() {\ndb.Query(os.Getenv("QUERY"))\n}\n')
+        skip = "--skip=" + ",".join(str(number) for number in range(1, 23) if number != 9)
+        result, observations, run = self.run_scan(
+            "golang", target, "--format=text", "--fail-on-warning", skip, str(target),
+            command_mode="--ci", direct_module=True)
+        context = f"{run}\n{result.stdout}\n{result.stderr}"
+        self.assertEqual(result.returncode, 1, context)
+        self.assertIn("go.taint.sql", result.stdout, context)
+        self.assertTrue(observations["created_paths"], context)
+        destination = self.root / "go-dumped-rules"
+        result, observations, run = self.run_scan(
+            "golang", target, "--dump-rules=" + str(destination),
+            command_mode="--list-rules", direct_module=True)
+        context = f"{run}\n{result.stdout}\n{result.stderr}"
+        self.assertEqual(result.returncode, 0, context)
+        listed = result.stdout.splitlines()
+        dumped = {line.split(":", 1)[1].strip()
+                  for path in destination.rglob("*.yml")
+                  for line in path.read_text(encoding="utf-8").splitlines()
+                  if line.startswith("id:")}
+        self.assertTrue(listed, context)
+        self.assertEqual(set(listed), dumped, context)
+        self.assertTrue(observations["created_paths"], context)
+
     def test_unsupported_java_refuses_before_module_execution(self) -> None:
         source = self.source("Unsupported.java", 'class Unsupported {}\n')
         (source.parent / "supported.py").write_text(CASES["python"][3], encoding="utf-8")

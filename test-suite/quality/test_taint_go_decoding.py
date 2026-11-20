@@ -820,6 +820,85 @@ class NativeFunctionValueTests(packages.PackageTestCase):
         ''')
         self.assert_hits([])
 
+    def test_immediate_closure_reader_results_keep_payload_and_error_slots(self):
+        for package in ('io', 'io/ioutil'):
+            with self.subTest(package=package):
+                self.source('handler.go', 'package app\nimport reader "' + package + '"\n'
+                            'func h() {\n'
+                            'payload, err := func() ([]byte, error) { return reader.ReadAll(r.Body) }()\n'
+                            'db.Query(string(payload))\ndb.Query(err.Error())\n}\n')
+                self.assert_hits([('handler.go', 5, 'go.taint.sql')])
+
+    def test_immediate_closure_returns_decoder_and_clean_error_contracts(self):
+        for package in ('encoding/json', 'encoding/xml'):
+            with self.subTest(package=package):
+                self.source('handler.go', 'package app\nimport codec "' + package + '"\n'
+                            'func h() {\n'
+                            'decoder := func() *codec.Decoder { return codec.NewDecoder(r.Body) }()\n'
+                            'var p Payload\nerr := decoder.Decode(&p)\n'
+                            'db.Query(p.SQL)\ndb.Query(err.Error())\n'
+                            'db.Query("SELECT $1", p.SQL)\n}\n')
+                self.assert_hits([('handler.go', 7, 'go.taint.sql')])
+
+    def test_immediate_closure_result_preserves_outer_pointer_alias(self):
+        self.source('handler.go', '''
+            package app
+            import "encoding/json"
+            func h() {
+                var p Payload
+                out := func() *Payload { return &p }()
+                json.NewDecoder(r.Body).Decode(out)
+                db.Query(p.SQL)
+            }
+        ''')
+        self.assert_hits([('handler.go', 7, 'go.taint.sql')])
+
+    def test_immediate_closure_local_pointer_result_is_explicitly_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        self.source('handler.go', '''
+            package app
+            func h() {
+                out := func() *Payload { var p Payload; p.SQL = r.FormValue("q"); return &p }()
+                db.Query(out.SQL)
+            }
+        ''')
+        with self.assertRaisesRegex(AnalysisLimit, 'closure-local pointer result transport'):
+            self.scan()
+
+    def test_immediate_closure_pointer_result_retains_captured_destination_writes(self):
+        self.source('handler.go', '''
+            package app
+            import "encoding/json"
+            func h() {
+                var p Payload
+                out := func() *Payload {
+                    json.NewDecoder(r.Body).Decode(&p)
+                    return &p
+                }()
+                db.Query(out.SQL)
+                db.Query(p.SQL)
+            }
+        ''')
+        self.assert_hits([('handler.go', 9, 'go.taint.sql'), ('handler.go', 10, 'go.taint.sql')])
+
+    def test_immediate_closure_named_pointer_result_retains_captured_destination_writes(self):
+        self.source('handler.go', '''
+            package app
+            import "encoding/json"
+            func h() {
+                var p Payload
+                out := func() (result *Payload) {
+                    result = &p
+                    json.NewDecoder(r.Body).Decode(result)
+                    return
+                }()
+                db.Query(out.SQL)
+                db.Query(p.SQL)
+            }
+        ''')
+        self.assert_hits([('handler.go', 10, 'go.taint.sql'), ('handler.go', 11, 'go.taint.sql')])
+
     def test_saved_native_operations_with_fixed_data_stay_clean(self):
         self.source('handler.go', '''
             package app

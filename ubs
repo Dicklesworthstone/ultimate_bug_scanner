@@ -206,21 +206,21 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='c0ece4e597ad14a738077dadd268bd334790c3fb51a2fa278fa2536c9bd467a5'
-  [cpp]='4be93e8f8377245014cc24d04e0dfd7506ede958fe0ad93ab7941f71b8549238'
-  [csharp]='ca2aa30f600f6e4d9809ce058f15604d61b152171346cbd30cf0f5a4e4edb4f2'
-  [elixir]='89d26f7e28511cd3d21a3a28b221033fd4bb01be4a6f0b8e296153d35f43449f'
-  [golang]='875f2261763df998be7547fdeeefa9b7c51ef8df08b13140973705064f717917'
-  [hcl]='35934afd9b832c3eae9bfcf9734b8fd2535e2d267b1bea46b1254d076e28f767'
-  [java]='1aeaa790d11630f3b4c56e03be189ad0fa0a8c31316d3c79c1faf2bb4b6c1611'
-  [js]='2806b8d6f450997f0e9787936caef7a8c8c5a78fc78f61fcae39030ab159ee8e'
-  [kotlin]='4339265575e2e28318df662535cd195d8cd0a7558c1b9406920f1a86287d12a4'
-  [php]='109756865a3ee7e55f80cb045621a41373d7c5207f5bbe67000621c540235679'
-  [python]='708d70a195b468e65970480fb0590b5aa582d6f11f0a570d1616edcc4a590cfd'
-  [ruby]='6df6d81d982f2d95bee6c1039239b7ff7b33e52c5dc1299cc282b2fdba6adeb6'
-  [rust]='5e9b74da4475c2552281873ad497027a6f693c46c8d622957ac8e01f635666e9'
-  [sql]='43ec928b41b49f086ef0147f04e895fca544875f0617db4af8eeea50869eb481'
-  [swift]='fa080cdd9d33b604807bb22ac0da9e937f7dcd22a00dd6c8c79305de7a36f66c'
+  [bash]='bdd1699b418cdca14c234e26e73770d4f97856cd8f04fce59ce29f255898a8ac'
+  [cpp]='5053ac02b5cde114e7ce329e4d6ef05f9bfbd5a800929407859855efc6f7de0e'
+  [csharp]='48bf5fb75ef719c68560d282a67f6291e18b72b51813412b5d471300d4481bb1'
+  [elixir]='3ade6a696fc7f7715f48b335f43c458dfb87c11956eb9d507b9c194a0e809ce6'
+  [golang]='fd607a4a3002a7e782c16ee183c08d1646ac0c07ab028e162a190c4a7c81a937'
+  [hcl]='70b82d3fca8d75f99d2259c8f83e0518777b216d25a1954276812f8237ca67b5'
+  [java]='f310719a4d74c28b66634c080b592035fe5c420b7d0511c19aca2e70e7fbc71e'
+  [js]='d3bc6a30923eab16237adc52d6928a044cfa82bd0b19c080c55c19da6c867ba4'
+  [kotlin]='768158317c000f53372c6e9811322b3d9391a80a3a9e725b443763391984495f'
+  [php]='92e6eeef8ed82acc3a41b4b116e4728548a434375188a15fd25961cdbf81043d'
+  [python]='2b3c58e26809243f8e533ab084d0baba7f8f589b7d677557aacd8e1e62e34e3b'
+  [ruby]='be7746c7e28a32b8ecc15a8123eed33e4793d6993b78fcc225f7abafad166b59'
+  [rust]='0819e8a230748493347184b1cc9c79eeab9382cebb521a3107c7a9f826e9fd02'
+  [sql]='c67f7393385bb07fe5dc4f2082d0c40494c7e790ad7195ed0271f30ba9d53857'
+  [swift]='c3aa139a069d70827fb1b30dba368b840f62bc147c6b3375af7eb6b3ccefc77c'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -321,7 +321,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_csharp_sql.py']='b17bdd2573b175957452232882667bc53dcabe8b57ec7b9cd9b1be91ebd13be6'
   ['helpers/ubs_core/analyzers/taint_elixir_redirect.py']='e79bcfc31754ce3485c2e3c398133eca890c3023ec135d410f72b3adfefe7da8'
   ['helpers/ubs_core/analyzers/taint_elixir_traversal.py']='26939c1285b3193efb1feebbd4eeff46e2c20bd1e6e8a797cf1f96a3b286d112'
-  ['helpers/ubs_core/analyzers/taint_go.py']='ba995c7c1a65d826e7e9bcd8a3bace07d568a4c86e2a66452a4ab2fe9e909052'
+  ['helpers/ubs_core/analyzers/taint_go.py']='d0e9577fd8c2b5ea33546ffaeb59b3abfd68d3f7973bdc8ee752dbbef9a969ca'
   ['helpers/ubs_core/analyzers/taint_java_redirect.py']='9b692ef24912c2a9fe1276bf19b8328d451fab5913aeaa1d9908a2aaf26f1e0d'
   ['helpers/ubs_core/analyzers/taint_java_sql.py']='010070f2cd8538e268588f39486da0b4ad1984a710f2d25ba1326eebf86d8d7d'
   ['helpers/ubs_core/analyzers/taint_java_traversal.py']='69da21ec5f2d99b0603e6af028948bfc0f7f54e31c493cc52eac5c67b8680aa8'
@@ -399,7 +399,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/elixir_rules.py']='3f8ca9a8d1cd898588005bb925b5b931d8d3947d41e7c235c48b9d8033ed65e4'
   ['helpers/ubs_core/elixir_scan.py']='6b9ef4f97ad0457bcc0e3dd0766d5ed6e7edb3c518da17ce5d1be782555bed64'
   ['helpers/ubs_core/explain.py']='9838afd5b0e30c9638be1a003d790ac970cabc4c658cc6cd43abd2de9335d2b6'
-  ['helpers/ubs_core/external_tools.py']='6006eeee27e941fb092680881067e3ba45a906443092c28bb9f85478069a7aae'
+  ['helpers/ubs_core/external_tools.py']='710e02a4bd281e5af3ef5ee4e3fe2d1ea000d4635516caaa0dfeb1c403230338'
   ['helpers/ubs_core/findings_merge.py']='d1666407750a67727738c9bc99b72013c364842c3ee202b7b7359c3ff92cedba'
   ['helpers/ubs_core/go_ast.py']='f459406b41a7aa4b5fd0af7cce5a961811d0bffd499fb99825ed631ec96d0f0d'
   ['helpers/ubs_core/go_detectors/__init__.py']='70cc7219036b6d704d9a9e9414c623b4d0eb65ef26e12aac19c8ba6aa055ba41'
@@ -423,7 +423,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/go_patterns/json_fs.py']='e561c18ac8d49ca7d3a0644381b5624d3d0e5f975c43a3056e4ad177538a7b6b'
   ['helpers/ubs_core/go_patterns/misc.py']='d23874e0fd10bc3538fd0c9b4eae998dbcb3076dd66020a6c764c7bb297506bd'
   ['helpers/ubs_core/go_rules.py']='a11e1036d06d313c102fda792f9842af7af69ad6250ec9dcb0c21ceaddc00ce1'
-  ['helpers/ubs_core/go_scan.py']='b4fb2961d3557125c43baea9e0729691f3f4df0ee09d3a94e40f264988926ae1'
+  ['helpers/ubs_core/go_scan.py']='cc085a8ac251513dd1e49bb8d69172e5f0ba42dcf4c39b5020d0f72e44d70966'
   ['helpers/ubs_core/hcl_scan.py']='78e256d0a730e75c63f2145fc00f9aa0417fa83477e350654b3c0b2b8668084f'
   ['helpers/ubs_core/io.py']='98b33056e732a07ecc5b5b38afa5d889cdb8bdbbba20c3ae73d165219706a3fd'
   ['helpers/ubs_core/java_ast.py']='50091504b3eed28240dea483b631b9bf47c45993ca1f2f9ff6daec6744eaecef'
@@ -596,7 +596,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='7543f49117b6549a56771e737c8d57a828c238af50a660faf27b65a1227bfd5f'
   ['helpers/ubs_core/taint_flow.py']='b50925e0f4bf7263f41650a1274c208b5e2c2a994d7cdfd518fb26b3dd5251cf'
-  ['lib/ubs-common.sh']='cc5416363e32bd42eb0fb5c2d1e2102d1d79b203ab359e3dc056fe082fe7fd1a'
+  ['lib/ubs-common.sh']='560588299d6d3c3a8a3b302a2a2b5c0fd3be57cac76dbe3c548049d912d58290'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -2245,7 +2245,7 @@ Environment Variables:
   CI=true                     Disable the opt-in auto-update check (like --ci)
   UBS_ENABLE_AUTO_UPDATE=1    Opt in to the 24h auto-update check
   UBS_NO_AUTO_UPDATE=1        Force-disable auto-update (like --no-auto-update)
-  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP scans;
+  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go scans;
                               unsupported languages and update/service modes exit 2.
                               Use TMPDIR to choose storage. Caller removes retained files.
   FORCE_SELF_UPDATE=1         Force an immediate verified self-update check
@@ -2414,7 +2414,7 @@ cat <<'JSON'
     {"name": "UBS_SKIP_TYPE_NARROWING", "value": "1", "description": "Skip the type-narrowing helpers."},
     {"name": "UBS_ENABLE_AUTO_UPDATE", "value": "1", "description": "Opt in to the 24h auto-update check."},
     {"name": "UBS_NO_AUTO_UPDATE", "value": "1", "description": "Force-disable auto-update."},
-    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP; unsupported languages and update/service modes refuse with exit 2. Requested external tools that cannot retain scratch report incomplete coverage. Use TMPDIR to choose storage."},
+    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go; unsupported languages and update/service modes refuse with exit 2. Requested external tools that cannot retain scratch report incomplete coverage. Go's compiled lifecycle helper requires --skip=17 for a complete static scan. Use TMPDIR to choose storage."},
     {"name": "UBS_RULES", "value": "DIR[:DIR...]", "description": "Custom rule directories (':'-separated, like PATH) used when no --rules is given; empty entries are ignored."},
     {"name": "UBS_NO_CACHE", "value": "1", "description": "Disable scan caching (like --no-cache)."},
     {"name": "UBS_CACHE_DIR", "value": "PATH", "description": "Override root directory for scan cache (like --cache-dir)."},
@@ -10809,11 +10809,11 @@ if [[ ${#langs[@]} -eq 0 ]]; then emit_no_langs_result; fi
 if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
   for L in "${langs[@]}"; do
     case "$L" in
-      rust|python|js|bash|hcl|csharp|kotlin|cpp|sql|ruby|php) ;;
+      rust|python|js|bash|hcl|csharp|kotlin|cpp|sql|ruby|php|golang) ;;
       *)
-        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php."
+        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang."
         emit_error_envelope "environment" "error" "retention-unsupported-language" \
-          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php" \
+          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang" \
           '"failed_modules":[]'
         exit 2 ;;
     esac

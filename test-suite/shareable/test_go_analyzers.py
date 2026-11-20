@@ -269,6 +269,74 @@ class Adapters(unittest.TestCase):
         self.assertEqual({o["status"] for o in outcomes}, {"skipped"})
         run.assert_not_called()
 
+    def test_retention_refuses_compilers_without_hiding_read_only_formatting(self) -> None:
+        with patch.dict(os.environ, {"UBS_KEEP_TEMP": "1"}), \
+                patch.object(tools.shutil, "which", side_effect=lambda name: name), \
+                patch.object(tools, "run_command_stream") as compiler, \
+                patch.object(tools, "run_command", return_value=subprocess.CompletedProcess(
+                    ["gofmt"], 0, str(self.file) + "\n", "")) as formatter:
+            outcomes = tools.scan_go_tools([self.file], self.sink, str(self.root), "./...", 1, self.errors)
+        compiler.assert_not_called()
+        formatter.assert_called_once()
+        self.assertEqual(formatter.call_args.args[1], ["gofmt", "-s", "-l", "--", str(self.file)])
+        self.assertEqual([(row["tool"], row["status"]) for row in outcomes],
+                         [("gofmt", "ok"), ("go vet", "partial"), ("govulncheck", "partial")])
+        self.assertEqual(len(self.errors), 2)
+        self.assertTrue(all("cannot retain external Go analyzer scratch" in row for row in self.errors))
+        self.assertEqual([row["rule"] for row in self.rows()], ["go.gofmt.format"])
+
+    def test_retention_public_static_findings_and_coverage(self) -> None:
+        """Real report contract; the separate syscall-audit tests remain required."""
+        env = dict(os.environ, UBS_KEEP_TEMP="1", UBS_NO_CACHE="1",
+                   UBS_NO_AUTO_UPDATE="1", UBS_ENABLE_AUTO_UPDATE="0",
+                   PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1")
+        for scenario in ("unsafe", "clean", "compiled-helper-refused"):
+            self.file.write_text('package sample\nimport "os"\nfunc run() {\n'
+                                 + ('db.Query("SELECT 1")' if scenario == "clean"
+                                    else 'db.Query(os.Getenv("QUERY"))') + '\n}\n')
+            kept = {9, 17} if scenario == "compiled-helper-refused" else {9}
+            skip = "--skip=" + ",".join(str(n) for n in range(1, 23) if n not in kept)
+            expected = [] if scenario == "clean" else [("go.taint.sql", "main.go", 4)]
+            partial = scenario == "compiled-helper-refused"
+            for direct in (True, False):
+                for output_format in ("json", "sarif"):
+                    with self.subTest(scenario=scenario, direct=direct, format=output_format):
+                        command = ["bash", str(REPO / "modules/ubs-golang.sh")] if direct else [
+                            "bash", str(REPO / "ubs"), "--only=golang",
+                            f"--module-dir={REPO / 'modules'}"]
+                        command += ["--ci", "--fail-on-warning", skip,
+                                    f"--format={output_format}", str(self.file)]
+                        result = subprocess.run(command, cwd=self.root, env=env,
+                                                capture_output=True, text=True, timeout=60)
+                        label = f"{scenario}-{'module' if direct else 'runner'}-{output_format}"
+                        (self.root / (label + ".stdout")).write_text(result.stdout)
+                        (self.root / (label + ".stderr")).write_text(result.stderr)
+                        context = f"{command}\n{result.stdout}\n{result.stderr}"
+                        self.assertEqual(result.returncode, 2 if partial else 1 if expected else 0,
+                                         context)
+                        document = json.loads(result.stdout)
+                        if output_format == "json":
+                            actual = sorted((row["rule"] if direct else row["rule_id"],
+                                             Path(row["path"] if direct else row["file"]).name,
+                                             row["line"]) for row in document.get("findings", []))
+                            self.assertEqual(document["status"], "partial" if partial else "ok", context)
+                            counts = document if direct else document["totals"]
+                            self.assertEqual(tuple(counts[k] for k in ("critical", "warning", "info")),
+                                             (len(expected), 0, 0), context)
+                        else:
+                            actual = sorted((row["ruleId"], Path(unquote(row["locations"][0]
+                                             ["physicalLocation"]["artifactLocation"]["uri"])).name,
+                                             row["locations"][0]["physicalLocation"]["region"]["startLine"])
+                                            for run in document["runs"] for row in run["results"])
+                            unsuccessful = any(invocation["executionSuccessful"] is False
+                                               for run in document["runs"]
+                                               for invocation in run.get("invocations", []))
+                            self.assertEqual(unsuccessful, partial, context)
+                        self.assertEqual(actual, expected, context)
+                        if partial:
+                            self.assertIn("cannot retain compiler scratch", result.stdout + result.stderr,
+                                          context)
+
     def test_package_patterns_are_argv_not_shell_code(self) -> None:
         calls = []
         @contextmanager

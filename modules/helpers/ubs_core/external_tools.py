@@ -1561,6 +1561,11 @@ def scan_go_tools(files: Sequence[Path], sink: TextIO, project_dir: str,
             if not installed:
                 outcomes.append({**outcome, "status": "skipped", "reason": "not installed"})
                 continue
+            if tool != "gofmt" and os.environ.get("UBS_KEEP_TEMP") == "1":
+                reason = f"{tool} refused: UBS_KEEP_TEMP=1 cannot retain external Go analyzer scratch"
+                errors.append(reason)
+                outcomes.append({**outcome, "status": "partial", "reason": reason})
+                continue
             before = len(errors)
             # One gofmt input makes its filename-only output unambiguous even
             # for names containing newlines. No -w: scanning never formats code.

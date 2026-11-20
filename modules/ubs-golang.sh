@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="cc5416363e32bd42eb0fb5c2d1e2102d1d79b203ab359e3dc056fe082fe7fd1a"
+UBS_LIB_CHECKSUM="560588299d6d3c3a8a3b302a2a2b5c0fd3be57cac76dbe3c548049d912d58290"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -278,7 +278,7 @@ from ubs_core.go_rules import generate
 generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else None)
 " 2>/dev/null; then
     echo "ERROR: failed to generate AST rules" >&2
-    rm -rf "$ast_rule_dir" 2>/dev/null || true
+    ubs_remove_temp -rf "$ast_rule_dir" 2>/dev/null || true
     exit 2
   fi
   if [[ -n "$DUMP_RULES_DIR" ]]; then
@@ -286,7 +286,7 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
     cp -R "$ast_rule_dir"/rules/. "$DUMP_RULES_DIR"/ 2>/dev/null || true
   fi
   list_generated_ast_rule_ids "$ast_rule_dir/rules"
-  rm -rf "$ast_rule_dir" 2>/dev/null || true
+  ubs_remove_temp -rf "$ast_rule_dir" 2>/dev/null || true
   exit 0
 fi
 
@@ -504,7 +504,10 @@ if as_text:
                 emit(f"  • {rid:<44} {n:>5}")
         if num == 17 and not run_life:
             emit("Info (0 found)")
-            emit("    Go toolchain unavailable — Install Go to run the AST helper")
+            if os.environ.get("UBS_KEEP_TEMP") == "1":
+                emit("    Go lifecycle helper refused: UBS_KEEP_TEMP=1 cannot retain compiler scratch")
+            else:
+                emit("    Go toolchain unavailable — Install Go to run the AST helper")
     emit("")
     emit("Summary Statistics:")
     emit(f"Files scanned: {files_n}")
@@ -559,6 +562,9 @@ run_contract_v2_go(){
   if [[ "$RUN_GO_TOOLS" -eq 1 ]]; then
     scan_args+=(--go-tools "--test-pkgs=$GOTEST_PKGS" "--go-timeout=$GO_TIMEOUT")
   fi
+  if [[ "${UBS_KEEP_TEMP:-0}" == "1" && ",$v2_skip," != *",17,"* ]]; then
+    scan_args+=(--lifecycle-refused)
+  fi
   if command -v ast-grep >/dev/null 2>&1 || command -v sg >/dev/null 2>&1; then
     ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-gov2-rules.XXXXXX)"
     if ! PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -c "
@@ -601,12 +607,12 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
     "${scan_args[@]}" --version "$VERSION" || exit_code=$?
   if [[ "$FORMAT" == "sarif" ]]; then
     PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" || exit_code=$?
-    rm -f "$v2_json_out" 2>/dev/null || true
+    ubs_remove_temp -f "$v2_json_out" 2>/dev/null || true
   else
     local life_raw="" life_status=0 run_life=0
     local go_life_helper=""
     ubs_resolve_helper go_life_helper "helpers/resource_lifecycle_go.go" || go_life_helper=""
-    if [[ ",$v2_skip," != *",17,"* && -n "$go_life_helper" && -f "$go_life_helper" ]] && command -v go >/dev/null 2>&1; then
+    if [[ "${UBS_KEEP_TEMP:-0}" != "1" && ",$v2_skip," != *",17,"* && -n "$go_life_helper" && -f "$go_life_helper" ]] && command -v go >/dev/null 2>&1; then
       life_raw="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-life.XXXXXX)"
       local -a life_args=()
       if [[ -n "$list_file" && -f "$list_file" ]]; then
@@ -624,15 +630,15 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
       "$v2_skip" "$tally_file" "$life_raw" "$life_status" "$run_life" || exit_code=$?
     if [[ -n "$text_out" ]]; then
       cat "$text_out" 2>/dev/null || true
-      rm -f "$text_out" 2>/dev/null || true
+      ubs_remove_temp -f "$text_out" 2>/dev/null || true
     fi
   fi
   if [[ -n "$REPORT_JSON" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi
-  rm -f "$list_file" "$sink" "$tally_file" "${life_raw:-}" 2>/dev/null || true
+  ubs_remove_temp -f "$list_file" "$sink" "$tally_file" "${life_raw:-}" 2>/dev/null || true
   if [[ -n "$ast_rule_dir" ]]; then
-    rm -rf -- "$ast_rule_dir" 2>/dev/null || true
+    ubs_remove_temp -rf -- "$ast_rule_dir" 2>/dev/null || true
   fi
   return "$exit_code"
 }

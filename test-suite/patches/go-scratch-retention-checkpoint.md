@@ -1,6 +1,28 @@
-# Go scratch-retention candidate: unfinished qualification
+# Go scratch retention: active support and qualification
 
-## Status
+## Active support and remaining audit — November 20, 2026
+
+The reviewed retention bridge is now active: Go uses the shared scratch-removal
+primitive, the runner accepts Go in retention mode, and the module explicitly
+reports the compiled lifecycle layer unavailable unless category 17 is omitted.
+Direct static-core callers keep their previous completion/cache semantics.
+Optional Go compiler adapters refuse retention-unsafe execution; read-only
+formatting remains available. The adapter regression and unchanged direct-core
+cache/context tests pass through DSR.
+
+Strict syscall audit execution is blocked here: `strace` reports
+`PTRACE_TRACEME: Operation not permitted`. The audit assertions remain unchanged
+and are not counted as passing. A separate real report-contract test passes all
+12 module/runner JSON/SARIF cases, covering unsafe, clean and refused-helper
+outcomes with exact findings, coverage status and exit assertions. The initial
+aggregate timed out during severe execution delays; the unchanged retry passed
+in 8,089 ms through DSR. Log SHA-256:
+`4c865c1e98c076bd785dcb5016f8217d807075d602eebef937ce48d4cfd97bea`.
+The Go shell module also passes ShellCheck. The kernel no-deletion guard remained
+enabled throughout execution, but no zero-deletion-attempt trace is claimed.
+The historical inactive-candidate record follows; broader qualification stays open.
+
+## Historical candidate status (superseded above)
 
 This is an inactive source/test patch, preserved after the execution workspace
 became unavailable. It is separate from the Go closure-parameter fix committed

@@ -933,6 +933,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", default="", help="module version recorded in the json summary")
     parser.add_argument("--fail-on-warning", action="store_true")
     parser.add_argument("--go-tools", action="store_true", help="run optional Go analyzers")
+    parser.add_argument("--lifecycle-refused", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--test-pkgs", default="./...", help="Go package patterns per selected module")
     parser.add_argument("--go-timeout", type=float, default=120, help="per-tool timeout in seconds")
     parser.add_argument("--enable-new-analyzers", action="store_true",
@@ -976,6 +977,14 @@ def main(argv: list[str] | None = None) -> int:
     # Every analysis layer that could not complete appends here, so a scan that
     # did not finish is never reported as a finished one (#111).
     scan_errors: list[str] = []
+    if args.lifecycle_refused:
+        # The module's compiled lifecycle bridge cannot retain compiler scratch.
+        # Direct static-core callers do not request that bridge. Keep its
+        # refusal outside the cache so warm scans report the same coverage.
+        scan_errors.append(
+            "Go lifecycle helper refused: UBS_KEEP_TEMP=1 cannot retain compiler scratch; "
+            "select --skip=17 for static checks without the compiled helper"
+        )
     if files_to_scan:
         from ubs_core.prefilter import build_prefilter_index, run_prefilter
         from ubs_core.registry import analyzers_for_lang

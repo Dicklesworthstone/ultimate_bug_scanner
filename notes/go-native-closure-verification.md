@@ -1,5 +1,31 @@
 # Go closure parameter transfer: qualification and exact recovery
 
+## Closure-result extension — November 20, 2026
+
+Immediate closure results now preserve individual value/metadata slots, native
+getter and decoder identities, named returns and enclosing pointer contents.
+Sole tuple-producing arguments and balanced parentheses around literal callees
+are modeled. Independent review reproduced and repaired eight complete-clean
+misses across named pointers, second argument slots and grouped callees; the
+unchanged 13-case asserting review corpus passes, including five controls.
+The final four-suite DSR source cohort passes 320 methods, with 12 native/public
+opt-in skips. Helper SHA-256:
+`d0e9577fd8c2b5ea33546ffaeb59b3abfd68d3f7973bdc8ee752dbbef9a969ca`.
+Source-cohort log SHA-256:
+`c469da67eb52dd610c613688d01a023abe22e0446c73805aa932cc220124da9d`.
+
+Public module/meta-runner regressions pass all 24 JSON/SARIF calls, asserting
+exact rules, locations, totals, exits, selected-file isolation, clean-slot
+controls and incomplete boundaries. The unchanged matrix completed through DSR
+in 14,385 ms after earlier attempts were delayed or interrupted. Public log
+SHA-256: `0e9aea702354cd3c96463c15725d9af5b2dba6c2fb654596ed4c7d64898085d0`.
+The real Go 1.27.4 native witness exceeded its unchanged 180-second build limit,
+so no native compiler pass is claimed. Existing direct-core cache/context tests
+pass with the separate retention bridge. Escaped closure-local pointers and
+general dynamic heap/callback semantics remain explicit boundaries. Full
+repository and release qualification remain open. The sections below describe
+prior work.
+
 ## Scope and status
 
 Base: `f1c06ea3f80497432a29581871b3719ad8462f9d`.

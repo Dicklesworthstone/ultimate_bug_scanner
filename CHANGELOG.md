@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track native JavaScript `Array.sort()` mutations through receiver aliases,
+  returned arrays and selected helpers. Preserve sparse extents, optional slots,
+  named properties and sanitizer domains. Custom comparator, object-coercion and
+  unproved indexed-property effects report incomplete coverage. Source/native
+  regressions and actual JSON/SARIF, selection, suppression and cache checks
+  cover the formerly complete-clean misses.
+
 - Model finite synchronous JavaScript `flatMap` callbacks on ordinary arrays,
   preserving callback inputs, sparse holes, one-level flattening, live element
   writes, object aliases, selected helpers and `thisArg`. Keep clean results

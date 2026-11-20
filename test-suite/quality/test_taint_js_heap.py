@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 import itertools
 import json
 import os
@@ -1533,6 +1534,318 @@ class HeapTaintTests(unittest.TestCase):
                     self.assert_fill_partial('const items = ["safe", req.query.html]; '
                                              + replacement + f'items.{method}({args}); res.send(items[0]);',
                                              reason=f'Array.{method}')
+
+    def scan_sort(self, source, *rules, partial=None):
+        """Retain independent native-sort inputs and completed/partial evidence."""
+        artifacts = ROOT / 'test-suite/artifacts/javascript-sort'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix=self._testMethodName + '-', dir=artifacts))
+        path = scratch / 'handler.js'
+        path.write_text(source + '\n', encoding='utf-8')
+        findings, problem = [], None
+        try:
+            findings.extend(taint.run(RunContext(lang='javascript', files=[path])))
+        except taint.AnalysisLimit as exc:
+            problem = str(exc)
+        receipt = {
+            'case': self.id(), 'source': str(path),
+            'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'helper_sha256': hashlib.sha256(Path(taint.__file__).read_bytes()).hexdigest(),
+            'python': sys.executable, 'findings': findings, 'incomplete': problem,
+        }
+        (scratch / 'result.json').write_text(json.dumps(receipt, indent=2) + '\n', encoding='utf-8')
+        print(f'[{self.id()}] source={path} incomplete={problem!r}', flush=True)
+        if partial is None:
+            self.assertIsNone(problem, receipt)
+        else:
+            self.assertIsNotNone(problem, receipt)
+            self.assertRegex(problem, partial)
+        self.assertEqual(Counter(row['rule'].removeprefix('javascript.taint.') for row in findings),
+                         Counter(rules), receipt)
+        for row in findings:
+            self.assertEqual(row['path'], str(path.resolve()))
+            self.assertEqual(row['severity'], 'critical')
+            self.assertGreater(row['line'], 0)
+            self.assertGreater(row['col'], 0)
+        return findings
+
+    def test_sort_moves_source_through_ignored_calls_and_aliases(self):
+        for call in ('items.sort()', 'alias.sort()', 'alias["sort"]()'):
+            with self.subTest(call=call):
+                source = ('const items=["zz-clean",req.query.html]; const alias=items;\n'
+                          + call + ';\nres.send(items[0]);')
+                found = self.scan_sort(source, 'xss')
+                self.assertEqual(found[0]['line'], 3)
+                self.assert_runtime_sends(source, ['review-input'])
+
+    def test_sort_preserves_returned_receiver_and_definite_cleanup(self):
+        self.scan_sort('const items=["zz-clean",req.query.html]; const alias=items.sort(); '
+                       'alias[0]="safe"; res.send(items[0]); res.send(items[1]);', 'xss')
+        self.scan_sort('const items=["zz-clean",req.query.html]; const alias=items.sort(); '
+                       'alias.fill("safe"); res.send(items[0]); res.send(items[1]);')
+        self.scan_sort('const items=["zz-clean",req.query.html]; res.send(items.sort().length);')
+
+    def test_sort_compacts_sparse_values_and_preserves_trailing_holes(self):
+        source = ('const items=[,,req.query.html,,]; items.sort(); '
+                  'res.send(items[0]); res.send(items[1]); res.send(items[3]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', None, None])
+        self.scan_sort('const items=[,,]; items.sort(); res.send(items[0]);')
+
+    def test_sort_keeps_named_fields_out_of_indexed_values(self):
+        for key in ('extra', '-1', '01', '4294967295'):
+            with self.subTest(key=key):
+                source = (f'const items=["safe"]; items["{key}"]=req.query.html; '
+                          f'items.sort(); res.send(items[0]); res.send(items["{key}"]);')
+                self.scan_sort(source, 'xss')
+                self.assert_runtime_sends(source, ['safe', 'review-input'])
+
+    def test_sort_local_summaries_preserve_caller_and_nested_aliases(self):
+        source = ('function order(items){return items.sort();}\n'
+                  'const box={items:["zz-clean",req.query.html]};\n'
+                  'const alias=order(box.items);\n'
+                  'res.send(box.items[0]);\nres.send(alias[0]);')
+        found = self.scan_sort(source, 'xss', 'xss')
+        self.assertEqual([row['line'] for row in found], [4, 5])
+        self.assert_runtime_sends(source, ['review-input', 'review-input'])
+        self.scan_sort('function order(items){return items.sort();} '
+                       'const dirty=["zz-clean",req.query.html]; const clean=["b","a"]; '
+                       'order(dirty); order(clean); res.send(dirty[0]); res.send(clean[0]);', 'xss')
+
+    def test_sort_retains_sink_specific_sanitization(self):
+        self.scan_sort('const items=["zz-clean",DOMPurify.sanitize(req.query.html)]; '
+                       'items.sort(); res.send(items[0]); eval(items[0]);', 'eval')
+        self.scan_sort('const items=["b","a"]; items.sort(); res.send(items[0]);')
+
+    def test_sort_joined_and_conditional_targets_do_not_prove_cleanup(self):
+        self.scan_sort('const a=[,"safe",req.query.html]; const b=["safe"]; '
+                       'const target=flag?a:b; target.sort(); res.send(a[0]); res.send(a[2]);', 'xss', 'xss')
+        self.scan_sort('const items=[,,req.query.html]; if(flag){items.sort();} '
+                       'res.send(items[0]); res.send(items[2]);', 'xss', 'xss')
+
+    def test_sort_uses_captured_receiver_after_argument_effects(self):
+        source = ('let items=["zz-clean","safe"]; const original=items; '
+                  'items.sort(undefined, (items=["new"]), (original[1]=req.query.html)); '
+                  'res.send(original[0]); res.send(items[0]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'new'])
+        self.scan_sort('const items=["safe"]; items.sort(undefined, req.query.html); res.send(items[0]);')
+
+    def test_sort_empty_and_singleton_skip_comparators_and_conversion(self):
+        for initializer, expected in (('[]', [None]), ('["safe"]', ['safe']), ('[,"safe"]', ['safe'])):
+            with self.subTest(initializer=initializer):
+                source = ('const items=' + initializer + '; const box={html:"safe"}; '
+                          'items.sort((a,b)=>{box.html=req.query.html;return 0;}); '
+                          'res.send(items[0]); res.send(box.html);')
+                self.scan_sort(source)
+                self.assert_runtime_sends(source, expected + ['safe'])
+        source = ('const box={html:"safe"}; '
+                  'const item={toString(){box.html=req.query.html;return "x";}}; '
+                  'const items=[,item]; const result=items.sort(); result[0].value=req.query.html; '
+                  'res.send(item.value); res.send(box.html);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+
+    def test_sort_selected_own_methods_keep_their_actual_behavior(self):
+        self.scan_sort('const items=["safe"]; items.sort=function(value){return "clean";}; '
+                       'res.send(items.sort(req.query.html));')
+        source = ('const items=["safe"]; items.sort=function(){this[0]=req.query.html;return this;}; '
+                  'const alias=items.sort(); res.send(items[0]); res.send(alias[0]);')
+        self.scan_sort(source, 'xss', 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'review-input'])
+        self.scan_sort('const items=["zz-clean",req.query.html]; items.sort=function(){return "safe";}; '
+                       'delete items.sort; items.sort(); res.send(items[0]);', 'xss')
+
+    def test_sort_callback_effects_and_unknown_comparators_are_incomplete(self):
+        source = ('const box={html:"safe"}; const items=["b","a"]; '
+                  'items.sort((a,b)=>{box.html=req.query.html;return 0;}); res.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, partial='Array.sort.*comparator')
+        for comparator in ('external', 'null', 'req.query.compare', '...comparators'):
+            with self.subTest(comparator=comparator):
+                self.scan_sort('const items=["zz-clean",req.query.html]; '
+                               'try{items.sort(' + comparator + ');}catch(error){} res.send(items[1]);',
+                               'xss', partial='Array.sort.*comparator')
+
+    def test_sort_object_conversion_is_incomplete_and_keeps_other_findings(self):
+        source = ('const box={html:"safe"}; const items=["b",'
+                  '{toString(){box.html=req.query.html;return "a";}}]; '
+                  'items.sort(); res.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, partial='Array.sort.*coercion')
+        self.scan_sort('const items=[{html:req.query.html},"safe"]; '
+                       'items.sort(); res.send(items[0].html);', 'xss', partial='Array.sort.*coercion')
+
+    def test_sort_descriptor_prototype_and_unknown_method_boundaries(self):
+        for setup in ('Object.freeze(items);', 'Object.seal(items);',
+                      'Object.defineProperty(items,"0",{get(){return req.query.html;}});',
+                      'Object.setPrototypeOf(items,foreign);'):
+            with self.subTest(setup=setup):
+                self.scan_sort('const items=["safe",req.query.html]; ' + setup
+                               + 'try{items.sort();}catch(error){} res.send(items[1]);',
+                               'xss', partial='Array.sort')
+        for setup in ('items.sort=external;', 'Array.prototype.sort=external;',
+                      'items[key]=external;'):
+            with self.subTest(setup=setup):
+                self.scan_sort('const items=["safe",req.query.html]; ' + setup
+                               + 'items.sort(); res.send(items[1]);', 'xss', partial='Array.sort')
+
+    def test_sort_sparse_maximum_length_never_expands_holes(self):
+        self.scan_sort('const items=[req.query.html]; items.length=4294967295; '
+                       'items.sort(); res.send(items[0]); res.send(items[4294967294]);', 'xss')
+
+    def test_sort_literal_receivers_and_returned_array_chains(self):
+        for source in (
+            'res.send(["zz-clean",req.query.html].sort()[0]);',
+            'const items=["zz-clean",req.query.html]; (items).sort(); res.send(items[0]);',
+            'function make(){return ["zz-clean",req.query.html];} res.send(make().sort()[0]);',
+            'const items=["zz-clean",req.query.html]; res.send(items.sort().sort()[0]);',
+            'const items=["zz-clean",req.query.html]; '
+            'res.send(items.flatMap(value=>[value]).sort()[0]);',
+        ):
+            with self.subTest(source=source):
+                self.scan_sort(source, 'xss')
+                self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort('res.send(["safe"].sort().flatMap(value=>[value])[0]);')
+
+    def test_sort_skipped_callback_sinks_and_unproven_empty_comparators(self):
+        for elements in ('[]', '["safe"]', '[,"safe"]'):
+            with self.subTest(elements=elements):
+                source = (f'const items={elements}; '
+                          'items.sort((a,b)=>{res.send(req.query.html);return 0;});')
+                self.scan_sort(source)
+                self.assert_runtime_sends(source, [])
+        for comparator in ('null', 'external', 'req.query.compare'):
+            with self.subTest(comparator=comparator):
+                self.scan_sort('const items=[]; try{items.sort(' + comparator + ');}catch(error){} '
+                               'res.send(req.query.html);', 'xss', partial='Array.sort.*comparator')
+
+    def test_sort_unknown_extent_and_inherited_indices_remain_incomplete(self):
+        for setup in ('items.length=unknown;', 'Array.prototype[0]=req.query.html;',
+                      'Object.prototype[0]=req.query.html;'):
+            with self.subTest(setup=setup):
+                self.scan_sort('const items=[,"safe",req.query.html]; ' + setup
+                               + 'items.sort(); res.send(items[2]);', 'xss', partial='Array.sort')
+
+    def test_sort_captures_method_identity_and_undefined_arguments(self):
+        source = ('const items=["zz-clean",req.query.html]; const skip=undefined; '
+                  'items.sort(skip, (items.sort=function(){return "clean";})); '
+                  'res.send(items[0]); res.send(items.sort());')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'clean'])
+        self.scan_sort('const items=["zz-clean",req.query.html]; '
+                       'items.sort(...[undefined]); res.send(items[0]);', 'xss')
+
+    def test_sort_optional_clean_slots_still_contribute_to_possible_extent(self):
+        source = ('const items=[,"bb",req.query.html]; if(flag){items[0]="aa";} '
+                  'items.sort(); res.send(items[2]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends('const flag=true; ' + source, ['review-input'])
+        source = ('const items=["aa","bb",req.query.html]; if(flag){delete items[0];} '
+                  'items.sort(); res.send(items[2]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends('const flag=false; ' + source, ['review-input'])
+
+    def sort_public_report(self, target, artifact, *, meta, fmt, expected, partial=False, cache=False):
+        command = ROOT / ('ubs' if meta else 'modules/ubs-js.sh')
+        arguments = [str(command), str(target), '--no-color', '--ci', f'--format={fmt}']
+        if meta:
+            arguments.append('--only=js')
+        result = subprocess.run(arguments, cwd=target.parent,
+                                env={**os.environ, 'UBS_KEEP_TEMP': '1', 'UBS_NO_AUTO_UPDATE': '1',
+                                     'UBS_NO_CACHE': '0' if cache else '1',
+                                     'UBS_CACHE_DIR': str(target.parent / 'cache'), 'UBS_PROFILE': '1'},
+                                capture_output=True, text=True, timeout=45)
+        artifact.with_suffix('.stdout').write_text(result.stdout, encoding='utf-8')
+        artifact.with_suffix('.stderr').write_text(result.stderr, encoding='utf-8')
+        self.assertEqual(result.returncode, 2 if partial else (1 if expected else 0),
+                         (arguments, result.stdout, result.stderr))
+        report = json.loads(result.stdout)
+        if fmt == 'json':
+            self.assertEqual(report['status'], 'partial' if partial else 'ok', report)
+            records = report.get('findings', [])
+            rule_key, path_key = ('rule_id', 'file') if meta else ('rule', 'path')
+            observed = [(row[rule_key], row['line'], row['col']) for row in records]
+            self.assertEqual(observed, expected, report)
+            totals = report['totals'] if meta else report
+            self.assertEqual([totals[key] for key in ('files', 'critical', 'warning', 'info')],
+                             [1, len(expected), 0, 0], report)
+            for row in records:
+                self.assertEqual(Path(row[path_key]).name, target.name, row)
+                self.assertEqual(row['severity'], 'critical', row)
+                self.assertFalse(row.get('suppressed', False), row)
+            if partial:
+                self.assertIn('Array.sort', result.stdout + result.stderr)
+                if meta:
+                    self.assertEqual(report['profile']['cache_hits'], 0, report)
+        else:
+            self.assertEqual(report['version'], '2.1.0', report)
+            records = [row for run in report['runs'] for row in run.get('results', [])]
+            observed = []
+            for row in records:
+                location = row['locations'][0]['physicalLocation']
+                observed.append((row['ruleId'], location['region']['startLine'],
+                                 location['region']['startColumn']))
+                self.assertEqual(Path(location['artifactLocation']['uri']).name, target.name, row)
+                self.assertEqual(row['level'], 'error', row)
+            self.assertEqual(observed, expected, report)
+            failed = [inv for run in report['runs'] for inv in run.get('invocations', [])
+                      if inv.get('executionSuccessful') is False]
+            self.assertEqual(bool(failed), partial, report)
+            for invocation in failed:
+                self.assertEqual(invocation['exitCode'], 2, invocation)
+                self.assertIn('Array.sort', json.dumps(invocation))
+        return report
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_sort_public_json_and_sarif_keep_findings_and_incomplete_status(self):
+        cases = (
+            ('alias', 'const items=["zz-clean",req.query.html]; const alias=items;\n'
+             'alias.sort();\nres.send(items[0]);\n', [("javascript.taint.xss", 3, 1)], False),
+            ('clean', 'const items=["b","a"];\nitems.sort();\nres.send(items[0]);\n', [], False),
+            ('sanitized', 'const items=["zz-clean",DOMPurify.sanitize(req.query.html)];\n'
+             'items.sort();\nres.send(items[0]);\n', [], False),
+            ('comparator', 'const box={html:"safe"}; const items=["b","a"];\n'
+             'items.sort((a,b)=>{box.html=req.query.html;return 0;});\nres.send(box.html);\n', [], True),
+            ('coercion', 'const box={html:"safe"};\n'
+             'const items=["b",{toString(){box.html=req.query.html;return "a";}}];\n'
+             'items.sort();\nres.send(req.query.html);\n', [("javascript.taint.xss", 4, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-sort-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial)
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_sort_public_cache_invalidation_and_suppression(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-sort-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const items=["zz-clean",req.query.html];\nitems.sort();\n'
+                  'res.send(items[0]);\n')
+        clean = ('const items=["zz-clean",req.query.html];\nitems.sort(); items.fill("safe");\n'
+                 'res.send(items[0]);\n')
+        suppressed = unsafe.replace('res.send(items[0]);', 'res.send(items[0]); // ubs:ignore')
+        for index, (source, expected) in enumerate((
+                (unsafe, [("javascript.taint.xss", 3, 1)]),
+                (unsafe, [("javascript.taint.xss", 3, 1)]),
+                (clean, []), (suppressed, []), (unsafe, [("javascript.taint.xss", 3, 1)]))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                        expected=expected, cache=True)
 
     def test_fill_mutates_alias_and_returns_same_array(self):
         self.scan('const items = ["safe"]; const alias = items; '

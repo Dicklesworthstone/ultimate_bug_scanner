@@ -1,5 +1,23 @@
 # Native JavaScript Array.sort: pending regression checkpoint
 
+## Activated implementation — November 20, 2026
+
+The recovered implementation is now active. All 19 original sort methods pass,
+including real Node witnesses, versus 31 failed assertions on the unchanged
+baseline. Two additional methods validate 25 actual module/meta-runner JSON and
+SARIF invocations, exact findings/locations/totals/exits, incomplete coverage,
+selected-file isolation, cache invalidation and suppression. The combined JS
+cohorts pass 497 distinct methods; one unrelated TypeScript compiler resolver
+oracle remains skipped. DSR ran every check with retained fixtures and unchanged
+assertions and deadlines. The existing 55-case heap CLI matrix passed in 89.575
+seconds. Canonical checksum verification passes. The repository-wide ShellCheck
+attempt was killed with exit 137; full-suite/release qualification is not claimed.
+Comparator/coercion effects retain the explicit incomplete boundary described
+below. The remaining checkpoint sections document historical, inactive evidence.
+
+Final helper SHA-256: `b27555e01b1e4968a7e5d9729a711c9355fadfb4b3c53195c71aa4dd4391d0e1`.
+Public DSR log SHA-256: `57818c2cd0b0824267c2c6117bbed46f1676d6185883c380546be69c26d2da0d`.
+
 ## Current recovery status — November 15, 2026 follow-up
 
 **The implementation is preserved but is not activated or qualified.** The current

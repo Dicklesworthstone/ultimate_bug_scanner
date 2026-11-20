@@ -1279,6 +1279,271 @@ class FindingsMergeTests(unittest.TestCase):
             self.assertEqual(doc3["totals"]["critical"], 1)
 
 
+class RustFindingsDispatchIntegrationTests(unittest.TestCase):
+    """Exercise Rust's canonical ledger through the actual meta-runner."""
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="ubs-rust-findings-", dir=artifacts))
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("UBS_", "XDG_"))}
+        self.env.update(NO_COLOR="1", UBS_NO_AUTO_UPDATE="1", UBS_ENABLE_AUTO_UPDATE="0",
+                        UBS_NO_CACHE="1", UBS_KEEP_TEMP="1", UBS_ALLOW_PARTIAL="0",
+                        PYTHONDONTWRITEBYTECODE="1")
+        for key in ("XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "TMPDIR"):
+            path = self.root / key.lower()
+            path.mkdir()
+            self.env[key] = str(path)
+
+    def invoke(self, label, command, env=None):
+        started = time.monotonic()
+        print(f"[rust-findings:{label}] RUN {shlex.join(command)}", flush=True)
+        proc = subprocess.run(command, cwd=self.project, env=env or self.env,
+                              capture_output=True, text=True, timeout=180, check=False)
+        (self.root / f"{label}.stdout").write_text(proc.stdout, encoding="utf-8")
+        (self.root / f"{label}.stderr").write_text(proc.stderr, encoding="utf-8")
+        (self.root / f"{label}.receipt.json").write_text(json.dumps({
+            "command": command, "exit_code": proc.returncode,
+            "elapsed_seconds": time.monotonic() - started,
+        }), encoding="utf-8")
+        return proc
+
+    def scan(self, label, *arguments, fmt="json", env=None):
+        command = [str(REPO_ROOT / "ubs"), "--ci", "--no-config", "--no-cache",
+                   "--no-cargo", "--ignore-file=/dev/null", "--only=rust"]
+        if fmt != "text":
+            command.append("--format=" + fmt)
+        return self.invoke(label, [*command, *arguments, str(self.project)], env)
+
+    def read_json(self, path):
+        return decode_report(self, path.read_text(encoding="utf-8"), str(path))
+
+    def read_jsonl(self, text):
+        return [decode_report(self, row) for row in text.splitlines() if row.strip()]
+
+    def test_real_rust_findings_survive_all_combined_formats_and_exports(self) -> None:
+        source = self.project / "secrets.rs"
+        source.write_text("".join(
+            f"pub fn authenticate_{index}(password: &str, candidate: &str) -> bool {{\n"
+            "    password == candidate\n}\n" for index in range(8)), encoding="utf-8")
+        rule = "rust.security.constant-time-compare"
+        expected = {(rule, source.name, 2 + 3 * index, "critical") for index in range(8)}
+
+        def identities(records, raw=False):
+            return {(row["rule" if raw else "rule_id"],
+                     Path(row["path" if raw else "file"]).name,
+                     row["line"], row["severity"])
+                    for row in records if row.get("rule" if raw else "rule_id") == rule}
+
+        ledger = self.root / "module.ndjson"
+        preview = self.root / "module-preview.json"
+        module = self.invoke("module", [
+            "bash", str(REPO_ROOT / "modules" / "ubs-rust.sh"), "--ci", "--no-cargo",
+            "--format=json", f"--report-json={ledger}", f"--emit-findings-json={preview}",
+            str(self.project),
+        ])
+        self.assertEqual(module.returncode, 1, module.stdout + module.stderr)
+        raw = self.read_jsonl(ledger.read_text(encoding="utf-8"))
+        self.assertEqual(identities(raw, raw=True), expected)
+        aggregates = [row for row in self.read_json(preview)["findings"]
+                      if row["severity"] == "critical" and row["count"] == 8]
+        self.assertTrue(aggregates)
+        self.assertEqual(len(aggregates[0]["samples"]), 3)
+
+        for fmt in ("json", "jsonl", "sarif", "text"):
+            with self.subTest(format=fmt):
+                report = self.root / f"{fmt}-report.json"
+                beads = self.root / f"{fmt}-beads.jsonl"
+                proc = self.scan(fmt, f"--report-json={report}", f"--beads-jsonl={beads}", fmt=fmt)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                doc = self.read_json(report)
+                self.assertEqual(doc["status"], "ok")
+                self.assertEqual(doc["failed_modules"], [])
+                scanner = next(row for row in doc["scanners"] if row["language"] == "rust")
+                self.assertIs(scanner["findings_sink"], True)
+                self.assertEqual(scanner["critical"], 8)
+                self.assertEqual(doc["totals"]["critical"], 8)
+                self.assertEqual(identities(doc["findings"]), expected)
+                relevant = [row for row in doc["findings"] if row["rule_id"] == rule]
+                self.assertEqual(len(relevant), 8)
+                self.assertTrue(all(row["message"] and len(row["fingerprint"]) == 16 for row in relevant))
+                beads_rows = self.read_jsonl(beads.read_text(encoding="utf-8"))
+                self.assertEqual(identities([row for row in beads_rows if row["type"] == "finding"]), expected)
+                if fmt == "json":
+                    primary = decode_report(self, proc.stdout)
+                    for key in ("status", "totals", "findings"):
+                        self.assertEqual(primary[key], doc[key])
+                elif fmt == "jsonl":
+                    self.assertEqual(identities([row for row in self.read_jsonl(proc.stdout)
+                                                 if row["type"] == "finding"]), expected)
+                elif fmt == "sarif":
+                    sarif = decode_report(self, proc.stdout)
+                    results = [row for run in sarif["runs"] for row in run["results"]
+                               if row["ruleId"] == rule]
+                    actual = set()
+                    fingerprints = {row["line"]: row["fingerprint"] for row in relevant}
+                    for row in results:
+                        location = row["locations"][0]["physicalLocation"]
+                        line = location["region"]["startLine"]
+                        actual.add((row["ruleId"], Path(unquote(location["artifactLocation"]["uri"])).name,
+                                    line, {"error": "critical", "warning": "warning", "note": "info"}[row["level"]]))
+                        self.assertEqual(row["partialFingerprints"]["ubs/v1"], fingerprints[line])
+                    self.assertEqual(actual, expected)
+
+        source.write_text("use std::sync::Mutex;\n"
+                          "pub fn read(lock: &Mutex<i32>) -> i32 {\n"
+                          "    *lock.lock().unwrap()\n}\n", encoding="utf-8")
+        for strict in (False, True):
+            proc = self.scan("warning-strict" if strict else "warning-default",
+                             *(["--fail-on-warning"] if strict else []))
+            self.assertEqual(proc.returncode, 1 if strict else 0, proc.stdout + proc.stderr)
+            doc = decode_report(self, proc.stdout)
+            self.assertEqual(doc["status"], "ok")
+            self.assertTrue(any(row["severity"] == "warning" and row["line"] == 3
+                                for row in doc["findings"]))
+        source.write_text("pub fn identity(value: i32) -> i32 { value }\n", encoding="utf-8")
+        proc = self.scan("clean", "--fail-on-warning")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        doc = decode_report(self, proc.stdout)
+        self.assertEqual(doc["status"], "ok")
+        self.assertEqual((doc["totals"]["critical"], doc["totals"]["warning"]), (0, 0))
+
+    def test_public_schemas_describe_and_validate_canonical_findings(self) -> None:
+        from jsonschema import Draft202012Validator
+
+        schemas = {}
+        for fmt in ("json", "jsonl"):
+            proc = self.invoke("schema-" + fmt, [str(REPO_ROOT / "ubs"), "--schema=" + fmt])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            schemas[fmt] = decode_report(self, proc.stdout)
+            Draft202012Validator.check_schema(schemas[fmt])
+        schema = schemas["json"]
+        properties = schema["$defs"]["report"]["properties"]
+        self.assertIn("findings", properties)
+        self.assertEqual(properties["findings"]["type"], "array")
+        item = properties["findings"]["items"]
+        if "$ref" in item:
+            item = schema["$defs"][item["$ref"].rsplit("/", 1)[-1]]
+        fields = {"lang", "rule_id", "category_id", "severity", "file", "line", "col",
+                  "message", "fingerprint", "suppressed", "scope", "count", "extras"}
+        self.assertTrue(fields <= item["properties"].keys())
+        self.assertEqual(schema["$defs"]["scanner"]["properties"]["findings_sink"]["type"], "boolean")
+        line_properties = schemas["jsonl"]["$defs"]["finding_line"]["properties"]
+        self.assertTrue((fields - {"lang"} | {"language"}) <= line_properties.keys())
+
+        finding = {"lang": "rust", "rule_id": "rust.example", "severity": "warning",
+                   "file": "source.rs", "line": 2, "col": 1, "message": "example",
+                   "fingerprint": "0123456789abcdef", "suppressed": False}
+        counts = {"files": 1, "critical": 0, "warning": 1, "info": 0}
+        report = {"project": ".", "timestamp": "2026-01-01T00:00:00Z", "status": "ok",
+                  "failed_modules": [], "totals": counts, "findings": [finding],
+                  "scanners": [{"language": "rust", "status": "ok", "findings_sink": True, **counts}]}
+        jsonl = {key: value for key, value in finding.items() if key != "lang"}
+        jsonl.update(type="finding", project=".", language="rust", title="example", count=1)
+        validators = {fmt: Draft202012Validator(doc) for fmt, doc in schemas.items()}
+        validators["json"].validate(report)
+        validators["jsonl"].validate(jsonl)
+        for key, invalid in (("rule_id", 1), ("file", []), ("line", "2"),
+                             ("severity", "unknown"), ("suppressed", "false")):
+            with self.subTest(field=key):
+                bad_report = {**report, "findings": [{**finding, key: invalid}]}
+                self.assertFalse(validators["json"].is_valid(bad_report))
+                self.assertFalse(validators["jsonl"].is_valid({**jsonl, key: invalid}))
+
+    def test_missing_v2_rust_ledger_is_incomplete_not_a_successful_empty_report(self) -> None:
+        (self.project / "probe.rs").write_text("pub fn identity(value: i32) -> i32 { value }\n", encoding="utf-8")
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        stub = bin_dir / "ubs-rust"
+        stub.write_text(r'''#!/usr/bin/env bash
+if [[ "${1:-}" == --help ]]; then echo 'contract: v2'; exit 0; fi
+format=text
+report=
+mode="${UBS_TEST_RUST_LEDGER_MODE:-missing}"
+warning=1
+for arg in "$@"; do
+  case "$arg" in
+    --format=*) format="${arg#*=}" ;;
+    --report-json=*) report="${arg#*=}" ;;
+  esac
+done
+[[ "$mode" == aggregate ]] && warning=3
+[[ "$mode" == clean-* ]] && warning=0
+if [[ -n "$report" ]]; then
+  case "$mode" in
+    missing|clean-missing) ;;
+    empty|clean-empty) : > "$report" ;;
+    summary) printf '%s\n' '{"language":"rust","files":1,"critical":0,"warning":1,"info":0}' > "$report" ;;
+    suppressed) printf '%s\n' '{"rule":"rust.ledger-probe","path":"probe.rs","line":1,"severity":"warning","suppressed":true}' > "$report" ;;
+    zero-project) printf '%s\n' '{"rule":"rust.ledger-probe","path":"","line":0,"severity":"info","scope":"project","count":0}' > "$report" ;;
+    zero-aggregate) printf '%s\n' '{"rule":"rust.ledger-probe","path":"","line":0,"severity":"warning","scope":"project_aggregate","count":0}' > "$report" ;;
+    info-only) printf '%s\n' '{"rule":"rust.ledger-probe","path":"probe.rs","line":1,"severity":"info"}' > "$report" ;;
+    default-severity) printf '%s\n' '{"rule":"rust.ledger-probe","path":"probe.rs","line":1,"message":"evidence"}' > "$report" ;;
+    aggregate) printf '%s\n' '{"rule":"rust.ledger-probe","path":"","line":0,"severity":"warning","scope":"project_aggregate","count":3,"message":"evidence"}' > "$report" ;;
+    valid) printf '%s\n' '{"rule":"rust.ledger-probe","path":"probe.rs","line":1,"severity":"warning","message":"evidence"}' > "$report" ;;
+  esac
+fi
+if [[ "$format" == json ]]; then
+  printf '{"language":"rust","project":".","files":1,"critical":0,"warning":%s,"info":0,"timestamp":"2026-01-01T00:00:00Z","status":"ok"}\n' "$warning"
+else
+  printf 'UBS module: rust (contract v2)\nFiles scanned: 1\nCritical issues: 0\nWarning issues: %s\nInfo items: 0\n' "$warning"
+fi
+''', encoding="utf-8")
+        stub.chmod(0o755)
+        env = {**self.env, "PATH": str(bin_dir) + os.pathsep + self.env.get("PATH", "")}
+        cases = (("missing", "json"), ("empty", "jsonl"), ("summary", "sarif"), ("missing", "text"),
+                 ("suppressed", "json"), ("zero-project", "json"), ("zero-aggregate", "json"), ("info-only", "json"))
+        for mode, fmt in cases:
+            with self.subTest(mode=mode, format=fmt):
+                label = f"lost-{mode}-{fmt}"
+                report = self.root / f"{label}.json"
+                proc = self.scan(label, f"--report-json={report}", fmt=fmt,
+                                 env={**env, "UBS_TEST_RUST_LEDGER_MODE": mode})
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                doc = self.read_json(report)
+                self.assertNotEqual(doc["status"], "ok")
+                scanner = next(row for row in doc["scanners"] if row["language"] == "rust")
+                self.assertEqual(scanner["warning"], 1)
+                self.assertEqual(scanner["module_error"], "MODULE_MISSING_FINDINGS")
+                self.assertTrue(any(row.get("module_error") == "MODULE_MISSING_FINDINGS"
+                                    for row in doc["failed_modules"]))
+                if fmt == "jsonl":
+                    self.assertTrue(any(row.get("status") == "partial" for row in self.read_jsonl(proc.stdout)))
+                elif fmt == "sarif":
+                    sarif = decode_report(self, proc.stdout)
+                    self.assertTrue(any(inv.get("executionSuccessful") is False
+                                        for run in sarif["runs"] for inv in run.get("invocations", [])))
+                print(f"[rust-findings:{label}] PASS", flush=True)
+
+        for mode in ("valid", "default-severity", "aggregate", "clean-empty", "clean-missing"):
+            with self.subTest(control=mode):
+                proc = self.scan("control-" + mode, env={**env, "UBS_TEST_RUST_LEDGER_MODE": mode})
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                doc = decode_report(self, proc.stdout)
+                self.assertEqual(doc["status"], "ok")
+                self.assertEqual(doc["failed_modules"], [])
+                expected = 0 if mode.startswith("clean-") else 3 if mode == "aggregate" else 1
+                self.assertEqual(doc["totals"]["warning"], expected)
+                if expected:
+                    self.assertTrue(any(row["rule_id"] == "rust.ledger-probe" for row in doc["findings"]))
+        proc = self.scan("plain-text", fmt="text", env={**env, "UBS_TEST_RUST_LEDGER_MODE": "missing"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+        (self.project / "buggy.py").write_text("def run(user):\n    return eval(user)\n", encoding="utf-8")
+        proc = self.scan("mixed", "--only=python,rust",
+                         env={**env, "ENABLE_UV_TOOLS": "0", "UBS_TEST_RUST_LEDGER_MODE": "missing"})
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        doc = decode_report(self, proc.stdout)
+        scanner = next(row for row in doc["scanners"] if row["language"] == "rust")
+        self.assertEqual(scanner["warning"], 1)
+        self.assertEqual(scanner["module_error"], "MODULE_MISSING_FINDINGS")
+        self.assertTrue(any(row["lang"] == "python" and row["rule_id"] == "py.security.eval-exec-usage"
+                            and row["line"] == 2 and row["severity"] == "critical" for row in doc["findings"]))
+
+
 class FindingsMergeFailureIntegrationTests(unittest.TestCase):
     """Drive the real runner with a module whose ledger fails validation."""
 

@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.85-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.86-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -559,6 +559,33 @@ ubs . --ci --format=sarif --output=report.sarif \
 ```
 
 Every rendering shares the same findings, baseline filtering, and scan-completion state. Partial scans still export the available evidence and retain exit 2; an empty scan exports its explicit no-coverage result and retains exit 3. A failed additional export exits 2, names the failed path, preserves its previous report, and still attempts the other requested exports.
+
+Contract-v2 scanners, including Rust, publish their canonical findings in the
+combined JSON report's **top-level `findings` array**. Select a scanner's records
+by `lang`:
+
+```bash
+jq '.findings[]? | select(.lang == "rust")' report.json
+```
+
+`scanners[]` holds per-language counts and completion status. Its optional
+`findings` arrays are aggregate previews; Rust does not need to supply one.
+`findings_sink: true` means that scanner supplied records to the canonical
+ledger, whose retained records may be empty after `--new-only` filtering.
+Consumers should use the top-level ledger rather than require a per-scanner
+array or combine both representations. An ordinary report with no findings may
+omit the top-level array; check `status`, `failed_modules` and the exit code
+before treating an empty result as a completed clean scan. Aggregate records
+can carry a `count`, so array length need not equal the severity totals.
+
+| Output | Finding location |
+|--------|------------------|
+| `--format=json`, `--report-json=FILE`, `--also=json:FILE` | Top-level `findings[]`, with `lang` identifying the scanner |
+| `--format=jsonl`, `--beads-jsonl=FILE`, `--also=jsonl:FILE` | `type: "finding"` records, with `language` identifying the scanner |
+| `--format=sarif`, `--also=sarif:FILE` | `runs[].results[]`, grouped by scanner language |
+
+These export flags also collect finding details when the primary output is
+text. `--jsonl-summary-only` explicitly omits individual JSONL finding records.
 
 Detailed JSONL preserves the public canonical finding fields, including nested
 analyzer evidence in `extras` (such as an ordered `extras.taint_path`), project

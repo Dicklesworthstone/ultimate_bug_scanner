@@ -68,9 +68,15 @@ _STDIN_METHODS = {
 _STDIN_READERS = {f'{stream}.{method}': stream
                   for stream, methods in _STDIN_METHODS.items() for method in methods}
 _STDIN_ITERATORS = {f'{stream}.__iter__': stream for stream in _STDIN_STREAMS}
+_STDIN_BUFFER_WRITERS = {
+    f'{stream}.{method}': stream
+    for stream in _STDIN_STREAMS if stream.endswith(('.buffer', '.raw'))
+    for method in ('readinto', 'readinto1') if method == 'readinto' or stream.endswith('.buffer')
+}
 _STDIN_UNMODELED = frozenset(f'{stream}.{method}' for stream in _STDIN_STREAMS
-                            for method in ('readinto', 'readinto1', 'detach'))
-_STDIN_API_NAMES = frozenset(_STDIN_READERS) | frozenset(_STDIN_ITERATORS) | _STDIN_UNMODELED
+                            for method in ('detach',))
+_STDIN_API_NAMES = (frozenset(_STDIN_READERS) | frozenset(_STDIN_ITERATORS)
+                    | frozenset(_STDIN_BUFFER_WRITERS) | _STDIN_UNMODELED)
 _STDIN_EAGER_PARSERS = frozenset({'json.load', 'tomllib.load'})
 _STDIN_CSV_PARSERS = frozenset({'csv.reader', 'csv.DictReader'})
 _STDIN_PARSER_CARRIERS = (_STDIN_EAGER_PARSERS | _STDIN_CSV_PARSERS | _STDIN_STREAMS
@@ -78,10 +84,10 @@ _STDIN_PARSER_CARRIERS = (_STDIN_EAGER_PARSERS | _STDIN_CSV_PARSERS | _STDIN_STR
 _STDIN_OPAQUE_ARGUMENTS = '@stdin:opaque-arguments'
 _SOURCE_MEMBERS = {'os': frozenset({'getenv', 'getenvb', 'environ', 'environb'}),
                    'sys': frozenset({'argv', 'stdin', '__stdin__'}),
-                   'builtins': frozenset({'iter', 'list', 'tuple', 'next'}),
+                   'builtins': frozenset({'iter', 'list', 'tuple', 'next', 'bytearray'}),
                    'json': frozenset({'load', 'loads', 'JSONDecoder', '_default_decoder'}),
                    'tomllib': frozenset({'load', 'loads'}),
-                   **{stream: methods | {'__iter__', 'buffer', 'raw'}
+                   **{stream: methods | {'__iter__', 'buffer', 'raw', 'readinto', 'readinto1'}
                       for stream, methods in _STDIN_METHODS.items()}}
 # Keep a precise prefix plus an aggregate unknown-length suffix in summaries.
 _MAX_VECTOR_CONTEXT = 16
@@ -464,6 +470,13 @@ class _CsvReader:
     stream: str
     dictionary: bool = False
     input_header: bool = False
+    format_safe: bool = True
+
+
+@dataclass(frozen=True)
+class _ByteBuffer:
+    """Exact native bytearray storage; facts and aliases live in the heap."""
+    empty: bool = False
     format_safe: bool = True
 
 
@@ -1003,7 +1016,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'globals', 'builtins', 'staticmethod', 'classmethod',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -1069,6 +1082,10 @@ def _without_object_contract(binding):
             raise AnalysisLimit('HTTP client mutation or escape is unresolved; analysis is incomplete')
         if isinstance(value, _CsvReader):
             raise AnalysisLimit('CSV reader mutation or escape is unresolved; analysis is incomplete')
+        if isinstance(value, _ByteBuffer):
+            # Content writes retain the native type, but a resize invalidates
+            # the allocation's original empty-capacity proof.
+            value = _ByteBuffer(format_safe=value.format_safe)
         if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance,
                               _LiteralMethodInstance, _ProcessInput, ast.ClassDef)):
             value = None
@@ -1906,6 +1923,9 @@ class FunctionSummary:
     # Request value identities only when a program/option/argv operation needs
     # them. Ordinary data and unrelated defaults share the same summary.
     value_parameters: frozenset[str] = frozenset()
+    # A symbolic readinto buffer needs a concrete writable-storage context.
+    # Defer this obligation instead of quarantining every helper context.
+    buffer_parameters: frozenset[str] = frozenset()
     # Final contents of written incoming cells and newly escaping cells.
     # Unlike object mutations, these may replace a value or delete its name.
     cells: tuple = ()
@@ -2031,6 +2051,7 @@ class _Flow:
         self.context_globals = ()
         self.capture_globals = set()
         self.value_parameters = set()
+        self.buffer_parameters = set()
         self.observed_global_writes = None
         self.deferred_generator_depth = 0
         self.materialized_generator_depth = 0
@@ -3332,7 +3353,7 @@ class _Flow:
     def unproved_producer(binding):
         return any(isinstance(value, _UnprovedProducer)
                    or isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance,
-                                         _CsvReader)) and not value.format_safe
+                                         _CsvReader, _ByteBuffer)) and not value.format_safe
                    for value in _binding_choices(binding))
 
     @staticmethod
@@ -3403,6 +3424,8 @@ class _Flow:
                 value = _LiteralMethodInstance(value.owner, value.function, False)
             elif isinstance(value, _CsvReader):
                 value = _CsvReader(value.stream, value.dictionary, value.input_header, False)
+            elif isinstance(value, _ByteBuffer):
+                value = _ByteBuffer(value.empty, False)
             elif isinstance(value, str) and value in _STDIN_PARSER_CARRIERS:
                 value = _BoundCallable(value, NO_REFERENCES, namespace_proven=True,
                                        producer_unproved=True)
@@ -4974,6 +4997,29 @@ class _Flow:
         """Finite read/iteration contracts; None leaves ordinary calls alone."""
         native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
         arguments, keywords = inputs.arguments, inputs.keywords
+        if native and name in {'bytearray', 'builtins.bytearray'}:
+            positions = self.call_positions(node, arguments, state)
+            if (len(positions) > 1 or keywords
+                    or not (self.stdin_parser_stable(node, members={'bytearray'})
+                            or self.generator_consumer_stable(node, {'bytearray'}))
+                    or isinstance(target, _BoundCallable) and target.producer_unproved):
+                return None
+            empty = True
+            if positions:
+                operand, _fact, binding, _refs = positions[0]
+                self.require_value(binding)
+                choices = _binding_choices(binding)
+                if (isinstance(operand, (ast.Starred, _ArgumentExpansion)) or not choices
+                        or not all(isinstance(value, ast.Constant)
+                                   and (type(value.value) is bytes
+                                        or type(value.value) in {int, bool} and value.value >= 0)
+                                   for value in choices)):
+                    return None
+                empty = all(not value.value for value in choices)
+            self.expression_bindings[node] = _ByteBuffer(empty)
+            self.expression_references[node] = frozenset({node})
+            self.possible_exception(state)
+            return join_facts(*arguments)
         if native and name in _STDIN_EAGER_PARSERS:
             return self.stdin_parser(node, state, target, name, receiver, inputs)
         if native and name in _STDIN_CSV_PARSERS:
@@ -4991,10 +5037,36 @@ class _Flow:
                 return CLEAN
             if name == '@csv.__next__':
                 return self.stdin_source(reader)
+        if native and name in _STDIN_BUFFER_WRITERS:
+            positions = self.call_positions(node, arguments, state)
+            if (None in keywords or any(isinstance(operand, (ast.Starred, _ArgumentExpansion))
+                                        for operand, _fact, _value, _refs in positions)):
+                raise AnalysisLimit('stdin buffer mutation argument expansion is unresolved; analysis is incomplete')
+            self.possible_exception(state)
+            if len(positions) != 1 or keywords:
+                return CLEAN  # Native readers take one positional-only buffer.
+            _operand, _fact, binding, references = positions[0]
+            self.require_value(binding)
+            choices = _binding_choices(binding)
+            if choices and all(isinstance(value, _SymbolicValue) for value in choices):
+                self.buffer_parameters.update(value.parameter for value in choices)
+                return CLEAN
+            if (not choices or not references or not all(isinstance(value, _ByteBuffer)
+                                                        and value.format_safe for value in choices)
+                    or isinstance(target, _BoundCallable) and target.producer_unproved):
+                raise AnalysisLimit('stdin buffer mutation or detachment is unmodeled: '
+                                    'writable buffer identity or producer effects are unresolved; '
+                                    'analysis is incomplete')
+            if not all(value.empty for value in choices):
+                # The result is a byte count; data enters the caller's shared
+                # allocation, including aliases and exceptional continuations.
+                self.mutate(references, self.stdin_source(_STDIN_BUFFER_WRITERS[name]), state)
+                self.possible_exception(state)
+            self.expression_bindings[node] = None
+            self.expression_references[node] = NO_REFERENCES
+            return CLEAN
         if native and name in _STDIN_UNMODELED:
-            # readinto mutates a caller-owned buffer; detach transfers an
-            # underlying stream and invalidates its old owner. Neither is a
-            # read-result contract, so do not silently drop those effects.
+            # Detachment transfers ownership and invalidates the old stream.
             raise AnalysisLimit('stdin buffer mutation or detachment is unmodeled; analysis is incomplete')
         if native and name in _STDIN_READERS:
             positions = self.call_positions(node, arguments, state)
@@ -6713,7 +6785,7 @@ class _Flow:
                         or _same_witness(binding, nominal)):
                     continue
                 if any(isinstance(value, (str, _LiteralString, _GeneratorString, _UnprovedProducer,
-                                          _LiteralMapping, _ArgumentVector, _ProcessInput,
+                                          _LiteralMapping, _ArgumentVector, _ProcessInput, _ByteBuffer,
                                           _LiteralMethodInstance,
                                           _FunctionValue, _ClosureValue,
                                           ast.FunctionDef, ast.AsyncFunctionDef,
@@ -6751,6 +6823,13 @@ class _Flow:
                 for value in _binding_choices(values.get(name)):
                     if isinstance(value, _SymbolicValue):
                         self.value_parameters.add(value.parameter)
+            for name in summary.buffer_parameters:
+                choices = _binding_choices(values.get(name))
+                if choices and all(isinstance(value, _SymbolicValue) for value in choices):
+                    self.buffer_parameters.update(value.parameter for value in choices)
+                else:
+                    raise AnalysisLimit('stdin buffer mutation helper requires a proven writable buffer; '
+                                        'analysis is incomplete')
             substitute = _CallSubstitution(self.substitute_trace, bound, call_name, self.engine.budget)
             for kind, line, column, label, fact in summary.effects:
                 propagated = substitute(fact)
@@ -6819,7 +6898,7 @@ class _Flow:
             # the caller's distinct generator/closure cells.
             format_frame_inert = (bool(self.materialized_generator_depth) or not any(
                 isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _LiteralMethodInstance,
-                                   _ArgumentVector, _LiteralMapping, _CsvReader,
+                                   _ArgumentVector, _LiteralMapping, _CsvReader, _ByteBuffer,
                                    _SymbolicValue, ast.Constant))
                 or isinstance(value, str) and value in _STDIN_PARSER_CARRIERS
                 or isinstance(value, _BoundCallable) and (
@@ -7122,7 +7201,7 @@ class _Flow:
                 if {'functools', _PARTIAL_CHANGED_MODULE} & _binding_choices(value) and name not in {
                         'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr'}:
                     self.mutate(frozenset({_PARTIAL_MODULE_REF}), CLEAN, state)
-                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, _LiteralJoinInstance, _LiteralMethodInstance,
+                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, _LiteralJoinInstance, _LiteralMethodInstance, _ByteBuffer,
                                            ast.ClassDef, _BoundClassMethod))
                        for choice in _binding_choices(value)) and name not in SANITIZERS and name not in {
                            'print', 'str', 'len', 'repr', 'tuple', 'list', 'bool', 'int', 'float',
@@ -7217,7 +7296,7 @@ class _Flow:
                             ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
                             _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _GeneratorString,
                             _UnprovedProducer, _LiteralMapping, _LiteralJoinInstance, _LiteralMethodInstance,
-                            _ProcessInput, ast.Constant)
+                            _ProcessInput, _ByteBuffer, ast.Constant)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
                     self.capture_globals.add((self.engine.tree, node.id))
@@ -8479,6 +8558,7 @@ class _Flow:
             exceptions=tuple(exceptions),
             capture_globals=frozenset(self.capture_globals),
             value_parameters=frozenset(self.value_parameters),
+            buffer_parameters=frozenset(self.buffer_parameters),
             cells=cells,
             multiple_cells=frozenset(cell_state.cells.multiple)
             if cell_state is not None and cell_state.cells is not None else frozenset(),
@@ -9642,7 +9722,7 @@ class _Analysis:
                 # Partial captures may retain exact scalar options such as
                 # shell=False. Their source AST identities are finite.
                 pass
-            elif not isinstance(value, (str, _LiteralMapping, _ProcessInput, _CsvReader, ast.FunctionDef, ast.AsyncFunctionDef,
+            elif not isinstance(value, (str, _LiteralMapping, _ProcessInput, _CsvReader, _ByteBuffer, ast.FunctionDef, ast.AsyncFunctionDef,
                                         ast.Lambda, ast.ClassDef)):
                 value = _SymbolicValue(name) if captured else None
             choices.append(value)
@@ -9741,7 +9821,7 @@ class _Analysis:
                 if (binding is nominal
                         and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
                                                      _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
-                                                     _LiteralMapping, _ProcessInput, _CsvReader))
+                                                     _LiteralMapping, _ProcessInput, _CsvReader, _ByteBuffer))
                         and not explicit_override
                         and gname in owner_bindings
                         and gname not in owner_fn.locals[function]
@@ -9754,7 +9834,7 @@ class _Analysis:
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
                                            ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
                                            _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
-                                           _LiteralMapping, _ProcessInput, _CsvReader, ast.Constant))
+                                           _LiteralMapping, _ProcessInput, _CsvReader, _ByteBuffer, ast.Constant))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):
@@ -9975,6 +10055,20 @@ class _Analysis:
             owner.reads = owner.writes = None
             owner.local_journal = None
             owner.budget = total_budget
+
+    def buffer_diagnostics(self):
+        """Resolve writable-buffer obligations after all selected callers run."""
+        functions = [function for function in self.functions
+                     if self.summaries.get(function, FunctionSummary()).buffer_parameters]
+        if not functions:
+            return ()
+        self.budget.spend(len(self.summaries))
+        qualified = {key[0] for key, value in self.summaries.items()
+                     if isinstance(key, tuple) and not value.buffer_parameters
+                     and not value.incomplete}
+        reason = 'stdin buffer mutation helper has unresolved writable-buffer inputs; analysis is incomplete'
+        return tuple(self.scope_diagnostic(function, reason) for function in functions
+                     if function not in qualified or not self.generator_helper_identity(function))
 
     def _escaping_namespace_factory(self):
         """Check settled return/capture bindings once, without executing code."""
@@ -10350,6 +10444,13 @@ class _Analysis:
                 diagnostics = list(self.scope_diagnostics)
                 for items in self.failed_scope_diagnostics.values():
                     diagnostics.extend(items)
+                if self.project is None:
+                    # Selected imports may acquire concrete contexts only
+                    # when their later callers run. The project settles these
+                    # obligations once all of its components have finished.
+                    buffer_diagnostics = self.buffer_diagnostics()
+                    problems.extend(item['reason'] for item in buffer_diagnostics)
+                    diagnostics.extend(buffer_diagnostics)
                 if self._escaping_namespace_factory():
                     reason = 'globals mapping factory stored in an object; analysis is incomplete'
                     problems.append(reason)
@@ -10818,6 +10919,15 @@ class _Project:
                     failures.append(f'{names}: {exc}')
             finally:
                 self.journal.clear()
+        unresolved_buffers = []
+        for _path, _text, engine, _offset in self.sources:
+            if engine not in self.ready or engine.project is None:
+                continue
+            try:
+                unresolved_buffers.extend(engine.buffer_diagnostics())
+            except AnalysisLimit as exc:
+                unresolved_buffers.append(engine.scope_diagnostic(engine.tree, str(exc)))
+        diagnostics.extend(unresolved_buffers)
         starts = [offset for _, _, _, offset in self.sources]
         indexes = {path: build_index(text, lang='python') for path, text, _, _ in self.sources}
         for (kind, line, column, label), trace in _sink_traces(effects):
@@ -10828,6 +10938,9 @@ class _Project:
                 continue
             yield path, rule, line, column, ' -> '.join((*trace.path, label))
         problems = []
+        if unresolved_buffers:
+            problems.append(f'{len(unresolved_buffers)} buffer scope(s): '
+                            + '; '.join(item['reason'] for item in unresolved_buffers[:3]))
         if self.failed_inputs:
             omitted = (f'; and {self.failed_inputs - len(self.input_failures)} more failed inputs'
                        if self.failed_inputs > len(self.input_failures) else '')

@@ -582,6 +582,161 @@ class StdinSourceTests(SourceTest):
         with self.assertRaisesRegex(taint_py.AnalysisLimit, 'generator materialization'):
             self.scan('import sys\neval("".join(line for line in sys.stdin))\n')
 
+    def test_binary_readinto_writes_reach_each_sink_domain(self):
+        sinks = (("os.system(value)", 'command'), ("eval(value)", 'eval'),
+                 ("cursor.execute('SELECT ' + value)", 'sql'),
+                 ("HttpResponse(value)", 'xss'), ("requests.get(value)", 'ssrf'))
+        for member in ('stdin', '__stdin__'):
+            for suffix, method in (('.buffer', 'readinto'), ('.buffer', 'readinto1'),
+                                   ('.buffer.raw', 'readinto')):
+                for sink, rule in sinks:
+                    with self.subTest(member=member, suffix=suffix, method=method, sink=sink):
+                        findings = self.assert_rules(
+                            f'import sys, requests\nbuffer = bytearray(4096)\n'
+                            f'sys.{member}{suffix}.{method}(buffer)\n'
+                            f'value = buffer.decode()\n{sink}\n', rule)
+                        self.assertIn(f'sys.{member}{suffix}', findings[0]['message'])
+
+    def test_binary_readinto_native_counts_aliases_and_empty_storage(self):
+        # Exercise CPython's real stdin protocol without evaluating its data.
+        # The count is scalar, aliases observe the write, and a prior immutable
+        # copy cannot acquire data written after that copy was made.
+        for method in ('buffer.readinto', 'buffer.readinto1', 'buffer.raw.readinto'):
+            for capacity in (0, 8):
+                with self.subTest(method=method, capacity=capacity):
+                    program = ('import json,sys\n'
+                               f'buffer = bytearray({capacity})\nalias = buffer\n'
+                               'before = bytes(buffer)\n'
+                               f'count = sys.stdin.{method}(alias)\n'
+                               'print(json.dumps([count, list(buffer), list(before), alias is buffer]))\n')
+                    result = subprocess.run([sys.executable, '-I', '-c', program],
+                                            input=b'external-input', capture_output=True,
+                                            timeout=15, check=True)
+                    self.assertEqual(json.loads(result.stdout),
+                                     [capacity, list(b'external'[:capacity]), [0] * capacity, True])
+
+    def test_binary_readinto_preserves_buffer_and_reader_aliases(self):
+        cases = (
+            'alias = buffer\nsys.stdin.buffer.readinto(alias)\neval(buffer.decode())\n',
+            'alias = buffer\nsys.stdin.buffer.readinto(buffer)\neval(alias.decode())\n',
+            'read = sys.stdin.buffer.readinto\nsys = None\nread(buffer)\neval(buffer.decode())\n',
+            'from sys import stdin as stream\nread = stream.buffer.readinto1\n'
+            'stream = None\nread(buffer)\neval(buffer.decode())\n',
+            'arguments = (buffer,)\nsys.stdin.buffer.readinto(*arguments)\neval(buffer.decode())\n',
+            'sys.stdin.buffer.readinto((alias := buffer))\neval(alias.decode())\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_rules('import sys\nbuffer = bytearray(16)\n' + source, 'eval')
+        for allocation in ('builtins.bytearray(16)', 'make(16)'):
+            with self.subTest(allocation=allocation):
+                self.assert_rules('import sys, builtins\nfrom builtins import bytearray as make\n'
+                                  f'buffer = {allocation}\nsys.stdin.buffer.readinto(buffer)\n'
+                                  'eval(buffer.decode())\n', 'eval')
+        self.assert_rules('import sys\nmake = bytearray\nbytearray = lambda size: None\n'
+                          'buffer = make(16)\nsys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n', 'eval')
+
+    def test_binary_readinto_exports_mutations_from_fixed_helpers(self):
+        cases = (
+            'def fill(buffer):\n    sys.stdin.buffer.readinto(buffer)\nfill(buffer)\n',
+            'def fill(stream, buffer):\n    stream.readinto(buffer)\nfill(sys.stdin.buffer, buffer)\n',
+            'def fill(read, buffer):\n    read(buffer)\nfill(sys.stdin.buffer.readinto, buffer)\n',
+            'def fill(buffer, read=sys.stdin.buffer.readinto):\n    read(buffer)\nfill(buffer)\n',
+            'def fill():\n    sys.stdin.buffer.readinto(buffer)\nfill()\n',
+            'def fill(buffer):\n    sys.stdin.buffer.readinto(buffer)\n'
+            'def forward(buffer):\n    fill(buffer)\nforward(buffer)\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_rules('import sys\nbuffer = bytearray(16)\n' + source
+                                  + 'eval(buffer.decode())\n', 'eval')
+        self.assert_rules('import sys\ndef consume():\n    buffer = bytearray(16)\n'
+                          '    sys.stdin.buffer.readinto(buffer)\n    eval(buffer.decode())\nconsume()\n', 'eval')
+
+    def test_binary_readinto_count_empty_storage_and_unrelated_data_stay_clean(self):
+        for allocation in ('bytearray()', 'bytearray(0)', 'bytearray(False)', 'bytearray(b"")'):
+            with self.subTest(allocation=allocation):
+                self.assert_rules('import sys\n' + f'buffer = {allocation}\n'
+                                  'sys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n')
+        self.assert_rules('import sys\nbuffer = bytearray(16)\n'
+                          'count = sys.stdin.buffer.readinto(buffer)\nHttpResponse(str(count))\n')
+        self.assert_rules('import sys\nbuffer = bytearray(16)\nother = bytearray(b"1")\n'
+                          'sys.stdin.buffer.readinto(buffer)\neval(other.decode())\n')
+        self.assert_rules('import sys\nbuffer = bytearray(b"1")\ncopy = bytes(buffer)\n'
+                          'sys.stdin.buffer.readinto(buffer)\neval(copy.decode())\n')
+        self.assert_rules('import sys\nbuffer = bytearray(16)\nsys.stdin.buffer.readinto(buffer)\n'
+                          'buffer = bytearray(b"1")\neval(buffer.decode())\n')
+        self.assert_rules('import sys\ndef fill(buffer):\n    sys.stdin.buffer.readinto(buffer)\n'
+                          'buffer = bytearray()\nfill(buffer)\neval(buffer.decode())\n')
+
+    def test_binary_readinto_selected_helper_modules_specialize_before_qualification(self):
+        for capacity, expected in ((0, []), (16, ['python.taint.eval'])):
+            with self.subTest(capacity=capacity), temporary_directory(prefix='ubs-readinto-modules-') as directory:
+                root = Path(directory)
+                helper, caller = root / 'reader.py', root / 'app.py'
+                helper.write_text('import sys\ndef fill(buffer):\n    sys.stdin.buffer.readinto(buffer)\n',
+                                  encoding='utf-8')
+                caller.write_text('from reader import fill\n' + f'buffer = bytearray({capacity})\n'
+                                  + 'fill(buffer)\neval(buffer.decode())\n', encoding='utf-8')
+                findings = list(taint_py.run(RunContext(lang='python', files=[caller, helper])))
+                self.assertEqual([finding['rule'] for finding in findings], expected, findings)
+                if findings:
+                    self.assertEqual(findings[0]['path'], str(caller))
+                    self.assertEqual(findings[0]['line'], 4)
+
+    def test_binary_readinto_resizing_and_control_flow_keep_possible_writes(self):
+        self.assert_rules('import sys\nbuffer = bytearray()\nalias = buffer\nalias.extend(b" ")\n'
+                          'sys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n', 'eval')
+        self.assert_rules('import sys\nbuffer = bytearray(16)\nif enabled:\n'
+                          '    sys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n', 'eval')
+        self.assert_rules('import sys\nif enabled:\n    buffer = bytearray()\n'
+                          'else:\n    buffer = bytearray(16)\nsys.stdin.buffer.readinto(buffer)\n'
+                          'eval(buffer.decode())\n', 'eval')
+        self.assert_rules('import sys\nbuffer = bytearray(16)\ntry:\n'
+                          '    sys.stdin.buffer.readinto(buffer)\nexcept OSError:\n'
+                          '    eval(buffer.decode())\n', 'eval')
+
+    def test_binary_readinto_respects_bound_data_and_sanitizer_domains(self):
+        prefix = ('import sys, html, shlex\nbuffer = bytearray(16)\n'
+                  'sys.stdin.buffer.readinto(buffer)\nvalue = buffer.decode()\n')
+        self.assert_rules(prefix + "cursor.execute('SELECT ?', (value,))\n")
+        self.assert_rules(prefix + 'HttpResponse(html.escape(value))\n')
+        self.assert_rules(prefix + "os.system('printf %s ' + shlex.quote(value))\n")
+        self.assert_rules(prefix + 'eval(html.escape(value))\n', 'eval')
+
+    def test_binary_readinto_invalid_calls_and_unrelated_names_do_not_write(self):
+        for call in ('sys.stdin.buffer.readinto()', 'sys.stdin.buffer.readinto(b=buffer)',
+                     'sys.stdin.buffer.readinto(buffer, 1)', 'sys.stdin.readinto(buffer)',
+                     'sys.stdin.buffer.raw.readinto1(buffer)', 'sys.stdout.buffer.readinto(buffer)',
+                     'sys.stdin.buffer.READINTO(buffer)'):
+            with self.subTest(call=call):
+                self.assert_rules('import sys\nbuffer = bytearray(16)\n' + call
+                                  + '\neval(buffer.decode())\n')
+        self.assert_rules('from . import sys\nbuffer = bytearray(16)\n'
+                          'sys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n')
+        self.assert_rules('import sys\nread = sys.stdin.buffer.readinto\nread = lambda b: 0\n'
+                          'buffer = bytearray(16)\nread(buffer)\neval(buffer.decode())\n')
+
+    def test_binary_readinto_unknown_buffers_and_mutated_native_apis_stay_incomplete(self):
+        for buffer in ('unknown()', '[]', 'b"fixed"', 'memoryview(bytearray(16))', 'bytearray(size)'):
+            with self.subTest(buffer=buffer), self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin buffer mutation'):
+                self.scan('import sys\nbuffer = ' + buffer + '\nsys.stdin.buffer.readinto(buffer)\n')
+        for setup in ('builtins.bytearray = replacement',
+                      'sys.stdin.buffer.readinto = replacement',
+                      'sys.stdin.buffer.readinto1 = replacement'):
+            with self.subTest(setup=setup), self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdlib source member mutation'):
+                self.scan('import sys, builtins\n' + setup + '\nbuffer = bytearray(16)\n'
+                          'sys.stdin.buffer.readinto(buffer)\n')
+        for call in ('sys.stdin.buffer.readinto(*arguments)', 'sys.stdin.buffer.readinto(buffer, **options)'):
+            with self.subTest(call=call), self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin buffer mutation argument'):
+                self.scan('import sys\nbuffer = bytearray(16)\n' + call + '\n')
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin buffer mutation'):
+            self.scan('import sys\ndef make():\n    owned = Owner()\n    return bytearray(16)\n'
+                      'buffer = make()\nsys.stdin.buffer.readinto(buffer)\neval(buffer.decode())\n')
+        for invocation in ('', 'fill(unknown())\n', 'register(fill)\nfill(bytearray(16))\n'):
+            with self.subTest(invocation=invocation), self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin buffer mutation'):
+                self.scan('import sys\ndef fill(buffer):\n    sys.stdin.buffer.readinto(buffer)\n' + invocation)
+
     def test_stdin_join_keeps_captured_receiver_producer_obligations(self):
         prefix = ("import sys\ncode = 'fixed'\nclass Owned:\n"
                   + '    def __del__(self):\n        global code\n        code = input()\n'
@@ -1292,6 +1447,37 @@ class SuppressionTests(SourceTest):
 
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 to run real runner integration')
 class RunnerIntegrationTests(unittest.TestCase):
+    def test_readinto_json_and_sarif(self):
+        prefix = ('import sys\ndef fill(buffer):\n    sys.stdin.buffer.readinto(buffer)\n'
+                  'buffer = bytearray(64)\nfill(buffer)\n')
+        cases = ((prefix + 'cursor.execute(buffer.decode())\n', True),
+                 (prefix + "cursor.execute('SELECT ?', (buffer.decode(),))\n", False),
+                 ('import sys\nbuffer = bytearray()\nsys.stdin.buffer.readinto(buffer)\n'
+                  'cursor.execute(buffer.decode())\n', False))
+        for source, expected in cases:
+            with temporary_directory(prefix='ubs-readinto-cli-') as directory:
+                path = Path(directory) / 'view.py'
+                path.write_text(source, encoding='utf-8')
+                for output in ('json', 'sarif'):
+                    with self.subTest(source=source, format=output):
+                        result = subprocess.run(
+                            [str(ROOT / 'ubs'), str(path), '--only=python', '--ci', f'--format={output}'],
+                            cwd=directory, env=dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1'),
+                            capture_output=True, text=True, timeout=180)
+                        self.assertIn(result.returncode, (0, 1), result.stdout + result.stderr)
+                        report = json.loads(result.stdout)
+                        if output == 'json':
+                            self.assertEqual(report.get('status'), 'ok', report)
+                            findings = [finding for finding in report.get('findings', [])
+                                        if finding['rule_id'] in {'py.taint.sql', 'python.taint.sql'}]
+                            lines = [finding['line'] for finding in findings]
+                        else:
+                            findings = [finding for run in report['runs'] for finding in run.get('results', [])
+                                        if finding['ruleId'] in {'py.taint.sql', 'python.taint.sql'}]
+                            lines = [finding['locations'][0]['physicalLocation']['region']['startLine']
+                                     for finding in findings]
+                        self.assertEqual(lines, [6] if expected else [], report)
+
     def test_runner_emits_taint_findings_and_safe_parameter_control(self):
         for code, expected in (("q=html.escape(input())\ncursor.execute(q)\n", True),
                                ("q=input()\ncursor.execute('select %s', (q,))\n", False),
@@ -1301,6 +1487,12 @@ class RunnerIntegrationTests(unittest.TestCase):
                                ("import sys\ncursor.execute('SELECT ' + sys.stdin.read())\n", True),
                                ("from sys import stdin as stream\ncursor.execute(stream.readline())\n", True),
                                ("import sys\ncursor.execute(sys.stdin.buffer.read().decode())\n", True),
+                               ("import sys\nbuffer=bytearray(64)\nsys.stdin.buffer.readinto(buffer)\n"
+                                "cursor.execute(buffer.decode())\n", True),
+                               ("import sys\ndef fill(buffer):\n    sys.stdin.buffer.readinto1(buffer)\n"
+                                "buffer=bytearray(64)\nfill(buffer)\ncursor.execute(buffer.decode())\n", True),
+                               ("import sys\nbuffer=bytearray(64)\nsys.stdin.buffer.readinto(buffer)\n"
+                                "cursor.execute('SELECT ?', (buffer.decode(),))\n", False),
                                ("import sys\nfor line in sys.stdin:\n    cursor.execute(line)\n", True),
                                ("import sys\nargs = (sys.stdin,)\ncursor.execute(next(*args))\n", True),
                                ("import sys\ncursor.execute('SELECT %s', (sys.stdin.read(),))\n", False),

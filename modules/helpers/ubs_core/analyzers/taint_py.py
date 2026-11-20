@@ -202,7 +202,14 @@ _HTTP_CLIENT_MEMBERS = {
     **{constructor: frozenset(_HTTP_CLIENT_METHODS[kind]) | {
         'send', '__init__', '__enter__', '__aenter__', 'build_request', 'prepare_request'}
        for constructor, kind in _HTTP_CLIENT_CONSTRUCTORS.items()},
+    'urllib': frozenset({'request'}),
+    'urllib.request': frozenset({'Request', 'urlopen', 'urlretrieve', 'build_opener',
+                                 'install_opener', 'OpenerDirector', '_opener'}),
+    'urllib.request.Request': frozenset({'__init__', 'full_url', 'get_full_url', 'set_proxy'}),
+    'urllib.request.OpenerDirector': frozenset({'__init__', 'open', 'add_handler'}),
 }
+_URLLIB_APIS = frozenset(f'urllib.request.{name}' for name in
+                       ('Request', 'urlopen', 'urlretrieve', 'build_opener', 'install_opener'))
 
 
 _PARAMETER_MARKERS = {
@@ -395,7 +402,17 @@ class _HTTPPending:
     streaming: bool = False
 
 
-def _http_contract(value, contract=(_HTTPClient, _HTTPPending)):
+@dataclass(frozen=True)
+class _UrllibRequest:
+    """A native Request carries its URL separately from inert handle data."""
+
+
+@dataclass(frozen=True)
+class _UrllibOpener:
+    """Only build_opener() with the native default handlers has authority."""
+
+
+def _http_contract(value, contract=(_HTTPClient, _HTTPPending, _UrllibRequest, _UrllibOpener)):
     return isinstance(value, _BoundCallable) and isinstance(value.receiver_binding, contract)
 
 
@@ -1101,7 +1118,7 @@ def _without_object_contract(binding):
 _QUALIFIER_WIDTH = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS))
 _KNOWN_QUALIFIER_PREFIXES = frozenset(
     '.'.join(qualified.split('.')[:size])
-    for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_HTTP_CLIENT_CONSTRUCTORS, 'httpx.URL',
+    for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_HTTP_CLIENT_CONSTRUCTORS, *_URLLIB_APIS, 'httpx.URL',
                       *_ALL_FRAMEWORK_NAMES, *_REQUEST_TYPES)
     for size in range(1, len(qualified.split('.')) + 1))
 
@@ -1699,7 +1716,7 @@ def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
         # Network clients and stream parsers require real import identities.
         # An unresolved relative import or local shadow cannot recover one
         # merely because its receiver has the standard library's spelling.
-        if node.id in {'requests', 'httpx', 'json', 'tomllib', 'csv'}:
+        if node.id in {'requests', 'httpx', 'urllib', 'json', 'tomllib', 'csv'}:
             return ''
         return node.id
     if isinstance(node, ast.Attribute):
@@ -2384,6 +2401,8 @@ class _Flow:
                 if not _http_contract(value):
                     raise AnalysisLimit('ambiguous HTTP context manager; analysis is incomplete')
                 contract = value.receiver_binding
+                if isinstance(contract, (_UrllibRequest, _UrllibOpener)):
+                    raise AnalysisLimit('urllib handle has no context manager protocol; analysis is incomplete')
                 asynchronous = (contract.asynchronous if isinstance(contract, _HTTPPending)
                                 else contract.kind == 'httpx.async')
                 if asynchronous != isinstance(node, ast.AsyncWith):
@@ -2437,6 +2456,10 @@ class _Flow:
         for value in _binding_choices(binding):
             if _http_contract(value):
                 raise AnalysisLimit('HTTP client storage or escape is unresolved; analysis is incomplete')
+            name = (value if isinstance(value, str) else value.name
+                    if isinstance(value, _BoundCallable) and value.namespace_proven else None)
+            if name in _URLLIB_APIS or name in {'urllib', 'urllib.request', 'urllib.request.OpenerDirector'}:
+                raise AnalysisLimit('urllib namespace or API escape is unresolved; analysis is incomplete')
             if (isinstance(value, _CsvReader) or isinstance(value, _BoundCallable)
                     and isinstance(value.receiver_binding, _CsvReader)):
                 raise AnalysisLimit('CSV reader storage or escape is unresolved; analysis is incomplete')
@@ -4413,7 +4436,8 @@ class _Flow:
                 for choice in _binding_choices(namespace):
                     name = (choice if isinstance(choice, str) else choice.name
                             if isinstance(choice, _BoundCallable) and choice.namespace_proven else None)
-                    if target.attr in _HTTP_CLIENT_MEMBERS.get(name, ()):
+                    if (target.attr in _HTTP_CLIENT_MEMBERS.get(name, ())
+                            or name in {'urllib.request.Request', 'urllib.request.OpenerDirector'}):
                         raise AnalysisLimit('HTTP client API replacement is unmodeled; analysis is incomplete')
             if isinstance(target, ast.Attribute) and any(
                     target.attr in members for members in _SOURCE_MEMBERS.values()):
@@ -6286,17 +6310,125 @@ class _Flow:
                     values.pop(original, None)
         return join_facts(*results)
 
-    def http_destination(self, node, inputs, position):
+    def http_destination(self, node, inputs, position, keyword='url'):
         """Select the URL once, preserving ambiguous expansion operands."""
         arguments, keywords = inputs.arguments, inputs.keywords
         star = next((index for index, argument in enumerate(node.args)
                      if index <= position and isinstance(argument, ast.Starred)), None)
         if star is not None:
-            return join_facts(*arguments[star:], keywords.get('url', CLEAN),
+            return join_facts(*arguments[star:], keywords.get(keyword, CLEAN),
                               keywords.get(None, CLEAN)), None
         if len(arguments) > position:
             return arguments[position], node.args[position]
-        return join_facts(keywords.get('url', CLEAN), keywords.get(None, CLEAN)), inputs.keyword_nodes.get('url')
+        return join_facts(keywords.get(keyword, CLEAN), keywords.get(None, CLEAN)), inputs.keyword_nodes.get(keyword)
+
+    def urllib_destination(self, node, inputs, state, *, keyword='url', request_allowed=True):
+        """Resolve a Request's selected URL, never its body or header fields."""
+        destination, expression = self.http_destination(node, inputs, 0, keyword)
+        value = self.expression_bindings.get(expression)
+        self.require_value(value)
+        for choice in _binding_choices(value):
+            if _http_contract(choice, _UrllibRequest):
+                if not request_allowed or choice.name != '@urllib.request':
+                    raise AnalysisLimit('urllib URL operand is not a string or Request; analysis is incomplete')
+                if choice.references & state.mutated:
+                    raise AnalysisLimit('urllib Request changed before use; analysis is incomplete')
+                destination = join_facts(destination, choice.receiver)
+            elif _http_contract(choice):
+                raise AnalysisLimit('urllib URL operand has an unsupported handle protocol; analysis is incomplete')
+            elif not (isinstance(choice, (_SymbolicValue, _LiteralString, _GeneratorString))
+                      or isinstance(choice, ast.Constant) and self.formatted_string_scalar(choice.value)):
+                # A subclass or arbitrary object can replace Request's
+                # properties. An absent aggregate taint fact does not prove
+                # that its destination/property callbacks are harmless.
+                if expression is None and destination:
+                    continue  # Preserve the conservative opaque-* URL hit.
+                if not self.urllib_url_coercion(expression, state):
+                    raise AnalysisLimit('urllib URL or Request protocol is unresolved; analysis is incomplete')
+        return destination
+
+    def urllib_url_coercion(self, expression, state):
+        """Request calls str(url); an opaque object's callback is not inert."""
+        binding = self.expression_bindings.get(expression)
+        self.require_value(binding)
+        choices = _binding_choices(binding)
+        if choices and all(
+                isinstance(value, _SymbolicValue)
+                or isinstance(value, (_LiteralString, _GeneratorString)) and value.format_safe
+                or isinstance(value, ast.Constant) and self.formatted_string_scalar(value.value)
+                for value in choices):
+            return True
+        # These selected native transforms return an exact string for an
+        # exact string operand. They protect other sink domains, not SSRF.
+        if isinstance(expression, ast.Call) and len(expression.args) == 1 and not expression.keywords:
+            callees = _binding_choices(self.expression_bindings.get(expression.func))
+            names = {value if isinstance(value, str) else value.name
+                     if isinstance(value, _BoundCallable) and value.namespace_proven else None
+                     for value in callees}
+            return (bool(names) and names <= {'html.escape', 'shlex.quote'}
+                    and self.materialized_generator_string(expression.args[0], state)
+                    and not self.unproved_producer(self.expression_bindings.get(expression.args[0])))
+        return False
+
+    def urllib_call(self, node, state, target, inputs):
+        """Native stdlib construction, saved URL readers and reached opens."""
+        name = target if isinstance(target, str) else target.name
+        if isinstance(target, _BoundCallable) and target.references & state.mutated:
+            raise AnalysisLimit('urllib receiver was mutated; analysis is incomplete')
+        if _http_contract(target, _UrllibRequest):
+            if name != '@urllib.request.get_full_url' or node.args or node.keywords:
+                raise AnalysisLimit('urllib Request callable protocol is unmodeled; analysis is incomplete')
+            self.expression_bindings[node] = _GeneratorString()
+            self.expression_references[node] = NO_REFERENCES
+            self.possible_exception(state)
+            return target.receiver
+        if name == 'urllib.request.install_opener':
+            raise AnalysisLimit('custom global urllib opener is unresolved; analysis is incomplete')
+        if name in {'urllib.request.Request', 'urllib.request.build_opener'}:
+            if None in inputs.keyword_nodes or any(isinstance(argument, ast.Starred) for argument in node.args):
+                raise AnalysisLimit('urllib constructor argument binding is unresolved; analysis is incomplete')
+            if name == 'urllib.request.build_opener':
+                if node.args or node.keywords:
+                    raise AnalysisLimit('custom urllib handlers are unresolved; analysis is incomplete')
+                destination, marker, contract = CLEAN, '@urllib.opener', _UrllibOpener()
+            else:
+                _destination, expression = self.http_destination(node, inputs, 0)
+                if not self.urllib_url_coercion(expression, state):
+                    raise AnalysisLimit('urllib URL string conversion is unresolved; analysis is incomplete')
+                headers = node.args[2] if len(node.args) > 2 else inputs.keyword_nodes.get('headers')
+                if headers is not None:
+                    binding = self.expression_bindings.get(headers)
+                    self.require_value(binding)
+                    literal = isinstance(headers, ast.Dict) and all(
+                        isinstance(key, ast.Constant) and type(key.value) is str for key in headers.keys)
+                    native = all(isinstance(choice, _LiteralMapping) and choice.keys is not None
+                                 and all(type(key) is str for key in choice.keys)
+                                 for choice in _binding_choices(binding))
+                    if not (literal or native) or self.expression_references.get(headers, NO_REFERENCES) & state.mutated:
+                        raise AnalysisLimit('urllib header iteration or key protocol is unresolved; analysis is incomplete')
+                destination = self.urllib_destination(node, inputs, state, request_allowed=False)
+                marker, contract = '@urllib.request', _UrllibRequest()
+            self.expression_bindings[node] = _BoundCallable(
+                marker, frozenset({node}), destination, True, receiver_binding=contract)
+            self.expression_references[node] = frozenset({node})
+            self.possible_exception(state)
+            return CLEAN
+        if _http_contract(target, _UrllibOpener) and name != '@urllib.opener.open':
+            raise AnalysisLimit('urllib opener callable protocol is unmodeled; analysis is incomplete')
+        destination = self.urllib_destination(
+            node, inputs, state, keyword='fullurl' if _http_contract(target, _UrllibOpener) else 'url',
+            request_allowed=name != 'urllib.request.urlretrieve')
+        self.effect('ssrf', node, 'HTTP request URL', destination)
+        if name == 'urllib.request.urlretrieve':
+            reporthook = node.args[2] if len(node.args) > 2 else inputs.keyword_nodes.get('reporthook')
+            if (None in inputs.keyword_nodes or any(isinstance(arg, ast.Starred) for arg in node.args)
+                    or reporthook is not None and not (
+                        isinstance(reporthook, ast.Constant) and reporthook.value is None)):
+                raise AnalysisLimit('urllib retrieval callback is unresolved; analysis is incomplete')
+        self.expression_bindings[node] = None
+        self.expression_references[node] = frozenset({node})
+        self.possible_exception(state)
+        return CLEAN
 
     def http_client(self, node, state, name, inputs):
         """Construct a native handle without tainting it with option data."""
@@ -6399,6 +6531,8 @@ class _Flow:
             raise AnalysisLimit('pending HTTP request called as a function; analysis is incomplete')
         native_name = (target if isinstance(target, str) else target.name
                        if isinstance(target, _BoundCallable) and target.namespace_proven else None)
+        if native_name in _URLLIB_APIS or _http_contract(target, (_UrllibRequest, _UrllibOpener)):
+            return self.urllib_call(node, state, target, inputs)
         if native_name in _HTTP_CLIENT_CONSTRUCTORS:
             return self.http_client(node, state, native_name, inputs)
         if native_name == 'httpx.URL':
@@ -7366,7 +7500,7 @@ class _Flow:
             receiver_fact = self.expression_facts.get(node.value, CLEAN)
             bases = _binding_choices(self.expression_bindings.get(node.value))
             if node.attr in {'join', 'strip', 'lstrip', 'rstrip', 'lower', 'upper',
-                             'capitalize', 'casefold', 'swapcase', 'title', 'replace'}:
+                             'capitalize', 'casefold', 'swapcase', 'title', 'replace', 'full_url', 'get_full_url'}:
                 # A helper's symbolic receiver otherwise erases the scalar
                 # producer contract before its bound method is captured.
                 self.require_value(self.expression_bindings.get(node.value))
@@ -7389,6 +7523,30 @@ class _Flow:
                                             if isinstance(ref, str) and ref.startswith('@global:'))
             for base in _binding_choices(self.expression_bindings.get(node.value)):
                 function = base.function if isinstance(base, (_FunctionValue, _ClosureValue)) else base
+                native = (base if isinstance(base, str) else base.name
+                          if isinstance(base, _BoundCallable) and base.namespace_proven else None)
+                if (native in _URLLIB_APIS or native in {'urllib', 'urllib.request', 'urllib.request.OpenerDirector'}) and node.attr in {
+                        '__dict__', '__globals__', '__closure__', '__code__', '__defaults__',
+                        '__kwdefaults__', '__class__', '__bases__'}:
+                    raise AnalysisLimit('urllib reflective namespace access is unresolved; analysis is incomplete')
+                if _http_contract(base, (_UrllibRequest, _UrllibOpener)):
+                    if base.references & state.mutated:
+                        raise AnalysisLimit('urllib receiver was mutated; analysis is incomplete')
+                    if isinstance(base.receiver_binding, _UrllibRequest) and base.name == '@urllib.request':
+                        if node.attr == 'full_url':
+                            fact = join_facts(fact, base.receiver)
+                            candidates.append(_GeneratorString())
+                        elif node.attr == 'get_full_url':
+                            candidates.append(_BoundCallable('@urllib.request.get_full_url', base.references,
+                                base.receiver, True, receiver_binding=base.receiver_binding))
+                        else:
+                            raise AnalysisLimit('urllib Request attribute protocol is unmodeled; analysis is incomplete')
+                    elif isinstance(base.receiver_binding, _UrllibOpener) and base.name == '@urllib.opener' and node.attr == 'open':
+                        candidates.append(_BoundCallable('@urllib.opener.open', base.references,
+                            base.receiver, True, receiver_binding=base.receiver_binding))
+                    else:
+                        raise AnalysisLimit('urllib handle attribute protocol is unmodeled; analysis is incomplete')
+                    continue
                 if _http_contract(base, _HTTPClient):
                     if base.references & state.mutated:
                         raise AnalysisLimit('HTTP client receiver was mutated; analysis is incomplete')

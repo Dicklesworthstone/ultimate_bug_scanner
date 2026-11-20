@@ -14,6 +14,7 @@ import unittest
 
 from test_taint_python_dataflow import ROOT, SourceTest
 from ubs_core.analyzers import taint_py
+from ubs_core.io import temporary_directory
 from ubs_core.registry import RunContext
 
 
@@ -648,6 +649,417 @@ class PooledHTTPClientTests(SourceTest):
             with self.subTest(source=source):
                 with self.assertRaises(taint_py.AnalysisLimit):
                     self.scan(source)
+
+
+class UrllibDestinationTests(SourceTest):
+    """The stdlib opener consumes a URL; Request construction does not."""
+
+    def test_native_url_sinks_and_selected_operands(self):
+        for name in ('urlopen', 'urlretrieve'):
+            for imports, call in (
+                ('import urllib.request', f'urllib.request.{name}'),
+                ('from urllib import request as client', f'client.{name}'),
+                (f'from urllib.request import {name} as send', 'send'),
+            ):
+                with self.subTest(name=name, imports=imports):
+                    self.assert_rules(f'{imports}\n{call}(input())\n', 'ssrf')
+                    self.assert_rules(f'{imports}\n{call}(url=input())\n', 'ssrf')
+                    self.assert_rules(f'{imports}\n{call}(**{{"url": input()}})\n', 'ssrf')
+                    self.assert_rules(f'{imports}\n{call}("https://safe.invalid", data=input())\n')
+            self.assert_rules(f'import urllib.request\nfetch = urllib.request.{name}\n'
+                              'urllib = other\nfetch(input())\n', 'ssrf')
+        self.assert_rules('from urllib.request import urlopen\n'
+                          'urlopen(*["https://safe.invalid", input()])\n')
+        self.assert_rules('from urllib.request import urlretrieve\n'
+                          'urlretrieve("https://safe.invalid", filename=input(), reporthook=None, data=input())\n')
+        self.assert_rules('from urllib.request import urlopen\nurlopen(*input())\n', 'ssrf')
+
+    def test_request_url_is_consumed_at_open_not_construction(self):
+        for imports, constructor in (
+            ('import urllib.request', 'urllib.request.Request'),
+            ('from urllib.request import Request as make', 'make'),
+            ('from urllib import request as client', 'client.Request'),
+        ):
+            with self.subTest(constructor=constructor):
+                source = imports + f'\nrequest = {constructor}(input())\n'
+                self.assert_rules(source)
+                self.assert_rules(source + 'from urllib.request import urlopen\nurlopen(request)\n', 'ssrf')
+        self.assert_rules('from urllib.request import Request, urlopen\n'
+                          'urlopen(Request(url=input()))\n', 'ssrf')
+        self.assert_rules('from urllib.request import Request, urlopen\n'
+                          'urlopen(Request(**{"url": input()}))\n', 'ssrf')
+
+    def test_request_body_headers_and_method_are_not_destinations(self):
+        self.assert_rules('''
+            from urllib.request import Request, urlopen
+            request = Request('https://safe.invalid', data=input(),
+                              headers={'X-User': input()}, method=input(),
+                              origin_req_host=input(), unverifiable=True)
+            urlopen(request, data=input(), timeout=3)
+        ''')
+        self.assert_rules('''
+            from urllib.request import Request, urlopen
+            request = Request('https://safe.invalid', input(), {'X-User': input()})
+            urlopen(request)
+        ''')
+        self.assert_rules('''
+            from urllib.request import Request
+            request = Request(input())
+            eval(str(request))
+        ''')
+
+    def test_request_aliases_readers_and_saved_constructors(self):
+        self.assert_rules('''
+            import urllib.request as native
+            make = native.Request
+            native = other
+            request = make(input())
+            alias = request
+            request = unrelated
+            from urllib.request import urlopen
+            urlopen(alias)
+        ''', 'ssrf')
+        for expression in ('request.full_url', 'request.get_full_url()'):
+            with self.subTest(expression=expression):
+                self.assert_rules('from urllib.request import Request, urlopen\n'
+                                  f'request = Request(input())\nurlopen({expression})\n', 'ssrf')
+        self.assert_rules('''
+            from urllib.request import Request, urlopen
+            request = Request(input())
+            read = request.get_full_url
+            request = unrelated
+            urlopen(read())
+        ''', 'ssrf')
+
+    def test_local_helpers_and_closures_preserve_selected_request_url(self):
+        self.assert_rules('''
+            from urllib.request import Request, urlopen
+            def prepare(target):
+                return Request(target)
+            def forward(request):
+                return urlopen(request)
+            forward(prepare(input()))
+        ''', 'ssrf')
+        self.assert_rules('''
+            from urllib.request import Request, urlopen
+            def prepare(data):
+                return Request('https://safe.invalid', data=data)
+            def forward(request):
+                return urlopen(request)
+            forward(prepare(input()))
+        ''')
+        self.assert_rules('''
+            from urllib.request import Request, urlopen
+            def prepare(target):
+                request = Request(target)
+                def send():
+                    return urlopen(request)
+                return send
+            prepare(input())()
+        ''', 'ssrf')
+        self.assert_rules('''
+            from urllib.request import Request, urlopen
+            def reader(request):
+                return request.get_full_url
+            urlopen(reader(Request(input()))())
+        ''', 'ssrf')
+
+    def test_default_openers_use_fullurl_argument(self):
+        self.assert_rules('''
+            from urllib.request import build_opener, Request
+            opener = build_opener()
+            opener.open(Request(input()))
+        ''', 'ssrf')
+        self.assert_rules('''
+            import urllib.request
+            opener = urllib.request.build_opener()
+            send = opener.open
+            opener = other
+            send(fullurl=input())
+        ''', 'ssrf')
+        self.assert_rules('''
+            from urllib.request import build_opener
+            def factory():
+                return build_opener()
+            def fetch(opener, target):
+                return opener.open(target)
+            fetch(factory(), input())
+        ''', 'ssrf')
+        self.assert_rules('''
+            from urllib.request import build_opener
+            build_opener().open('https://safe.invalid', data=input())
+        ''')
+
+    def test_url_guard_and_strong_overwrite_remain_clean(self):
+        prefix = HTTPDestinationTests.url_guard_source()
+        self.assert_rules(prefix + '''
+import urllib.request
+target = input()
+if not approved(target):
+    raise ValueError('blocked')
+urllib.request.urlopen(urllib.request.Request(target))
+''')
+        self.assert_rules('''
+            from urllib.request import Request, urlopen
+            target = input()
+            target = 'https://safe.invalid'
+            urlopen(Request(target))
+        ''')
+        for sanitizer in ('html.escape', 'shlex.quote'):
+            with self.subTest(sanitizer=sanitizer):
+                self.assert_rules(f'import urllib.request, html, shlex\n'
+                                  f'urllib.request.urlopen(urllib.request.Request({sanitizer}(input())))\n', 'ssrf')
+
+    def test_shadowed_imports_and_unrelated_open_methods_stay_clean(self):
+        for source in (
+            'from .urllib.request import urlopen\nurlopen(input())\n',
+            'from other import urlopen\nurlopen(input())\n',
+            'import urllib.request\nurllib = other\nurllib.request.urlopen(input())\n',
+            'from urllib.request import urlopen\nurlopen = other\nurlopen(input())\n',
+            'def urlopen(target):\n    return None\nurlopen(input())\n',
+            'opener = other()\nopener.open(input())\n',
+            'import urllib.request\ndef fetch(urllib):\n    urllib.request.urlopen(input())\n',
+        ):
+            with self.subTest(source=source):
+                self.assert_rules(source)
+
+    def test_request_mutation_and_escape_stay_explicit(self):
+        for mutation in (
+            'request.full_url = input()',
+            'alias = request\nalias.host = input()',
+            'request.set_proxy(input(), "https")',
+            'configure(request)',
+            'stored = [request]',
+        ):
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('from urllib.request import Request, urlopen\n'
+                              'request = Request("https://safe.invalid")\n'
+                              + mutation + '\nurlopen(request)\n')
+        for member in ('Request', 'urlopen', 'urlretrieve', 'build_opener', '_opener'):
+            with self.subTest(member=member):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(f'import urllib.request\nurllib.request.{member} = replacement\n'
+                              'urllib.request.urlopen("https://safe.invalid")\n')
+
+    def test_custom_opener_and_retrieval_callbacks_stay_explicit(self):
+        for source in (
+            'import urllib.request\nurllib.request.install_opener(custom)\n'
+            'urllib.request.urlopen("https://safe.invalid")\n',
+            'from urllib.request import build_opener\nbuild_opener(custom).open("https://safe.invalid")\n',
+            'from urllib.request import build_opener\nopener = build_opener()\n'
+            'opener.add_handler(custom)\nopener.open("https://safe.invalid")\n',
+            'from urllib.request import urlretrieve\n'
+            'urlretrieve("https://safe.invalid", reporthook=callback)\n',
+            'from urllib.request import urlretrieve\n'
+            'urlretrieve("https://safe.invalid", "output", callback)\n',
+            'from urllib.request import Request, urlopen\nurlopen(Request(**options))\n',
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(source)
+
+    def test_argument_effects_and_sink_locations_are_preserved(self):
+        found = self.assert_rules('''
+            from urllib.request import Request, urlopen
+            request = Request(input(), headers={'X-User': eval(input())})
+            urlopen(request, data=eval(input()))
+        ''', 'eval', 'eval', 'ssrf')
+        self.assertEqual(sorted((row['rule'], row['line']) for row in found),
+                         [('python.taint.eval', 2), ('python.taint.eval', 3), ('python.taint.ssrf', 3)])
+
+    def test_native_request_destinations_without_network(self):
+        from urllib import request as native
+        from urllib.response import addinfourl
+        from unittest.mock import patch
+
+        seen = []
+
+        class Capture(native.BaseHandler):
+            def default_open(self, request):
+                seen.append((request.full_url, request.data, request.get_header('X-user')))
+                response = addinfourl(io.BytesIO(b'ok'), {}, request.full_url, 200)
+                response.msg = 'OK'
+                return response
+
+        opener = native.build_opener(native.ProxyHandler({}), Capture())
+        with temporary_directory(prefix='ubs-urllib-native-') as temporary:
+            target = 'https://untrusted.invalid/items'
+            request = native.Request(target, data=b'body', headers={'X-User': 'metadata'})
+            self.assertEqual(seen, [])
+            self.assertEqual(request.get_full_url(), target)
+            with patch.object(native, '_opener', opener):
+                with native.urlopen(request) as response:
+                    self.assertEqual(response.read(), b'ok')
+                with opener.open(fullurl='https://safe.invalid', data=b'untrusted-body') as response:
+                    self.assertEqual(response.read(), b'ok')
+                output = str(Path(temporary, 'download'))
+                saved, _headers = native.urlretrieve(target, filename=output)
+                self.assertEqual(saved, output)
+                self.assertEqual(Path(saved).read_bytes(), b'ok')
+            self.assertEqual(seen, [(target, b'body', 'metadata'),
+                                   ('https://safe.invalid', b'untrusted-body', None),
+                                   (target, None, None)])
+
+    def test_joined_request_and_string_destinations_keep_both_branches(self):
+        for destination in ('Request(input()) if choose else "https://safe.invalid"',
+                            'Request("https://safe.invalid") if choose else input()',
+                            'Request(input()) if choose else Request("https://safe.invalid")'):
+            with self.subTest(destination=destination):
+                self.assert_rules('from urllib.request import Request, urlopen\n'
+                                  f'destination = {destination}\nurlopen(destination)\n', 'ssrf')
+        self.assert_rules('from urllib.request import Request, urlopen\n'
+                          'destination = Request("https://safe.invalid") if choose else "https://safe.invalid/other"\n'
+                          'urlopen(destination)\n')
+
+    def test_handles_never_borrow_unproved_protocols(self):
+        for source in (
+            'from urllib.request import Request, urlopen\nr = Request(input())\nurlopen(r.get_full_url)\n',
+            'from urllib.request import Request, urlretrieve\nurlretrieve(Request(input()))\n',
+            'from urllib.request import Request\nwith Request(input()):\n    pass\n',
+            'from urllib.request import build_opener\nwith build_opener():\n    pass\n',
+            'from urllib.request import Request\nr = Request(input())\ngetattr(r, "full_url")\n',
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(source)
+
+    def test_reflective_namespace_and_class_replacement_are_explicit(self):
+        for operation in (
+            'setattr(native, "urlopen", replacement)',
+            'configure(native)',
+            'native.Request.__new__ = replacement',
+            'native.Request.__str__ = replacement',
+            'native.OpenerDirector.open = replacement',
+            'native.__dict__["urlopen"] = replacement',
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('import urllib.request as native\n' + operation +
+                              '\nnative.urlopen(native.Request("https://safe.invalid"))\n')
+
+    def test_custom_header_iteration_and_key_callbacks_stay_explicit(self):
+        for headers in ('custom_headers', '{custom_key: "value"}', '{**custom_headers}'):
+            with self.subTest(headers=headers):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('from urllib.request import Request, urlopen\n'
+                              f'urlopen(Request("https://safe.invalid", headers={headers}))\n')
+        self.assert_rules('from urllib.request import Request, urlopen\n'
+                          'headers = {"X-Value": input()}\n'
+                          'urlopen(Request("https://safe.invalid", headers=headers))\n')
+
+    def test_custom_url_string_conversion_cannot_certify_clean(self):
+        for method in (
+            'return input()',
+            'global target\n        target = input()\n        return "https://safe.invalid"',
+        ):
+            with self.subTest(method=method):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('from urllib.request import Request, urlopen\n'
+                              'target = "https://safe.invalid"\nclass URL:\n'
+                              f'    def __str__(self):\n        {method}\n'
+                              'request = Request(URL())\nurlopen(request)\nurlopen(target)\n')
+        with self.assertRaises(taint_py.AnalysisLimit):
+            self.scan('from urllib.request import Request, urlopen\n'
+                      'urlopen(Request(opaque_url))\n')
+
+    def test_custom_request_subclasses_cannot_borrow_native_identity(self):
+        for initializer in ('super().__init__(input())', 'Request.__init__(self, input())'):
+            with self.subTest(initializer=initializer):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('from urllib.request import Request, urlopen\n'
+                              'class Custom(Request):\n    def __init__(self):\n'
+                              f'        {initializer}\nurlopen(Custom())\n')
+        for call in ('urlopen(opaque_request)', 'build_opener().open(opaque_request)'):
+            with self.subTest(call=call):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('from urllib.request import urlopen, build_opener\n' + call + '\n')
+
+    @unittest.skipUnless(os.environ.get('UBS_URLLIB_E2E') == '1', 'opt-in verified urllib scanner integration')
+    def test_public_module_and_runner_formats(self):
+        cases = (
+            ('direct', 'from urllib.request import urlopen\nurlopen(input())\n', 2, False, 2),
+            ('request-alias', 'from urllib.request import Request, urlopen\n'
+             'request = Request(input())\nalias = request\nurlopen(alias)\n', 4, False, 4),
+            ('opener-alias', 'from urllib.request import build_opener\n'
+             'opener = build_opener()\nsend = opener.open\nsend(fullurl=input())\n', 4, False, None),
+            ('safe-metadata', 'from urllib.request import Request, urlopen\n'
+             'request = Request("https://safe.invalid", data=input(), headers={"X-Value": input()})\n'
+             'urlopen(request)\n', None, False, 3),
+            ('suppressed', 'from urllib.request import urlopen\n'
+             'urlopen(input())  # ubs:ignore[python.taint.ssrf]\n', None, False, 2),
+            ('partial-mutation', 'from urllib.request import Request, urlopen\n'
+             'request = Request("https://safe.invalid")\nrequest.full_url = input()\n'
+             'urlopen(request)\n', None, True, 4),
+            ('partial-retained', 'from urllib.request import urlopen, build_opener\n'
+             'urlopen(input())\nbuild_opener(custom)\n', 2, True, 2),
+        )
+        with temporary_directory(prefix='ubs-urllib-public-') as temporary:
+            directory = Path(temporary)
+            # This matrix targets the security category; the source cohort
+            # independently checks interactions with existing HTTP analyzers.
+            skip = '--skip=' + ','.join(str(value) for value in range(1, 25) if value != 7)
+            env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'ENABLE_UV_TOOLS': '0',
+                   'UBS_KEEP_TEMP': '1', 'UBS_NO_CACHE': '1', 'UBS_ALLOW_PARTIAL': '0'}
+            for case, source, line, partial, timeout_line in cases:
+                path = directory / (case + '.py')
+                path.write_text(source, encoding='utf-8')
+                expected = sorted((rule, path.name, site) for rule, site in (
+                    ('python.taint.ssrf', line), ('py.security.http-timeout', timeout_line)) if site is not None)
+                for runner in (False, True):
+                    entrypoint = ROOT / 'ubs' if runner else ROOT / 'modules' / 'ubs-python.sh'
+                    for output in ('json', 'sarif'):
+                        with self.subTest(case=case, runner=runner, output=output):
+                            tag = f'{case}-{"runner" if runner else "module"}-{output}'
+                            command = [str(entrypoint), '--ci', '--no-color', skip, '--format=' + output]
+                            command += ['--only=python'] if runner else ['--no-uv']
+                            result = subprocess.run([*command, str(path)], cwd=directory, env=env,
+                                                    capture_output=True, text=True, timeout=120)
+                            (directory / (tag + '.stdout')).write_text(result.stdout, encoding='utf-8')
+                            (directory / (tag + '.stderr')).write_text(result.stderr, encoding='utf-8')
+                            detail = (tag, result.returncode, result.stdout, result.stderr)
+                            self.assertEqual(result.returncode, 2 if partial else 1 if line else 0, detail)
+                            document = json.loads(result.stdout)
+                            if output == 'json':
+                                self.assertEqual(document['status'], 'partial' if partial else 'ok', detail)
+                                totals = document['totals'] if runner else document
+                                self.assertEqual(totals['files'], 1, detail)
+                                self.assertEqual(totals['critical'], int(line is not None), detail)
+                                self.assertEqual(totals['warning'], int(timeout_line is not None), detail)
+                                self.assertEqual(totals['info'], 0, detail)
+                                rows = document['findings']
+                                self.assertEqual(len(rows), len(expected), detail)
+                                if runner:
+                                    actual = [(row['rule_id'], Path(row['file']).name, row['line']) for row in rows]
+                                    self.assertTrue(all(row['col'] == 1 for row in rows), detail)
+                                else:
+                                    self.assertTrue(all(row['count'] == 1 and len(row['samples']) == 1
+                                                        for row in rows), detail)
+                                    actual = [(row['rule_id'], Path(sample['file']).name, sample['line'])
+                                              for row in rows for sample in row['samples']]
+                                self.assertEqual(sorted(actual), expected, detail)
+                            else:
+                                runs = document['runs']
+                                self.assertTrue(runs, detail)
+                                rows = [row for run in runs for row in run['results']]
+                                self.assertEqual(len(rows), len(expected), detail)
+                                actual = []
+                                for row in rows:
+                                    self.assertEqual(len(row['locations']), 1, detail)
+                                    location = row['locations'][0]['physicalLocation']
+                                    self.assertTrue(location['artifactLocation']['uri'].endswith(path.name), detail)
+                                    self.assertEqual(location['region']['startColumn'], 1, detail)
+                                    actual.append((row['ruleId'], path.name, location['region']['startLine']))
+                                self.assertEqual(sorted(actual), expected, detail)
+                                for run in runs:
+                                    if partial:
+                                        invocation = run['invocations'][0]
+                                        self.assertIs(invocation['executionSuccessful'], False, detail)
+                                        self.assertEqual(invocation['exitCode'], 2, detail)
+                                    else:
+                                        self.assertTrue(all(inv['executionSuccessful'] is True
+                                                            for inv in run.get('invocations', [])), detail)
+                            print(f'[{tag}] PASS', flush=True)
 
 
 if __name__ == '__main__':

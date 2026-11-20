@@ -1,6 +1,84 @@
 # Python urllib SSRF source-regression checkpoint
 
-## Status
+## Active implementation and qualification — November 20, 2026
+
+The preserved regression cases now accompany an active implementation of native
+`urllib.request` destination tracking. Actual imported `urlopen`, `urlretrieve`,
+`Request` and default `build_opener` identities carry URL provenance through
+aliases, selected helpers, closures, `full_url`, saved `get_full_url` and saved
+opener methods. Constructing a Request is not itself a network sink, and its
+handle, body and headers do not become the selected destination. Fixed URLs,
+strong replacement and domain-specific guards retain their clean behavior.
+
+Mutation, custom handlers/proxies, callback options, opaque escapes, reflection,
+custom URL coercion and Request subclasses remain explicit incomplete-analysis
+boundaries. Independent review reproduced four previously complete-clean
+protocol cases; these now report incomplete coverage. Request and opener objects
+do not acquire context-manager authority.
+
+The implementation was merged with the concurrent stdin-buffer change on main;
+that upstream dataflow support remains intact. Final analyzer SHA-256:
+`6ec01af84496010e9c4b30260e1d4472178c52023445419e7ac02f40bda495f3`.
+HTTP regression file SHA-256:
+`e52f82fafca8701a3a4b82532ee619489be1420a790baad0f0866a1e1fb9d4e2`.
+
+Observed DSR checks, using retained fixtures and the inherited deletion fence:
+
+- The merged HTTP/dataflow/callable cohort passed 261 methods with six opt-in
+  skips (267 collected), including the upstream stdin buffer tests. Log SHA-256:
+  `b5603cfb0b8faa0e78c668706de8fb54f9d96d2f15511d950da3701b6f4e44df`.
+- All 28 actual module/runner JSON/SARIF calls passed exact rule, location,
+  severity-total, status and exit assertions for direct URLs, Request aliases,
+  saved openers, clean metadata, suppression and partial scans with retained
+  findings. Log SHA-256:
+  `6942ebb4f4600ac3c963a48b1e9ac49b80d355cf9670825140b5d1d1227c50fe`.
+- The standard-library no-network witness passed. It uses real urllib request
+  objects and an in-process handler; it does not contact external destinations.
+
+The first completed public matrix exposed two new harness adapter errors:
+omitted existing timeout warnings and an incorrect assumption that runner JSON
+used the module's grouped finding shape. Both were corrected while preserving
+all fixture sources, SSRF expectations, sink sites, exits and status assertions.
+The final matrix explicitly checks each ancillary timeout rule/site and both
+documented JSON shapes. The unsuccessful initial log remains retained:
+`47abb26456c61210041af79dfdf1c1386c5cb93ac841736eb8a354bff8f02911`.
+
+This is bounded urllib support. aiohttp, generalized callback/transport behavior
+and full repository/release qualification remain open.
+
+Final integration preserves main's subsequent shared findings-ledger/Rust fix
+at `796afcda299cd02a434879d4d2507a1eb6d07357` and uses development version 5.5.87.
+All 89 public CLI cases pass again on that combined tree, with the original
+assertions and per-call limits unchanged:
+
+| Matrix | Actual calls | DSR log SHA-256 |
+| --- | ---: | --- |
+| JavaScript sort, suppression and cache | 25 | `20d18c28f68b22e96abb4572d821b604c328197179baedd23aace3e55b7cae15` |
+| Go closure results | 24 | `717f51ec4dc53a2c9bc54ffb10ebc3238515408100ae099d0a8973968decdaf8` |
+| Go retained-scratch reports | 12 | `24163b692b1f377457ea982c900efe1b87ea2dc7e31051588dbd70f83aedc373` |
+| Python urllib destinations | 28 | `db5e6df14e8cb6b6eb2935e4609e3e0e8cd0b546a608d10a12e493bfbb65be99` |
+
+Final canonical checksums, SHA256SUMS, shell syntax and diff whitespace checks
+pass. The full ShellCheck command was killed with exit 137. The repository suite
+passed checksums and all 12 rule inventories, then reported missing Swift fixture
+pairs and exceeded its 120-second DSR envelope during quality discovery. The
+manifest, Swift fixtures and rule-quality harness are unchanged from the session
+baseline; later error/failure markers have no completed traceback summary.
+Repository-suite log SHA-256:
+`ae2462214a7a43441dfb94d43f55fb3ecb82baf4fa88448b6ff221bccf58e51c`.
+
+The Python helper's UBS selfscan is partial (exit 2): zero critical findings,
+56 warnings, and explicit generator/live-cell/step-budget limits. Review maps
+52 warnings to unchanged lines. Four diagnostics concern two new exact-string
+checks for header keys; accepting string subclasses would weaken the modeled
+protocol boundary, so those checks are intentionally retained. No clean
+selfscan or full-suite pass is claimed. Selfscan log SHA-256:
+`627b45fa6d3a217fcec6f29e82c4e16e73df677875dc617bd42b5de469c9f297`.
+
+The following sections preserve the earlier inactive checkpoint and are
+superseded by this status.
+
+## Historical status
 
 This preserves executed failing source regressions and unfinished implementation
 work. The execution environment became unavailable before the urllib transfer

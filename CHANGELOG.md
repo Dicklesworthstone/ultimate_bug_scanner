@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track Python `urllib.request` destinations through native `urlopen`,
+  `urlretrieve`, `Request` aliases/readers and default opener methods. Preserve
+  URL provenance through helpers and closures while keeping request handles,
+  bodies and metadata distinct. Custom URL conversion, subclasses, handlers,
+  mutation and unmodeled callbacks report incomplete coverage. Source and real
+  JSON/SARIF regressions cover unsafe, clean, suppressed and partial outcomes.
+
 - Preserve native Go callback results through immediate and parenthesized
   function-literal calls, named returns and tuple arguments. Keep environment
   getters, payload/error slots, HTML-specific sanitizers, decoder identities and

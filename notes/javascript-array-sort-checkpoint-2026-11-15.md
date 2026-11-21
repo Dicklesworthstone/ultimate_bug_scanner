@@ -1,4 +1,70 @@
-# Native JavaScript Array.sort: pending regression checkpoint
+# Native JavaScript array sorting and copying
+
+## Copying methods — November 21, 2026
+
+The native array transfer now models `toSorted`, `toReversed`, `toSpliced`
+and `with`. Each operation creates a distinct outer array while retaining
+shallow references to its element objects. Replacing an outer slot cannot
+silently clean the other array; writing a nested object through a copy remains
+visible through the original and its other copies. Reverse, splice and
+replacement preserve supported literal slot locations and negative indices.
+Copies densify sparse holes into present undefined entries, omit named
+properties and leave the source array unchanged. Selected helper summaries,
+copy chains, captured receivers and sink-specific sanitizer provenance remain
+connected to the resulting values.
+
+The frozen original eight-case witness set exposed six complete-clean XSS
+misses and two false positives; all eight native Node observations agreed with
+their fixed expectations. The candidate matches all eight scanner expectations.
+A separate frozen 23-case oracle improves from 13/23 on the incumbent to 23/23
+on the candidate, with all 23 native Node programs matching the independent
+expectations. This is bounded regression evidence, not an estimate of overall
+scanner accuracy.
+
+| Check | Observed result |
+| --- | --- |
+| New copying-method source cohort | 12 methods pass, no skips; DSR 18.141 seconds. |
+| Existing sort source cohort | All 19 unchanged methods pass, no skips; DSR 2.904 seconds. |
+| Original native/scanner witnesses | 8/8 native observations and 8/8 scanner expectations pass; DSR 3.730 seconds. |
+| Independent oracle | 23/23 candidate cases pass, versus 13/23 incumbent cases; all 23 native observations match. |
+| Public module/meta-runner integration | Both methods pass, no skips: 21 actual calls (16 JSON/SARIF and selected-file checks, 5 cache/invalidation/suppression checks). Unittest 29.750 seconds; DSR 30.083 seconds, exit 0. |
+
+The source cohorts contain 31 maintained methods in total. The independent
+oracle, original witnesses and public calls are separate evidence populations
+and are not summed as unique cases. DSR ran the checks with retained artifacts.
+The public subprocess deadline remains 45 seconds per invocation. An earlier
+public invocation lost its execution session before any test result; its
+header-only log and empty receipt remain retained separately from this
+complete passing rerun.
+
+`toSorted` conservatively retains possible element provenance rather than
+proving scalar sort order. Comparator execution, object coercion, unresolved
+indices, unknown overrides and altered indexed-property contracts retain
+explicit incomplete-analysis boundaries when they cannot be modeled safely.
+For a known zero/singleton occupied set, a selected comparator does not
+create an artificial execution boundary. Selected own-method bodies retain their actual
+behavior. Dense copy allocation is charged against the existing work budget
+before expansion. This does not add general comparator, coercion, descriptor,
+borrowed-method or custom-prototype execution support.
+
+Final helper SHA-256:
+`8a48a8e0ab112275dbea3f73fcfd105079200bed65dc6b8d46fb59038137f86f`.
+Final heap-test SHA-256:
+`ab80ab541b8069b6712ee8f841327885aab9a661bfc7281a599e313ecd40d0e2`.
+New-source DSR log SHA-256:
+`c83e3d00a6adddbf56c650bc57d39d0aeb73266f6f54cf2781348854dacc9dcb`.
+Existing-sort DSR log SHA-256:
+`f91cbabffd0b20df07010a56ffd3212662175b7291e1069fea24f72bc486af33`.
+Original-witness DSR log SHA-256:
+`055d19ffbe9699a624268c1a0954d8004d127003a9a778386468da1a3cabb28d`.
+Independent DSR log SHA-256:
+`c928a63144f2ba131b4fea57a2632949de51fd3bb26f8bc5ce90ac938ba435a4`.
+Public DSR log SHA-256: `dece255168c6d5837545e880a111855488117a32ecf5421f2a5db1e7885d04f7`.
+
+The earlier 497-method result below belongs to the previous sort activation;
+that full population was not rerun for this copying-method slice. No new
+full-suite, release, performance or Bead-closure qualification is claimed here.
+
 
 ## Activated implementation — November 20, 2026
 

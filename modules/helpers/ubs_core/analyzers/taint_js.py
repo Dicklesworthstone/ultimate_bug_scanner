@@ -1671,7 +1671,8 @@ class _Flow:
                         # Element spreads use the wildcard slot directly and
                         # must not be mistaken for prototype/method writes.
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
-                                       'splice', 'copyWithin', 'sort', 'entries', 'map', 'flatMap'):
+                                       'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed',
+                                       'toSpliced', 'with', 'entries', 'map', 'flatMap'):
                             slots[method] = _alternatives(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
@@ -2238,7 +2239,7 @@ class _Flow:
         return bool(refs) and not frozenset(fact) and all(
             ref in state.heap and isinstance(ref[0], _Scope)
             and (len(ref) == 2 or isinstance(ref[2], frozenset)
-                 or ref[2] in {'binding-rest', 'arguments-rest', 'commonjs', 'array-splice'})
+                 or ref[2] in {'binding-rest', 'arguments-rest', 'commonjs', 'array-splice', 'array-copy'})
             for ref in refs)
 
     def plain_data_descriptor_call(self, method, arguments, prepared, state):
@@ -2538,6 +2539,117 @@ class _Flow:
             definite = known and ordinary and pure and len(refs) == 1 and ref not in state.weak_refs
             self.merge_array_mutation(ref, changed, length, state, definite=definite)
         return receiver
+
+    def array_copy(self, receiver, method, arguments, prepared, state, location, callback=None):
+        """Copy native indexed values into a fresh dense array.
+
+        Only the outer container is copied: object elements retain their heap
+        identities. Holes become present undefined values, named properties
+        are not copied, and neither source slots nor its length are changed.
+        """
+        actual, uncertain, maybe_missing, kinds = prepared
+        variants, lengths = [], []
+        default = (uncertain != 0 and (not actual or kinds.get(0) == 'undefined'
+                   or (actual[0][1] and 0 not in maybe_missing)))
+        comparator = ((_function_target(actual[0][0]) or callback)
+                      if actual and uncertain != 0 and method == 'toSorted' else None)
+        if method == 'toSorted':
+            if not default and comparator is None:
+                self.incomplete.add('Array.toSorted comparator requires a selected callable or undefined')
+            if (comparator is not None and arguments and comparator.parent is self.scope
+                    and arguments[0][0] <= comparator.start < comparator.end <= arguments[0][1]):
+                self.engine.modeled_callbacks.add(comparator)
+                if callback is not comparator:
+                    self.engine.escaped_callbacks.add(comparator)
+        for ref in _refs(receiver):
+            source, length = state.heap[ref], state.array_lengths[ref]
+            numeric = {key: value for key, value in source.items()
+                       if self.array_index(key) is not None and (length is None or int(key) < length)}
+            self.engine.budget.spend(1 + len(source))
+            ordinary = self.array_mutation_contract(ref, state)
+            known = length is not None and None not in source and ordinary
+            if not known:
+                self.incomplete.add(f'Array.{method} requires finite ordinary indexed properties')
+            start = count = None
+            inserted = []
+            if method in {'with', 'toSpliced'}:
+                first, pure = self.array_integer_argument(arguments, prepared, 0, 0)
+                if method == 'with':
+                    inserted = [actual[1][0] if len(actual) > 1 else frozenset()]
+                    if first is not None and length is not None:
+                        if first >= length or first <= -length - 1:
+                            pure = False
+                            self.incomplete.add('Array.with index is outside the selected array extent')
+                        else:
+                            index = int(first)
+                            start = length + index if index < 0 else index
+                            if not 0 <= start < length:
+                                pure = False
+                                self.incomplete.add('Array.with index is outside the selected array extent')
+                    count = 1
+                else:
+                    start = self.array_relative_index(first, length)
+                    inserted = [value for value, _absent in actual[2:]]
+                    if uncertain is None and len(actual) < 2:
+                        count = (0 if not actual else length - start
+                                 if length is not None and start is not None else None)
+                    else:
+                        raw_count, count_pure = self.array_integer_argument(arguments, prepared, 1, 0)
+                        pure = pure and count_pure
+                        count = (0 if raw_count <= 0 else length - start if raw_count >= length - start
+                                 else int(raw_count)) if None not in (raw_count, start, length) else None
+                if uncertain is not None:
+                    inserted = [value for value, _absent in actual]
+                if not pure or uncertain is not None or start is None or count is None:
+                    known = False
+                    self.incomplete.add(f'Array.{method} bounds or spread require unsupported value semantics')
+            new_length = (length + len(inserted) - count
+                          if known and method == 'toSpliced' else length if known else None)
+            if new_length is not None and new_length > 4294967295:
+                known, new_length = False, None
+                self.incomplete.add(f'Array.{method} result length exceeds the native array limit')
+            if method == 'toSorted':
+                compare = not known or len(numeric) > 1
+                if compare and not default:
+                    self.incomplete.add('Array.toSorted comparator effects require unsupported invocation semantics')
+                    if comparator is not None:
+                        self.engine.escaped_callbacks.add(comparator)
+                if compare and default and any(_refs(value) for value in numeric.values()):
+                    self.incomplete.add('Array.toSorted element coercion requires unsupported value semantics')
+            if known:
+                # Charge before expansion: sparse maximum-length arrays must
+                # fail the existing work budget without allocating their holes.
+                self.engine.budget.spend(new_length)
+                copied = {}
+                possible = _alternatives(*numeric.values()) if method == 'toSorted' else None
+                for index in range(new_length):
+                    if method == 'toSorted':
+                        value = possible if index < len(numeric) else frozenset()
+                    elif method == 'toReversed':
+                        value = source.get(str(length - index - 1), _ABSENT)
+                    elif start <= index < start + len(inserted):
+                        value = inserted[index - start]
+                    else:
+                        old = index if index < start else index + count - len(inserted)
+                        value = source.get(str(old), _ABSENT)
+                    copied[str(index)] = _Fact(value, _refs(value))
+            else:
+                possible = _alternatives(*numeric.values(), source.get(None, _ABSENT), *inserted)
+                copied = {None: _Fact(possible, _refs(possible), absent=True)}
+            variants.append(copied)
+            lengths.append(new_length)
+        result = (self.scope, location, 'array-copy')
+        previous = state.heap.get(result)
+        if previous is not None:
+            variants.append(previous)
+            lengths.append(state.array_lengths.get(result))
+            state.weak_refs.add(result)
+        keys = set().union(*(slots.keys() for slots in variants))
+        state.heap[result] = {key: _alternatives(*(slots.get(key, slots.get(None, _ABSENT))
+                                                 for slots in variants)) for key in keys}
+        state.array_lengths[result] = (lengths[0] if lengths
+            and all(length == lengths[0] for length in lengths) else None)
+        return _Fact(refs=(result,))
 
     def array_splice(self, receiver, arguments, prepared, state, location):
         """Transform selected slots and return a fresh, sparse removed array."""
@@ -2944,7 +3056,8 @@ class _Flow:
     def native_array_target(self, receiver, method, state):
         refs = _refs(receiver)
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
-        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin', 'sort', 'flatMap'}
+        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin',
+                       'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flatMap'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
@@ -2962,7 +3075,7 @@ class _Flow:
                 if unknown:
                     fact = _join(fact, selected)
             cursor = selected_end
-            match = re.match(r'\s*\.\s*(flatMap|sort)\s*\(', code[cursor:end])
+            match = re.match(r'\s*\.\s*(flatMap|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
             if match is None:
                 break
             opening = cursor + match.end() - 1
@@ -3048,6 +3161,8 @@ class _Flow:
             return self.array_splice(receiver, arguments, prepared, state, location)
         if kind == 'array' and method == 'sort':
             return self.array_sort(receiver, arguments, prepared, state, callback)
+        if kind == 'array' and method in {'toSorted', 'toReversed', 'toSpliced', 'with'}:
+            return self.array_copy(receiver, method, arguments, prepared, state, location, callback)
         if kind == 'array' and method == 'flatMap':
             return self.array_flatmap(receiver, arguments, prepared, state, location, callback)
         if values and (kind == 'reflect' or (kind == 'object' and method in {
@@ -3385,7 +3500,8 @@ class _Flow:
                     self.incomplete.add('Own method requires an unsupported escaped closure environment')
                 return None, receiver
             return candidate, receiver
-        if (report and key in {'splice', 'copyWithin', 'sort', 'flatMap'} and _refs(receiver)
+        if (report and key in {'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flatMap'}
+                and _refs(receiver)
                 and all(ref in state.array_lengths for ref in _refs(receiver))
                 and self.native_target(name, state) is None):
             self.incomplete.add(f'Array.{key} requires a known native or selected callable')
@@ -3942,7 +4058,8 @@ class _Flow:
         cursor = start
         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
         if (primary_end is not None and primary_end < end - 1
-                and re.match(r'\s*\.\s*(?:flatMap|sort)\s*\(', code[primary_end + 1:end])):
+                and re.match(r'\s*\.\s*(?:flatMap|sort|toSorted|toReversed|toSpliced|with)\s*\(',
+                             code[primary_end + 1:end])):
             primary = self.value(start, primary_end + 1, state)
             primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)
             facts.append(primary)
@@ -4014,7 +4131,7 @@ class _Flow:
                 arguments = self.template_arguments(opening, closing)
             sink = self.engine.call_sinks.get(match_start)
             callback = (self.callable(*arguments[0], state)
-                        if native is not None and native[0] == 'array' and native[2] in {'sort', 'flatMap'}
+                        if native is not None and native[0] == 'array' and native[2] in {'sort', 'toSorted', 'flatMap'}
                         and arguments else None)
             if arguments and callback is None:
                 unmodeled = self.callable(*arguments[0], state)
@@ -4716,7 +4833,7 @@ class _Engine:
         self.modeled_callbacks = set()
         self.escaped_callbacks = set()
         self.flatmap_result_kinds = {}
-        self.has_array_callbacks = 'flatMap' in self.text or 'sort' in self.text
+        self.has_array_callbacks = any(name in self.text for name in ('flatMap', 'sort', 'toSorted'))
         self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
         self.current_task = None
         self.heap_solve_depth = 0

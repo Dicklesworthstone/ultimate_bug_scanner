@@ -1569,6 +1569,159 @@ class HeapTaintTests(unittest.TestCase):
             self.assertGreater(row['col'], 0)
         return findings
 
+    def test_copy_methods_preserve_shared_element_identity(self):
+        for method in ('toReversed()', 'toSorted()', 'toSpliced(1,1)', 'with(1,"new")'):
+            with self.subTest(method=method):
+                initial = '[{html:"safe"}]' if method in {'toReversed()', 'toSorted()'} else '[{html:"safe"},"old"]'
+                source = (f'const items={initial}; const copied=items.{method};\n'
+                          'copied[0].html=req.query.html;\nres.send(items[0].html);')
+                found = self.scan_sort(source, 'xss')
+                self.assertEqual([row['line'] for row in found], [3])
+                self.assert_runtime_sends(source, ['review-input'])
+
+    def test_copy_methods_create_fresh_containers_with_snapshot_values(self):
+        for method in ('toReversed()', 'toSorted()', 'toSpliced()', 'with(1,"safe")'):
+            with self.subTest(method=method):
+                source = ('const items=["safe","safe"]; '
+                          f'const copied=items.{method}; copied[0]=req.query.html;\n'
+                          'res.send(items[0]);\nres.send(copied[0]);')
+                found = self.scan_sort(source, 'xss')
+                self.assertEqual([row['line'] for row in found], [3])
+                self.assert_runtime_sends(source, ['safe', 'review-input'])
+                source = ('const items=[req.query.html,req.query.html]; '
+                          f'const copied=items.{method}; items.fill("safe");\n'
+                          'res.send(items[0]);\nres.send(copied[0]);')
+                found = self.scan_sort(source, 'xss')
+                self.assertEqual([row['line'] for row in found], [3])
+                self.assert_runtime_sends(source, ['safe', 'review-input'])
+
+    def test_copy_methods_do_not_mutate_source_or_copy_named_properties(self):
+        for method in ('toReversed()', 'toSorted()', 'toSpliced(0,1)', 'with(0,"safe")'):
+            with self.subTest(method=method):
+                source = ('const items=[req.query.html,"safe"]; items.extra=req.query.html; '
+                          f'const copied=items.{method};\n'
+                          'res.send(items[0]);\nres.send(copied.extra);\nres.send(copied.length);')
+                found = self.scan_sort(source, 'xss')
+                self.assertEqual([row['line'] for row in found], [2])
+                length = 1 if method == 'toSpliced(0,1)' else 2
+                self.assert_runtime_sends(source, ['review-input', None, length])
+
+    def test_copy_reversed_slots_and_spliced_insertions_have_exact_locations(self):
+        cases = (
+            ('["safe",req.query.html]', 'toReversed()', ['review-input', 'safe']),
+            ('[req.query.html,"safe"]', 'toSpliced(0,1)', ['safe', None]),
+            ('["safe","old"]', 'toSpliced(-1,1,req.query.html)', ['safe', 'review-input']),
+            ('["safe"]', 'toSpliced(0,0,req.query.html)', ['review-input', 'safe']),
+            ('[req.query.html,"safe"]', 'with(-2,"clean")', ['clean', 'safe']),
+            ('["safe","old"]', 'with(-1,req.query.html)', ['safe', 'review-input']),
+            ('[req.query.html,"safe"]', 'with(null,"clean")', ['clean', 'safe']),
+        )
+        for initial, method, expected in cases:
+            with self.subTest(initial=initial, method=method):
+                source = (f'const items={initial}; const copied=items.{method};\n'
+                          'res.send(copied[0]);\nres.send(copied[1]);')
+                found = self.scan_sort(source, *('xss' for value in expected if value == 'review-input'))
+                self.assertEqual([row['line'] for row in found],
+                                 [2 + index for index, value in enumerate(expected) if value == 'review-input'])
+                self.assert_runtime_sends(source, expected)
+
+    def test_copy_methods_densify_holes_before_callbacks(self):
+        for method in ('toReversed()', 'toSorted()', 'toSpliced()', 'with(0,undefined)'):
+            with self.subTest(method=method):
+                source = (f'const copied=[,].{method}; '
+                          'const box={html:"safe"}; '
+                          'copied.flatMap(value=>{box.html=req.query.html;return [];}); '
+                          'res.send(box.html);')
+                self.scan_sort(source, 'xss')
+                self.assert_runtime_sends(source, ['review-input'])
+
+    def test_copy_methods_retain_sink_specific_sanitization(self):
+        for method in ('toReversed()', 'toSorted()', 'toSpliced()', 'with(1,"safe")'):
+            with self.subTest(method=method):
+                self.scan_sort('const items=[DOMPurify.sanitize(req.query.html),DOMPurify.sanitize(req.query.html)]; '
+                               f'const copied=items.{method}; res.send(copied[0]); eval(copied[0]);', 'eval')
+
+    def test_copy_methods_preserve_helper_and_joined_receiver_identity(self):
+        source = ('function duplicate(items){return items.toReversed();}\n'
+                  'const a=[{html:"safe"}]; const b=[{html:"safe"}];\n'
+                  'const copied=duplicate(a); copied[0].html=req.query.html;\n'
+                  'res.send(a[0].html);\nres.send(b[0].html);')
+        found = self.scan_sort(source, 'xss')
+        self.assertEqual([row['line'] for row in found], [4])
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        self.scan_sort('const a=[{html:"safe"}]; const b=[{html:"safe"}]; '
+                       'const selected=flag?a:b; const copied=selected.toReversed(); '
+                       'copied[0].html=req.query.html; res.send(a[0].html); res.send(b[0].html);',
+                       'xss', 'xss')
+
+    def test_copy_methods_capture_receiver_before_argument_rebinding(self):
+        source = ('let items=["safe","old"]; const original=items; '
+                  'const copied=items.with(1,req.query.html,(items=["new"])); '
+                  'res.send(original[1]); res.send(copied[1]); res.send(items[0]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['old', 'review-input', 'new'])
+        self.scan_sort('const items=["safe"]; const copied=items.toReversed(req.query.html); '
+                       'res.send(copied[0]);')
+
+    def test_copy_methods_support_literal_return_and_copy_chains(self):
+        for source in (
+            'res.send(["safe",req.query.html].toReversed()[0]);',
+            'function make(){return ["safe",req.query.html];} res.send(make().toReversed()[0]);',
+            'const items=["safe",req.query.html]; res.send((items).toReversed()[0]);',
+            'res.send(["safe",req.query.html].with(0,"new").toReversed()[0]);',
+            'res.send(["safe"].toSpliced(0,0,req.query.html).with(1,"new")[0]);',
+        ):
+            with self.subTest(source=source):
+                self.scan_sort(source, 'xss')
+                self.assert_runtime_sends(source, ['review-input'])
+
+    def test_copy_methods_keep_selected_own_methods_and_reject_unknown_overrides(self):
+        for method in ('toReversed', 'toSorted', 'toSpliced', 'with'):
+            with self.subTest(method=method):
+                source = ('const items=["safe"]; '
+                          f'items.{method}=function(){{return this;}}; '
+                          f'const copied=items.{method}(); copied[0]=req.query.html; '
+                          'res.send(items[0]);')
+                self.scan_sort(source, 'xss')
+                self.assert_runtime_sends(source, ['review-input'])
+                for setup in (f'items.{method}=external;', f'Array.prototype.{method}=external;',
+                              'items[key]=external;'):
+                    self.scan_sort('const items=[req.query.html]; ' + setup
+                                   + f'items.{method}(); res.send(items[0]);',
+                                   'xss', partial=f'Array.{method}')
+
+    def test_copy_sorted_skips_singleton_comparator_and_keeps_callback_boundaries(self):
+        source = ('const box={html:"safe"}; const items=[,"safe"]; '
+                  'const copied=items.toSorted((a,b)=>{box.html=req.query.html;return 0;}); '
+                  'res.send(box.html); res.send(copied[0]); res.send(copied[1]);')
+        self.scan_sort(source)
+        self.assert_runtime_sends(source, ['safe', 'safe', None])
+        source = ('const box={html:"safe"}; const items=["b","a"]; '
+                  'items.toSorted((a,b)=>{box.html=req.query.html;return 0;}); res.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, partial='Array.toSorted.*comparator')
+        for comparator in ('null', 'external', '...comparators'):
+            self.scan_sort(f'const items=[]; try{{items.toSorted({comparator});}}catch(error){{}} '
+                           'res.send(req.query.html);', 'xss', partial='Array.toSorted.*comparator')
+
+    def test_copy_methods_do_not_hide_coercion_descriptor_or_budget_limits(self):
+        for method in ('with(offset,"safe")', 'with(8,"safe")', 'toSpliced(offset,1)',
+                       'toSpliced(0,count)', 'with(0n,"safe")'):
+            with self.subTest(method=method):
+                self.scan_sort('const items=[req.query.html]; '
+                               f'try{{items.{method};}}catch(error){{}} res.send(items[0]);',
+                               'xss', partial='Array.(with|toSpliced)')
+        for method in ('toReversed()', 'toSorted()', 'toSpliced()', 'with(0,"safe")'):
+            with self.subTest(method=method):
+                self.scan_sort('const items=[req.query.html]; '
+                               'Object.defineProperty(items,"0",{get(){return req.query.html;}}); '
+                               f'items.{method}; res.send(req.query.html);', 'xss', partial='Array.')
+                self.scan_sort('const items=[req.query.html]; items.length=4294967295; '
+                               f'items.{method}; res.send("safe");', partial='work limit')
+        self.scan_sort('const items=["safe",{html:req.query.html}]; '
+                       'const copied=items.toSorted(); res.send(copied[0].html);',
+                       'xss', partial='Array.toSorted.*coercion')
+
     def test_sort_moves_source_through_ignored_calls_and_aliases(self):
         for call in ('items.sort()', 'alias.sort()', 'alias["sort"]()'):
             with self.subTest(call=call):
@@ -1746,7 +1899,8 @@ class HeapTaintTests(unittest.TestCase):
         self.scan_sort(source, 'xss')
         self.assert_runtime_sends('const flag=false; ' + source, ['review-input'])
 
-    def sort_public_report(self, target, artifact, *, meta, fmt, expected, partial=False, cache=False):
+    def sort_public_report(self, target, artifact, *, meta, fmt, expected, partial=False, cache=False,
+                           partial_reason='Array.sort'):
         command = ROOT / ('ubs' if meta else 'modules/ubs-js.sh')
         arguments = [str(command), str(target), '--no-color', '--ci', f'--format={fmt}']
         if meta:
@@ -1775,7 +1929,7 @@ class HeapTaintTests(unittest.TestCase):
                 self.assertEqual(row['severity'], 'critical', row)
                 self.assertFalse(row.get('suppressed', False), row)
             if partial:
-                self.assertIn('Array.sort', result.stdout + result.stderr)
+                self.assertIn(partial_reason, result.stdout + result.stderr)
                 if meta:
                     self.assertEqual(report['profile']['cache_hits'], 0, report)
         else:
@@ -1794,8 +1948,64 @@ class HeapTaintTests(unittest.TestCase):
             self.assertEqual(bool(failed), partial, report)
             for invocation in failed:
                 self.assertEqual(invocation['exitCode'], 2, invocation)
-                self.assertIn('Array.sort', json.dumps(invocation))
+                self.assertIn(partial_reason, json.dumps(invocation))
         return report
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_copy_methods_public_json_and_sarif_preserve_identity_and_limits(self):
+        alias = ('const items=[{html:"safe"},"safe"];\n'
+                 'const reversed=items.toReversed();\n'
+                 'const spliced=items.toSpliced(1,1);\n'
+                 'const replaced=items.with(1,"new");\n'
+                 'const sorted=spliced.toSorted();\n'
+                 'reversed[1].html=req.query.html;\n'
+                 'res.send(items[0].html);\nres.send(spliced[0].html);\n'
+                 'res.send(replaced[0].html);\nres.send(sorted[0].html);\n')
+        cases = (
+            ('alias', alias, [('javascript.taint.xss', line, 1) for line in (7,8,9,10)], False),
+            ('clean', 'const items=[req.query.html,"safe"];\n'
+             'const a=items.toSpliced(0,1); const b=items.with(0,"safe");\n'
+             'res.send(a[0]); res.send(b[0]); res.send(a.toReversed().toSorted()[0]);\n', [], False),
+            ('comparator', 'const items=["b","a"]; const box={html:"safe"};\n'
+             'items.toSorted((a,b)=>{box.html=req.query.html;return 0;});\n'
+             'res.send(box.html);\n', [], True),
+            ('coercion', 'const items=["safe",{toString(){return req.query.html;}}];\n'
+             'items.toSorted();\nres.send(req.query.html);\n', [('javascript.taint.xss', 3, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-array-copy-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Array.toSorted')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_copy_methods_public_cache_invalidation_and_suppression(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-array-copy-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const items=[{html:"safe"}];\nconst copy=items.toReversed();\n'
+                  'copy[0].html=req.query.html;\nres.send(items[0].html);\n')
+        clean = unsafe.replace('copy[0].html=req.query.html;', 'copy[0]={html:req.query.html};')
+        suppressed = unsafe.replace('res.send(items[0].html);', 'res.send(items[0].html); // ubs:ignore')
+        for index, (source, expected) in enumerate((
+                (unsafe, [('javascript.taint.xss', 4, 1)]),
+                (unsafe, [('javascript.taint.xss', 4, 1)]),
+                (clean, []), (suppressed, []), (unsafe, [('javascript.taint.xss', 4, 1)]))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                        expected=expected, cache=True)
 
     @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
                          'real module and meta-runner integration requires ast-grep')

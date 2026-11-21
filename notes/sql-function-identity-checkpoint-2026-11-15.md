@@ -44,15 +44,25 @@ checks passed through DSR (17,900 ms; log SHA-256
 The production scanner and test blobs were uploaded through GitHub and matched
 the exact local Git object hashes before publication.
 
+After the first commit, the remaining public receipt was recovered: selection,
+cache invalidation, suppression and staged-index preservation all passed
+(**4 methods**, 37,929 ms; log SHA-256
+`c9edae766b5d15949f751fbc42f2364861313ac32cc30c97baf709b78a184572`).
+All 12 public methods therefore have observed passing assertions across the
+interrupted cohort and the completed continuation; the interrupted aggregate
+itself is still not a passing receipt.
+
 Qualification limits remain explicit. The initial 120-second combined source/
 public run timed out; a subsequent public run lost its execution transport after
-25 actual CLI calls, before the full class returned. The remaining selection,
-cache, suppression and staged-index methods were submitted separately, but their
-final result was not recovered before the environment became unavailable.
-The prescribed full suite and changed-source self-scan were also submitted
-through DSR with retained scratch and the repository's deletion guard; no final
-result was observed. Full ShellCheck was killed with exit 137. An earlier
-integrity attempt timed out before the successful unchanged-gate rerun.
+25 actual CLI calls, before the full class returned. The prescribed full suite
+was submitted through DSR with retained scratch and the repository's deletion
+guard. Its rule-quality harness reported existing unpaired Swift fixtures;
+there is no complete full-suite pass. Changed-source self-analysis timed out
+after the Python module finished, before the runner returned its final report
+(exit 124 at 120 seconds; log SHA-256
+`1c75eab46a905a553c85e81cd843feb25bb72fb83176a6b1ab351af80ed53287`).
+Full ShellCheck was killed with exit 137. An earlier integrity attempt timed
+out before the successful unchanged-gate rerun.
 
 These are bounded source and observed CLI results, not a complete public-suite,
 full-repository, live PostgreSQL, platform or release qualification. The original

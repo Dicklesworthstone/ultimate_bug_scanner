@@ -411,6 +411,8 @@ class _HTTPPending:
     # Session requests in aiohttp implement BOTH coroutine and async-context
     # protocols. HTTPX streams and aiohttp.request() are context-only.
     context_manager: bool = False
+    # A deferred effect keeps the originating AST and its selected module.
+    # Summary substitution changes facts and aliases, never source ownership.
     call_owner: ast.Module | None = None
 
 
@@ -6580,7 +6582,7 @@ class _Flow:
             self.expression_bindings[node] = _BoundCallable(
                 '@http.pending', references, destination, True,
                 receiver_binding=_HTTPPending(node, asynchronous, streaming, contract.kind == 'aiohttp',
-                    self.engine.tree if contract.kind == 'aiohttp' else None))
+                                              self.engine.tree))
             self.expression_references[node] = references
             return CLEAN
         self.effect('ssrf', node, 'HTTP request URL', destination)
@@ -6604,11 +6606,16 @@ class _Flow:
         if (not isinstance(contract, _HTTPPending)
                 or contract.streaming != streaming and not (streaming and contract.context_manager)):
             raise AnalysisLimit('HTTP request consumption protocol is unresolved; analysis is incomplete')
-        if contract.call_owner is not None and contract.call_owner is not self.engine.tree:
-            # Effects currently belong to their enclosing module summary.
-            # A foreign returned request must not report its helper's line
-            # against the consuming module's unrelated source path.
-            raise AnalysisLimit('cross-file HTTP pending request location is unresolved; analysis is incomplete')
+        if contract.call_owner is not self.engine.tree:
+            project = self.engine.project
+            owner = project.tree_owners.get(contract.call_owner) if project is not None else None
+            if owner is None or owner.project is not project:
+                raise AnalysisLimit('cross-file HTTP pending request location is unresolved; analysis is incomplete')
+            # Selected modules share virtual source coordinates. Keep the
+            # request call's original location so deferred consumption uses
+            # the defining file's suppression index, just like eager effects.
+            # Equal paths or line numbers from a different project do not
+            # provide that proof, nor do imports made opaque by a cycle.
         if value.references & state.mutated:
             raise AnalysisLimit('HTTP request receiver changed before execution; analysis is incomplete')
         self.effect('ssrf', contract.call, 'HTTP request URL', value.receiver)
@@ -10845,6 +10852,7 @@ class _Project:
             self.namespaces.add(key)
             self.namespaces.update(parent for parent in key.parents if parent.is_relative_to(self.root))
         self.paths = {engine: path for path, _, engine, _ in self.sources}
+        self.tree_owners = {engine.tree: engine for _, _, engine, _ in self.sources}
         self.import_dependencies = {engine: self.dependencies(engine) for _, _, engine, _ in self.sources}
         self.owners = {function: engine for _, _, engine, _ in self.sources for function in engine.functions}
         self.module_references = {'@module:' + str(key) for key in self.namespaces}

@@ -211,3 +211,34 @@ these three gaps.
   - Staged-source self-scan selected the three modified analyzers after the repository's test-suite ignore rule, started Python scanning, then timed out after 90 seconds (exit 124) without a completed JSON report. DSR log SHA256: `ad99eff75946af7e63cb3f4c517b7e375b6f95164581b6977863baf2b1cc6b31`.
   - The prescribed `test-suite/run_all.sh` passed its integrity and generated-rule inventory steps, reproduced missing buggy/clean Swift fixture pairs in the rule-quality harness, and reached its 180-second aggregate limit during unit discovery (exit 124, observed duration 182.253 seconds). Discovery under uv-selected CPython 3.14.10 reported errors and a failure before interruption; final per-test tracebacks were not produced, so these are unresolved and are not attributed to a particular cause. The inherited no-deletion guard and retained temporary directories were active. DSR log SHA256: `982a80caa07904685580056ea86b671a90ee51fd87e263e21fab21e77d705e9c`.
 - [x] Record unresolved whole-repository and release gates without closing the D6 or release umbrellas. The prescribed full ShellCheck process was killed after about 100 seconds without diagnostics; no lint pass is claimed (log SHA256 `fd3acc0c811ea35ba92a919db4fe88e1ea0e737d912bd19d95be19bab141d8cd`). Scoped Beads retain delivered feature evidence and remaining boundaries; no release tag or full qualification is claimed.
+
+## 11. November 20, 2026 continuation: native callback and input transport
+
+Base: `c026e11535a5bd54d0f02e9c9a6f8c63353d7945`. The plan, Beads and
+active implementations were checked again before selecting these gaps.
+
+### Python deferred HTTP origins across selected modules (`1b9j.6.4`)
+
+- [x] Freeze helper-returned request cases before implementation: 19 aiohttp subcases fail the old foreign-origin guard; the missing-owner guard also exposes an unsafe bypass. Existing HTTPX, requests and urllib controls remain valid.
+- [x] Share selected-project AST ownership across all pending HTTP contracts. Preserve the defining helper's path, line, column and suppression context through returns, forwarding, await and supported context consumption. Missing or foreign project identities remain explicitly incomplete.
+- [x] Verify actual aiohttp 3.14.5 and HTTPX 0.28.1 behavior without network traffic. The HTTP source cohort passes 79 tests with five opt-in skips; DSR log SHA256 `d3a0bc8772fe218085f436cfaebcd7a30c23bb7377043418494d539f92820446`.
+- [x] Pass all 27 planned public module/runner JSON/SARIF checks on isolated development version 5.5.94: returned aiohttp await, HTTPX stream, safe/unused/suppressed handles, findings retained during partial analysis and cold/warm/helper-edit cache behavior. Exact locations, totals, statuses and exits are asserted. DSR log SHA256 `927b81ed876b6b1583d2c793aa545648d8588edc33e49041543d1ea8abbbec69`.
+- [x] Verify canonical module/helper/SHA256 pins, runner syntax and whitespace. DSR log SHA256 `50f09ec7dcb995beb31b7d09f18f06dc53e43d1c60cce2fa3fbdee321e769f7d`.
+- [x] Retain the failed shared-checkout public receipt: it correctly rejected stale pins before its first case; the passing matrix uses the isolated pinned publisher without bypasses.
+- [ ] Resolve broader module/call-summary qualification. The 491-test cohort reports 16 skips and three failures: recursive global override and argparse delayed-generator expectations reproduce unchanged on clean `c026e115` (baseline log SHA256 `15e43affbc9acb23d2246085c3b0f4c100a9969a76b4bd938beb3134e74328d1`); an embedded staged CLI check refused the shared checkout's stale pins. Neither the whole cohort nor the full-repository/release gates are claimed passing.
+
+### JavaScript native reductions (`1b9j.6.5`)
+
+- [x] Freeze 14 native witnesses and exact scanner outcomes: the incumbent has five unsafe misses and four clean-control false positives, all incorrectly reported as complete.
+- [x] Implement `reduce` and `reduceRight` through the common native array traversal and callback summaries, preserving accumulator identity, strong replacement, sparse directional traversal, seed semantics, source mutation, callback writes and throws.
+- [x] Pass all 56 focused source/native methods, including existing map/forEach/flatMap behavior and the 18 new reduction methods. DSR log SHA256 `3021451279f884534137365c0a918c69fde251a78bb96ef115c2b1d4e115208d`.
+- [ ] Complete independent review and pinned public formats, selection, suppression and cache checks, then publish with canonical integrity pins.
+
+### Go buffered input and native Reader payloads (`1b9j.6.6`)
+
+- [x] Reproduce complete-clean misses through Scanner.Text, aliased Reader.ReadString, io.ReadAll(os.Stdin) and JSON decoding from stdin, plus a metadata false positive on a literal reader. Real Go 1.24.4 witnesses distinguish pre-Scan empty text, scanned stdin and fixed text.
+- [ ] Complete the shared native Reader capability and bufio contracts; verify source/native and related regression cohorts, then exact public formats and cache/selection/suppression controls before publication.
+
+The broad D6 and release umbrellas remain open. All public scanner matrices are
+serialized against isolated, canonically pinned feature trees; source checks may
+run concurrently. Failed and interrupted receipts remain retained.

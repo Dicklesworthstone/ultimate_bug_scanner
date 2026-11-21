@@ -1062,6 +1062,352 @@ urllib.request.urlopen(urllib.request.Request(target))
                             print(f'[{tag}] PASS', flush=True)
 
 
+class CrossFileHTTPTransportTests(SourceTest):
+    """Selected helpers retain native handles, source facts and defining sites."""
+
+    def project_findings(self, sources, *, selected=None):
+        with temporary_directory(prefix='ubs-http-transport-') as temporary:
+            directory = Path(temporary)
+            paths = {}
+            for name, source in sources.items():
+                path = directory / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source, encoding='utf-8')
+                paths[name] = path
+            return list(taint_py.run(RunContext(
+                lang='python', files=[paths[name] for name in selected or sources],
+                profile={'project_dir': str(directory)})))
+
+    def assert_sites(self, findings, *expected):
+        self.assertEqual(sorted((row['rule'], Path(row['path']).name, row['line'], row['col'])
+                                for row in findings), sorted(expected), findings)
+
+    def test_returned_pending_requests_keep_defining_sites(self):
+        cases = (
+            ('httpx', 'AsyncClient', 'client.get(target)', 'await pending'),
+            ('httpx', 'AsyncClient', 'client.stream("GET", target)',
+             'async with pending:\n        pass'),
+            ('httpx', 'Client', 'client.stream("GET", target)', 'with pending:\n        pass'),
+            ('aiohttp', 'ClientSession', 'client.get(target)', 'await pending'),
+            ('aiohttp', 'ClientSession', 'client.get(target)', 'async with pending:\n        pass'),
+            ('aiohttp', 'ClientSession', 'client.get(target)', 'asyncio.create_task(pending)'),
+            ('aiohttp', 'ClientSession', 'client.get(target)', 'await asyncio.gather(pending)'),
+        )
+        for module, constructor, request, consume in cases:
+            sources = {
+                'transport.py': 'def prepare(client, target):\n    return ' + request + '\n',
+                'view.py': 'from transport import prepare\nimport ' + module + ', asyncio\n'
+                           'async def send():\n    client = ' + module + '.' + constructor + '()\n'
+                           '    pending = prepare(client, input())\n    ' + consume + '\n',
+            }
+            for selected in (tuple(sources), tuple(reversed(sources))):
+                with self.subTest(module=module, constructor=constructor, consume=consume, selected=selected):
+                    findings = self.project_findings(sources, selected=selected)
+                    self.assert_sites(findings, ('python.taint.ssrf', 'transport.py', 2, 12))
+                    self.assertIn('input', findings[0]['message'])
+                    self.assertIn('prepare', findings[0]['message'])
+
+    def test_forwarded_and_async_factories_keep_request_sources(self):
+        for module, constructor in (('aiohttp', 'ClientSession'), ('httpx', 'AsyncClient')):
+            for declaration, prepare in (('def', 'prepare(client)'),
+                                         ('async def', 'await prepare(client)')):
+                sources = {
+                    'transport.py': declaration + ' prepare(client):\n'
+                                    '    return client.get(input())\n',
+                    'relay.py': 'from transport import prepare\n'
+                                'async def forward(client):\n    return ' + prepare + '\n',
+                    'view.py': 'from relay import forward\nimport ' + module + '\n'
+                               'async def send():\n    client = ' + module + '.' + constructor + '()\n'
+                               '    pending = await forward(client)\n    await pending\n',
+                }
+                for selected in (tuple(sources), tuple(reversed(sources))):
+                    with self.subTest(module=module, declaration=declaration, selected=selected):
+                        findings = self.project_findings(sources, selected=selected)
+                        self.assert_sites(findings, ('python.taint.ssrf', 'transport.py', 2, 12))
+                        self.assertIn('input', findings[0]['message'])
+
+    def test_module_context_factories_and_request_line_suppression(self):
+        for helper_ignore, caller_ignore in (('', ''), ('  # ubs:ignore[python.taint.ssrf]', ''),
+                                              ('', '  # ubs:ignore[python.taint.ssrf]')):
+            sources = {
+                'transport.py': 'import aiohttp\ndef prepare(target):\n'
+                                '    return aiohttp.request("GET", target)' + helper_ignore + '\n',
+                'view.py': 'from transport import prepare\nasync def send():\n'
+                           '    async with prepare(input()):' + caller_ignore + '\n        pass\n',
+            }
+            for selected in (tuple(sources), tuple(reversed(sources))):
+                with self.subTest(helper_ignore=helper_ignore, caller_ignore=caller_ignore, selected=selected):
+                    findings = self.project_findings(sources, selected=selected)
+                    expected = () if helper_ignore else (('python.taint.ssrf', 'transport.py', 3, 12),)
+                    self.assert_sites(findings, *expected)
+
+    def test_safe_and_unconsumed_returned_handles_remain_clean(self):
+        for module, constructor, request, consume in (
+            ('aiohttp', 'ClientSession', 'client.post(target, data=body)', 'await pending'),
+            ('httpx', 'AsyncClient', 'client.post(target, data=body)', 'await pending'),
+            ('httpx', 'Client', 'client.stream("POST", target, data=body)', 'with pending:\n        pass'),
+        ):
+            for destination, action in (('"https://safe.invalid"', consume), ('input()', 'pass')):
+                with self.subTest(module=module, constructor=constructor, destination=destination, action=action):
+                    self.assert_sites(self.project_findings({
+                        'transport.py': 'def prepare(client, target, body):\n    return ' + request + '\n',
+                        'view.py': 'from transport import prepare\nimport ' + module + '\n'
+                                   'async def send():\n    client = ' + module + '.' + constructor + '()\n'
+                                   '    pending = prepare(client, ' + destination + ', input())\n'
+                                   '    ' + action + '\n',
+                    }))
+
+    def test_imported_client_factories_keep_base_url_provenance(self):
+        for module, constructor in (('aiohttp', 'ClientSession'), ('httpx', 'AsyncClient')):
+            for target, expected in (('"/relative"', (('python.taint.ssrf', 'view.py', 4, 11),)),
+                                     ('"https://safe.invalid/fixed"', ())):
+                with self.subTest(module=module, target=target):
+                    findings = self.project_findings({
+                        'transport.py': 'import ' + module + '\ndef make(base):\n'
+                                        '    return ' + module + '.' + constructor + '(base_url=base)\n',
+                        'view.py': 'from transport import make\nasync def send():\n'
+                                   '    client = make(input())\n    await client.get(' + target + ')\n',
+                    })
+                    self.assert_sites(findings, *expected)
+                    if expected:
+                        self.assertIn('input', findings[0]['message'])
+
+    def test_mutation_escape_and_protocol_mismatch_remain_incomplete(self):
+        for module, constructor in (('aiohttp', 'ClientSession'), ('httpx', 'AsyncClient')):
+            for action in ('client.base_url = input()\n    await pending',
+                           'configure(client)\n    await pending', 'configure(pending)',
+                           'with pending:\n        pass'):
+                with self.subTest(module=module, action=action):
+                    with self.assertRaises(taint_py.AnalysisLimit):
+                        self.project_findings({
+                            'transport.py': 'def prepare(client, target):\n    return client.get(target)\n',
+                            'view.py': 'from transport import prepare\nimport ' + module + '\n'
+                                       'async def send():\n    client = ' + module + '.' + constructor + '()\n'
+                                       '    pending = prepare(client, "https://safe.invalid")\n'
+                                       '    ' + action + '\n',
+                        })
+        with self.assertRaises(taint_py.AnalysisLimit):
+            self.project_findings({
+                'transport.py': 'import aiohttp\ndef prepare(target):\n'
+                                '    return aiohttp.request("GET", target)\n',
+                'view.py': 'from transport import prepare\nasync def send():\n'
+                           '    await prepare(input())\n',
+            })
+
+    def test_unselected_and_shadowed_helpers_do_not_borrow_native_identity(self):
+        sources = {
+            'transport.py': 'import aiohttp\ndef prepare(target):\n'
+                            '    return aiohttp.request("GET", target)\n',
+            'view.py': 'from transport import prepare\nasync def send():\n'
+                       '    async with prepare(input()):\n        pass\n',
+        }
+        self.assert_sites(self.project_findings(sources, selected=('view.py',)))
+        sources['aiohttp.py'] = 'def request(method, target):\n    return None\n'
+        self.assert_sites(self.project_findings(sources))
+
+    def test_existing_eager_and_urllib_handles_keep_consumption_sites(self):
+        for module, constructor in (('requests', 'Session'), ('httpx', 'Client')):
+            with self.subTest(module=module):
+                findings = self.project_findings({
+                    'transport.py': 'def fetch(client, target):\n    return client.get(target)\n',
+                    'view.py': 'from transport import fetch\nimport ' + module + '\n'
+                               'client = ' + module + '.' + constructor + '()\nfetch(client, input())\n',
+                })
+                self.assert_sites(findings, ('python.taint.ssrf', 'transport.py', 2, 12))
+        findings = self.project_findings({
+            'transport.py': 'from urllib.request import Request\ndef prepare(target):\n'
+                            '    return Request(target)\n',
+            'view.py': 'from transport import prepare\nfrom urllib.request import urlopen\n'
+                       'pending = prepare(input())\nurlopen(pending)\n',
+        })
+        self.assert_sites(findings, ('python.taint.ssrf', 'view.py', 4, 1))
+
+    def test_pending_origin_requires_the_current_selected_project(self):
+        import ast
+
+        with temporary_directory(prefix='ubs-http-origin-') as temporary:
+            directory = Path(temporary)
+            path = directory / 'transport.py'
+            path.write_text('client.get(target)\n', encoding='utf-8')
+            first = taint_py._Project([path], directory)
+            second = taint_py._Project([path], directory)
+            engine = first.sources[0][2]
+            foreign = second.sources[0][2].tree
+            flow = taint_py._Flow(engine, engine.tree)
+            # Equal text, paths and coordinates do not prove shared ownership.
+            for origin in (foreign, ast.parse('client.get(target)\n'), None):
+                with self.subTest(origin=origin):
+                    pending = taint_py._BoundCallable(
+                        '@http.pending', taint_py.NO_REFERENCES, namespace_proven=True,
+                        receiver_binding=taint_py._HTTPPending(
+                            foreign.body[0].value, asynchronous=True, call_owner=origin))
+                    with self.assertRaisesRegex(taint_py.AnalysisLimit, 'HTTP pending request location'):
+                        flow.resume_http(pending, taint_py._State())
+
+    def test_native_returned_handles_defer_effects_without_network(self):
+        try:
+            import aiohttp
+            import httpx
+        except ImportError:
+            self.skipTest('aiohttp and HTTPX are required for the native transport witness')
+        import asyncio
+        import types
+        from unittest import mock
+
+        helper = types.ModuleType('transport')
+        exec(compile('def prepare(client, target):\n    return client.get(target)\n'
+                     'async def forward(client, target):\n    return prepare(client, target)\n'
+                     'def stream(client, target):\n    return client.stream("GET", target)\n',
+                     'transport.py', 'exec'), helper.__dict__)
+
+        async def witness():
+            observed = []
+
+            class Response:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *error):
+                    pass
+
+            async def capture_aiohttp(client, method, url, **options):
+                observed.append(('aiohttp', method, str(url)))
+                return Response()
+
+            def capture_httpx(request):
+                observed.append(('httpx', request.method, str(request.url)))
+                return httpx.Response(200, content=b'ok')
+
+            with mock.patch.object(aiohttp.ClientSession, '_request', capture_aiohttp):
+                async with aiohttp.ClientSession() as client:
+                    pending = await helper.forward(client, 'https://aiohttp.invalid/await')
+                    self.assertEqual(observed, [])
+                    await pending
+                    pending = helper.prepare(client, 'https://aiohttp.invalid/context')
+                    self.assertEqual(len(observed), 1)
+                    async with pending:
+                        pass
+            async with httpx.AsyncClient(transport=httpx.MockTransport(capture_httpx)) as client:
+                pending = await helper.forward(client, 'https://httpx.invalid/await')
+                self.assertEqual(len(observed), 2)
+                await pending
+                pending = helper.stream(client, 'https://httpx.invalid/stream')
+                self.assertEqual(len(observed), 3)
+                async with pending:
+                    pass
+            self.assertEqual(observed, [
+                ('aiohttp', 'GET', 'https://aiohttp.invalid/await'),
+                ('aiohttp', 'GET', 'https://aiohttp.invalid/context'),
+                ('httpx', 'GET', 'https://httpx.invalid/await'),
+                ('httpx', 'GET', 'https://httpx.invalid/stream'),
+            ])
+            print('Native returned HTTP handles:', aiohttp.__version__, httpx.__version__, observed, flush=True)
+
+        asyncio.run(witness())
+
+    @unittest.skipUnless(os.environ.get('UBS_HTTP_TRANSPORT_E2E') == '1',
+                         'opt-in selected HTTP helper scanner integration')
+    def test_public_selected_helper_locations_status_and_cache(self):
+        helper = 'def prepare(client, target):\n    return client.get(target)\n'
+        caller = ('from transport import prepare\nimport aiohttp\nasync def send():\n'
+                  '    client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))\n'
+                  '    pending = prepare(client, input())\n    await pending\n')
+        cases = (
+            ('awaited', helper, caller, True, False),
+            ('httpx-stream', helper.replace('client.get(target)', 'client.stream("GET", target)'),
+             caller.replace('import aiohttp', 'import httpx')
+                   .replace('aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))',
+                            'httpx.AsyncClient(timeout=5)')
+                   .replace('await pending', 'async with pending:\n        pass'), True, False),
+            ('safe', helper, caller.replace('prepare(client, input())',
+                                           'prepare(client, "https://safe.invalid")'), False, False),
+            ('unused', helper, caller.replace('    await pending\n', ''), False, False),
+            ('suppressed', helper.replace('client.get(target)',
+                                          'client.get(target)  # ubs:ignore[python.taint.ssrf]'),
+             caller, False, False),
+            ('partial-retained', helper, caller +
+             '    await client.get("https://safe.invalid", proxy=input())\n', True, True),
+        )
+        with temporary_directory(prefix='ubs-http-transport-public-') as temporary:
+            directory = Path(temporary)
+            skip = '--skip=' + ','.join(str(value) for value in range(1, 25) if value != 7)
+            env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'ENABLE_UV_TOOLS': '0',
+                   'UBS_KEEP_TEMP': '1', 'UBS_NO_CACHE': '1', 'UBS_ALLOW_PARTIAL': '0',
+                   'UBS_CACHE_DIR': str(directory / 'cache')}
+
+            def check(project, tag, unsafe, partial, runner, output, *, cache=False):
+                entrypoint = ROOT / 'ubs' if runner else ROOT / 'modules' / 'ubs-python.sh'
+                command = [str(entrypoint), '--ci', '--no-color', skip, '--format=' + output]
+                command += ['--only=python'] if runner else ['--no-uv']
+                result = subprocess.run([*command, str(project)], cwd=directory,
+                                        env={**env, 'UBS_NO_CACHE': '0' if cache else '1'},
+                                        capture_output=True, text=True, timeout=120)
+                (directory / (tag + '.stdout')).write_text(result.stdout, encoding='utf-8')
+                (directory / (tag + '.stderr')).write_text(result.stderr, encoding='utf-8')
+                detail = (tag, result.returncode, result.stdout, result.stderr)
+                self.assertEqual(result.returncode, 2 if partial else 1 if unsafe else 0, detail)
+                document = json.loads(result.stdout)
+                expected = [('python.taint.ssrf', 'transport.py', 2)] if unsafe else []
+                if output == 'json':
+                    self.assertEqual(document['status'], 'partial' if partial else 'ok', detail)
+                    totals = document['totals'] if runner else document
+                    self.assertEqual((totals['files'], totals['critical'], totals['warning'], totals['info']),
+                                     (2, int(unsafe), 0, 0), detail)
+                    rows = document.get('findings', []) if runner and not unsafe else document['findings']
+                    self.assertEqual(len(rows), len(expected), detail)
+                    if runner:
+                        if not unsafe:
+                            self.assertEqual([scanner['findings'] for scanner in document['scanners']], [[]], detail)
+                        actual = [(row['rule_id'], Path(row['file']).name, row['line']) for row in rows]
+                        self.assertTrue(all(row['col'] == 12 for row in rows), detail)
+                    else:
+                        self.assertTrue(all(row['count'] == 1 and len(row['samples']) == 1 for row in rows), detail)
+                        actual = [(row['rule_id'], Path(sample['file']).name, sample['line'])
+                                  for row in rows for sample in row['samples']]
+                    self.assertEqual(actual, expected, detail)
+                else:
+                    runs = document['runs']
+                    self.assertTrue(runs, detail)
+                    rows = [row for run in runs for row in run['results']]
+                    self.assertEqual(len(rows), len(expected), detail)
+                    actual = []
+                    for row in rows:
+                        self.assertEqual(len(row['locations']), 1, detail)
+                        location = row['locations'][0]['physicalLocation']
+                        self.assertTrue(location['artifactLocation']['uri'].endswith('transport.py'), detail)
+                        self.assertEqual(location['region']['startColumn'], 12, detail)
+                        actual.append((row['ruleId'], 'transport.py', location['region']['startLine']))
+                    self.assertEqual(actual, expected, detail)
+                    for run in runs:
+                        if partial:
+                            self.assertIs(run['invocations'][0]['executionSuccessful'], False, detail)
+                            self.assertEqual(run['invocations'][0]['exitCode'], 2, detail)
+                        else:
+                            self.assertTrue(all(inv['executionSuccessful'] is True
+                                                for inv in run.get('invocations', [])), detail)
+                print(f'[{tag}] PASS', flush=True)
+
+            for name, helper_source, caller_source, unsafe, partial in cases:
+                project = directory / name
+                project.mkdir()
+                (project / 'transport.py').write_text(helper_source, encoding='utf-8')
+                (project / 'view.py').write_text(caller_source, encoding='utf-8')
+                for runner in (False, True):
+                    for output in ('json', 'sarif'):
+                        check(project, f'{name}-{"runner" if runner else "module"}-{output}',
+                              unsafe, partial, runner, output)
+            project = directory / 'cache-project'
+            project.mkdir()
+            transport = project / 'transport.py'
+            transport.write_text(helper.replace('client.get(target)',
+                                                 'client.get("https://safe.invalid")'), encoding='utf-8')
+            (project / 'view.py').write_text(caller, encoding='utf-8')
+            check(project, 'helper-cold', False, False, True, 'json', cache=True)
+            check(project, 'helper-warm', False, False, True, 'json', cache=True)
+            transport.write_text(helper, encoding='utf-8')
+            check(project, 'helper-edited', True, False, True, 'json', cache=True)
+
+
 class AiohttpDestinationTests(SourceTest):
     """Native aiohttp requests are lazy, awaitable async context managers.
 
@@ -1336,9 +1682,13 @@ class AiohttpDestinationTests(SourceTest):
             caller.write_text('from transport import prepare\nimport aiohttp\nasync def send():\n'
                               '    client = aiohttp.ClientSession()\n    await prepare(client, input())\n',
                               encoding='utf-8')
-            with self.assertRaisesRegex(taint_py.AnalysisLimit, 'cross-file HTTP'):
-                list(taint_py.run(RunContext(lang='python', files=[caller, helper],
-                                            profile={'project_dir': str(directory)})))
+            for selected in ([caller, helper], [helper, caller]):
+                with self.subTest(selected=selected):
+                    findings = list(taint_py.run(RunContext(lang='python', files=selected,
+                                                          profile={'project_dir': str(directory)})))
+                    self.assertEqual([(row['rule'], row['path'], row['line'], row['col'])
+                                      for row in findings],
+                                     [('python.taint.ssrf', str(helper), 2, 12)])
 
     @unittest.skipUnless(os.environ.get('UBS_AIOHTTP_E2E') == '1', 'opt-in verified aiohttp scanner integration')
     def test_public_awaited_context_and_base_contract(self):

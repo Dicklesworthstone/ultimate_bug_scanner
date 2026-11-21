@@ -156,3 +156,51 @@ complete.
 Production scanners and discovery tests remain unchanged in these checkpoint
 commits. The interrupted execution environment blocks the remaining qualification;
 all three functional Beads stay open/in progress.
+
+## 10. November 20, 2026 native dataflow gaps
+
+Original base: `06222fb6b9069ec95d2c72d6f753403613804702`; publication integrates
+concurrent SQL, JavaScript array-copy and Python nested-generator work through
+`e0032f0295173827fb5184a09fa1bb50fba1cac1`.
+This session follows the comprehensive feedback plan and current Beads. Earlier
+open source-coverage tasks were checked against active code before selecting
+these three gaps.
+
+### JavaScript synchronous array callbacks (`1b9j.6.1`)
+
+- [x] Freeze native Node witnesses and unsafe/clean scanner cases before implementation; the initial 16-method baseline exposes 29 failed assertions/subcases.
+- [x] Reuse bounded native array traversal for `map`, `flatMap` and `forEach`, including live element reads, captured length, holes, per-index map results, aliases and callback writes/throws.
+- [x] Preserve `thisArg`, helper contexts, selected own methods, empty callbacks and sink-specific sanitizer behavior; unknown property/callback protocols remain explicitly incomplete.
+- [x] Repair independently discovered nested callback captures without executing unused callbacks; all six outer `map`/`forEach` and inner `map`/`forEach`/`flatMap` combinations retain the unsafe write.
+- [x] Pass the final 38 focused methods, including native Node witnesses and the existing 19-method `flatMap` cohort. Returned closures outside the selected escape model remain an explicit boundary.
+- [x] Pass all 29 actual module/meta-runner JSON/SARIF, selected-file, suppression and cache/edit checks against the isolated original-base publication tree. The original aggregate timeout is retained; unchanged cases pass in 12/12/5-call shards, with each subprocess still bounded at 45 seconds.
+- [x] Preserve concurrent native array-copy implementation and tests; the merged source cohort passes all 50 methods (the previous 38 plus 12 incoming copy regressions). DSR log SHA256: `68cfdcddb074fa74b2e2e01ac474f291c674702e122d69e90046b5d2a757714e`.
+- [ ] Repeat the public reports on the merged tree; runner changes from the original verified tree are version and canonical integrity pins.
+- [x] Publish the implementation and evidence directly to `main` with canonical integrity pins and development version 5.5.91; the broader Bead acceptance remains open.
+
+### Python aiohttp destinations (`1b9j.6.2`)
+
+- [x] Freeze 12 source methods before implementation: 51 failed assertions on the incumbent; verify lazy construction, await, async context and task behavior with real aiohttp and no network traffic.
+- [x] Track actual `ClientSession`/module API identities, aliases, selected same-file helper flow, URL slots and base URLs through deferred requests.
+- [x] Distinguish session requests that support await and async context entry from the context-only module API; unused handles do not become reached sinks.
+- [x] Preserve fixed destinations and payload/metadata controls; expose proxy, custom callback/transport, receiver mutation, reflection and unsupported cross-file pending requests explicitly.
+- [x] Pass all 14 independent source cases and the final 29 focused methods; rerun the two unchanged subprocess checks that timed out during the interrupted broader run.
+- [ ] Complete the 39-invocation public format, selection, suppression and cache/edit matrix against current pins; the first 12-call unsafe/context/base shard passed. A new test's incorrect column-1 expectation was corrected to the actual awaited call columns; production code was unchanged.
+- [ ] Publish the verified implementation and evidence directly to `main`.
+
+### Go formatted input (`1b9j.6.3`)
+
+- [x] Reproduce missing native `fmt.Scan*`, `Fscan*` and `Sscan*` destination writes before implementation, including incorrect count/error payload propagation.
+- [x] Add stdlib identity and bounded builtin text destination proofs, pointer aliases, selected helpers, weak writes and clean result slots; preserve fixed inputs and bound SQL.
+- [x] Refuse custom Scanner/readers, encoded/dynamic formats, global destinations and unproved type/dispatch protocols explicitly; guard native source capabilities when stored or replaced.
+- [x] Verify package/local builtin-type shadow controls and compile a real Go witness with retained build files. The final focused source/native run passes 18 methods without skips.
+- [x] Run the independent 14-case review: 13 precise outcomes pass and a callable replaced during argument evaluation remains explicitly incomplete, never silently clean.
+- [ ] Complete the final broad Go cohort and the 32-invocation module/meta-runner JSON/SARIF/selection matrix.
+- [ ] Publish the verified implementation and evidence directly to `main`.
+
+### Combined qualification and tracking
+
+- [x] Preserve historical Beads content, restore one missing historical comment identity required by the Beads importer, and add the three scoped implementation tasks; blocking dependencies are acyclic.
+- [x] Retain failed and interrupted test attempts; execution-environment stalls and killed processes are not passing evidence.
+- [ ] Verify combined module/helper/SHA256 pins, touched-source self-scan and the prescribed full repository suite.
+- [ ] Record unresolved whole-repository and release gates without closing the D6 or release umbrellas. The prescribed full ShellCheck process was killed after about 100 seconds without diagnostics; no lint pass is claimed.

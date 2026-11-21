@@ -1672,7 +1672,7 @@ class _Flow:
                         # must not be mistaken for prototype/method writes.
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
                                        'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed',
-                                       'toSpliced', 'with', 'entries', 'map', 'flatMap'):
+                                       'toSpliced', 'with', 'entries', 'map', 'flatMap', 'forEach'):
                             slots[method] = _alternatives(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
@@ -2767,7 +2767,7 @@ class _Flow:
                 slots[None] = _Fact(joined, _refs(joined), absent=True)
         return receiver
 
-    def array_callback(self, callee, element, receiver, this_arg, state, location):
+    def array_callback(self, callee, element, receiver, this_arg, state, location, method):
         """Use ordinary call summaries for a synchronous native callback."""
         self.engine.import_captures(callee, state, self.rule)
         self.engine.dependents[(callee, self.rule)][self.scope] = None
@@ -2776,7 +2776,7 @@ class _Flow:
         # element as a missing argument. The index and source are supplied.
         scalar = not _refs(element) or bool(frozenset(element))
         if scalar and callee.params and callee.params[0][2] is not None:
-            self.incomplete.add('Array.flatMap element default requires a known undefined or present value')
+            self.incomplete.add(f'Array.{method} element default requires a known undefined or present value')
         prepared = ([(element, scalar), (frozenset(), False), (receiver, False)],
                     None, {0} if scalar else set(), {1: 'present', 2: 'present'})
         bound = self.bind(callee, prepared, state, location, receiver=this_arg)
@@ -2929,43 +2929,50 @@ class _Flow:
                     for index in range(next(iter(sizes)))], True
         return [_join(*(item for items in variants for item in items))], False
 
-    def array_flatmap(self, receiver, arguments, prepared, state, location, callback=None):
-        """Map live finite array slots into a fresh, one-level flattened array.
+    def array_iteration(self, receiver, method, arguments, prepared, state, location, callback=None):
+        """Execute map, flatMap and forEach over live finite array slots.
 
         The source length is captured once, while elements are read immediately
         before each callback. Sparse lengths never turn into dense loops.
         Callback writes, throws and borrowed object identities use the same
-        bounded heap summaries as ordinary local calls.
+        bounded heap summaries as ordinary local calls. Map preserves source
+        indices and holes; flatMap flattens once; forEach discards return values.
         """
         actual, uncertain, _missing, _kinds = prepared
         callee = (_function_target(actual[0][0]) or callback) if actual else None
-        result = (self.scope, location, 'array-flatmap')
-        previous = state.heap.get(result)
-        previous_length = state.array_lengths.get(result)
+        produces_array = method != 'forEach'
+        result = (self.scope, location, 'array-' + method)
+        returned = _Fact(refs=(result,)) if produces_array else frozenset()
+        previous = state.heap.get(result) if produces_array else None
+        previous_length = state.array_lengths.get(result) if produces_array else None
         refs = _refs(receiver)
         if (uncertain is not None or callee is None or callee.generator or callee.asynchronous
                 or self.escaped_callable(callee)):
             if callee is not None:
                 self.engine.escaped_callbacks.add(callee)
-            self.incomplete.add('Array.flatMap requires a selected synchronous callback')
-            state.heap[result] = dict(previous or {})
-            state.array_lengths[result] = None
-            return _Fact(refs=(result,))
-        if any(not self.array_mutation_contract(ref, state, species=True)
+            self.incomplete.add(f'Array.{method} requires a selected synchronous callback')
+            if produces_array:
+                state.heap[result] = dict(previous or {})
+                state.array_lengths[result] = None
+            return returned
+        if any(not self.array_mutation_contract(ref, state, species=produces_array)
                or state.array_lengths[ref] is None or None in state.heap[ref] for ref in refs):
             self.engine.escaped_callbacks.add(callee)
-            self.incomplete.add('Array.flatMap requires finite ordinary arrays and native array species')
-            state.heap[result] = dict(previous or {})
-            state.array_lengths[result] = None
-            return _Fact(refs=(result,))
+            requirement = 'finite ordinary arrays and native array species' if produces_array else 'finite ordinary arrays'
+            self.incomplete.add(f'Array.{method} requires {requirement}')
+            if produces_array:
+                state.heap[result] = dict(previous or {})
+                state.array_lengths[result] = None
+            return returned
         this_arg = actual[1][0] if len(actual) > 1 else frozenset()
-        result_kind = self.flatmap_result_kind(callee)
+        result_kind = self.flatmap_result_kind(callee) if method == 'flatMap' else None
         if (not callee.arrow and not _refs(this_arg)
                 and re.search(r'\bthis\b', callee.code[callee.body_start:callee.body_end])):
-            self.incomplete.add('Array.flatMap callback requires a known this receiver')
-            state.heap[result] = dict(previous or {})
-            state.array_lengths[result] = None
-            return _Fact(refs=(result,))
+            self.incomplete.add(f'Array.{method} callback requires a known this receiver')
+            if produces_array:
+                state.heap[result] = dict(previous or {})
+                state.array_lengths[result] = None
+            return returned
         if callee.name and not callee.declaration and not callee.arrow:
             # The general binding model does not create a function
             # expression's private immutable self-name environment. A
@@ -2975,7 +2982,7 @@ class _Flow:
             if any(self.engine.lexical_binding(callee, callee.name, callee.body_start + match.start())[0]
                    is not callee for match in self_name.finditer(
                        callee.code[callee.body_start:callee.body_end])):
-                self.incomplete.add('Array.flatMap named callback self-reference requires unsupported lexical binding semantics')
+                self.incomplete.add(f'Array.{method} named callback self-reference requires unsupported lexical binding semantics')
                 self.engine.escaped_callbacks.add(callee)
         self.engine.dependents[(callee, self.rule)][self.scope] = None
         if (arguments and callee.parent is self.scope
@@ -2992,17 +2999,17 @@ class _Flow:
             branch = state.copy()
             selected = _Fact(refs=(ref,))
             limit = branch.array_lengths[ref]
-            cursor, size, slots = 0, 0, {}
+            cursor, size, slots = 0, limit if method == 'map' else 0, {}
             while cursor < limit:
                 source = branch.heap[ref]
                 self.engine.budget.spend(1 + len(source))
                 if not self.array_mutation_contract(ref, branch) or None in source:
-                    self.incomplete.add('Array.flatMap callback changed the indexed property protocol')
+                    self.incomplete.add(f'Array.{method} callback changed the indexed property protocol')
                     size = None
                     break
                 length = branch.array_lengths[ref]
                 if length is None:
-                    self.incomplete.add('Array.flatMap callback changed the source to an unknown length')
+                    self.incomplete.add(f'Array.{method} callback changed the source to an unknown length')
                     size = None
                     break
                 positions = [int(key) for key in source if self.array_index(key) is not None
@@ -3016,26 +3023,30 @@ class _Flow:
                 bypass = None if definite else branch.copy()
                 try:
                     mapped = self.array_callback(callee, value, selected, this_arg, branch,
-                                                 (location, 'flatmap-index', index))
+                                                 (location, method + '-index', index), method)
                 except _NoNormalCompletion:
                     if bypass is None:
                         branch = None
                         break
                     branch = bypass
                 else:
-                    values, exact = self.flatmap_values(mapped, branch, result_kind)
+                    values, exact = (self.flatmap_values(mapped, branch, result_kind)
+                                     if method == 'flatMap' else ([], True))
                     if not definite:
                         branch = _join_states(branch, bypass)
-                    if size is not None and exact and definite:
-                        slots.update({str(size + offset): item for offset, item in enumerate(values)})
-                        size += len(values)
-                    else:
-                        possible = _join(*values)
-                        for key, old in tuple(slots.items()):
-                            if getattr(old, 'absent', False):
-                                slots[key] = _alternatives(old, possible)
-                        slots[None] = _alternatives(slots.get(None, _ABSENT), possible)
-                        size = None
+                    if method == 'map':
+                        slots[str(index)] = _Fact(mapped, _refs(mapped), absent=not definite)
+                    elif method == 'flatMap':
+                        if size is not None and exact and definite:
+                            slots.update({str(size + offset): item for offset, item in enumerate(values)})
+                            size += len(values)
+                        else:
+                            possible = _join(*values)
+                            for key, old in tuple(slots.items()):
+                                if getattr(old, 'absent', False):
+                                    slots[key] = _alternatives(old, possible)
+                            slots[None] = _alternatives(slots.get(None, _ABSENT), possible)
+                            size = None
                 cursor = index + 1
             if branch is not None:
                 if previous is not None:
@@ -3044,20 +3055,21 @@ class _Flow:
                              for key in previous.keys() | slots.keys()}
                     branch.weak_refs.add(result)
                     size = size if size == previous_length else None
-                branch.heap[result] = slots
-                branch.array_lengths[result] = size
+                if produces_array:
+                    branch.heap[result] = slots
+                    branch.array_lengths[result] = size
                 branches.append(branch)
         merged = _join_states(*branches)
         if merged is None:
             raise _NoNormalCompletion
         self.replace_state(state, merged)
-        return _Fact(refs=(result,))
+        return returned
 
     def native_array_target(self, receiver, method, state):
         refs = _refs(receiver)
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
         if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin',
-                       'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flatMap'}
+                       'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flatMap', 'map', 'forEach'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
@@ -3075,7 +3087,7 @@ class _Flow:
                 if unknown:
                     fact = _join(fact, selected)
             cursor = selected_end
-            match = re.match(r'\s*\.\s*(flatMap|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
+            match = re.match(r'\s*\.\s*(flatMap|map|forEach|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
             if match is None:
                 break
             opening = cursor + match.end() - 1
@@ -3163,8 +3175,8 @@ class _Flow:
             return self.array_sort(receiver, arguments, prepared, state, callback)
         if kind == 'array' and method in {'toSorted', 'toReversed', 'toSpliced', 'with'}:
             return self.array_copy(receiver, method, arguments, prepared, state, location, callback)
-        if kind == 'array' and method == 'flatMap':
-            return self.array_flatmap(receiver, arguments, prepared, state, location, callback)
+        if kind == 'array' and method in {'flatMap', 'map', 'forEach'}:
+            return self.array_iteration(receiver, method, arguments, prepared, state, location, callback)
         if values and (kind == 'reflect' or (kind == 'object' and method in {
                 'defineProperty', 'defineProperties', 'freeze', 'seal', 'preventExtensions', 'setPrototypeOf'})):
             target = _join(*values) if uncertain == 0 else values[0]
@@ -3500,7 +3512,8 @@ class _Flow:
                     self.incomplete.add('Own method requires an unsupported escaped closure environment')
                 return None, receiver
             return candidate, receiver
-        if (report and key in {'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flatMap'}
+        if (report and key in {'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed', 'toSpliced',
+                              'with', 'flatMap', 'map', 'forEach'}
                 and _refs(receiver)
                 and all(ref in state.array_lengths for ref in _refs(receiver))
                 and self.native_target(name, state) is None):
@@ -4058,7 +4071,7 @@ class _Flow:
         cursor = start
         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
         if (primary_end is not None and primary_end < end - 1
-                and re.match(r'\s*\.\s*(?:flatMap|sort|toSorted|toReversed|toSpliced|with)\s*\(',
+                and re.match(r'\s*\.\s*(?:flatMap|map|forEach|sort|toSorted|toReversed|toSpliced|with)\s*\(',
                              code[primary_end + 1:end])):
             primary = self.value(start, primary_end + 1, state)
             primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)
@@ -4131,7 +4144,7 @@ class _Flow:
                 arguments = self.template_arguments(opening, closing)
             sink = self.engine.call_sinks.get(match_start)
             callback = (self.callable(*arguments[0], state)
-                        if native is not None and native[0] == 'array' and native[2] in {'sort', 'toSorted', 'flatMap'}
+                        if native is not None and native[0] == 'array' and native[2] in {'sort', 'toSorted', 'flatMap', 'map', 'forEach'}
                         and arguments else None)
             if arguments and callback is None:
                 unmodeled = self.callable(*arguments[0], state)
@@ -4833,7 +4846,7 @@ class _Engine:
         self.modeled_callbacks = set()
         self.escaped_callbacks = set()
         self.flatmap_result_kinds = {}
-        self.has_array_callbacks = any(name in self.text for name in ('flatMap', 'sort', 'toSorted'))
+        self.has_array_callbacks = any(name in self.text for name in ('flatMap', 'map', 'forEach', 'sort', 'toSorted'))
         self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
         self.current_task = None
         self.heap_solve_depth = 0
@@ -4905,7 +4918,15 @@ class _Engine:
         while True:
             changed = False
             for scope, targets in self.local_targets.items():
-                extra = set().union(*(self.capture_keys[target] for target in targets)) - self.capture_keys[scope]
+                # A nested callback can be invoked by a native array method
+                # without a syntactic call to its local name. Its outer cells
+                # must cross the enclosing call boundary before that callback
+                # runs. Transport captures only: nesting does not execute the
+                # child or add it to the direct-call/effect graph.
+                nested = {key for child in scope.children for key in self.capture_keys[child]
+                          if key[0] is not scope}
+                extra = (set().union(*(self.capture_keys[target] for target in targets)) | nested
+                         ) - self.capture_keys[scope]
                 if extra:
                     self.capture_keys[scope].update(extra)
                     changed = True

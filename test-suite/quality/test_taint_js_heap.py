@@ -2167,6 +2167,302 @@ class HeapTaintTests(unittest.TestCase):
                 self.scan('const items = [req.query.html]; ' + override
                           + 'items.fill("safe"); res.send(items[0]);', 'xss')
 
+    def test_map_returns_callback_values_in_separate_indexed_slots(self):
+        source = ('const items = ["safe", req.query.html];\n'
+                  'const out = items.map(value => value);\n'
+                  'res.send(out[0]);\nres.send(out[1]);\nres.send(out.length);')
+        self.assert_runtime_sends(source, ['safe', 'review-input', 2])
+        findings = self.scan(source, 'xss')
+        self.assertEqual([finding['line'] for finding in findings], [4])
+        source = ('const items = [1]; const out = items.map(value => req.query.html); '
+                  'res.send(out[0]);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+
+    def test_map_keeps_nested_arrays_and_borrowed_object_identity(self):
+        source = ('const box = {html: "safe"}; const items = [1]; '
+                  'const out = items.map(value => [box]); '
+                  'out[0][0].html = req.query.html; res.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+        source = ('const box = {html: req.query.html, label: "safe"}; '
+                  'const items = [box]; const out = items.map(value => value); '
+                  'res.send(out[0].label); out[0].html = "safe"; res.send(box.html);')
+        self.assert_runtime_sends(source, ['safe', 'safe'])
+        self.scan(source)
+
+    def test_map_keeps_constant_results_and_sink_specific_sanitizers_clean(self):
+        for mapper, rules in (('value => "safe"', ()),
+                              ('value => DOMPurify.sanitize(value)', ('eval', 'sql', 'command')),
+                              ('value => value', ('xss', 'eval', 'sql', 'command'))):
+            with self.subTest(mapper=mapper):
+                self.scan('const items = [req.query.html]; '
+                          f'const out = items.map({mapper}); '
+                          'res.send(out[0]); eval(out[0]); db.query(out[0]); shell.exec(out[0]);', *rules)
+
+    def test_for_each_executes_captured_writes_and_returns_undefined(self):
+        source = ('const box = {html: "safe"}; let saved = "safe"; '
+                  'const items = [req.query.html]; '
+                  'const out = items.forEach(value => { box.html = value; saved = value; return value; }); '
+                  'res.send(box.html); res.send(saved); res.send(out);')
+        self.assert_runtime_sends(source, ['review-input', 'review-input', None])
+        self.scan(source, 'xss', 'xss')
+        self.scan('const items = [{html: req.query.html}]; const box = items[0]; '
+                  'items.forEach(value => { value.html = "safe"; }); res.send(box.html);')
+
+    def test_iterating_callbacks_skip_empty_arrays_and_holes(self):
+        for method, initial in itertools.product(('map', 'forEach'), ('[]', '[,,]')):
+            with self.subTest(method=method, initial=initial):
+                source = (f'const items = {initial}; let saved = "safe"; '
+                          f'items.{method}(value => {{ saved = req.query.html; '
+                          'res.send(req.query.html); return req.query.html; }); res.send(saved);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan(source)
+        source = ('const items = [, req.query.html, , "safe"]; '
+                  'const out = items.map(value => value); '
+                  'res.send(out[0]); res.send(out[1]); res.send(out[2]); '
+                  'res.send(out[3]); res.send(out.length);')
+        self.assert_runtime_sends(source, [None, 'review-input', None, 'safe', 4])
+        self.scan(source, 'xss')
+
+    def test_map_callbacks_snapshot_length_and_read_live_slots(self):
+        source = ('const items = [req.query.html, req.query.html]; '
+                  'const out = items.map((value, index, source) => { '
+                  'source[1] = "safe"; source.push(req.query.html); return value; }); '
+                  'res.send(out[0]); res.send(out[1]); res.send(out[2]); res.send(out.length);')
+        self.assert_runtime_sends(source, ['review-input', 'safe', None, 2])
+        self.scan(source, 'xss')
+        source = ('const items = ["safe", ,]; '
+                  'const out = items.map((value, index, source) => { '
+                  'source[1] = req.query.html; return value; }); res.send(out[1]);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+        source = ('const items = ["safe", req.query.html]; '
+                  'const out = items.map((value, index, source) => { '
+                  'delete source[1]; return value; }); res.send(out[1]); res.send(out.length);')
+        self.assert_runtime_sends(source, [None, 2])
+        self.scan(source)
+
+    def test_for_each_reads_new_future_slots_but_not_appended_elements(self):
+        source = ('const items = ["safe", ,]; const out = []; '
+                  'items.forEach((value, index, source) => { '
+                  'source[1] = req.query.html; source.push(req.query.html); out.push(value); }); '
+                  'res.send(out[0]); res.send(out[1]); res.send(out[2]);')
+        self.assert_runtime_sends(source, ['safe', 'review-input', None])
+        self.scan(source, 'xss')
+
+    def test_iterating_callbacks_preserve_throws_and_prior_effects(self):
+        for method in ('map', 'forEach'):
+            with self.subTest(method=method):
+                source = ('const items = [req.query.html]; let saved = "safe"; try { '
+                          f'items.{method}(value => {{ saved = value; throw "stop"; }}); '
+                          'saved = "safe"; } catch (error) { res.send(saved); }')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan(source, 'xss')
+                source = ('const items = [req.query.html]; try { '
+                          f'items.{method}(value => {{ throw value; }}); res.send(req.query.html); '
+                          '} catch (error) { res.send(error); }')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan(source, 'xss')
+
+    def test_iterating_callbacks_resolve_named_callbacks_and_helper_arguments(self):
+        source = ('function wrap(value) { return {html: value}; } '
+                  'function transform(items) { return items.map(wrap); } '
+                  'const dirty = transform([req.query.html]); const clean = transform(["safe"]); '
+                  'res.send(dirty[0].html); res.send(clean[0].html);')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        self.scan(source, 'xss')
+        source = ('function transform(items, target) { '
+                  'function write(value) { target.html = value; } items.forEach(write); } '
+                  'const dirty = {}; const clean = {}; '
+                  'transform([req.query.html], dirty); transform(["safe"], clean); '
+                  'res.send(dirty.html); res.send(clean.html);')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        self.scan(source, 'xss')
+
+    def test_iterating_callbacks_separate_this_index_and_source_arguments(self):
+        source = ('const items = ["safe"]; '
+                  'const out = items.map(function(value, index, source) { '
+                  'return [this.html, index, source[0]]; }, {html: req.query.html}); '
+                  'res.send(out[0][0]); res.send(out[0][1]); res.send(out[0][2]);')
+        self.assert_runtime_sends(source, ['review-input', 0, 'safe'])
+        self.scan(source, 'xss')
+        source = ('const target = {html: "safe"}; const items = [req.query.html]; '
+                  'items.forEach(function(value) { this.html = value; }, target); res.send(target.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan(source, 'xss')
+
+    def test_iterating_callbacks_honor_selected_own_methods(self):
+        for method in ('map', 'forEach'):
+            with self.subTest(method=method):
+                self.scan('const items = [req.query.html]; '
+                          f'items.{method} = function(callback) {{ return ["safe"]; }}; '
+                          f'const out = items.{method}(value => req.query.html); res.send(out[0]);')
+                self.scan('const items = ["safe"]; '
+                          f'items.{method} = function(callback) {{ return [req.query.html]; }}; '
+                          f'const out = items.{method}(value => "safe"); res.send(out[0]);', 'xss')
+
+    def test_map_literal_receivers_computed_methods_and_postfix_chains(self):
+        for source in (
+            'res.send([1].map(value => req.query.html)[0]);',
+            'function make() { return [req.query.html]; } res.send(make().map(value => value)[0]);',
+            'const items = [1]; const out = items["map"](value => req.query.html); res.send(out[0]);',
+            'const items = [1]; const out = (items).map(value => [req.query.html])[0]'
+            '.map(value => value); res.send(out[0]);',
+        ):
+            with self.subTest(source=source):
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan(source, 'xss')
+
+    def test_map_preserves_large_sparse_extent_without_dense_visitation(self):
+        self.scan('const items = []; items.length = 4294967294; '
+                  'items[4000000000] = req.query.html; const out = items.map(value => value); '
+                  'res.send(out[0]); res.send(out[4000000000]); res.send(out.length);', 'xss')
+
+    def test_iterating_callbacks_expose_unknown_protocols_and_async_boundaries(self):
+        for method in ('map', 'forEach'):
+            for callback in ('async value => value', 'function* (value) { yield value; }', 'external'):
+                with self.subTest(method=method, callback=callback):
+                    self.assert_fill_partial('res.send(req.query.html); const items = ["safe"]; '
+                        f'items.{method}({callback});', 'xss', reason=f'Array.{method}')
+            for setup in ('Object.defineProperty(items, "0", {get() { return req.query.html; }});',
+                          'Object.setPrototypeOf(items, foreign);', f'Array.prototype.{method} = external;'):
+                with self.subTest(method=method, setup=setup):
+                    self.assert_fill_partial('res.send(req.query.html); const items = ["safe"]; '
+                        + setup + f'items.{method}(value => value);', 'xss', reason=f'{method}|Object[.]')
+            self.assert_fill_partial('res.send(req.query.html); const items = [...unknown]; '
+                f'items.{method}(value => "safe");', 'xss', reason=f'Array.{method}')
+        self.assert_fill_partial('res.send(req.query.html); const items = ["safe"]; '
+            'items.constructor = foreign; items.map(value => value);', 'xss', reason='Array.map')
+        # forEach never invokes ArraySpeciesCreate; constructor overrides alone
+        # do not affect its iteration or prove arbitrary callback execution.
+        self.scan('const items = [req.query.html]; items.constructor = foreign; '
+                  'items.forEach(value => res.send(value));', 'xss')
+
+    def test_iterating_callbacks_do_not_hide_escaped_entrypoints(self):
+        for method in ('map', 'forEach'):
+            for escape in ('external(saved);', 'external(0, {callback: saved});'):
+                with self.subTest(method=method, escape=escape):
+                    self.scan(f'let saved; [].{method}(saved = () => {{ '
+                              'res.send(req.query.html); return "safe"; }); ' + escape, 'xss')
+            self.scan(f'[].{method}(value => {{ res.send(req.query.html); return "safe"; }}); '
+                      'external(0, "safe");')
+
+    def test_iterating_callbacks_compose_nested_native_visits(self):
+        for outer, inner in itertools.product(('map', 'forEach', 'flatMap'), repeat=2):
+            with self.subTest(outer=outer, inner=inner):
+                source = ('const box = {html: "safe"}; '
+                          f'["safe"].{outer}(value => [req.query.html].{inner}'
+                          '(item => { box.html = item; })); res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input'])
+                if outer == 'flatMap':
+                    # The existing flatMap result-shape boundary still applies
+                    # to a call expression. It must retain the nested write's
+                    # finding even though flattening that return is incomplete.
+                    self.assert_fill_partial(source, 'xss', reason='flatMap.*(?:alternatives|shape)')
+                else:
+                    self.scan(source, 'xss')
+
+    def test_nested_native_captures_follow_named_callbacks_without_running_unused_ones(self):
+        for method in ('map', 'forEach'):
+            with self.subTest(method=method):
+                source = ('const box = {html: "safe"}; '
+                          'function visit(items) { const write = value => { box.html = value; }; '
+                          f'items.{method}(write); }} visit([req.query.html]); res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan(source, 'xss')
+                source = ('const box = {html: "safe"}; '
+                          'function visit(items) { const write = value => { box.html = req.query.html; }; '
+                          f'items.{method}(write); }} visit([]); res.send(box.html);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan(source)
+
+    def test_map_returned_closures_keep_explicit_capture_boundary(self):
+        source = ('const callbacks = [req.query.html].map(value => () => value); '
+                  'res.send(callbacks[0]());')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.assert_fill_partial(source, reason='escaped closure')
+
+    def test_iterating_callback_defaults_and_length_changes_stay_explicit(self):
+        for method in ('map', 'forEach'):
+            with self.subTest(method=method):
+                self.assert_fill_partial('const items = [undefined]; '
+                    f'items.{method}((value = req.query.html) => res.send(value));',
+                    'xss', reason=f'{method}.*default')
+                self.assert_fill_partial('res.send(req.query.html); const items = [1, 2]; '
+                    f'items.{method}((value, index, source) => {{ source.length = unknown; return value; }});',
+                    'xss', reason=f'{method}.*length')
+
+    def iterating_callbacks_public_formats(self, group):
+        cases = (
+            ('map-source', 'const items=[1];\nconst out=items.map(value=>req.query.html);\n'
+             'res.send(out[0]);\n', [("javascript.taint.xss", 3, 1)], None),
+            ('foreach-source', 'const box={html:"safe"};\nconst items=[req.query.html];\n'
+             'items.forEach(value=>{box.html=value;});\nres.send(box.html);\n',
+             [("javascript.taint.xss", 4, 1)], None),
+            ('map-clean', 'const items=[req.query.html];\nconst out=items.map(value=>"safe");\n'
+             'res.send(out[0]);\n', [], None),
+            ('empty-callback', 'let html="safe";\nconst items=[];\n'
+             'items.forEach(value=>{html=req.query.html;});\nres.send(html);\n', [], None),
+            ('map-protocol', 'const items=["safe"];\nitems.constructor=external;\n'
+             'items.map(value=>value);\nres.send(req.query.html);\n',
+             [("javascript.taint.xss", 4, 1)], 'Array.map'),
+            ('foreach-unknown', 'const items=["safe"];\n'
+             'items.forEach(external);\nres.send(req.query.html);\n',
+             [("javascript.taint.xss", 3, 1)], 'Array.forEach'),
+        )
+        self.assertIn(group, ('values', 'boundaries'))
+        cases = cases[:3] if group == 'values' else cases[3:]
+        artifacts = ROOT / 'test-suite/artifacts/javascript-array-callbacks-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix=group + '-', dir=artifacts))
+        for name, source, expected, reason in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=reason is not None,
+                                            partial_reason=reason)
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_iterating_callbacks_public_values_and_selected_files(self):
+        self.iterating_callbacks_public_formats('values')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_iterating_callbacks_public_boundaries_and_empty_arrays(self):
+        self.iterating_callbacks_public_formats('boundaries')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_iterating_callbacks_public_cache_edit_and_suppression(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-array-callbacks-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const items=[1];\nconst out=items.map(value=>req.query.html);\n'
+                  'res.send(out[0]);\n')
+        clean = unsafe.replace('value=>req.query.html', 'value=>"safe"')
+        suppressed = unsafe.replace('res.send(out[0]);', 'res.send(out[0]); // ubs:ignore')
+        for index, (source, expected) in enumerate((
+                (unsafe, [("javascript.taint.xss", 3, 1)]),
+                (unsafe, [("javascript.taint.xss", 3, 1)]),
+                (clean, []), (suppressed, []), (unsafe, [("javascript.taint.xss", 3, 1)]))):
+            with self.subTest(index=index):
+                if index != 1:
+                    target.write_text(source, encoding='utf-8')
+                report = self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                                expected=expected, cache=True)
+                if index == 1:
+                    self.assertEqual(report['profile']['cache_hits'], 1, report)
+                elif index < 4:
+                    self.assertEqual(report['profile']['cache_hits'], 0, report)
+
     def test_flatmap_preserves_source_returns_and_exact_positions(self):
         source = ('const items = [1]; const out = items.flatMap(value => ["safe", req.query.html]); '
                   'res.send(out[0]); res.send(out[1]); res.send(out.length);')

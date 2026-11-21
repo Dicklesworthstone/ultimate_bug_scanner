@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# UBS module: PostgreSQL SQL. Bounded migration/function security analysis.
+# UBS module: PostgreSQL SQL. Bounded migration/routine security analysis.
 # contract: v2. Native SQL analysis requires Python; no database is contacted.
 set -Eeuo pipefail
 
 # Bootstrap the same checksum-pinned shared library as the other modules.
-UBS_LIB_CHECKSUM="a8d80588383a9ba392842ca0edf945314b090117d44d542ba1c13162b034e6a4"
+UBS_LIB_CHECKSUM="e7bbe4349746f7f229d5e3bfc500d92ccb9d77af861f61c356cbc71fdf947cf5"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -71,7 +71,7 @@ usage(){
   cat <<'USAGE'
 Usage: ubs-sql.sh [PROJECT_DIR|FILE] [options] [OUTPUT_FILE]
 
-PostgreSQL migration DDL only. Function bodies and deployed catalog/ACL state
+PostgreSQL migration DDL only. Routine bodies and deployed catalog/ACL state
 are not executed; unresolved relevant state produces incomplete analysis.
 
 Options:

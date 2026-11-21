@@ -1,10 +1,11 @@
 """Bounded PostgreSQL migration checks, without executing SQL or loading a database.
 
 This is a selected-file DDL model, not a catalog or a PL/pgSQL interpreter.
-Function bodies are opaque; DO bodies accept only proven role-membership
-grants. Function identity includes input argument types; privilege changes
-take effect at transaction publication boundaries. Selected function renames
-and schema transfers preserve the object's privileges and local settings.
+Function/procedure bodies are opaque; DO bodies accept only proven role-membership
+grants. Routines share an input-signature namespace but retain their object kind;
+procedure lookup also checks the unmarked OUT-argument signature convention.
+Privilege changes take effect at transaction publication boundaries. Selected
+routine renames and schema transfers preserve privileges and local settings.
 Ordinary WITH queries and literal psql error/display controls preserve this
 state; client substitution and effectful commands remain explicit boundaries.
 Unknown DDL context is reported explicitly and is never cached as complete.
@@ -25,21 +26,21 @@ from ubs_core.suppression import has_suppression_marker
 
 RULES = {
     "sql.security.definer-search-path": ("search-path", 1, "SECURITY DEFINER search path permits object shadowing"),
-    "sql.security.definer-public-execute": ("privileges", 2, "SECURITY DEFINER function is executable by PUBLIC"),
+    "sql.security.definer-public-execute": ("privileges", 2, "SECURITY DEFINER routine is executable by PUBLIC"),
 }
 RULE_METADATA = {
     "sql.security.definer-search-path": {
         "language": "sql", "name": "SECURITY DEFINER search path", "family": "function_privileges",
         "category_id": "sql.search-path", "severity": "warning", "confidence": "unknown",
-        "message": "Function-local schema lookup can expose objects used with definer privileges.",
+        "message": "Routine-local schema lookup can expose objects used with definer privileges.",
         "remediation": "Set search_path to schemas whose CREATE privileges are restricted to trusted roles, with pg_temp last. Fully qualify references; an empty path does not exclude temporary relations.",
         "manifest_cases": ["sql-definer-buggy", "sql-definer-clean"],
     },
     "sql.security.definer-public-execute": {
         "language": "sql", "name": "SECURITY DEFINER PUBLIC execution", "family": "function_privileges",
         "category_id": "sql.privileges", "severity": "warning", "confidence": "unknown",
-        "message": "A selected migration publishes a privileged function with PUBLIC execution access.",
-        "remediation": "Create the function, REVOKE EXECUTE or ALL from PUBLIC, and GRANT EXECUTE to intended roles before COMMIT. Match input argument types; revoking only a grant option does not revoke EXECUTE.",
+        "message": "A selected migration publishes a privileged function or procedure with PUBLIC execution access.",
+        "remediation": "Create the routine, REVOKE EXECUTE or ALL from PUBLIC, and GRANT EXECUTE to intended roles before COMMIT. Match the object kind and argument signature; revoking only a grant option does not revoke EXECUTE.",
         "manifest_cases": ["sql-definer-buggy", "sql-definer-clean"],
     },
 }
@@ -231,13 +232,15 @@ TYPE_STARTS = frozenset({
 })
 
 
-def argument_type(tokens: list[Token], declaration: bool) -> str | None:
+def argument_type(tokens: list[Token], declaration: bool, *, include_out: bool = False) -> str | None:
     tokens = list(tokens)
     if not tokens:
         raise Incomplete("empty function argument")
     if tokens[0].is_word("out"):
-        return None
-    if tokens[0].kind == "word" and tokens[0].value in {"in", "inout", "variadic"}:
+        if not include_out:
+            return None
+        tokens = tokens[1:]
+    elif tokens[0].kind == "word" and tokens[0].value in {"in", "inout", "variadic"}:
         tokens = tokens[1:]
     # Default expressions do not participate in overload identity.
     depth = 0
@@ -290,7 +293,8 @@ def argument_type(tokens: list[Token], declaration: bool) -> str | None:
     return (name if quoted_type else TYPE_ALIASES.get(name, name)) + array
 
 
-def function_identity(tokens: list[Token], start: int, *, declaration: bool = False):
+def function_identity(tokens: list[Token], start: int, *, declaration: bool = False,
+                      include_out: bool = False):
     names = []
     index = start
     while index < len(tokens) and tokens[index].kind in {"word", "quoted"}:
@@ -316,7 +320,7 @@ def function_identity(tokens: list[Token], start: int, *, declaration: bool = Fa
     types = []
     if arguments:
         for group in split_top(arguments):
-            value = argument_type(group, declaration)
+            value = argument_type(group, declaration, include_out=include_out)
             if value is not None:
                 types.append(value)
     return (tuple(names), tuple(types)), index
@@ -520,6 +524,8 @@ class Function:
     public: bool | None = True
     body: str = ""
     language: str = ""
+    kind: str = "function"
+    all_arguments: tuple[str, ...] = ()
 
 
 @dataclass
@@ -762,6 +768,40 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
     finding_spans: dict[tuple, tuple[int, int, int]] = {}
     errors: list[str] = []
 
+    def routine_target(tokens: list[Token], start: int, kind: str, *, missing_ok=False):
+        """Resolve a selected routine without crossing kinds or OUT overloads.
+
+        PostgreSQL first uses input types. For procedures, a signature without
+        any explicit mode also admits the full argument list including OUTs;
+        two different matches are ambiguous. Names do not disambiguate them.
+        """
+        key, end = function_identity(tokens, start)
+        if len(key[0]) == 1 and state.session_path_changed:
+            raise Incomplete("unqualified routine identity depends on the session search_path")
+        candidates = {}
+        exact = state.functions.get(key)
+        if exact is not None and kind in {"routine", exact.kind}:
+            candidates[exact.key] = exact
+        if kind != "function":
+            opening = next(index for index in range(start, end)
+                           if tokens[index].kind == "symbol" and tokens[index].value == "(")
+            groups = split_top(tokens[opening + 1:end - 1])
+            modes = any(group and group[0].kind == "word" and
+                        group[0].value in {"in", "out", "inout", "variadic"}
+                        for group in groups)
+            if not modes:
+                for selected in state.functions.values():
+                    if (selected.kind == "procedure" and selected.key[0] == key[0]
+                            and selected.all_arguments == key[1]):
+                        candidates[selected.key] = selected
+        if len(candidates) > 1:
+            raise Incomplete("procedure signature is ambiguous between input and OUT-inclusive argument lists")
+        if not candidates:
+            if missing_ok and exact is None:
+                return None, end
+            raise Incomplete(f"{kind.upper()} target is not resolved with the selected object kind and signature")
+        return next(iter(candidates.values())), end
+
     def publish():
         for function in state.functions.values():
             if not function.definer:
@@ -771,7 +811,7 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
             schemas = function.search_path
             if not function.path_unknown:
                 if schemas is None:
-                    messages["sql.security.definer-search-path"] = "No function-local search_path is set; caller/session schemas can shadow objects used with definer privileges."
+                    messages["sql.security.definer-search-path"] = f"No {function.kind}-local search_path is set; caller/session schemas can shadow objects used with definer privileges."
                 elif schemas:
                     if "pg_temp" not in schemas:
                         messages["sql.security.definer-search-path"] = "pg_temp is omitted and is implicitly searched first for relations and types. Put it after trusted schemas."
@@ -787,11 +827,11 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
                 else:
                     try:
                         if not empty_path_body(function):
-                            messages["sql.security.definer-search-path"] = "Empty search_path still searches pg_temp first; the function body uses an unqualified relation."
+                            messages["sql.security.definer-search-path"] = f"Empty search_path still searches pg_temp first; the {function.kind} body uses an unqualified relation."
                     except Incomplete as exc:
                         errors.append(f"line {function.anchor.line}: {exc}")
             if function.public is True:
-                messages["sql.security.definer-public-execute"] = "PUBLIC can execute this SECURITY DEFINER function under the selected migration's default or explicit grants. Revoke PUBLIC EXECUTE and grant intended roles in the same transaction."
+                messages["sql.security.definer-public-execute"] = f"PUBLIC can execute this SECURITY DEFINER {function.kind} under the selected migration's default or explicit grants. Revoke PUBLIC EXECUTE and grant intended roles in the same transaction."
             elif function.public is None:
                 errors.append(f"line {function.anchor.line}: existing/default ACL of {name} is unknown; CREATE OR REPLACE preserves existing privileges")
             for rule, message in messages.items():
@@ -801,6 +841,7 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
                     "col": function.anchor.col, "severity": "warning", "category_id": slug,
                     "message": name + ": " + message, "suppressed": False,
                     "extras": {"dialect": "postgresql", "function": name,
+                               "routine_kind": function.kind,
                                "scope": "selected migration; external schema ownership and ACLs are not proved"},
                 }
                 # Names can change while the dangerous definition and its
@@ -840,23 +881,32 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
             return
         if not any(token.is_word("execute") or token.is_word("all") for token in privileges):
             return
-        if sequence(statement[on + 1:], "all", "functions", "in", "schema"):
+        target = statement[on + 1:direction]
+        if (len(target) >= 4 and target[0].is_word("all")
+                and target[1].kind == "word" and target[1].value in {"functions", "procedures", "routines"}
+                and sequence(target[2:], "in", "schema")):
+            kind = target[1].value[:-1]
             schemas = []
             for group in split_top(statement[on + 5:direction]):
                 if len(group) != 1 or group[0].kind not in {"word", "quoted"}:
                     raise Incomplete("unresolved schema-wide function privilege target")
                 schemas.append(group[0].value)
             for function in state.functions.values():
-                if len(function.key[0]) == 2 and function.key[0][0] in schemas:
+                if (len(function.key[0]) == 2 and function.key[0][0] in schemas
+                        and kind in {"routine", function.kind}):
                     function.public = grant
             return  # The rule covers selected functions, not unseen catalog rows.
-        if statement[on + 1].kind != "word" or statement[on + 1].value not in {"function", "routine"}:
+        if statement[on + 1].kind != "word" or statement[on + 1].value not in {"function", "procedure", "routine"}:
             return
+        selected = []
         for group in split_top(statement[on + 2:direction]):
-            key, end = function_identity(group, 0)
-            if end != len(group) or key not in state.functions:
+            function, end = routine_target(group, 0, statement[on + 1].value)
+            if end != len(group):
                 raise Incomplete("function privilege target is not resolved in the selected migration")
-            state.functions[key].public = grant
+            selected.append(function)
+        # A bad target invalidates the whole SQL statement, not just its suffix.
+        for function in selected:
+            function.public = grant
 
     def process(statement: list[Token]):
         nonlocal state, transaction, savepoints
@@ -932,7 +982,8 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
                 state.default_public = None
                 raise Incomplete("default privilege grantor requires external role context")
             on = word_index(tail, "on")
-            if on < 0 or not sequence(tail[on + 1:], "functions"):
+            if (on < 0 or on + 1 >= len(tail) or tail[on + 1].kind != "word"
+                    or tail[on + 1].value not in {"functions", "routines"}):
                 raise Incomplete("unsupported default privilege target")
             if any(token.is_word("all") or token.is_word("execute") for token in tail[1:on]):
                 state.default_public = tail[0].is_word("grant")
@@ -940,9 +991,12 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
             if len(statement) < 3 or statement[2].kind not in {"word", "quoted"} or statement[2].is_word("if"):
                 raise Incomplete("unresolved schema creation")
             state.schema_public_create[statement[2].value] = False
-        elif sequence(statement, "create", "function") or sequence(statement, "create", "or", "replace", "function"):
+        elif any(sequence(statement, "create", kind) or sequence(statement, "create", "or", "replace", kind)
+                 for kind in ("function", "procedure")):
             replace = sequence(statement, "create", "or", "replace")
-            key, end = function_identity(statement, 4 if replace else 2, declaration=True)
+            start = 4 if replace else 2
+            kind = statement[start - 1].value
+            key, end = function_identity(statement, start, declaration=True)
             if len(state.functions) >= MAX_FUNCTIONS and key not in state.functions:
                 raise Incomplete("SQL function-state budget exhausted")
             if any(sequence(statement[index:], "begin", "atomic") for index in range(end, len(statement))):
@@ -950,21 +1004,23 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
             if not any(token.is_word("language") for token in statement[end:]):
                 raise Incomplete("function declaration lacks a PostgreSQL LANGUAGE clause")
             previous = state.functions.get(key)
+            if previous is not None and (previous.kind != kind or not replace):
+                raise Incomplete("routine declaration conflicts with an existing selected input signature or object kind")
             if len(key[0]) == 1 and state.session_path_changed:
                 raise Incomplete("unqualified function identity depends on the session search_path")
             public = previous.public if replace and previous else None if replace else state.default_public
-            function = Function(key, first, statement[-1].end, public=public)
+            all_key, _ = function_identity(statement, start, declaration=True, include_out=True)
+            function = Function(key, first, statement[-1].end, public=public,
+                                kind=kind, all_arguments=all_key[1])
             function_options(function, statement[end:], errors)
             body_index = word_index(statement, "as", end)
             if (body_index < 0 or body_index + 1 >= len(statement)
                     or statement[body_index + 1].kind not in {"body", "string"}):
                 raise Incomplete("function requires a literal PostgreSQL AS body")
             state.functions[key] = function
-        elif sequence(statement, "alter", "function"):
-            key, end = function_identity(statement, 2)
-            if key not in state.functions:
-                raise Incomplete("ALTER FUNCTION target is not resolved in the selected migration")
-            function = state.functions[key]
+        elif any(sequence(statement, "alter", kind) for kind in ("function", "procedure", "routine")):
+            function, end = routine_target(statement, 2, statement[1].value)
+            key = function.key
             tail = statement[end:]
             if sequence(tail, "owner"):
                 if (len(tail) != 3 or not tail[1].is_word("to")
@@ -995,19 +1051,32 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
                 state.functions.pop(key)
                 state.functions[new_key] = function
             else:
+                if function.kind == "procedure" and any(token.is_word("depends") for token in tail):
+                    raise Incomplete("procedure extension dependencies require external catalog context")
                 if any(token.is_word("rename") or token.is_word("schema") or token.is_word("owner") for token in tail):
                     raise Incomplete("ALTER FUNCTION identity change requires additional catalog context")
                 function.anchor, function.end = first, statement[-1].end
                 function_options(function, tail, errors)
         elif first.value in {"grant", "revoke"}:
             privilege(statement)
-        elif sequence(statement, "drop", "function"):
+        elif any(sequence(statement, "drop", kind) for kind in ("function", "procedure", "routine")):
             tail = statement[2:]
-            if sequence(tail, "if", "exists"):
+            missing_ok = sequence(tail, "if", "exists")
+            if missing_ok:
                 tail = tail[2:]
+            if tail and tail[-1].is_word("restrict"):
+                tail = tail[:-1]
+            if tail and tail[-1].is_word("cascade"):
+                raise Incomplete("routine DROP CASCADE requires external dependency context")
+            selected = []
             for group in split_top(tail):
-                key, _end = function_identity(group, 0)
-                state.functions.pop(key, None)
+                function, end = routine_target(group, 0, statement[1].value, missing_ok=missing_ok)
+                if end != len(group):
+                    raise Incomplete("unresolved routine DROP target")
+                if function is not None:
+                    selected.append(function)
+            for function in selected:
+                state.functions.pop(function.key)
         elif first.is_word("do"):
             do_membership_grants(statement, state)
         elif first.is_word("with"):
@@ -1024,8 +1093,6 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
             elif sequence(tail, "role") or sequence(tail, "authorization"):
                 state.default_public = None
                 raise Incomplete("role change invalidates selected default privileges")
-        elif sequence(statement, "create", "procedure") or sequence(statement, "create", "or", "replace", "procedure") or sequence(statement, "alter", "procedure"):
-            raise Incomplete("procedure privilege analysis is outside the function-only model")
         elif first.value not in {"select", "insert", "update", "delete", "create", "alter", "drop",
                                  "comment", "set", "reset", "truncate", "vacuum", "analyze", "explain"}:
             raise Incomplete(f"line {first.line}: unsupported PostgreSQL statement {first.value!r}")
@@ -1159,7 +1226,7 @@ def main(argv=None) -> int:
                "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                "files": len(files), **counts, "status": "partial" if errors else "ok", "findings": records,
                "categories": category_counts, "ast_grep_rules": 0, "uv_tools": [],
-               "extras": {"profile": profile, "dialect": "postgresql", "scope": "selected-file migration DDL; function bodies and deployed privileges are not evaluated"}}
+               "extras": {"profile": profile, "dialect": "postgresql", "scope": "selected-file migration DDL; routine bodies and deployed privileges are not evaluated"}}
     if os.environ.get("UBS_PROFILE") == "1":
         summary["profile"] = profile
     if errors:

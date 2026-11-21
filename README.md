@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.95-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.96-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -368,7 +368,7 @@ configurable through `UBS_PHP_MAX_TOKENS`, `UBS_PHP_MAX_NESTING` and
 `UBS_PHP_MAX_STEPS`. PHP confidence remains `unknown` pending independent corpus
 calibration; fixture coverage is not a calibrated confidence score.
 
-#### PostgreSQL migration and function privileges
+#### PostgreSQL migration and routine privileges
 
 `.sql`, `.psql`, and `.pgsql` files use a bounded PostgreSQL DDL analyzer without
 requiring a database, PostgreSQL executable, or ast-grep:
@@ -379,13 +379,21 @@ ubs --staged --format=sarif --fail-on-warning
 ubs explain sql.security.definer-public-execute
 ```
 
-Two warning rules check `SECURITY DEFINER` functions: function-local search paths
+Two warning rules check `SECURITY DEFINER` functions and procedures: local search paths
 that permit object shadowing, and `PUBLIC EXECUTE` exposure. The analyzer tracks
 literal input signatures, PostgreSQL type aliases, overloads, named/default/OUT
-parameters, selected `ALTER FUNCTION` changes, grants/revokes, default execution
-privileges, transactions and savepoints. Creating and restricting a function in
+parameters, selected `ALTER FUNCTION`/`PROCEDURE`/`ROUTINE` changes, grants/revokes,
+default execution privileges, transactions and savepoints. Creating and restricting a routine in
 one transaction stays clean; revoking access after a commit retains the earlier
 exposure finding. Revoking a grant option does not revoke execution.
+
+Procedure identity survives renames, schema moves and owner changes. Explicit
+routine kinds prevent a function-only revoke from hiding procedure exposure:
+`ALL FUNCTIONS` excludes procedures, while `ALL ROUTINES` includes both.
+For `ALTER DEFAULT PRIVILEGES`, `FUNCTIONS` and `ROUTINES` both affect future
+functions and procedures. Procedure signatures with `OUT` parameters accept
+input-only and complete argument lists; ambiguous unmarked overloads produce
+incomplete analysis and preserve known findings.
 
 Ordinary queries and bounded `WITH` CTEs preserve this migration state, including
 recursive, nested, materialized and data modifying forms. Literal psql controls
@@ -402,8 +410,8 @@ migration. Actual SQL comments support `ubs:ignore[rule-id]`. SQL categories are
 baseline filtering and the normal incremental cache use the shared runner.
 
 The analysis covers each selected file in its own statement order. It does not
-infer migration order across files, execute function bodies, inspect a deployed
-catalog, or certify all database access controls. Fresh function defaults follow
+infer migration order across files, execute routine bodies, inspect a deployed
+catalog, or certify all database access controls. Fresh routine defaults follow
 PostgreSQL's standard PUBLIC execution grant unless the selected migration changes
 it. Existing `CREATE OR REPLACE` ACLs, unproved schema CREATE privileges, role
 changes, dynamic SQL, psql includes, connection/execution/conditional commands,
@@ -413,11 +421,12 @@ search path is accepted only for the bounded SQL-body proof; unqualified relatio
 still expose implicit temporary-schema lookup. Custom `--rules` for SQL are
 explicitly unsupported. No warning is emitted merely for ordinary `DELETE` or
 `UPDATE` statements. Limits are 4 MiB, 200,000 tokens, 10,000 statements and 2,000
-function identities, 64 retained savepoints and 64 nested query scopes per source.
+routine identities, 64 retained savepoints and 64 nested query scopes per source.
 Confidence remains uncalibrated.
 
 The underlying privilege and search-path semantics follow PostgreSQL's
 [CREATE FUNCTION security guidance](https://www.postgresql.org/docs/current/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY),
+[CREATE PROCEDURE semantics](https://www.postgresql.org/docs/current/sql-createprocedure.html),
 [search_path documentation](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-SEARCH-PATH),
 and [REVOKE semantics](https://www.postgresql.org/docs/current/sql-revoke.html).
 

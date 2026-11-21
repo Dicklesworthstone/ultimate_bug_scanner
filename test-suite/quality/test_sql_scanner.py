@@ -11,6 +11,9 @@ https://www.postgresql.org/docs/current/runtime-config-client.html
 https://www.postgresql.org/docs/current/ddl-priv.html
 https://www.postgresql.org/docs/current/sql-alterdefaultprivileges.html
 https://www.postgresql.org/docs/current/sql-alterfunction.html
+https://www.postgresql.org/docs/current/sql-createprocedure.html
+https://www.postgresql.org/docs/current/sql-dropprocedure.html
+https://www.postgresql.org/docs/current/sql-grant.html
 https://www.postgresql.org/docs/current/sql-do.html
 https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-FORMAT
 https://www.postgresql.org/docs/current/sql-select.html
@@ -1016,6 +1019,268 @@ INCOMPLETE_CASES = (
 )
 
 
+# Procedure labels also distinguish PostgreSQL's two OUT-argument lookup
+# conventions and the different ALL FUNCTIONS / ALL ROUTINES privilege sets.
+# These cases were fixed before activating the procedure implementation.
+PROCEDURE_CASES = (
+    Case("procedure_default_exposure", """
+        CREATE PROCEDURE app.run() -- expect:path,public
+        LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN NULL; END $$;
+    """),
+    Case("procedure_hardened_in_one_transaction", """
+        BEGIN;
+        CREATE PROCEDURE app.run(IN item integer)
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        REVOKE EXECUTE ON PROCEDURE app.run(IN int4) FROM PUBLIC;
+        GRANT EXECUTE ON PROCEDURE app.run(integer) TO app_role;
+        COMMIT;
+    """),
+    Case("procedure_default_invoker_is_clean", """
+        CREATE PROCEDURE app.run() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
+    """),
+    Case("procedure_revoke_does_not_fix_path", """
+        BEGIN;
+        CREATE PROCEDURE app.run() -- expect:path
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog
+        AS $$ BEGIN NULL; END $$;
+        REVOKE ALL ON PROCEDURE app.run() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("procedure_replace_preserves_acl", """
+        BEGIN;
+        CREATE PROCEDURE app.run() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
+        REVOKE ALL ON PROCEDURE app.run() FROM PUBLIC;
+        CREATE OR REPLACE PROCEDURE app.run() -- expect:path
+        LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN NULL; END $$;
+        COMMIT;
+    """),
+    Case("procedure_and_function_share_name_with_different_inputs", """
+        BEGIN;
+        CREATE FUNCTION app.run(integer) RETURNS int -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE PROCEDURE app.run(text) LANGUAGE plpgsql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        REVOKE ALL ON PROCEDURE app.run(text) FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("all_functions_does_not_revoke_procedures", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS int LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        REVOKE ALL ON ALL FUNCTIONS IN SCHEMA app FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("all_procedures_does_not_revoke_functions", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS int -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE PROCEDURE app.p() LANGUAGE plpgsql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        REVOKE ALL ON ALL PROCEDURES IN SCHEMA app FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("all_routines_covers_functions_and_procedures", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS int LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE PROCEDURE app.p() LANGUAGE plpgsql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        REVOKE ALL ON ALL ROUTINES IN SCHEMA app FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("default_functions_privileges_include_procedures", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+        CREATE PROCEDURE app.p() LANGUAGE plpgsql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("default_routines_privileges_include_functions", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        CREATE PROCEDURE app.p() LANGUAGE plpgsql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        CREATE FUNCTION app.f() RETURNS int LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+    """),
+    Case("procedure_rename_schema_and_owner_keep_acl", """
+        BEGIN;
+        CREATE PROCEDURE app.p(integer) LANGUAGE plpgsql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        ALTER PROCEDURE app.p(integer) RENAME TO renamed;
+        ALTER PROCEDURE app.renamed(integer) SET SCHEMA api;
+        ALTER PROCEDURE api.renamed(integer) OWNER TO app_owner;
+        REVOKE ALL ON ROUTINE api.renamed(integer) FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("alter_routine_selects_procedure", """
+        BEGIN;
+        CREATE PROCEDURE app.p() LANGUAGE plpgsql
+        SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        ALTER ROUTINE app.p() SECURITY DEFINER; -- expect:public
+        COMMIT;
+    """),
+    Case("procedure_savepoint_restores_security_and_identity", """
+        BEGIN;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        SAVEPOINT before_change;
+        ALTER PROCEDURE app.p() RENAME TO renamed;
+        REVOKE ALL ON PROCEDURE app.renamed() FROM PUBLIC;
+        ALTER PROCEDURE app.renamed() RESET search_path;
+        ROLLBACK TO before_change;
+        COMMIT;
+    """),
+    Case("procedure_drop_removes_unpublished_exposure", """
+        BEGIN;
+        CREATE PROCEDURE app.p() LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN NULL; END $$;
+        DROP PROCEDURE app.p() RESTRICT;
+        COMMIT;
+    """),
+    Case("procedure_out_explicit_input_identity", """
+        BEGIN;
+        CREATE PROCEDURE app.p(IN item integer, OUT result text)
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN result := ''; END $$;
+        REVOKE ALL ON PROCEDURE app.p(IN integer) FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("procedure_out_full_signature_identity", """
+        BEGIN;
+        CREATE PROCEDURE app.p(IN item integer, OUT result text)
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN result := ''; END $$;
+        REVOKE ALL ON PROCEDURE app.p(integer, text) FROM PUBLIC;
+        ALTER PROCEDURE app.p(integer, text) RENAME TO renamed;
+        DROP PROCEDURE app.renamed(integer, text);
+        COMMIT;
+    """),
+    Case("procedure_out_explicit_modes_disambiguate_overloads", """
+        BEGIN;
+        CREATE PROCEDURE app.p(IN item integer, OUT result text)
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN result := ''; END $$;
+        CREATE PROCEDURE app.p(IN item integer, IN value text) -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        REVOKE ALL ON PROCEDURE app.p(IN integer, OUT text) FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("procedure_inout_variadic_and_defaults", """
+        BEGIN;
+        CREATE PROCEDURE app.p(INOUT item integer, VARIADIC values text[] DEFAULT ARRAY[]::text[])
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        REVOKE ALL ON PROCEDURE app.p(INOUT pg_catalog.int4, VARIADIC text[]) FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("procedure_identity_changes_do_not_duplicate_exposure", """
+        CREATE PROCEDURE app.p() -- expect:path,public
+        LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN NULL; END $$;
+        ALTER PROCEDURE app.p() RENAME TO renamed;
+        ALTER ROUTINE app.renamed() SET SCHEMA api;
+    """),
+    Case("procedure_quoted_public_is_an_ordinary_role", """
+        BEGIN;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        REVOKE EXECUTE ON PROCEDURE app.p() FROM "PUBLIC";
+        COMMIT;
+    """),
+    Case("procedure_invoker_transition_before_commit", """
+        BEGIN;
+        CREATE PROCEDURE app.p() LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN NULL; END $$;
+        ALTER PROCEDURE app.p() SECURITY INVOKER;
+        COMMIT;
+    """),
+    Case("procedure_defaults_only_affect_future_objects", """
+        BEGIN;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        ALTER DEFAULT PRIVILEGES REVOKE ALL ON ROUTINES FROM PUBLIC;
+        CREATE PROCEDURE app.later() LANGUAGE plpgsql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        COMMIT;
+    """),
+)
+
+PROCEDURE_INCOMPLETE_CASES = (
+    Case("procedure_wrong_grant_kind_preserves_exposure", """
+        BEGIN;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        REVOKE ALL ON FUNCTION app.p() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("procedure_wrong_alter_kind_preserves_exposure", """
+        BEGIN;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        ALTER FUNCTION app.p() SECURITY INVOKER;
+        COMMIT;
+    """),
+    Case("procedure_wrong_drop_kind_preserves_exposure", """
+        BEGIN;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        DROP FUNCTION app.p();
+        COMMIT;
+    """),
+    Case("procedure_cannot_replace_function_kind", """
+        BEGIN;
+        CREATE FUNCTION app.p() RETURNS int -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE OR REPLACE PROCEDURE app.p() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
+        COMMIT;
+    """),
+    Case("procedure_rename_cannot_overwrite_function", """
+        BEGIN;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        CREATE FUNCTION app.f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;
+        ALTER PROCEDURE app.p() RENAME TO f;
+        COMMIT;
+    """),
+    Case("procedure_out_implicit_signature_ambiguity", """
+        BEGIN;
+        CREATE PROCEDURE app.p(IN item integer, OUT result text) -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN result := ''; END $$;
+        CREATE PROCEDURE app.p(integer, text) -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp
+        AS $$ BEGIN NULL; END $$;
+        REVOKE ALL ON PROCEDURE app.p(integer, text) FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("procedure_unseen_replacement_acl_is_unknown", """
+        CREATE OR REPLACE PROCEDURE app.p() LANGUAGE plpgsql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("procedure_call_does_not_execute_body_in_scanner", """
+        CREATE PROCEDURE app.p() -- expect:path,public
+        LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN NULL; END $$;
+        CALL app.p();
+    """),
+    Case("procedure_from_current_does_not_borrow_path", """
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT
+        AS $$ BEGIN NULL; END $$;
+    """),
+    Case("procedure_unqualified_lookup_requires_catalog", """
+        CREATE PROCEDURE app.p() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
+        ALTER PROCEDURE app.p SECURITY DEFINER;
+    """),
+)
+
+
 class EvidenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1107,6 +1372,10 @@ def native_test(case, incomplete=False):
 for _case in CASES:
     setattr(SQLNativeTests, "test_" + _case.name, native_test(_case))
 for _case in INCOMPLETE_CASES:
+    setattr(SQLNativeTests, "test_incomplete_" + _case.name, native_test(_case, True))
+for _case in PROCEDURE_CASES:
+    setattr(SQLNativeTests, "test_" + _case.name, native_test(_case))
+for _case in PROCEDURE_INCOMPLETE_CASES:
     setattr(SQLNativeTests, "test_incomplete_" + _case.name, native_test(_case, True))
 
 
@@ -1259,6 +1528,19 @@ class SQLPublicTests(EvidenceTest):
         cases = (CASES[0], CASES[2], INCOMPLETE_CASES[0])
         directory = self.materialize(cases, "partial")
         for mode in ("module-json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
+
+    def test_procedure_oracle_through_module_and_runner_formats(self):
+        directory = self.materialize(PROCEDURE_CASES, "procedures")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, PROCEDURE_CASES)
+
+    def test_procedure_boundaries_keep_known_findings(self):
+        cases = PROCEDURE_INCOMPLETE_CASES
+        directory = self.materialize(cases, "procedure-boundaries")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
             with self.subTest(mode=mode):
                 self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
 

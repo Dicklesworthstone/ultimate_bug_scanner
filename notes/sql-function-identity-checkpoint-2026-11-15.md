@@ -68,6 +68,84 @@ These are bounded source and observed CLI results, not a complete public-suite,
 full-repository, live PostgreSQL, platform or release qualification. The original
 acceptance gates and umbrella beads remain open.
 
+## November 20 continuation: procedure security DDL
+
+Development version **5.5.96** extends the selected migration model to PostgreSQL
+procedures. `CREATE [OR REPLACE] PROCEDURE`, selected `ALTER PROCEDURE` and
+`ALTER ROUTINE`, and `DROP PROCEDURE`/`ROUTINE` preserve object kind, ACLs, local
+search paths, input signatures, all-argument signatures and transaction state.
+Functions and procedures share the input-signature namespace; a wrong-kind
+operation cannot silently harden or remove the other object.
+
+`GRANT`/`REVOKE` distinguish `FUNCTION`, `PROCEDURE` and `ROUTINE`, including
+schema-wide forms. `ALL FUNCTIONS` excludes procedures, whereas `ALL ROUTINES`
+includes both. For default privileges, PostgreSQL treats `FUNCTIONS` and
+`ROUTINES` identically. Procedure lookup supports input-only and OUT-inclusive
+signatures; unmarked signatures that match two selected procedures are explicitly
+incomplete. Multi-target privilege and drop statements validate every target
+before applying effects. Existing rule IDs and function findings remain stable;
+the finding metadata additionally identifies `routine_kind`.
+
+The maintained oracle added **23 complete cases and 10 explicit boundaries**
+before source activation. On immutable main `c026e11535a5bd54d0f02e9c9a6f8c63353d7945`,
+the 213-method native cohort failed 30 new expectations. The candidate passed all
+**214 source/helper methods**, with no skips. Twelve real CLI invocations then
+passed: the complete procedure corpus, its incomplete boundaries, and the
+existing function corpus, each through module/runner JSON/SARIF. Exact rules,
+locations, totals, exits and completion assertions were retained.
+
+An independently authored 29-case oracle matched **28/29** outcomes: 21 exact
+results and seven required incomplete boundaries. Its remaining exact expectation
+for a schema-specific default-privilege revoke remains failed; that construct
+still reports the pre-existing explicit external-context limitation. The raw
+independent aggregate is not green. One original expected source location was
+corrected from CREATE to ALTER only after an immutable-incumbent function witness
+proved the existing anchor contract. The original failed receipt remains retained.
+No PostgreSQL server execution was performed; labels follow official PostgreSQL
+documentation and source, and these are scanner/source/CLI observations.
+
+Qualified scanner SHA256:
+`ca9a7f1bc3044e54888943204cb6afe3743ebc8f761bc45b35c526583669a14a`.
+Git blob: `b288bbc162bba3618e0006ced0e98be51d5325de`.
+
+DSR evidence (unchanged native executor, individual checks):
+
+| Check | Log SHA256 |
+| --- | --- |
+| Maintained baseline, 30 failures | `19f4215c746fb89b58c3f2bb6f49e4e1aaaca784ad97d67b64413a97d0fe5b19` |
+| Source/helper, 214 passed | `c3c7ae36876ca932123d5a6c293ef7a70b699dd779a49cbda38e2bbb168c2134` |
+| Public, 12 invocations passed | `06a57021b9396fa5785aae9162e892f32aaf1678dce4b87861d65a252ab529a3` |
+| Independent, 28/29 with one preserved refusal | `76cdd5d3284c9960a2b33a074a637f247af922493509041369d844611ade08c0` |
+| Immutable function anchor witness | `b997067dc4e96d97a7320074c15127c274ca2aca64e8676315c20d2646fdd5fd` |
+| Canonical integrity, runner/module syntax and whitespace | `8cb439d0b8b4c295416555ee9f50083591d2862cf376042461f06c549a60a31e` |
+
+Maintained logs are under `test-suite/artifacts/procedure-session-20261120/` in
+the development checkout; public/integrity logs are under
+`test-suite/artifacts/procedure-public-20261120/` in the isolated publication
+checkout. Independent evidence is under `test-suite/artifacts/independent-semantic-20261120/`.
+The published source retains schema/role-specific default-privilege, external
+catalog, body execution, CALL, SQL-standard body and dependency-cascade boundaries.
+Cross-file migration ordering and broader repository/release qualification remain
+open. This procedure slice does not close the SQL umbrella beads.
+
+Publication preserves concurrent main through `82687fc4a959867d88a4e8038841a9c554f79920`,
+including the Python deferred-origin and JavaScript reducer implementations.
+The executor disconnected before the merged checkout's native verification began.
+The qualified SQL source and tests are unchanged. The combined integrity chain
+was reconstructed from immutable GitHub content using the canonical generator's
+rules; that reconstruction first reproduced all 23 previously native-generated
+publication files byte-for-byte, and incoming runner/library hashes matched their
+published pins. Independent remote hash review checks the resulting combined
+objects. This is content/integrity recovery, not an executed merged DSR receipt.
+
+Primary references:
+
+- https://www.postgresql.org/docs/current/sql-createprocedure.html
+- https://www.postgresql.org/docs/current/sql-alterprocedure.html
+- https://www.postgresql.org/docs/18/sql-dropprocedure.html
+- https://www.postgresql.org/docs/current/sql-grant.html
+- https://www.postgresql.org/docs/current/sql-alterdefaultprivileges.html
+
 ## Recoverable implementation
 
 - Base commit: `f1c06ea3f80497432a29581871b3719ad8462f9d`.

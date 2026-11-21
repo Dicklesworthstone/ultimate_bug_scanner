@@ -1062,5 +1062,399 @@ urllib.request.urlopen(urllib.request.Request(target))
                             print(f'[{tag}] PASS', flush=True)
 
 
+class AiohttpDestinationTests(SourceTest):
+    """Native aiohttp requests are lazy, awaitable async context managers.
+
+    Fixed behavior oracle from aiohttp's ClientSession/request implementations:
+    https://docs.aiohttp.org/en/stable/_modules/aiohttp/client.html
+    No source fixture opens a network connection.
+    """
+
+    def test_native_constructor_imports_and_saved_methods(self):
+        for setup, constructor in (
+            ('import aiohttp', 'aiohttp.ClientSession'),
+            ('import aiohttp.client as native', 'native.ClientSession'),
+            ('from aiohttp import ClientSession as make', 'make'),
+            ('from aiohttp.client import ClientSession as make', 'make'),
+        ):
+            for consumer in ('await fetch(input())', 'async with fetch(input()):\n        pass'):
+                with self.subTest(constructor=constructor, consumer=consumer):
+                    self.assert_rules(f'{setup}\nasync def send():\n'
+                                      f'    client = {constructor}()\n'
+                                      '    fetch = client.get\n    client = unrelated\n'
+                                      f'    {consumer}\n', 'ssrf')
+
+    def test_session_context_and_each_url_operand(self):
+        for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'request'):
+            prefix = '"GET", ' if method == 'request' else ''
+            setup = 'import aiohttp\nasync def send():\n    async with aiohttp.ClientSession() as client:\n'
+            with self.subTest(method=method):
+                self.assert_rules(setup + f'        await client.{method}({prefix}input())\n', 'ssrf')
+                self.assert_rules(setup + f'        await client.{method}({prefix}url=input())\n', 'ssrf')
+                self.assert_rules(setup + f'        await client.{method}({prefix}"https://safe.invalid", '
+                                  'params={"q": input()}, headers={"X-Data": input()})\n')
+        self.assert_rules('import aiohttp\nasync def send():\n'
+                          '    client = aiohttp.ClientSession(headers={"X-Data": input()}, '
+                          'cookies={"value": input()})\n'
+                          '    await client.post("https://safe.invalid", data=input())\n')
+
+    def test_pending_requests_require_execution(self):
+        setup = 'import aiohttp, asyncio\nasync def send():\n    client = aiohttp.ClientSession()\n'
+        self.assert_rules(setup + '    pending = client.get(input())\n')
+        for consumption in ('await pending', 'async with pending:\n        pass',
+                            'asyncio.create_task(pending)', 'asyncio.ensure_future(pending)',
+                            'await asyncio.gather(pending)'):
+            with self.subTest(consumption=consumption):
+                self.assert_rules(setup + '    pending = client.get(input())\n'
+                                  f'    {consumption}\n', 'ssrf')
+        self.assert_rules(setup + '    pending = client.get(input())\n'
+                          '    pending = unrelated\n    await pending\n')
+
+    def test_base_url_and_absolute_destination_have_distinct_provenance(self):
+        for constructor in ('aiohttp.ClientSession(input())', 'aiohttp.ClientSession(base_url=input())'):
+            setup = 'import aiohttp\nasync def send():\n    client = ' + constructor + '\n'
+            self.assert_rules(setup)
+            for relative in ('/relative', 'relative', ''):
+                with self.subTest(constructor=constructor, relative=relative):
+                    self.assert_rules(setup + f'    await client.get({relative!r})\n', 'ssrf')
+            self.assert_rules(setup + '    await client.get("https://safe.invalid/fixed")\n')
+        self.assert_rules('import aiohttp\nasync def send():\n'
+                          '    client = aiohttp.ClientSession("https://safe.invalid")\n'
+                          '    await client.get(input())\n', 'ssrf')
+
+    def test_helpers_aliases_and_closures_preserve_pending_identity(self):
+        source = '''
+            import aiohttp
+            def make(base):
+                return aiohttp.ClientSession(base_url=base)
+            def prepare(client, url):
+                return client.get(url)
+            async def send():
+                client = make(input())
+                alias = client
+                pending = prepare(alias, '/relative')
+                await pending
+        '''
+        self.assert_rules(source, 'ssrf')
+        self.assert_rules(source.replace("'/relative'", "'https://safe.invalid/fixed'"))
+        self.assert_rules('''
+            import aiohttp
+            def prepare(url):
+                client = aiohttp.ClientSession()
+                def send():
+                    return client.get(url)
+                return send
+            async def consume():
+                async with prepare(input())():
+                    pass
+        ''', 'ssrf')
+
+    def test_literal_argument_expansion_and_scalar_overwrites(self):
+        setup = 'import aiohttp\nasync def send():\n    client = aiohttp.ClientSession()\n'
+        for call in ('client.request(*["GET", input()])',
+                     'client.request(**{"method": "GET", "url": input()})',
+                     'client.get(**{"url": input(), "params": {"q": "fixed"}})'):
+            with self.subTest(call=call):
+                self.assert_rules(setup + f'    await {call}\n', 'ssrf')
+        self.assert_rules(setup + '    target = input()\n    target = "https://safe.invalid"\n'
+                          '    await client.get(target)\n')
+        self.assert_rules(setup + '    await client.request(input(), "https://safe.invalid")\n')
+
+    def test_shadowed_apis_and_lexical_decoys_stay_clean(self):
+        for setup, constructor in (
+            ('', 'ClientSession'),
+            ('from unrelated import ClientSession', 'ClientSession'),
+            ('from .aiohttp import ClientSession', 'ClientSession'),
+            ('import aiohttp\naiohttp = unrelated', 'aiohttp.ClientSession'),
+            ('from aiohttp import ClientSession\nClientSession = unrelated', 'ClientSession'),
+        ):
+            with self.subTest(setup=setup):
+                self.assert_rules(setup + '\nasync def send():\n'
+                                  f'    client = {constructor}()\n    await client.get(input())\n')
+        self.assert_rules('import aiohttp\ntext = "await aiohttp.ClientSession().get(input())"\n'
+                          '# async with aiohttp.ClientSession().get(input()): pass\n')
+
+    def test_argument_effects_and_other_coroutines_are_not_lost(self):
+        self.assert_rules('''
+            import aiohttp, asyncio
+            async def execute(value):
+                eval(value)
+            async def send():
+                client = aiohttp.ClientSession()
+                await asyncio.gather(client.get(input()), execute(input()))
+        ''', 'ssrf', 'eval')
+        findings = self.assert_rules('import aiohttp\nasync def send():\n'
+                                    '    client = aiohttp.ClientSession()\n'
+                                    '    await client.post("https://safe.invalid", data=eval(input()))\n', 'eval')
+        self.assertEqual((findings[0]['line'], findings[0]['severity']), (4, 'critical'))
+
+    def test_module_request_is_context_only(self):
+        for setup, request in (('import aiohttp', 'aiohttp.request'),
+                               ('from aiohttp.client import request as send', 'send')):
+            with self.subTest(request=request):
+                self.assert_rules(setup + '\nasync def fetch():\n'
+                                  f'    pending = {request}("GET", input())\n')
+                self.assert_rules(setup + '\nasync def fetch():\n'
+                                  f'    async with {request}("GET", input()):\n        pass\n', 'ssrf')
+                self.assert_rules(setup + '\nasync def fetch():\n'
+                                  f'    async with {request}(input(), "https://safe.invalid", data=input()):\n'
+                                  '        pass\n')
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(setup + '\nasync def fetch():\n'
+                              f'    await {request}("GET", input())\n')
+
+    def test_custom_transports_callbacks_and_protocols_stay_explicit(self):
+        for option in ('connector=custom', 'trace_configs=[trace]', 'middlewares=[rewrite]',
+                       'request_class=CustomRequest', 'response_class=CustomResponse',
+                       'json_serialize=custom', 'raise_for_status=callback'):
+            with self.subTest(option=option):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('import aiohttp\nasync def send():\n'
+                              f'    client = aiohttp.ClientSession({option})\n'
+                              '    await client.get("https://safe.invalid")\n')
+        for options in ('middlewares=[rewrite]', 'raise_for_status=callback', 'auth=custom'):
+            with self.subTest(options=options):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('import aiohttp\nasync def send():\n    client = aiohttp.ClientSession()\n'
+                              f'    await client.get("https://safe.invalid", {options})\n')
+        self.assert_rules('import aiohttp\nasync def send():\n'
+                          '    client = aiohttp.ClientSession(trace_configs=[], middlewares=(), raise_for_status=True)\n'
+                          '    await client.get("https://safe.invalid", middlewares=(), raise_for_status=False)\n')
+
+    def test_receiver_and_class_mutation_stay_explicit(self):
+        for body in ('client._base_url = input()\n    await client.get("/relative")',
+                     'alias = client\n    alias.get = replacement\n    await client.get(input())',
+                     'pending = client.get("/relative")\n    configure(client)\n    await pending',
+                     'storage = [client]\n    await client.get(input())'):
+            with self.subTest(body=body):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('import aiohttp\nasync def send():\n    client = aiohttp.ClientSession()\n'
+                              '    ' + body + '\n')
+        for source in ('import aiohttp\naiohttp.ClientSession = replacement\n',
+                       'import aiohttp\naiohttp.ClientSession.get = replacement\n'):
+            with self.subTest(source=source):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(source + 'async def send():\n    await aiohttp.ClientSession().get(input())\n')
+
+    def test_native_aiohttp_lazy_request_protocol_without_network(self):
+        try:
+            import aiohttp
+        except ImportError:
+            self.skipTest('aiohttp is unavailable for the native no-network witness')
+        import asyncio
+        from unittest import mock
+
+        async def witness():
+            observed = []
+
+            class Response:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *error):
+                    pass
+
+                def close(self):
+                    pass
+
+                def release(self):
+                    pass
+
+                async def wait_for_close(self):
+                    pass
+
+            async def capture(client, method, url, **options):
+                observed.append((method, url))
+                return Response()
+
+            with mock.patch.object(aiohttp.ClientSession, '_request', capture):
+                async with aiohttp.ClientSession() as client:
+                    pending = client.get('https://await.invalid')
+                    self.assertEqual(observed, [])
+                    await pending
+                    async with client.post('https://context.invalid'):
+                        pass
+                    await asyncio.create_task(client.request('PUT', 'https://task.invalid'))
+                async with aiohttp.request('HEAD', 'https://module.invalid'):
+                    pass
+            self.assertEqual(observed, [('GET', 'https://await.invalid'), ('POST', 'https://context.invalid'),
+                                        ('PUT', 'https://task.invalid'), ('HEAD', 'https://module.invalid')])
+            print('Native aiohttp witness:', aiohttp.__version__, observed, flush=True)
+
+        asyncio.run(witness())
+
+    def test_proxy_and_reflective_api_changes_remain_explicit(self):
+        for source in (
+            'import aiohttp\nasync def send():\n'
+            '    client = aiohttp.ClientSession(proxy=input())\n'
+            '    await client.get("https://safe.invalid")\n',
+            'import aiohttp\nasync def send():\n'
+            '    client = aiohttp.ClientSession()\n'
+            '    await client.get("https://safe.invalid", proxy=input())\n',
+            'import aiohttp\naiohttp.__dict__["ClientSession"] = replacement\n',
+            'import aiohttp\nsetattr(aiohttp.ClientSession, "_request", replacement)\n',
+            'import aiohttp\nconfigure(aiohttp.client)\n',
+            'import aiohttp\nclass Client(aiohttp.ClientSession):\n    pass\n'
+            'async def send():\n    await Client().get(input())\n',
+        ):
+            with self.subTest(source=source):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(source)
+
+    def test_request_metadata_callbacks_and_later_argument_mutation_remain_explicit(self):
+        for option in ('headers=custom', 'cookies=custom', 'params=custom',
+                       'headers={custom_key: "fixed"}', 'params={**custom}'):
+            with self.subTest(option=option):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('import aiohttp\nasync def send():\n'
+                              '    client = aiohttp.ClientSession()\n'
+                              f'    await client.get("https://safe.invalid", {option})\n')
+        with self.assertRaises(taint_py.AnalysisLimit):
+            self.scan('''
+                import aiohttp
+                async def send():
+                    client = aiohttp.ClientSession()
+                    headers = {"X-Data": "fixed"}
+                    pending = client.get("https://safe.invalid", headers=headers)
+                    headers["Other"] = custom
+                    await pending
+            ''')
+        self.assert_rules('''
+            import aiohttp
+            async def send():
+                client = aiohttp.ClientSession()
+                headers = {"X-Data": input()}
+                await client.get("https://safe.invalid", headers=headers)
+        ''')
+
+    def test_cross_file_pending_requests_do_not_invent_caller_locations(self):
+        with temporary_directory(prefix='ubs-aiohttp-cross-file-') as temporary:
+            directory = Path(temporary)
+            helper = directory / 'transport.py'
+            helper.write_text('def prepare(client, url):\n    return client.get(url)\n', encoding='utf-8')
+            caller = directory / 'view.py'
+            caller.write_text('from transport import prepare\nimport aiohttp\nasync def send():\n'
+                              '    client = aiohttp.ClientSession()\n    await prepare(client, input())\n',
+                              encoding='utf-8')
+            with self.assertRaisesRegex(taint_py.AnalysisLimit, 'cross-file HTTP'):
+                list(taint_py.run(RunContext(lang='python', files=[caller, helper],
+                                            profile={'project_dir': str(directory)})))
+
+    @unittest.skipUnless(os.environ.get('UBS_AIOHTTP_E2E') == '1', 'opt-in verified aiohttp scanner integration')
+    def test_public_awaited_context_and_base_contract(self):
+        self._public_module_runner_and_cache_contract(('awaited', 'context-alias', 'base-url'))
+
+    @unittest.skipUnless(os.environ.get('UBS_AIOHTTP_E2E') == '1', 'opt-in verified aiohttp scanner integration')
+    def test_public_safe_unused_and_suppressed_contract(self):
+        self._public_module_runner_and_cache_contract(('safe-data', 'unused', 'suppressed'))
+
+    @unittest.skipUnless(os.environ.get('UBS_AIOHTTP_E2E') == '1', 'opt-in verified aiohttp scanner integration')
+    def test_public_partial_module_and_cache_contract(self):
+        self._public_module_runner_and_cache_contract(
+            ('custom-transport', 'partial-retained', 'module-context'), cache=True)
+
+    def _public_module_runner_and_cache_contract(self, names, *, cache=False):
+        setup = ('import aiohttp\nasync def send():\n'
+                 '    client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))\n')
+        cases = (
+            ('awaited', setup + '    await client.get(input())\n', 4, 11, False),
+            ('context-alias', setup + '    fetch = client.get\n    pending = fetch(input())\n'
+             '    async with pending:\n        pass\n', 5, 15, False),
+            ('base-url', setup.replace('ClientSession(timeout=', 'ClientSession(base_url=input(), timeout=')
+             + '    await client.get("/relative")\n', 4, 11, False),
+            ('safe-data', setup + '    await client.post("https://safe.invalid", data=input(), '
+             'params={"q": input()}, headers={"X-Data": input()})\n', None, None, False),
+            ('unused', setup + '    pending = client.get(input())\n', None, None, False),
+            ('suppressed', setup + '    await client.get(input())  # ubs:ignore[python.taint.ssrf]\n', None, None, False),
+            ('custom-transport', setup.replace('ClientSession(timeout=', 'ClientSession(connector=custom, timeout=')
+             + '    await client.get("https://safe.invalid")\n', None, None, True),
+            ('partial-retained', setup + '    await client.get(input())\n'
+             '    await client.get("https://safe.invalid", proxy=input())\n', 4, 11, True),
+            ('module-context', 'import aiohttp\nasync def send():\n'
+             '    async with aiohttp.request("GET", input(), timeout=aiohttp.ClientTimeout(total=5)):\n'
+             '        pass\n', 3, 16, False),
+        )
+        with temporary_directory(prefix='ubs-aiohttp-public-') as temporary:
+            directory = Path(temporary)
+            skip = '--skip=' + ','.join(str(value) for value in range(1, 25) if value != 7)
+            env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'ENABLE_UV_TOOLS': '0',
+                   'UBS_KEEP_TEMP': '1', 'UBS_NO_CACHE': '1', 'UBS_ALLOW_PARTIAL': '0'}
+
+            def check(path, tag, line, column, partial, runner, output, *, cache=False):
+                entrypoint = ROOT / 'ubs' if runner else ROOT / 'modules' / 'ubs-python.sh'
+                command = [str(entrypoint), '--ci', '--no-color', skip, '--format=' + output]
+                command += ['--only=python'] if runner else ['--no-uv']
+                run_env = {**env, 'UBS_NO_CACHE': '0' if cache else '1',
+                           'UBS_CACHE_DIR': str(directory / 'cache')}
+                result = subprocess.run([*command, str(path)], cwd=directory, env=run_env,
+                                        capture_output=True, text=True, timeout=120)
+                (directory / (tag + '.stdout')).write_text(result.stdout, encoding='utf-8')
+                (directory / (tag + '.stderr')).write_text(result.stderr, encoding='utf-8')
+                detail = (tag, result.returncode, result.stdout, result.stderr)
+                self.assertEqual(result.returncode, 2 if partial else 1 if line else 0, detail)
+                document = json.loads(result.stdout)
+                expected = [('python.taint.ssrf', path.name, line)] if line is not None else []
+                if output == 'json':
+                    self.assertEqual(document['status'], 'partial' if partial else 'ok', detail)
+                    totals = document['totals'] if runner else document
+                    self.assertEqual((totals['files'], totals['critical'], totals['warning'], totals['info']),
+                                     (1, len(expected), 0, 0), detail)
+                    # The runner schema permits the canonical array to be
+                    # absent when no finding records were produced.
+                    rows = document.get('findings', []) if runner and not expected else document['findings']
+                    self.assertEqual(len(rows), len(expected), detail)
+                    if runner and not expected:
+                        self.assertEqual([scanner['findings'] for scanner in document['scanners']], [[]], detail)
+                    if runner:
+                        actual = [(row['rule_id'], Path(row['file']).name, row['line']) for row in rows]
+                        self.assertTrue(all(row['col'] == column for row in rows), detail)
+                    else:
+                        self.assertTrue(all(row['count'] == 1 and len(row['samples']) == 1 for row in rows), detail)
+                        actual = [(row['rule_id'], Path(sample['file']).name, sample['line'])
+                                  for row in rows for sample in row['samples']]
+                    self.assertEqual(actual, expected, detail)
+                else:
+                    runs = document['runs']
+                    self.assertTrue(runs, detail)
+                    rows = [row for run in runs for row in run['results']]
+                    self.assertEqual(len(rows), len(expected), detail)
+                    actual = []
+                    for row in rows:
+                        self.assertEqual(len(row['locations']), 1, detail)
+                        location = row['locations'][0]['physicalLocation']
+                        self.assertTrue(location['artifactLocation']['uri'].endswith(path.name), detail)
+                        self.assertEqual(location['region']['startColumn'], column, detail)
+                        actual.append((row['ruleId'], path.name, location['region']['startLine']))
+                    self.assertEqual(actual, expected, detail)
+                    for run in runs:
+                        if partial:
+                            self.assertIs(run['invocations'][0]['executionSuccessful'], False, detail)
+                            self.assertEqual(run['invocations'][0]['exitCode'], 2, detail)
+                        else:
+                            self.assertTrue(all(inv['executionSuccessful'] is True
+                                                for inv in run.get('invocations', [])), detail)
+                print(f'[{tag}] PASS', flush=True)
+
+            self.assertTrue(set(names) <= {case[0] for case in cases})
+            for case, source, line, column, partial in cases:
+                if case not in names:
+                    continue
+                path = directory / (case + '.py')
+                path.write_text(source, encoding='utf-8')
+                for runner in (False, True):
+                    for output in ('json', 'sarif'):
+                        check(path, f'{case}-{"runner" if runner else "module"}-{output}',
+                              line, column, partial, runner, output)
+            # The other intentionally unsafe files must stay out of a
+            # selected-file scan, and editing that file must invalidate cache.
+            if cache:
+                target = directory / 'selected.py'
+                target.write_text(setup + '    await client.get("https://safe.invalid")\n', encoding='utf-8')
+                check(target, 'selected-cold', None, None, False, True, 'json', cache=True)
+                check(target, 'selected-warm', None, None, False, True, 'json', cache=True)
+                target.write_text(setup + '    await client.get(input())\n', encoding='utf-8')
+                check(target, 'selected-edited', 4, 11, False, True, 'json', cache=True)
+
+
 if __name__ == '__main__':
     unittest.main()

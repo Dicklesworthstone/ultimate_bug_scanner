@@ -175,7 +175,7 @@ these three gaps.
 - [x] Pass the final 38 focused methods, including native Node witnesses and the existing 19-method `flatMap` cohort. Returned closures outside the selected escape model remain an explicit boundary.
 - [x] Pass all 29 actual module/meta-runner JSON/SARIF, selected-file, suppression and cache/edit checks against the isolated original-base publication tree. The original aggregate timeout is retained; unchanged cases pass in 12/12/5-call shards, with each subprocess still bounded at 45 seconds.
 - [x] Preserve concurrent native array-copy implementation and tests; the merged source cohort passes all 50 methods (the previous 38 plus 12 incoming copy regressions). DSR log SHA256: `68cfdcddb074fa74b2e2e01ac474f291c674702e122d69e90046b5d2a757714e`.
-- [ ] Repeat the public reports on the merged tree; runner changes from the original verified tree are version and canonical integrity pins.
+- [x] Verify the final combined 5.5.93 tree with all 12 public value/selected-file cases for dirty map, dirty forEach and clean mapping across module/runner JSON/SARIF. DSR log SHA256: `bf37c213d8949b27123020517487c5fdaad61ac53a33c73b41f5bc04136ffd1f`. The other 17 public boundary/cache cases retain their original-base passing receipts; no full-matrix merged replay is claimed.
 - [x] Publish the implementation and evidence directly to `main` with canonical integrity pins and development version 5.5.91; the broader Bead acceptance remains open.
 
 ### Python aiohttp destinations (`1b9j.6.2`)
@@ -185,8 +185,10 @@ these three gaps.
 - [x] Distinguish session requests that support await and async context entry from the context-only module API; unused handles do not become reached sinks.
 - [x] Preserve fixed destinations and payload/metadata controls; expose proxy, custom callback/transport, receiver mutation, reflection and unsupported cross-file pending requests explicitly.
 - [x] Pass all 14 independent source cases and the final 29 focused methods; rerun the two unchanged subprocess checks that timed out during the interrupted broader run.
-- [ ] Complete the 39-invocation public format, selection, suppression and cache/edit matrix against current pins; the first 12-call unsafe/context/base shard passed. A new test's incorrect column-1 expectation was corrected to the actual awaited call columns; production code was unchanged.
-- [ ] Publish the verified implementation and evidence directly to `main`.
+- [x] Preserve incoming nested-generator forwarding and its tests while merging the aiohttp change. The merged HTTP/callable/immediate-generator cohort passes 204 tests with 7 opt-in skips; DSR log SHA256: `df9ad803e344482a85952730012f88bc91e5b4b41686550c3d4e6d87b6da3d87`.
+- [x] Observe all 39 distinct public format, selection, suppression and cache/edit cases passing: 12 unsafe/context/base calls on the original frozen source, then 12 safe/suppression and 15 partial/module-context/cache calls on the merged source. Merged logs: `6f3191c173ba96e150509e809e1c72ec995954f1051d139d22ec19fc7adec0df`, `e02f3cfc6c2d998821fbd8be0c528c3626e21796ed96a66d281beb0867edf0e2`.
+- [x] Correct new test oracles to actual awaited source columns and the documented optional empty runner findings field; retain both failed receipts. Unsafe reports still require their canonical findings, and safe reports require exact empty scanner arrays, zero totals, successful status and exits. The added assertions also pass against the retained safe reports (`9be1c1d49d753e4963278dbcf23c8ac2daa79a20fcd71f5d71247b7906555ef1`).
+- [x] Publish the verified implementation and evidence directly to `main` with development version 5.5.93 and final combined integrity pins.
 
 ### Go formatted input (`1b9j.6.3`)
 
@@ -204,5 +206,8 @@ these three gaps.
 - [x] Preserve historical Beads content, restore one missing historical comment identity required by the Beads importer, and add the three scoped implementation tasks; blocking dependencies are acyclic.
 - [x] Retain failed and interrupted test attempts; execution-environment stalls and killed processes are not passing evidence.
 - [x] Verify the JavaScript publication's combined module/helper/SHA256 pins, runner syntax and whitespace after preserving concurrent Python generator changes. DSR log SHA256: `db6a583422cee43bfd426cdae930cb864cabeb6e08bf625895724093b5844d34`.
-- [ ] Verify final combined pins, touched-source self-scan and the prescribed full repository suite.
-- [ ] Record unresolved whole-repository and release gates without closing the D6 or release umbrellas. The prescribed full ShellCheck process was killed after about 100 seconds without diagnostics; no lint pass is claimed.
+- [x] Verify final combined module/helper/SHA256 pins, runner syntax and whitespace for all three features on development version 5.5.93. DSR log SHA256: `2e21b47c566827ce263acd0713fe644aa179d08896b4d638a46e648b831be323`.
+- [ ] Complete touched-source self-scan and the prescribed full repository suite. Final combined-tree attempts are retained and do not establish a pass:
+  - Staged-source self-scan selected the three modified analyzers after the repository's test-suite ignore rule, started Python scanning, then timed out after 90 seconds (exit 124) without a completed JSON report. DSR log SHA256: `ad99eff75946af7e63cb3f4c517b7e375b6f95164581b6977863baf2b1cc6b31`.
+  - The prescribed `test-suite/run_all.sh` passed its integrity and generated-rule inventory steps, reproduced missing buggy/clean Swift fixture pairs in the rule-quality harness, and reached its 180-second aggregate limit during unit discovery (exit 124, observed duration 182.253 seconds). Discovery under uv-selected CPython 3.14.10 reported errors and a failure before interruption; final per-test tracebacks were not produced, so these are unresolved and are not attributed to a particular cause. The inherited no-deletion guard and retained temporary directories were active. DSR log SHA256: `982a80caa07904685580056ea86b671a90ee51fd87e263e21fab21e77d705e9c`.
+- [x] Record unresolved whole-repository and release gates without closing the D6 or release umbrellas. The prescribed full ShellCheck process was killed after about 100 seconds without diagnostics; no lint pass is claimed (log SHA256 `fd3acc0c811ea35ba92a919db4fe88e1ea0e737d912bd19d95be19bab141d8cd`). Scoped Beads retain delivered feature evidence and remaining boundaries; no release tag or full qualification is claimed.

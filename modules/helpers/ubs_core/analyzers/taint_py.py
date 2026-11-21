@@ -189,7 +189,12 @@ _HTTP_CLIENT_CONSTRUCTORS = {
        for constructor in ('Session', 'session')},
     'httpx.Client': 'httpx',
     'httpx.AsyncClient': 'httpx.async',
+    'aiohttp.ClientSession': 'aiohttp',
+    'aiohttp.client.ClientSession': 'aiohttp',
 }
+_AIOHTTP_REQUEST_APIS = frozenset({'aiohttp.request', 'aiohttp.client.request'})
+_AIOHTTP_API_NAMES = frozenset({'aiohttp', 'aiohttp.client', 'aiohttp.ClientSession',
+                              'aiohttp.client.ClientSession', *_AIOHTTP_REQUEST_APIS})
 _HTTP_CLIENT_METHODS = {
     kind: {**{method: 0 for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options')},
            'request': 1, **({'stream': 1} if kind.startswith('httpx') else {})}
@@ -198,15 +203,18 @@ _HTTP_CLIENT_METHODS = {
 _HTTP_CLIENT_MEMBERS = {
     **{module: frozenset(name.rsplit('.', 1)[1] for name in _HTTP_CLIENT_CONSTRUCTORS
                          if name.rsplit('.', 1)[0] == module)
-       for module in ('requests', 'requests.sessions', 'httpx')},
+       for module in ('requests', 'requests.sessions', 'httpx', 'aiohttp', 'aiohttp.client')},
     **{constructor: frozenset(_HTTP_CLIENT_METHODS[kind]) | {
-        'send', '__init__', '__enter__', '__aenter__', 'build_request', 'prepare_request'}
+        'send', '__init__', '__enter__', '__aenter__', '__aexit__',
+        '_request', '_build_url', 'build_request', 'prepare_request'}
        for constructor, kind in _HTTP_CLIENT_CONSTRUCTORS.items()},
     'urllib': frozenset({'request'}),
     'urllib.request': frozenset({'Request', 'urlopen', 'urlretrieve', 'build_opener',
                                  'install_opener', 'OpenerDirector', '_opener'}),
     'urllib.request.Request': frozenset({'__init__', 'full_url', 'get_full_url', 'set_proxy'}),
     'urllib.request.OpenerDirector': frozenset({'__init__', 'open', 'add_handler'}),
+    'aiohttp': frozenset({'ClientSession', 'request', 'client'}),
+    'aiohttp.client': frozenset({'ClientSession', 'request'}),
 }
 _URLLIB_APIS = frozenset(f'urllib.request.{name}' for name in
                        ('Request', 'urlopen', 'urlretrieve', 'build_opener', 'install_opener'))
@@ -400,6 +408,10 @@ class _HTTPPending:
     call: ast.Call
     asynchronous: bool
     streaming: bool = False
+    # Session requests in aiohttp implement BOTH coroutine and async-context
+    # protocols. HTTPX streams and aiohttp.request() are context-only.
+    context_manager: bool = False
+    call_owner: ast.Module | None = None
 
 
 @dataclass(frozen=True)
@@ -1118,7 +1130,8 @@ def _without_object_contract(binding):
 _QUALIFIER_WIDTH = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS))
 _KNOWN_QUALIFIER_PREFIXES = frozenset(
     '.'.join(qualified.split('.')[:size])
-    for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_HTTP_CLIENT_CONSTRUCTORS, *_URLLIB_APIS, 'httpx.URL',
+    for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_HTTP_CLIENT_CONSTRUCTORS,
+                      *_AIOHTTP_REQUEST_APIS, *_URLLIB_APIS, 'httpx.URL',
                       *_ALL_FRAMEWORK_NAMES, *_REQUEST_TYPES)
     for size in range(1, len(qualified.split('.')) + 1))
 
@@ -1716,7 +1729,7 @@ def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
         # Network clients and stream parsers require real import identities.
         # An unresolved relative import or local shadow cannot recover one
         # merely because its receiver has the standard library's spelling.
-        if node.id in {'requests', 'httpx', 'urllib', 'json', 'tomllib', 'csv'}:
+        if node.id in {'requests', 'httpx', 'aiohttp', 'urllib', 'json', 'tomllib', 'csv'}:
             return ''
         return node.id
     if isinstance(node, ast.Attribute):
@@ -2404,7 +2417,7 @@ class _Flow:
                 if isinstance(contract, (_UrllibRequest, _UrllibOpener)):
                     raise AnalysisLimit('urllib handle has no context manager protocol; analysis is incomplete')
                 asynchronous = (contract.asynchronous if isinstance(contract, _HTTPPending)
-                                else contract.kind == 'httpx.async')
+                                else contract.kind in {'httpx.async', 'aiohttp'})
                 if asynchronous != isinstance(node, ast.AsyncWith):
                     raise AnalysisLimit('HTTP context manager protocol mismatch; analysis is incomplete')
                 if isinstance(contract, _HTTPPending):
@@ -2460,6 +2473,8 @@ class _Flow:
                     if isinstance(value, _BoundCallable) and value.namespace_proven else None)
             if name in _URLLIB_APIS or name in {'urllib', 'urllib.request', 'urllib.request.OpenerDirector'}:
                 raise AnalysisLimit('urllib namespace or API escape is unresolved; analysis is incomplete')
+            if name in _AIOHTTP_API_NAMES:
+                raise AnalysisLimit('aiohttp namespace or API escape is unresolved; analysis is incomplete')
             if (isinstance(value, _CsvReader) or isinstance(value, _BoundCallable)
                     and isinstance(value.receiver_binding, _CsvReader)):
                 raise AnalysisLimit('CSV reader storage or escape is unresolved; analysis is incomplete')
@@ -6433,7 +6448,11 @@ class _Flow:
     def http_client(self, node, state, name, inputs):
         """Construct a native handle without tainting it with option data."""
         kind = _HTTP_CLIENT_CONSTRUCTORS[name]
-        if node.args or None in inputs.keyword_nodes or kind == 'requests' and inputs.keywords:
+        aiohttp = kind == 'aiohttp'
+        if (None in inputs.keyword_nodes or kind == 'requests' and inputs.keywords
+                or node.args and not aiohttp
+                or aiohttp and (len(node.args) > 1 or any(isinstance(arg, ast.Starred) for arg in node.args)
+                                or node.args and 'base_url' in inputs.keywords)):
             raise AnalysisLimit('HTTP client constructor argument binding is unresolved; analysis is incomplete')
         for option in ('event_hooks', 'transport', 'mounts'):
             expression = inputs.keyword_nodes.get(option)
@@ -6442,7 +6461,11 @@ class _Flow:
                     or isinstance(expression, ast.Dict) and not expression.keys):
                 raise AnalysisLimit('HTTP client custom transport or hooks are unresolved; analysis is incomplete')
         self.http_auth(inputs.keyword_nodes.get('auth'))
-        base = inputs.keywords.get('base_url', CLEAN) if kind.startswith('httpx') else CLEAN
+        if aiohttp:
+            self.aiohttp_options(inputs, state)
+            base, _expression = self.http_destination(node, inputs, 0, 'base_url')
+        else:
+            base = inputs.keywords.get('base_url', CLEAN) if kind.startswith('httpx') else CLEAN
         # Receiver references support aliases and summary mutation checks;
         # concrete base provenance stays out of callable context keys.
         self.expression_bindings[node] = _BoundCallable(
@@ -6450,6 +6473,60 @@ class _Flow:
         self.expression_references[node] = frozenset({node})
         self.possible_exception(state)
         return CLEAN
+
+    def aiohttp_options(self, inputs, state):
+        """Selected native options must not conceal request-rewriting code.
+
+        Connector, middleware, trace and serializer hooks can change the URL
+        or run arbitrary effects. Empty native options do not install hooks;
+        custom objects remain an explicit analysis boundary.
+        """
+        if None in inputs.keyword_nodes:
+            raise AnalysisLimit('aiohttp option expansion is unresolved; analysis is incomplete')
+        for name in ('connector', 'cookie_jar', 'loop', 'json_serialize_bytes',
+                     'proxy_auth', 'upload_tracker'):
+            expression = inputs.keyword_nodes.get(name)
+            if expression is not None and not (
+                    isinstance(expression, ast.Constant) and expression.value is None):
+                raise AnalysisLimit('aiohttp custom transport or callback is unresolved; analysis is incomplete')
+        for name in ('request_class', 'response_class', 'ws_response_class',
+                     'json_serialize', 'fallback_charset_resolver'):
+            if name in inputs.keyword_nodes:
+                raise AnalysisLimit('aiohttp custom request protocol is unresolved; analysis is incomplete')
+        for name in ('trace_configs', 'middlewares'):
+            expression = inputs.keyword_nodes.get(name)
+            if expression is not None and not (
+                    isinstance(expression, ast.Constant) and expression.value is None
+                    or isinstance(expression, (ast.List, ast.Tuple)) and not expression.elts):
+                raise AnalysisLimit('aiohttp custom middleware or trace is unresolved; analysis is incomplete')
+        expression = inputs.keyword_nodes.get('raise_for_status')
+        if expression is not None and not (
+                isinstance(expression, ast.Constant) and type(expression.value) in {bool, type(None)}):
+            raise AnalysisLimit('aiohttp response callback is unresolved; analysis is incomplete')
+        proxy = inputs.keyword_nodes.get('proxy')
+        if proxy is not None and not (
+                isinstance(proxy, ast.Constant) and (proxy.value is None or type(proxy.value) is str)):
+            raise AnalysisLimit('aiohttp dynamic proxy destination is unresolved; analysis is incomplete')
+        for name in ('headers', 'cookies', 'params'):
+            expression = inputs.keyword_nodes.get(name)
+            if expression is None or isinstance(expression, ast.Constant) and expression.value is None:
+                continue
+            binding = self.expression_bindings.get(expression)
+            self.require_value(binding)
+            choices = _binding_choices(binding)
+            literal = isinstance(expression, ast.Dict) and all(
+                isinstance(key, ast.Constant) and type(key.value) in {str, bytes, int, float, bool}
+                for key in expression.keys)
+            native = bool(choices) and all(
+                isinstance(choice, _SymbolicValue)
+                or isinstance(choice, _LiteralMapping) and choice.keys is not None
+                    and all(type(key) in {str, bytes, int, float, bool} for key in choice.keys)
+                or isinstance(choice, _ArgumentVector)
+                    and self.materialized_generator_binding(choice, NO_REFERENCES, state)
+                or name == 'params' and isinstance(choice, (_LiteralString, _GeneratorString))
+                    and choice.format_safe for choice in choices)
+            if not (literal or native) or self.expression_references.get(expression, NO_REFERENCES) & state.mutated:
+                raise AnalysisLimit('aiohttp metadata iteration or key protocol is unresolved; analysis is incomplete')
 
     def http_auth(self, expression):
         """Basic credentials are data; an Auth object may yield another URL."""
@@ -6476,24 +6553,35 @@ class _Flow:
         if position is None:
             raise AnalysisLimit('HTTP client method is unmodeled; analysis is incomplete')
         self.http_auth(inputs.keyword_nodes.get('auth'))
+        if contract.kind == 'aiohttp':
+            self.aiohttp_options(inputs, state)
         destination, expression = self.http_destination(node, inputs, position)
-        if contract.kind.startswith('httpx'):
+        if contract.kind.startswith('httpx') or contract.kind == 'aiohttp':
             value = self.expression_bindings.get(expression)
             self.require_value(value)
             literals = [_literal_text(choice) for choice in _binding_choices(value)]
-            # HTTPX regards //host/path as relative. Only a proven scheme
-            # and authority override its base; an opaque URL may use either.
+            # HTTPX regards //host/path as relative. Aiohttp uses YARL's
+            # authority test; its session request can override the base.
+            # An opaque URL may use either the request or the base value.
             absolute = bool(literals) and all(
-                text is not None and self.http_absolute_url(text) for text in literals)
+                text is not None and self.http_absolute_url(
+                    text, require_scheme=contract.kind != 'aiohttp') for text in literals)
             if not absolute:
                 destination = join_facts(destination, target.receiver)
         streaming = method == 'stream'
-        asynchronous = contract.kind == 'httpx.async'
+        asynchronous = contract.kind in {'httpx.async', 'aiohttp'}
         if streaming or asynchronous:
+            references = target.references
+            if contract.kind == 'aiohttp':
+                # A later mutation of a captured argument can install a
+                # payload/URL callback before the coroutine starts running.
+                references |= frozenset().union(*(self.expression_references.get(argument, NO_REFERENCES)
+                    for argument in (*node.args, *inputs.keyword_nodes.values())))
             self.expression_bindings[node] = _BoundCallable(
-                '@http.pending', target.references, destination, True,
-                receiver_binding=_HTTPPending(node, asynchronous, streaming))
-            self.expression_references[node] = target.references
+                '@http.pending', references, destination, True,
+                receiver_binding=_HTTPPending(node, asynchronous, streaming, contract.kind == 'aiohttp',
+                    self.engine.tree if contract.kind == 'aiohttp' else None))
+            self.expression_references[node] = references
             return CLEAN
         self.effect('ssrf', node, 'HTTP request URL', destination)
         self.expression_bindings[node] = None
@@ -6502,19 +6590,25 @@ class _Flow:
         return CLEAN
 
     @staticmethod
-    def http_absolute_url(text):
+    def http_absolute_url(text, *, require_scheme=True):
         # A nonempty authority can still have an empty host (user@ or :443).
         # HTTPX resolves those spellings against its base just like /path.
         try:
             parsed = urlsplit(text)
-            return bool(parsed.scheme and parsed.hostname)
+            return bool(parsed.hostname and (parsed.scheme or not require_scheme))
         except ValueError as exc:
             raise AnalysisLimit('HTTP URL parsing is unresolved; analysis is incomplete') from exc
 
     def resume_http(self, value, state, *, streaming=False):
         contract = value.receiver_binding
-        if not isinstance(contract, _HTTPPending) or contract.streaming != streaming:
+        if (not isinstance(contract, _HTTPPending)
+                or contract.streaming != streaming and not (streaming and contract.context_manager)):
             raise AnalysisLimit('HTTP request consumption protocol is unresolved; analysis is incomplete')
+        if contract.call_owner is not None and contract.call_owner is not self.engine.tree:
+            # Effects currently belong to their enclosing module summary.
+            # A foreign returned request must not report its helper's line
+            # against the consuming module's unrelated source path.
+            raise AnalysisLimit('cross-file HTTP pending request location is unresolved; analysis is incomplete')
         if value.references & state.mutated:
             raise AnalysisLimit('HTTP request receiver changed before execution; analysis is incomplete')
         self.effect('ssrf', contract.call, 'HTTP request URL', value.receiver)
@@ -6535,6 +6629,18 @@ class _Flow:
             return self.urllib_call(node, state, target, inputs)
         if native_name in _HTTP_CLIENT_CONSTRUCTORS:
             return self.http_client(node, state, native_name, inputs)
+        if native_name in _AIOHTTP_REQUEST_APIS:
+            self.aiohttp_options(inputs, state)
+            self.http_auth(inputs.keyword_nodes.get('auth'))
+            destination, _expression = self.http_destination(node, inputs, 1)
+            references = frozenset().union(*(self.expression_references.get(argument, NO_REFERENCES)
+                for argument in (*node.args, *inputs.keyword_nodes.values())))
+            self.expression_bindings[node] = _BoundCallable(
+                '@http.pending', references, destination, True,
+                receiver_binding=_HTTPPending(node, asynchronous=True, streaming=True, call_owner=self.engine.tree))
+            self.expression_references[node] = references
+            self.possible_exception(state)
+            return CLEAN
         if native_name == 'httpx.URL':
             raise AnalysisLimit('HTTPX URL object construction is unmodeled; analysis is incomplete')
         if isinstance(target, ast.ClassDef):
@@ -7525,10 +7631,11 @@ class _Flow:
                 function = base.function if isinstance(base, (_FunctionValue, _ClosureValue)) else base
                 native = (base if isinstance(base, str) else base.name
                           if isinstance(base, _BoundCallable) and base.namespace_proven else None)
-                if (native in _URLLIB_APIS or native in {'urllib', 'urllib.request', 'urllib.request.OpenerDirector'}) and node.attr in {
+                if (native in _URLLIB_APIS or native in _AIOHTTP_API_NAMES
+                        or native in {'urllib', 'urllib.request', 'urllib.request.OpenerDirector'}) and node.attr in {
                         '__dict__', '__globals__', '__closure__', '__code__', '__defaults__',
                         '__kwdefaults__', '__class__', '__bases__'}:
-                    raise AnalysisLimit('urllib reflective namespace access is unresolved; analysis is incomplete')
+                    raise AnalysisLimit('HTTP reflective namespace access is unresolved; analysis is incomplete')
                 if _http_contract(base, (_UrllibRequest, _UrllibOpener)):
                     if base.references & state.mutated:
                         raise AnalysisLimit('urllib receiver was mutated; analysis is incomplete')
@@ -8445,6 +8552,12 @@ class _Flow:
         elif isinstance(node, ast.ClassDef):
             for expression in (*node.bases, *node.decorator_list):
                 self.expr(expression, state)
+            for base in node.bases:
+                for binding in _binding_choices(self.expression_bindings.get(base)):
+                    name = (binding if isinstance(binding, str) else binding.name
+                            if isinstance(binding, _BoundCallable) and binding.namespace_proven else None)
+                    if name in {'aiohttp.ClientSession', 'aiohttp.client.ClientSession'}:
+                        raise AnalysisLimit('aiohttp session subclass dispatch is unresolved; analysis is incomplete')
             for keyword in node.keywords:
                 self.expr(keyword.value, state)
             namespace = state.copy()

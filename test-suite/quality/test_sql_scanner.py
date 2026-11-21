@@ -775,11 +775,6 @@ INCOMPLETE_CASES = (
     """),
     Case("mysql_delimiter_is_not_postgres", "DELIMITER //\nCREATE FUNCTION f() RETURNS INT RETURN 1//\n"),
     Case("psql_include_requires_external_context", "\\i privileges.sql\n"),
-    Case("schema_default_revoke_does_not_override_global_grant", """
-        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
-        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql SECURITY DEFINER
-        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
-    """),
     Case("do_block_can_execute_hidden_ddl", """
         DO $body$ BEGIN
         EXECUTE 'CREATE FUNCTION app.hidden() RETURNS integer LANGUAGE sql SECURITY DEFINER AS ''SELECT 1''';
@@ -1281,6 +1276,189 @@ PROCEDURE_INCOMPLETE_CASES = (
 )
 
 
+# PostgreSQL's per-schema default ACL is added to the global default ACL.
+# These labels are frozen before the schema-default implementation. In
+# particular, the former incomplete single-schema REVOKE case now requires
+# the positive PUBLIC finding instead of merely accepting an incomplete scan.
+SCHEMA_DEFAULT_CASES = (
+    Case("schema_default_revoke_does_not_override_global_grant", """
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+    """),
+    Case("schema_default_revoke_does_not_override_global_procedure_grant", """
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_grants_both_routine_kinds_only_in_selected_schema", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON ROUTINES TO PUBLIC;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        CREATE PROCEDURE private.p()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("global_default_revoke_preserves_prior_schema_grant", """
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES REVOKE ALL PRIVILEGES ON ROUTINES FROM PUBLIC;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_revoke_undoes_only_its_schema_grant", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app, other GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE ALL ON ROUTINES FROM PUBLIC;
+        CREATE PROCEDURE app.p()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        CREATE FUNCTION other.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+    """),
+    Case("schema_default_names_preserve_quoting_and_identifier_folding", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA "App Space", APP GRANT ALL PRIVILEGES ON ROUTINES TO PUBLIC;
+        CREATE PROCEDURE "App Space".p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE PROCEDURE "APP".p()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_grant_affects_future_objects_only", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        CREATE FUNCTION app.before() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON ROUTINES TO PUBLIC;
+        CREATE PROCEDURE app.after() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_revoke_does_not_revoke_existing_object", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        BEGIN;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+        CREATE PROCEDURE app.before() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+        CREATE PROCEDURE app.after()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        COMMIT;
+    """),
+    Case("schema_default_grant_does_not_reset_replaced_routine_acl", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        CREATE PROCEDURE app.p() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+        CREATE OR REPLACE PROCEDURE app.p()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_transfer_does_not_apply_target_default_privileges", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+        BEGIN;
+        CREATE PROCEDURE private.p()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        ALTER PROCEDURE private.p() SET SCHEMA app;
+        COMMIT;
+    """),
+    Case("schema_default_rollback_removes_uncommitted_grant", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        BEGIN;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+        ROLLBACK;
+        CREATE PROCEDURE app.p()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_savepoint_restores_reverted_grant", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        BEGIN;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+        SAVEPOINT keep_grant;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE ALL ON ROUTINES FROM PUBLIC;
+        ROLLBACK TO keep_grant;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        COMMIT;
+    """),
+    Case("schema_default_named_roles_do_not_mean_public", """
+        ALTER DEFAULT PRIVILEGES REVOKE ALL ON ROUTINES FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON ROUTINES TO "public", GROUP app_reader;
+        CREATE PROCEDURE app.p()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_public_among_named_roles_is_public", """
+        ALTER DEFAULT PRIVILEGES REVOKE ALL ON ROUTINES FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON ROUTINES TO app_reader, PUBLIC;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_grant_option_revoke_preserves_execute", """
+        ALTER DEFAULT PRIVILEGES REVOKE ALL ON ROUTINES FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON ROUTINES TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE GRANT OPTION FOR EXECUTE ON FUNCTIONS FROM PUBLIC;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_revoke_restrict_and_cascade_preserve_other_schema", """
+        ALTER DEFAULT PRIVILEGES REVOKE ALL ON ROUTINES FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app, other GRANT EXECUTE ON ROUTINES TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON ROUTINES FROM PUBLIC RESTRICT;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA other REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC CASCADE;
+        CREATE PROCEDURE app.p()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+        CREATE FUNCTION other.f() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+    """),
+    Case("unqualified_routine_still_has_known_global_public_grant", """
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        CREATE PROCEDURE p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("unqualified_routine_with_no_schema_grants_is_private", """
+        ALTER DEFAULT PRIVILEGES REVOKE ALL ON ROUTINES FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        CREATE PROCEDURE p()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+)
+
+SCHEMA_DEFAULT_INCOMPLETE_CASES = (
+    Case("unqualified_routine_cannot_choose_a_schema_default_grant", """
+        ALTER DEFAULT PRIVILEGES REVOKE ALL ON ROUTINES FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON ROUTINES TO PUBLIC;
+        CREATE PROCEDURE p()
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_external_role_remains_unknown", """
+        ALTER DEFAULT PRIVILEGES FOR ROLE deployer IN SCHEMA app REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        CREATE PROCEDURE app.p() -- expect:path
+        LANGUAGE plpgsql SECURITY DEFINER AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_malformed_schema_list_cannot_hide_public", """
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app, REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_malformed_role_list_cannot_remove_prior_grant", """
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON ROUTINES TO PUBLIC;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON ROUTINES FROM PUBLIC,;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_wrong_direction_cannot_hide_public", """
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON ROUTINES TO PUBLIC;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+    Case("schema_default_unsupported_procedures_keyword_is_partial", """
+        ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON PROCEDURES FROM PUBLIC;
+        CREATE PROCEDURE app.p() -- expect:public
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+    """),
+)
+
+
 class EvidenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1307,6 +1485,32 @@ class EvidenceTest(unittest.TestCase):
 
 
 class SQLNativeTests(EvidenceTest):
+    def test_role_changes_do_not_reuse_another_owners_schema_defaults(self):
+        analyzer = importlib.import_module("ubs_core.sql_scan")
+        for index, change in enumerate(("SET ROLE next_owner", "RESET ROLE",
+                                        "RESET SESSION AUTHORIZATION")):
+            with self.subTest(change=change):
+                case = Case("schema_default_role_change_" + str(index), f"""
+                    ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT EXECUTE ON ROUTINES TO PUBLIC;
+                    {change};
+                    ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+                    CREATE PROCEDURE app.p() LANGUAGE plpgsql SECURITY DEFINER
+                    SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+                    ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON ROUTINES FROM PUBLIC;
+                    CREATE PROCEDURE app.private() LANGUAGE plpgsql SECURITY DEFINER
+                    SET search_path = pg_catalog, pg_temp AS $$ BEGIN NULL; END $$;
+                """)
+                directory = self.materialize((case,), case.name)
+                records, errors = analyzer.analyze_source(case.source, str(directory / case.filename))
+                (directory / "receipt.json").write_text(json.dumps({
+                    **self.identity, "findings": records, "errors": errors,
+                    "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+                }, indent=2) + "\n", encoding="utf-8")
+                self.assertEqual(records, [], (case.source, records, errors))
+                self.assertTrue(any("ACL of app.p() is unknown" in error for error in errors), errors)
+                self.assertFalse(any("ACL of app.private() is unknown" in error for error in errors), errors)
+                self.assertTrue(any("role change" in error for error in errors), errors)
+
     def test_same_line_redefinitions_keep_distinct_publication_evidence(self):
         # Both definitions can be observed by another session in autocommit
         # mode, even though the same spelling and line number are reused.
@@ -1376,6 +1580,10 @@ for _case in INCOMPLETE_CASES:
 for _case in PROCEDURE_CASES:
     setattr(SQLNativeTests, "test_" + _case.name, native_test(_case))
 for _case in PROCEDURE_INCOMPLETE_CASES:
+    setattr(SQLNativeTests, "test_incomplete_" + _case.name, native_test(_case, True))
+for _case in SCHEMA_DEFAULT_CASES:
+    setattr(SQLNativeTests, "test_" + _case.name, native_test(_case))
+for _case in SCHEMA_DEFAULT_INCOMPLETE_CASES:
     setattr(SQLNativeTests, "test_incomplete_" + _case.name, native_test(_case, True))
 
 
@@ -1540,6 +1748,19 @@ class SQLPublicTests(EvidenceTest):
     def test_procedure_boundaries_keep_known_findings(self):
         cases = PROCEDURE_INCOMPLETE_CASES
         directory = self.materialize(cases, "procedure-boundaries")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
+
+    def test_schema_default_privileges_through_module_and_runner_formats(self):
+        directory = self.materialize(SCHEMA_DEFAULT_CASES, "schema-defaults")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, SCHEMA_DEFAULT_CASES)
+
+    def test_schema_default_boundaries_preserve_public_findings(self):
+        cases = SCHEMA_DEFAULT_INCOMPLETE_CASES
+        directory = self.materialize(cases, "schema-default-boundaries")
         for mode in ("module-json", "module-sarif", "json", "sarif"):
             with self.subTest(mode=mode):
                 self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)

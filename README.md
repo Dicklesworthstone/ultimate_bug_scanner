@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.96-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.97-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -395,6 +395,14 @@ functions and procedures. Procedure signatures with `OUT` parameters accept
 input-only and complete argument lists; ambiguous unmarked overloads produce
 incomplete analysis and preserve known findings.
 
+Schema-specific default privileges are additive: `IN SCHEMA ... REVOKE` cannot
+remove a global PUBLIC grant, and a global revoke leaves explicit schema grants
+intact. The scanner applies these defaults only to future routines, preserves
+existing ACLs through replacement and schema moves, and restores default state on
+rollback/savepoints. Quoted and multiple schema names are supported. Role changes
+and unqualified creation names whose schema would change the effective ACL remain
+explicitly incomplete.
+
 Ordinary queries and bounded `WITH` CTEs preserve this migration state, including
 recursive, nested, materialized and data modifying forms. Literal psql controls
 (`\set ON_ERROR_STOP`, `\set ECHO`, `\set VERBOSITY`, `\echo`, and `\warn`) preserve
@@ -427,6 +435,7 @@ Confidence remains uncalibrated.
 The underlying privilege and search-path semantics follow PostgreSQL's
 [CREATE FUNCTION security guidance](https://www.postgresql.org/docs/current/sql-createfunction.html#SQL-CREATEFUNCTION-SECURITY),
 [CREATE PROCEDURE semantics](https://www.postgresql.org/docs/current/sql-createprocedure.html),
+[default privilege semantics](https://www.postgresql.org/docs/current/sql-alterdefaultprivileges.html),
 [search_path documentation](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-SEARCH-PATH),
 and [REVOKE semantics](https://www.postgresql.org/docs/current/sql-revoke.html).
 

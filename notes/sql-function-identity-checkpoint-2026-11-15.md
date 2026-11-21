@@ -146,6 +146,67 @@ Primary references:
 - https://www.postgresql.org/docs/current/sql-grant.html
 - https://www.postgresql.org/docs/current/sql-alterdefaultprivileges.html
 
+## November 20 continuation: schema-specific routine defaults
+
+Development version **5.5.97** models `ALTER DEFAULT PRIVILEGES IN SCHEMA`
+for the selected creating role. Per-schema PUBLIC execution grants are added to
+global defaults; a per-schema revoke cannot remove the standard global grant,
+and a global revoke does not remove an explicit schema grant. Both `FUNCTIONS`
+and `ROUTINES` affect functions and procedures. Multiple/quoted schema names,
+named grantees, grant-option-only revokes, transactions and savepoints retain
+their distinct semantics. The complete statement is validated before changing
+the default state.
+
+Only future creations use these defaults. Existing ACLs survive replacement,
+renames and schema moves. An unqualified creation stays unresolved when its
+unknown schema could change the effective ACL. `SET`/`RESET ROLE` and session
+authorization changes invalidate both global and schema default facts; a later
+global revoke alone cannot accidentally prove that the new role has no schema
+grants. Explicit selected revokes can re-establish the relevant current-role
+facts. External role/catalog proof and cross-file ordering remain open.
+
+The maintained labels were frozen before implementation: **18 complete cases,
+six incomplete boundaries, and three role-change subcases**. One former
+incomplete fixture was strengthened to demand the actual PUBLIC warning and a
+complete result. Immutable `b577b7e467b19a093d2cb1d8c3cc5206bd571087` failed
+25 assertions across the 238-method source/helper cohort. The candidate passed
+all **238 source/helper methods** without skips and **16 actual CLI invocations**:
+schema defaults, their boundaries, existing procedures and existing functions,
+each through module/runner JSON/SARIF. Rules, positions, totals, completion and
+exits remain exact assertions. These are scanner/source/CLI observations against
+PostgreSQL's documented contract; no PostgreSQL server was run.
+
+An independently authored, unchanged **18-case oracle** also passes (17 exact
+outcomes and one retained role boundary), versus 1/18 on immutable `b577b7e`.
+Its labels cover additive scope, replacement, schema moves, drop/recreation and
+transaction restoration; no native PostgreSQL claim is made.
+
+The original procedure publication was also verified after execution resumed:
+canonical generators made no changes on exact published `b577b7e`, integrity
+checks and shell syntax passed, and its 214 source/helper methods plus 12 actual
+CLI calls passed. That executed receipt resolves the earlier merged-tree
+verification limitation without changing the historical publication account.
+
+DSR evidence under `test-suite/artifacts/schema-defaults-20261120/`:
+
+| Check | Log SHA256 |
+| --- | --- |
+| Frozen baseline, 25 failed assertions | `c0769d6eb6a192d1375694832a2d243e018f888d499bdcffd8164a20f5f91474` |
+| Candidate source/helper, 238 passed | `d06e0755499834cf1a4492c08d320662506cbaa9c910f5fa72fdd03adecb1d6f` |
+| Canonical integrity, source/helper and 16 CLI calls | `e5f992b46651f83ebe4bd4e9a722e05f30c286881bdbd4f462d4c1b356aa7c93` |
+| Independent baseline, 1/18 | `e6aa050deca92088a1ed94f32f6ded887f16c49581976d8fd758024c76fbc674` |
+| Independent candidate, 18/18 | `98313b7cc9b7e3430318cf41a56746d817682be9be8e77befc54d3539e15603d` |
+| Exact published procedure tree rerun | `2b25807c663954d64287cb12057d345cc54d5f7a397b7993c84fbb3fcb770099` |
+
+Scanner SHA256:
+`0a19a02497550bc24bf11d389aa2e2b28d9afe3427b0775a896b4cfedbe16c8e`.
+Maintained oracle SHA256:
+`5db2703760d5eee16d15b0fc333cb15712bc9bca572bd29e9f264d9b86e8883c`.
+This bounded extension does not close the SQL umbrella or claim full-repository
+or release qualification.
+
+Primary reference: https://www.postgresql.org/docs/current/sql-alterdefaultprivileges.html
+
 ## Recoverable implementation
 
 - Base commit: `f1c06ea3f80497432a29581871b3719ad8462f9d`.

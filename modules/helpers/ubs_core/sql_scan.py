@@ -533,7 +533,93 @@ class State:
     functions: dict[tuple, Function] = field(default_factory=dict)
     schema_public_create: dict[str, bool] = field(default_factory=dict)
     default_public: bool | None = True
+    schema_default_public: dict[str, bool] = field(default_factory=dict)
+    schema_defaults_known: bool = True
     session_path_changed: bool = False
+
+
+def invalidate_default_privileges(state: State) -> None:
+    """Defaults belong to the creating role, not to its memberships."""
+    state.default_public = None
+    state.schema_default_public.clear()
+    state.schema_defaults_known = False
+
+
+def routine_default_public(state: State, key: tuple) -> bool | None:
+    """Per-schema grants add to global defaults; they cannot subtract them."""
+    if state.default_public is True:
+        return True
+    if len(key[0]) == 2:
+        scoped = state.schema_default_public.get(
+            key[0][0], False if state.schema_defaults_known else None)
+    else:
+        # The selected source does not prove the initial creation schema for
+        # an unqualified name. It is private only when every possible schema
+        # has the same known absence of a PUBLIC grant.
+        scoped = False if (state.schema_defaults_known and
+                           not any(state.schema_default_public.values())) else None
+    if scoped is True:
+        return True
+    return False if state.default_public is False and scoped is False else None
+
+
+def default_privileges(statement: list[Token], state: State) -> None:
+    """Apply a complete, current-owner routine default-ACL statement atomically."""
+    tail = statement[3:]
+    if sequence(tail, "for"):
+        invalidate_default_privileges(state)
+        raise Incomplete("role-specific default privileges require external context")
+    if any(sequence(tail[index:], "granted", "by") for index in range(len(tail))):
+        invalidate_default_privileges(state)
+        raise Incomplete("default privilege grantor requires external role context")
+    schemas = []
+    if sequence(tail, "in", "schema"):
+        action = next((index for index in range(2, len(tail))
+                       if tail[index].is_word("grant") or tail[index].is_word("revoke")), -1)
+        if action < 0:
+            raise Incomplete("schema default privileges require GRANT or REVOKE")
+        for group in split_top(tail[2:action]):
+            if len(group) != 1 or group[0].kind not in {"word", "quoted"}:
+                raise Incomplete("default privilege schemas must be literal schema identifiers")
+            schemas.append(group[0].value)
+        tail = tail[action:]
+    if not (sequence(tail, "grant") or sequence(tail, "revoke")):
+        raise Incomplete("unsupported default privilege syntax")
+    grant = tail[0].is_word("grant")
+    grant_option_only = sequence(tail, "revoke", "grant", "option", "for")
+    first_privilege = 4 if grant_option_only else 1
+    on = word_index(tail, "on", first_privilege)
+    privileges = tail[first_privilege:on] if on >= 0 else []
+    if not ((len(privileges) == 1 and (sequence(privileges, "execute") or
+                                      sequence(privileges, "all"))) or
+            (len(privileges) == 2 and sequence(privileges, "all", "privileges"))):
+        raise Incomplete("unsupported routine default privilege")
+    if (on + 2 >= len(tail) or tail[on + 1].kind != "word" or
+            tail[on + 1].value not in {"functions", "routines"}):
+        raise Incomplete("unsupported default privilege target")
+    if not tail[on + 2].is_word("to" if grant else "from"):
+        raise Incomplete("default privilege grantee direction is unresolved")
+    roles = tail[on + 3:]
+    if grant and sequence(roles[-3:], "with", "grant", "option"):
+        roles = roles[:-3]
+    elif not grant and roles and roles[-1].kind == "word" and roles[-1].value in {"cascade", "restrict"}:
+        roles = roles[:-1]
+    public = False
+    for group in split_top(roles):
+        if len(group) == 2 and group[0].is_word("group"):
+            if group[1].is_word("public"):
+                raise Incomplete("PUBLIC is not a named GROUP role")
+            group = group[1:]
+        if len(group) != 1 or group[0].kind not in {"word", "quoted"}:
+            raise Incomplete("default privilege grantees must be literal roles or PUBLIC")
+        public |= group[0].is_word("public")
+    if not public or grant_option_only:
+        return
+    if schemas:
+        for schema in schemas:
+            state.schema_default_public[schema] = grant
+    else:
+        state.default_public = grant
 
 
 def role_membership_grant(tokens: list[Token]) -> None:
@@ -970,23 +1056,7 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
             savepoints = savepoints[:match]
             return
         if sequence(statement, "alter", "default", "privileges"):
-            tail = statement[3:]
-            if not (sequence(tail, "grant") or sequence(tail, "revoke")):
-                state.default_public = None
-                raise Incomplete("role/schema-specific default privileges require external context")
-            if not any(token.is_word("public") for token in tail):
-                return
-            if sequence(tail, "revoke", "grant", "option", "for"):
-                return
-            if any(sequence(tail[index:], "granted", "by") for index in range(len(tail))):
-                state.default_public = None
-                raise Incomplete("default privilege grantor requires external role context")
-            on = word_index(tail, "on")
-            if (on < 0 or on + 1 >= len(tail) or tail[on + 1].kind != "word"
-                    or tail[on + 1].value not in {"functions", "routines"}):
-                raise Incomplete("unsupported default privilege target")
-            if any(token.is_word("all") or token.is_word("execute") for token in tail[1:on]):
-                state.default_public = tail[0].is_word("grant")
+            default_privileges(statement, state)
         elif sequence(statement, "create", "schema"):
             if len(statement) < 3 or statement[2].kind not in {"word", "quoted"} or statement[2].is_word("if"):
                 raise Incomplete("unresolved schema creation")
@@ -1008,7 +1078,7 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
                 raise Incomplete("routine declaration conflicts with an existing selected input signature or object kind")
             if len(key[0]) == 1 and state.session_path_changed:
                 raise Incomplete("unqualified function identity depends on the session search_path")
-            public = previous.public if replace and previous else None if replace else state.default_public
+            public = previous.public if replace and previous else None if replace else routine_default_public(state, key)
             all_key, _ = function_identity(statement, start, declaration=True, include_out=True)
             function = Function(key, first, statement[-1].end, public=public,
                                 kind=kind, all_arguments=all_key[1])
@@ -1083,15 +1153,16 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
             query_statement(statement)
         elif first.value in {"execute", "prepare", "call"}:
             raise Incomplete("dynamic or external SQL execution is outside the selected migration model")
-        elif first.is_word("set"):
+        elif first.is_word("set") or first.is_word("reset"):
             tail = statement[1:]
             if tail and tail[0].kind == "word" and tail[0].value in {"local", "session"}:
                 tail = tail[1:]
             if sequence(tail, "search_path"):
-                parse_search_path(tail[1:])
+                if first.is_word("set"):
+                    parse_search_path(tail[1:])
                 state.session_path_changed = True
             elif sequence(tail, "role") or sequence(tail, "authorization"):
-                state.default_public = None
+                invalidate_default_privileges(state)
                 raise Incomplete("role change invalidates selected default privileges")
         elif first.value not in {"select", "insert", "update", "delete", "create", "alter", "drop",
                                  "comment", "set", "reset", "truncate", "vacuum", "analyze", "explain"}:

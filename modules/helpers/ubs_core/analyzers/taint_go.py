@@ -40,12 +40,23 @@ FIELD_PATH_LIMIT = 8
 
 _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
                     'io': 'io', 'io/ioutil': 'ioutil', 'html': 'html',
-                    'html/template': 'template', 'text/template': 'template', 'os': 'os'}
+                    'html/template': 'template', 'text/template': 'template', 'os': 'os',
+                    'fmt': 'fmt', 'strings': 'strings', 'bytes': 'bytes'}
 _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
                    'io': {'ReadAll'}, 'ioutil': {'ReadAll'},
                    'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
-                   'os': {'Getenv', 'LookupEnv'}}
+                   'os': {'Getenv', 'LookupEnv', 'Stdin'},
+                   'fmt': {'Scan', 'Scanln', 'Scanf', 'Fscan', 'Fscanln', 'Fscanf',
+                           'Sscan', 'Sscanln', 'Sscanf'},
+                   'strings': {'NewReader'}, 'bytes': {'NewReader', 'NewBuffer', 'NewBufferString'}}
 _ENVIRONMENT_OPERATIONS = frozenset({('os', 'Getenv'), ('os', 'LookupEnv')})
+_SCAN_OPERATIONS = frozenset(('fmt', member) for member in _NATIVE_MEMBERS['fmt'])
+_SOURCE_OPERATIONS = _ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS
+
+
+def _source_boundary(operations, action):
+    family = 'formatted input' if operations & _SCAN_OPERATIONS else 'environment'
+    return AnalysisLimit(f'Go {family} callable {action} is unsupported; analysis is incomplete')
 
 SOURCE_PATTERNS = [
     re.compile(r"\.FormValue\s*\(", re.IGNORECASE),
@@ -307,6 +318,11 @@ class _PointerKey:
 
 
 @dataclass(frozen=True)
+class _ScanKindKey:
+    cell: str
+
+
+@dataclass(frozen=True)
 class _DecoderKey:
     cell: str
 
@@ -426,6 +442,9 @@ def _join_states(*states):
                                         all(item is not None and item.definite for item in decoders))
         elif isinstance(name, _NativeKey):
             result[name] = _join_native(*(state.get(name) for state in states))
+        elif isinstance(name, _ScanKindKey):
+            kinds = {state.get(name, '') for state in states}
+            result[name] = next(iter(kinds)) if len(kinds) == 1 else ''
         elif isinstance(name, _FieldKey):
             result[name] = _join(*(_field_fact(state, name.cell, name.path) for state in states))
         else:
@@ -652,6 +671,7 @@ class _Function:
     body: tuple[_Statement, ...]
     variadic: int | None = None
     reference_parameters: frozenset[int] = frozenset()
+    parameter_types: tuple[str, ...] = ()
 
 
 def _parameter_names(code: str) -> tuple[str, ...]:
@@ -689,6 +709,19 @@ def _reference_parameters(code: str) -> frozenset[int]:
     return frozenset(references)
 
 
+def _parameter_types(code: str) -> tuple[str, ...]:
+    types, grouped = [], ''
+    for start, end in reversed(_parts(code)):
+        part = code[start:end].strip()
+        match = re.match(r'^[A-Za-z_]\w*\s+(.+)$', part, re.DOTALL)
+        if match:
+            grouped = re.sub(r'\s+', '', match.group(1))
+        elif not grouped or not re.fullmatch(r'[A-Za-z_]\w*', part):
+            grouped = re.sub(r'\s+', '', part)
+        types.append(grouped)
+    return tuple(reversed(types))
+
+
 def _functions(code: str, parser: _Parser) -> list[_Function]:
     functions, covered = [], 0
     pattern = re.compile(r'\bfunc\s+(?:\([^)]*\)\s*)?(?P<name>[A-Za-z_]\w*)\s*(?:\[[^]]*\]\s*)?\('
@@ -716,7 +749,8 @@ def _functions(code: str, parser: _Parser) -> list[_Function]:
         functions.append(_Function(name, match.start(), end, parameters, results,
                                    parser.block(opening + 1, end - 1),
                                    len(parameters) - 1 if '...' in code[match.end():param_end] else None,
-                                   _reference_parameters(code[match.end():param_end])))
+                                   _reference_parameters(code[match.end():param_end]),
+                                   _parameter_types(code[match.end():param_end])))
         covered = end
     return functions
 
@@ -805,6 +839,7 @@ class _Analysis:
         self.native_cell_writes: dict[str, _NativeInfo | None] = {}
         self.native_mutations: set[str] = set()
         self.native_escapes: set[str] = set()
+        self.scan_writes: dict[_Target, _Fact] = {}
         self.uncertain_globals = uncertain_globals if uncertain_globals is not None else set()
         self.global_cells = global_cells
         self.resolve_summary = resolve_summary
@@ -912,7 +947,7 @@ class _Analysis:
         identity = self.native_identity(root, member, offset, scope)
         return _NativeInfo(frozenset({identity})) if identity is not None else _UNKNOWN_NATIVE
 
-    def check_environment_storage(self, code, offset, state, scope):
+    def check_source_storage(self, code, offset, state, scope):
         # Scalar native identities and selected helper results are modeled.
         # Composite values are not a callable heap: losing a getter inside a
         # slice/map/struct must not turn a former source into a clean result.
@@ -959,8 +994,10 @@ class _Analysis:
                 natives = (info.native for info in summary.value_returns if info is not None) if summary else ()
             else:
                 natives = (self.native_callable(root, member, offset + match.start(), state, scope),)
-            if any(native is not None and native.operations & _ENVIRONMENT_OPERATIONS for native in natives):
-                raise AnalysisLimit('Go environment callable aggregate storage is unsupported; analysis is incomplete')
+            operations = frozenset().union(*(native.operations & _SOURCE_OPERATIONS
+                                             for native in natives if native is not None))
+            if operations:
+                raise _source_boundary(operations, 'aggregate storage')
 
     def value_info(self, expr, offset, state, scope):
         expr, offset = self.unparenthesize(expr, offset)
@@ -980,6 +1017,108 @@ class _Analysis:
             if results:
                 return results[0]
         return _ValueInfo(pointers=self.pointers(expr, state, scope))
+
+    def scan_type(self, typename, scope):
+        typename = re.sub(r'\s+', '', typename)
+        if typename == 'string' and 'string' not in scope.bindings and 'string' not in self.summaries:
+            return 'text'
+        if typename in {'[]byte', '[]uint8'} and not any(
+                name in scope.bindings or name in self.summaries for name in ('byte', 'uint8')):
+            return 'text'
+        return ''
+
+    def scan_kind(self, expr, offset, state, scope):
+        """Prove a builtin text destination without borrowing fmt.Scanner authority."""
+        expr, offset = self.unparenthesize(expr, offset)
+        if _string_literal(expr) is not None:
+            return 'text'
+        if re.fullmatch(r'[A-Za-z_]\w*', expr):
+            return state.get(_ScanKindKey(scope.bindings.get(expr, expr)), '')
+        if re.fullmatch(r'(?:r|req|request)\s*\.\s*Body', expr):
+            return 'request-reader'
+        construction = re.fullmatch(r'new\s*\(\s*(string|\[\]\s*(?:byte|uint8))\s*\)', expr)
+        if construction and 'new' not in scope.bindings and 'new' not in self.summaries:
+            return self.scan_type(construction.group(1), scope)
+        conversion = re.match(r'(string|\[\]\s*(?:byte|uint8))\s*\(', expr)
+        if conversion:
+            return self.scan_type(conversion.group(1), scope)
+        call = re.fullmatch(r'([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(.*\)', expr, re.DOTALL)
+        if call:
+            identity = self.native_identity(call.group(1), call.group(2), offset, scope)
+            if identity in _ENVIRONMENT_OPERATIONS | {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}:
+                return 'text'
+        return ''
+
+    def scan_input(self, operations, arguments, values, targets, state, scope):
+        """Bounded native text scanning; unsupported protocols remain visible.
+
+        fmt.Scan* reads stdin, Fscan* reads its first Reader, and Sscan* reads
+        its first string. The format is never input contents. Partial scans
+        leave later destinations unchanged, so these are weak writes. Return
+        counts/errors for the supported token/text contract are not payloads.
+        Custom Scanner methods, numeric-to-rune conversion and encoded text
+        need more than this engine's current fact lattice and fail explicitly.
+        """
+        layouts = {(operation.startswith('Scan'), operation.startswith('Fscan'), operation.endswith('f'))
+                   for _, operation in operations}
+        if len(layouts) != 1:
+            raise AnalysisLimit('Go formatted input callable alternatives are unsupported; analysis is incomplete')
+        stdin, reader, formatted = next(iter(layouts))
+        first = (0 if stdin else 1) + int(formatted)
+        if len(arguments) < first:
+            raise AnalysisLimit('Go formatted input argument shape is unsupported; analysis is incomplete')
+        verbs = ['s'] * (len(arguments) - first)
+        if formatted:
+            format_text = _string_literal(arguments[first - 1][0])
+            if format_text is None:
+                raise AnalysisLimit('Go formatted input dynamic format is unsupported; analysis is incomplete')
+            verbs = []
+            cursor = 0
+            while cursor < len(format_text):
+                if format_text[cursor] != '%':
+                    cursor += 1
+                    continue
+                directive = re.match(r'%(\d*)([%sv])', format_text[cursor:])
+                if directive is None:
+                    raise AnalysisLimit('Go formatted input encoded or nontext format is unsupported; analysis is incomplete')
+                if directive.group(2) != '%':
+                    verbs.append('' if directive.group(1) and not directive.group(1).strip('0')
+                                 else directive.group(2))
+                cursor += directive.end()
+        if not verbs or len(arguments) == first:
+            return
+        if stdin:
+            payload = frozenset({_Trace('os.Stdin', path=('os.Stdin',))})
+        else:
+            payload = values[0]
+            if reader:
+                input_expr, origin = self.unparenthesize(*arguments[0])
+                native_stdin = re.fullmatch(r'([A-Za-z_]\w*)\s*\.\s*Stdin', input_expr)
+                if native_stdin and self.native_identity(native_stdin.group(1), 'Stdin', origin, scope) == ('os', 'Stdin'):
+                    payload = frozenset({_Trace('os.Stdin', path=('os.Stdin',))})
+                else:
+                    constructor = re.fullmatch(r'([A-Za-z_]\w*)\s*\.\s*(NewReader|NewBuffer|NewBufferString)\s*\(.*\)',
+                                               input_expr, re.DOTALL)
+                    identity = (self.native_identity(constructor.group(1), constructor.group(2), origin, scope)
+                                if constructor else None)
+                    request_body = self.scan_kind(input_expr, origin, state, scope) == 'request-reader'
+                    if identity not in {('strings', 'NewReader'), ('bytes', 'NewReader'),
+                                        ('bytes', 'NewBuffer'), ('bytes', 'NewBufferString')} and not request_body:
+                        raise AnalysisLimit('Go formatted input reader protocol is unsupported; analysis is incomplete')
+        for index, verb in enumerate(verbs, first):
+            if index >= len(arguments):
+                break
+            if not verb:
+                continue
+            argument, _origin = arguments[index]
+            destinations = targets[index]
+            if (argument.rstrip().endswith('...') or not destinations
+                    or any(not target.whole or target.path or target.indexed or target.cell in self.global_cells
+                           or state.get(_ScanKindKey(target.cell)) != 'text' for target in destinations)):
+                raise AnalysisLimit('Go formatted input destination or Scanner protocol is unsupported; analysis is incomplete')
+            self.write_targets(destinations, payload, state, 'fmt.' + sorted(operations)[0][1])
+            for target in destinations:
+                self.scan_writes[target] = _join(self.scan_writes.get(target, _CLEAN), payload)
 
     def invalidate_native_targets(self, targets, state):
         # Code receiving an address can replace the callable or retain that
@@ -1056,8 +1195,8 @@ class _Analysis:
                 native = info.native if info is not None else None
                 self.native_writes[key] = _join_native(self.native_writes.get(key), native)
             if target.path or target.indexed:
-                if info is not None and info.native is not None and info.native.operations & _ENVIRONMENT_OPERATIONS:
-                    raise AnalysisLimit('Go environment callable field/index storage is unsupported; analysis is incomplete')
+                if info is not None and info.native is not None and info.native.operations & _SOURCE_OPERATIONS:
+                    raise _source_boundary(info.native.operations, 'field/index storage')
                 continue
             native_key = _NativeKey(target.cell)
             native = info.native if info is not None else None
@@ -1094,6 +1233,7 @@ class _Analysis:
         readall = bool(operations) and operations <= {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
         sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
         environment = operations & _ENVIRONMENT_OPERATIONS
+        scanning = operations & _SCAN_OPERATIONS
         methods = {'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
                    'UseNumber', 'DisallowUnknownFields', 'Buffered'}
         method = member if receiver is not None and member in methods else None
@@ -1107,7 +1247,7 @@ class _Analysis:
                 outer_end = pairs.get(opening)
                 if outer_end is None:
                     return None
-        if not (constructor or unmarshal or readall or sanitizer or environment or method):
+        if not (constructor or unmarshal or readall or sanitizer or environment or scanning or method):
             return None
         if whole and code[outer_end + 1:].strip():
             return None
@@ -1145,6 +1285,14 @@ class _Analysis:
         # lose a source introduced by that captured-cell write.
         operations = native.operations if native is not None else frozenset()
         environment = operations & _ENVIRONMENT_OPERATIONS
+        scanning = operations & _SCAN_OPERATIONS
+        if scanning:
+            if native.unknown or operations != scanning:
+                raise AnalysisLimit('Go formatted input unknown callable alternative is unsupported; analysis is incomplete')
+            raw_arguments = [(expr[match.end() + left:match.end() + right], offset + match.end() + left)
+                             for left, right in _parts(code[match.end():end])]
+            self.scan_input(scanning, raw_arguments, values, targets, state, scope)
+            return finish(end, (_CLEAN, _CLEAN))
         if environment:
             if len(values) != 1:
                 return finish(end, (fallback,))
@@ -1266,8 +1414,8 @@ class _Analysis:
             for actual in targets[index]:
                 target = _field_target(actual, path)
                 if target.path or target.indexed:
-                    if native is not None and native.operations & _ENVIRONMENT_OPERATIONS:
-                        raise AnalysisLimit('Go environment callable field/index storage is unsupported; analysis is incomplete')
+                    if native is not None and native.operations & _SOURCE_OPERATIONS:
+                        raise _source_boundary(native.operations, 'field/index storage')
                     continue
                 # Output-parameter summaries are may-writes: another branch or
                 # aliased parameter can leave the old callable in place. Keep
@@ -1352,7 +1500,7 @@ class _Analysis:
         expr, offset = self.unparenthesize(expr, offset)
         self.closure_results.pop(offset, None)
         code = _call_code(_masked_source(expr))
-        self.check_environment_storage(code, offset, state, scope)
+        self.check_source_storage(code, offset, state, scope)
         pairs = _pairs(code)
         masked = list(code)
         facts = []
@@ -1394,6 +1542,7 @@ class _Analysis:
             if opening is not None and opening in pairs:
                 close = pairs[opening]
                 parameters = _parameter_names(code[match.end():param_end])
+                parameter_types = _parameter_types(code[match.end():param_end])
                 closure_scope = scope.child()
                 invocation = close + 1
                 while invocation < len(code) and code[invocation].isspace():
@@ -1401,7 +1550,7 @@ class _Analysis:
                 invoked = invocation < len(code) and code[invocation] == '(' and invocation in pairs
                 delayed = re.search(r'\b(?:go|defer)\s*$', code[:match.start()]) is not None
                 immediate = invoked and not delayed
-                enclosing_getters = {}
+                enclosing_sources = {}
                 if immediate:
                     for enclosing in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)\s*\(', code):
                         if enclosing.start() >= match.start():
@@ -1410,8 +1559,8 @@ class _Analysis:
                             continue
                         name = enclosing.group(1)
                         native = self.native_callable(name, None, offset + enclosing.start(1), state, scope)
-                        if native is not None and native.operations & _ENVIRONMENT_OPERATIONS:
-                            enclosing_getters[scope.bindings.get(name, name)] = native.operations & _ENVIRONMENT_OPERATIONS
+                        if native is not None and native.operations & _SOURCE_OPERATIONS:
+                            enclosing_sources[scope.bindings.get(name, name)] = native.operations & _SOURCE_OPERATIONS
                 arguments, argument_infos, argument_expressions = [], [], []
                 if invoked:
                     parts = _parts(code[invocation + 1:pairs[invocation]])
@@ -1453,6 +1602,8 @@ class _Analysis:
                         # Captured outer cells remain independently uncertain
                         # for delayed execution, as established above.
                         closure_state[_NativeKey(key)] = info.native if info is not None else _UNKNOWN_NATIVE
+                        typename = parameter_types[index] if index < len(parameter_types) else ''
+                        closure_state[_ScanKindKey(key)] = self.scan_type(typename, closure_scope)
                         if info is not None:
                             if info.decoder is not None:
                                 closure_state[_DecoderKey(key)] = info.decoder
@@ -1474,17 +1625,16 @@ class _Analysis:
                 closure_flow = nested.block(_Parser(self.code).block(offset + opening + 1, offset + close),
                                             closure_state, closure_scope)
                 if immediate:
-                    for cell in nested.native_mutations & enclosing_getters.keys():
+                    for cell in nested.native_mutations & enclosing_sources.keys():
                         replacement = (closure_flow.normal.get(_NativeKey(cell))
                                        if closure_flow.normal is not None
                                        else nested.native_cell_writes.get(cell))
                         retained = replacement.operations if replacement is not None else frozenset()
-                        if enclosing_getters[cell] - retained:
+                        if enclosing_sources[cell] - retained:
                             # Closure bodies precede outer calls in this
                             # evaluator. A replacement cannot erase the old
                             # callee; assigning the same getter preserves it.
-                            raise AnalysisLimit('Go environment callable replacement during argument evaluation '
-                                                'is unsupported; analysis is incomplete')
+                            raise _source_boundary(enclosing_sources[cell], 'replacement during argument evaluation')
                 # Invocation timing and captured writes are not described by
                 # return facts. A possible writer invalidates the old proof.
                 for cell in nested.native_mutations:
@@ -1500,6 +1650,13 @@ class _Analysis:
                                 self.native_cell_writes.get(cell), native)
                 for (sink_offset, label), fact in nested.effects.items():
                     self.effect(sink_offset, label, fact)
+                captured_scans = {target: fact for target, fact in nested.scan_writes.items()
+                                  if target.cell in state}
+                if captured_scans and not immediate:
+                    raise AnalysisLimit('Go formatted input delayed closure writes are unsupported; analysis is incomplete')
+                for target, fact in captured_scans.items():
+                    self.write_targets((target,), fact, state, 'closure scanning')
+                    self.scan_writes[target] = _join(self.scan_writes.get(target, _CLEAN), fact)
                 if immediate:
                     whole = (not code[:match.start()].strip()
                              and not code[pairs[invocation] + 1:].strip())
@@ -1522,9 +1679,12 @@ class _Analysis:
                                 # when assignment clears the handle's own fact.
                                 self.write_targets(info.pointers, nested.returns[index], state, 'closure result')
                         self.closure_results[offset] = (nested.returns, nested.value_returns)
-                    elif any(info is not None and info.native is not None
-                           and info.native.operations & _ENVIRONMENT_OPERATIONS for info in nested.value_returns):
-                        raise AnalysisLimit('Go environment callable closure-result transport is unsupported; analysis is incomplete')
+                    else:
+                        source_operations = frozenset().union(*(
+                            info.native.operations & _SOURCE_OPERATIONS for info in nested.value_returns
+                            if info is not None and info.native is not None))
+                        if source_operations:
+                            raise _source_boundary(source_operations, 'closure-result transport')
                     facts.extend(nested.returns)
                 if invoked:
                     close = pairs[invocation]
@@ -1541,8 +1701,8 @@ class _Analysis:
                 end = pairs.get(match.end() - 1)
                 if end is not None:
                     if match.group(1) == 'append' and match.group(2) is None:
-                        self.check_environment_storage(code[match.start():end + 1],
-                                                       offset + match.start(), state, scope)
+                        self.check_source_storage(code[match.start():end + 1],
+                                                  offset + match.start(), state, scope)
                     for start, stop in _parts(code[match.end():end]):
                         argument = expr[match.end() + start:match.end() + stop]
                         self.invalidate_native_targets(
@@ -1706,6 +1866,13 @@ class _Analysis:
                 updates[_PointerKey(key)] = pointers
                 updates[_DecoderKey(key)] = decoder
                 updates[_NativeKey(key)] = native
+                declared_type = re.match(r'\s*(?:var|const)\s+'
+                                         r'[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s+(.+?)\s*=', code, re.DOTALL)
+                kind_key = _ScanKindKey(key)
+                if declared_type:
+                    updates[kind_key] = self.scan_type(declared_type.group(1), scope)
+                elif state.get(kind_key) != 'text':
+                    updates[kind_key] = self.scan_kind(expression, expr_start, state, scope)
                 self.native_mutations.add(key)
                 self.native_cell_writes[key] = _join_native(self.native_cell_writes.get(key), native)
             assigned = {key for key in updates if isinstance(key, str)}
@@ -1720,6 +1887,8 @@ class _Analysis:
                 key = scope.declare(name.strip(), start)
                 state[key] = _CLEAN
                 state[_NativeKey(key)] = _UNKNOWN_NATIVE
+                typename = code[declaration.end(1):].strip()
+                state[_ScanKindKey(key)] = self.scan_type(typename, scope)
         self.value(self.source[start:end], start, state, scope)
         return _Flow(state)
 
@@ -1914,6 +2083,9 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                     state[key] = frozenset({_Trace(parameter, index, (parameter,))})
                     native, decoder = signature[index] if signature is not None else (_UNKNOWN_NATIVE, None)
                     state[_NativeKey(key)] = native
+                    typename = function.parameter_types[index] if index < len(function.parameter_types) else ''
+                    state[_ScanKindKey(key)] = analysis.scan_type(
+                        typename[1:] if typename.startswith('*') else typename, scope)
                     if decoder is not None:
                         state[_DecoderKey(key)] = _DecoderInfo(
                             frozenset({_Trace(parameter, index, (parameter,), 'decoder')}), decoder)

@@ -195,12 +195,14 @@ these three gaps.
 - [x] Refuse custom Scanner/readers, encoded/dynamic formats, global destinations and unproved type/dispatch protocols explicitly; guard native source capabilities when stored or replaced.
 - [x] Verify package/local builtin-type shadow controls and compile a real Go witness with retained build files. The final focused source/native run passes 18 methods without skips.
 - [x] Run the independent 14-case review: 13 precise outcomes pass and a callable replaced during argument evaluation remains explicitly incomplete, never silently clean.
-- [ ] Complete the final broad Go cohort and the 32-invocation module/meta-runner JSON/SARIF/selection matrix.
-- [ ] Publish the verified implementation and evidence directly to `main`.
+- [x] Pass the final four Go suites against the final shared source guards: 337 passed, 15 opt-in skips. DSR log SHA256: `c467645dea6ebc933444fd9b86df9e1eb3ef8e15eaa2783ced656e0301454526`.
+- [x] Observe all 32 distinct module/meta-runner JSON/SARIF/selection cases passing. The two full public methods retain failed timeout receipts: 15 unsafe/metadata and 13 clean/boundary cases passed there; the exact missing saved/meta JSON case and three encoded-boundary cases passed unchanged 45-second replays. Replay log SHA256s: `ea426eb6d643c2a726c21379563e3aade5b8d3636c76584ad2cd8832ecc3a4b0`, `00f7f25f2132dac333ecc25a11af9444cb6c0d2b83365636943c9fc25e04f776`.
+- [x] Publish the verified implementation and evidence directly to `main` with refreshed canonical pins and development version 5.5.92.
 
 ### Combined qualification and tracking
 
 - [x] Preserve historical Beads content, restore one missing historical comment identity required by the Beads importer, and add the three scoped implementation tasks; blocking dependencies are acyclic.
 - [x] Retain failed and interrupted test attempts; execution-environment stalls and killed processes are not passing evidence.
-- [ ] Verify combined module/helper/SHA256 pins, touched-source self-scan and the prescribed full repository suite.
+- [x] Verify the JavaScript publication's combined module/helper/SHA256 pins, runner syntax and whitespace after preserving concurrent Python generator changes. DSR log SHA256: `db6a583422cee43bfd426cdae930cb864cabeb6e08bf625895724093b5844d34`.
+- [ ] Verify final combined pins, touched-source self-scan and the prescribed full repository suite.
 - [ ] Record unresolved whole-repository and release gates without closing the D6 or release umbrellas. The prescribed full ShellCheck process was killed after about 100 seconds without diagnostics; no lint pass is claimed.

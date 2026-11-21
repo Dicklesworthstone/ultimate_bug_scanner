@@ -13,6 +13,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest.mock import patch
 import test_taint_go_packages as packages
@@ -191,6 +192,369 @@ class DecodingFlowTests(packages.PackageTestCase):
     def test_decoding_in_comments_and_raw_strings_is_inert(self):
         self.check('var p Payload\n_ = `json.NewDecoder(r.Body).Decode(&p)`\n'
                    '// json.NewDecoder(r.Body).Decode(&p)\ndb.Query(p.SQL)')
+
+
+class NativeScanningFlowTests(packages.PackageTestCase):
+    """Native formatted input writes selected text destinations, not return slots."""
+
+    def setUp(self):
+        self.started = time.monotonic()
+        artifacts = packages.ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='go-native-scanning-', dir=artifacts))
+        self.sources = {}
+        print(f'[{self.id()}] RUN', flush=True)
+
+    def check_scan(self, body, expected=(), *, imports='import ("fmt"; "strings"; "html")', helpers=''):
+        self.source('handler.go', 'package app\n' + imports + '\n' + textwrap.dedent(helpers)
+                    + '\nfunc h() {\n' + textwrap.dedent(body) + '\n}\n')
+        findings = self.scan()
+        (self.root / 'findings.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+        source = self.sources['handler.go'].read_text()
+        sites = []
+        for marker, rule, sink in expected:
+            lines = [(number, line) for number, line in enumerate(source.splitlines(), 1)
+                     if '// ' + marker in line]
+            self.assertEqual(len(lines), 1, (marker, source))
+            number, line = lines[0]
+            sites.append((number, line.index(sink) + 1, 'go.taint.' + rule))
+        actual = [(row['line'], row['col'], row['rule']) for row in findings]
+        self.assertEqual(sorted(actual), sorted(sites), (source, findings))
+        return findings
+
+    def test_stdin_scan_family_writes_text_and_preserves_result_slots(self):
+        for operation, arguments in [('Scan', '&value'), ('Scanln', '&value'), ('Scanf', '"%s", &value')]:
+            with self.subTest(operation=operation):
+                self.check_scan('var value string\nn, err := fmt.' + operation + '(' + arguments + ')\n'
+                                'db.Query(value) // query\nexec.Command("sh", "-c", value) // command\n'
+                                'fmt.Fprint(w, value) // output\nfmt.Fprint(w, n, err)',
+                                [('query', 'sql', 'db.Query'), ('command', 'command', 'exec.Command'),
+                                 ('output', 'xss', 'fmt.Fprint')])
+
+    def test_string_scan_family_uses_input_slot_and_keeps_metadata_clean(self):
+        for operation, arguments in [('Sscan', 'input, &value'), ('Sscanln', 'input, &value'),
+                                     ('Sscanf', 'input, "%s", &value')]:
+            with self.subTest(operation=operation):
+                self.check_scan('input := r.FormValue("query")\nvar value string\n'
+                                'n, err := fmt.' + operation + '(' + arguments + ')\n'
+                                'db.Query(value) // query\nfmt.Fprint(w, n, err)',
+                                [('query', 'sql', 'db.Query')])
+
+    def test_reader_scan_family_tracks_bodies_and_native_stdin(self):
+        for operation, separator in [('Fscan', ''), ('Fscanln', ''), ('Fscanf', '"%s", ')]:
+            for reader in ('r.Body', 'os.Stdin', 'strings.NewReader(r.FormValue("query"))'):
+                with self.subTest(operation=operation, reader=reader):
+                    self.check_scan('var value string\nn, err := fmt.' + operation + '(' + reader + ', '
+                                    + separator + '&value)\ndb.Query(value) // query\nfmt.Fprint(w, n, err)',
+                                    [('query', 'sql', 'db.Query')],
+                                    imports='import ("fmt"; "os"; "strings")')
+
+    def test_fixed_input_and_safe_bound_queries_stay_clean(self):
+        self.check_scan('''
+            var a, b, c string
+            fmt.Sscan("fixed", &a)
+            fmt.Sscanf("fixed", "%s", &b)
+            fmt.Fscan(strings.NewReader("fixed"), &c)
+            db.Query(a)
+            db.Query(b)
+            db.Query(c)
+            fmt.Scan(&a)
+            db.Query("SELECT $1", a)
+            fmt.Fprint(w, html.EscapeString(a))
+            exec.Command("printf", "%s", a)
+        ''')
+
+    def test_reader_body_aliases_preserve_contents(self):
+        self.check_scan('''
+            body := request.Body
+            alias := body
+            var value string
+            fmt.Fscan(alias, &value)
+            db.Query(value) // query
+        ''', [('query', 'sql', 'db.Query')])
+
+    def test_saved_callable_alias_parentheses_and_dot_imports(self):
+        self.check_scan('''
+            var value string
+            read := input.Sscanf
+            saved := read
+            n, err := ((saved))(r.FormValue("q"), "%s", &value)
+            db.Query(value) // query
+            fmt.Fprint(w, n, err)
+        ''', [('query', 'sql', 'db.Query')], imports='import input "fmt"')
+        self.check_scan('var value string\nScanln(&value)\ndb.Query(value) // query',
+                        [('query', 'sql', 'db.Query')], imports='import . "fmt"')
+
+    def test_pointers_branches_literal_kills_and_value_copies(self):
+        self.check_scan('''
+            first, second := "first", "second"
+            before := first
+            out := &first
+            if choice { out = &second }
+            fmt.Scan(out)
+            db.Query(first) // first
+            db.Query(second) // second
+            db.Query(before)
+            first = "fixed"
+            db.Query(first)
+        ''', [('first', 'sql', 'db.Query'), ('second', 'sql', 'db.Query')])
+
+    def test_byte_slice_and_new_string_destinations(self):
+        self.check_scan('''
+            var bytes []byte
+            text := new(string)
+            fmt.Scan(&bytes, text)
+            db.Query(string(bytes)) // bytes
+            db.Query(*text) // text
+        ''', [('bytes', 'sql', 'db.Query'), ('text', 'sql', 'db.Query')])
+
+    def test_selected_helper_pointer_effects_and_captured_calls(self):
+        self.check_scan('''
+            var value string
+            parse(r.FormValue("q"), &value)
+            db.Query(value) // helper
+            value = "fixed"
+            read := fmt.Scan
+            func() { read(&value) }()
+            db.Query(value) // captured
+        ''', [('helper', 'sql', 'db.Query'), ('captured', 'sql', 'db.Query')], helpers='''
+            func parse(input string, out *string) (int, error) {
+                return fmt.Sscan(input, out)
+            }
+        ''')
+
+    def test_failed_or_partial_clean_scan_does_not_erase_prior_value(self):
+        self.check_scan('''
+            var value string = r.FormValue("q")
+            fmt.Sscan("", &value)
+            db.Query(value) // preserved
+        ''', [('preserved', 'sql', 'db.Query')])
+
+    def test_text_token_scan_preserves_domain_specific_sanitization(self):
+        self.check_scan('''
+            var value string
+            fmt.Sscan(html.EscapeString(r.FormValue("q")), &value)
+            fmt.Fprint(w, value)
+            db.Query(value) // sql
+            exec.Command("sh", "-c", value) // command
+        ''', [('sql', 'sql', 'db.Query'), ('command', 'command', 'exec.Command')])
+
+    def test_import_lookalikes_and_shadowed_scanners_do_not_invent_stdin(self):
+        self.check_scan('var value string\nfmt.Scan(&value)\ndb.Query(value)',
+                        imports='import fmt "example.test/format"')
+        self.check_scan('var value string\nfmt := formatter\nfmt.Scan(&value)\ndb.Query(value)')
+        self.check_scan('''
+            var value string
+            Scan := func(out *string) (int, error) { return 0, nil }
+            Scan(&value)
+            db.Query(value)
+        ''', imports='import . "fmt"')
+
+    def test_unused_callable_and_no_destination_calls_are_not_sources(self):
+        self.check_scan('''
+            read := fmt.Scan
+            fmt.Fprint(w, read)
+            count, err := fmt.Scan()
+            fmt.Fprint(w, count, err)
+            count, err = fmt.Sscan(r.FormValue("q"))
+            fmt.Fprint(w, count, err)
+        ''')
+
+    def test_unknown_scanner_reader_and_destination_lists_are_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+        cases = (
+            'var value CustomScanner\nfmt.Scan(&value)',
+            'value := wrap(r.FormValue("q"))\nfmt.Scan(&value)',
+            'value := r.FormValue("q")\nfmt.Scan(&value)',
+            'var value int\nfmt.Scan(&value)\nfmt.Fprint(w, string(value))',
+            'var value Payload\nfmt.Scan(&value.SQL)',
+            'var value string\nfmt.Fscan(customReader, &value)',
+            'var value string\nfmt.Fscan(customReader(r.Body), &value)',
+            'var value string\nvalues := []any{&value}\nfmt.Scan(values...)',
+            'var value string\nread := fmt.Scan\nif custom { read = callbacks.Scan }\nread(&value)',
+            'var value string\ngo func() { fmt.Scan(&value) }()\ndb.Query(value)',
+        )
+        for body in cases:
+            with self.subTest(body=body), self.assertRaisesRegex(AnalysisLimit, 'formatted input'):
+                self.check_scan(body)
+
+    def test_encoded_and_dynamic_formats_do_not_grant_sanitizer_proof(self):
+        from ubs_core.taint_flow import AnalysisLimit
+        for format_expression in ('"%q"', '"%x"', 'r.FormValue("format")'):
+            with self.subTest(format_expression=format_expression):
+                with self.assertRaisesRegex(AnalysisLimit, 'formatted input'):
+                    self.check_scan('var value string\nfmt.Sscanf(html.EscapeString(r.FormValue("q")), '
+                                    + format_expression + ', &value)\nfmt.Fprint(w, value)')
+
+    def test_source_capability_storage_and_argument_replacement_are_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+        cases = (
+            'scans := []func(...any) (int, error){fmt.Scan}\nvar value string\n'
+            'scans[0](&value)\ndb.Query(value)',
+            'var holder Holder\nholder.scan = fmt.Scan\nvar value string\n'
+            'holder.scan(&value)\ndb.Query(value)',
+            'var value string\nscan := fmt.Scan\nscan(func() *string { '
+            'scan = callbacks.Scan; return &value }())\ndb.Query(value)',
+        )
+        for body in cases:
+            with self.subTest(body=body), self.assertRaisesRegex(AnalysisLimit, 'formatted input'):
+                self.check_scan(body)
+        with self.assertRaisesRegex(AnalysisLimit, 'formatted input'):
+            self.check_scan('read()\ndb.Query(value)', helpers='''
+                var value string
+                func read() { fmt.Scan(&value) }
+            ''')
+
+    def test_shadowed_builtin_type_names_do_not_prove_plain_destinations(self):
+        from ubs_core.taint_flow import AnalysisLimit
+        for declaration, typename in [('type string Custom', 'string'),
+                                      ('type string = Custom', 'string'),
+                                      ('type byte Custom', '[]byte'),
+                                      ('type uint8 Custom', '[]uint8')]:
+            for local in (False, True):
+                with self.subTest(declaration=declaration, local=local):
+                    with self.assertRaisesRegex(AnalysisLimit, 'formatted input'):
+                        self.check_scan((declaration + '\n' if local else '')
+                                        + 'var value ' + typename + '\nfmt.Scan(&value)',
+                                        helpers='' if local else declaration)
+
+    @unittest.skipUnless(os.environ.get('UBS_GO_SCAN_NATIVE') == '1',
+                         'set UBS_GO_SCAN_NATIVE=1 for the real Go compiler witness')
+    def test_native_scan_writes_match_real_go_inputs_and_safe_controls(self):
+        from test_keep_temp import prevent_child_deletion
+
+        source = textwrap.dedent('''
+            package main
+            import ("fmt"; "strings"; "os"; "encoding/json")
+            type Recorder struct { Queries []string }
+            func (db *Recorder) Query(query string, args ...any) { db.Queries = append(db.Queries, query) }
+            func parse(input string, out *string) (int, error) { return fmt.Sscan(input, out) }
+            func main() {
+                db := &Recorder{}
+                var direct, supplied, read, viaHelper string
+                count, err := fmt.Scan(&direct)
+                if err != nil || count != 1 { panic("stdin scan failed") }
+                db.Query(direct) // direct
+                saved := fmt.Sscanf
+                count, err = saved(os.Getenv("UBS_GO_SCAN_INPUT"), "%s", &supplied)
+                if err != nil || count != 1 { panic("string scan failed") }
+                db.Query(supplied) // supplied
+                fmt.Fscan(strings.NewReader(os.Getenv("UBS_GO_SCAN_INPUT")), &read)
+                db.Query(read) // read
+                parse(os.Getenv("UBS_GO_SCAN_INPUT"), &viaHelper)
+                db.Query(viaHelper) // helper
+                db.Query("SELECT $1", direct)
+                direct = "fixed"
+                fmt.Sscan("", &direct)
+                db.Query(direct)
+                var constant string
+                fmt.Sscanf("constant", "%s", &constant)
+                db.Query(constant)
+                if err := json.NewEncoder(os.Stdout).Encode(db.Queries); err != nil { panic(err) }
+            }
+        ''').lstrip('\n')
+        path = self.source('main.go', source)
+        executable = self.root / 'scan-witness'
+        environment = dict(os.environ, GO111MODULE='off', GOWORK='off', GOTOOLCHAIN='local',
+                           UBS_GO_SCAN_INPUT='<supplied>')
+        compiler = os.environ.get('UBS_GO_COMPILER', 'go')
+        build = subprocess.run([compiler, 'build', '-work', '-o', str(executable), str(path)],
+                               cwd=self.root, env=environment, capture_output=True, text=True,
+                               timeout=180, preexec_fn=prevent_child_deletion)
+        (self.root / 'build.stdout.log').write_text(build.stdout)
+        (self.root / 'build.stderr.log').write_text(build.stderr)
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        result = subprocess.run([str(executable)], input='<stdin>\n', cwd=self.root, env=environment,
+                                capture_output=True, text=True, timeout=30, preexec_fn=prevent_child_deletion)
+        (self.root / 'native.stdout.log').write_text(result.stdout)
+        (self.root / 'native.stderr.log').write_text(result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout),
+                         ['<stdin>', '<supplied>', '<supplied>', '<supplied>', 'SELECT $1', 'fixed', 'constant'])
+        findings = self.scan()
+        expected = sorted((number, line.index('db.Query') + 1, 'go.taint.sql')
+                          for number, line in enumerate(source.splitlines(), 1)
+                          if any('// ' + marker in line for marker in ('direct', 'supplied', 'read', 'helper')))
+        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings), expected, findings)
+
+
+@unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1',
+                     'set UBS_TAINT_E2E=1 for real Go module and runner reports')
+class NativeScanningModuleTests(unittest.TestCase):
+    def test_public_unsafe_and_metadata_reports(self):
+        self.check_public_cases(0, 4)
+
+    def test_public_controls_and_boundaries(self):
+        self.check_public_cases(4, 8)
+
+    def check_public_cases(self, start, end):
+        from test_keep_temp import prevent_child_deletion
+
+        cases = (
+            ('stdin', 'var value string\nfmt.Scan(&value)\ndb.Query(value) // query', True, False),
+            ('saved', 'var value string\nread := fmt.Sscanf\n'
+             'read(r.FormValue("q"), "%s", &value)\ndb.Query(value) // query', True, False),
+            ('body', 'var value string\nfmt.Fscan(r.Body, &value)\ndb.Query(value) // query', True, False),
+            ('metadata', 'var value string\nn, err := fmt.Scan(&value)\nfmt.Fprint(w, n, err)', False, False),
+            ('bound', 'var value string\nfmt.Scan(&value)\ndb.Query("SELECT $1", value)', False, False),
+            ('literal', 'var value string\nfmt.Sscan("fixed", &value)\ndb.Query(value)', False, False),
+            ('custom', 'var value CustomScanner\nfmt.Scan(&value)', False, True),
+            ('encoded', 'var value string\nfmt.Sscanf(r.FormValue("q"), "%q", &value)', False, True),
+        )
+        artifacts = packages.ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='go-scanning-public-', dir=artifacts))
+        skipped = ','.join(str(category) for category in range(1, 23) if category != 9)
+        for name, body, unsafe, partial in cases[start:end]:
+            folder = root / name
+            folder.mkdir()
+            source = 'package app\nimport "fmt"\nfunc h() {\n' + body + '\n}\n'
+            path = folder / 'handler.go'
+            path.write_text(source)
+            (folder / 'unselected.go').write_text('package app\nfunc other() { db.Query(r.FormValue("q")) }\n')
+            expected = [(number, line.index('db.Query') + 1, 'go.taint.sql')
+                        for number, line in enumerate(source.splitlines(), 1) if '// query' in line]
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, format=output):
+                        command = [str(packages.ROOT / ('ubs' if meta else 'modules/ubs-golang.sh')),
+                                   str(path), '--ci', '--no-color', '--format=' + output, '--skip=' + skipped]
+                        if meta:
+                            command.append('--only=golang')
+                        result = subprocess.run(command, cwd=folder, capture_output=True, text=True,
+                                                timeout=45, preexec_fn=prevent_child_deletion,
+                                                env=dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1',
+                                                         UBS_NO_CACHE='1', UBS_CACHE_DIR=str(folder / 'cache')))
+                        prefix = folder / f'{meta}-{output}'
+                        prefix.with_suffix('.stdout.log').write_text(result.stdout)
+                        prefix.with_suffix('.stderr.log').write_text(result.stderr)
+                        self.assertEqual(result.returncode, 2 if partial else 1 if unsafe else 0,
+                                         (command, result.stdout, result.stderr))
+                        report = json.loads(result.stdout)
+                        if output == 'json':
+                            self.assertEqual(report['status'], 'partial' if partial else 'ok', report)
+                            totals = report['totals'] if meta else report
+                            self.assertEqual([totals[key] for key in ('files', 'critical', 'warning', 'info')],
+                                             [1, len(expected), 0, 0], report)
+                            records = report['findings']
+                            actual = [(row['line'], row['col'], row['rule_id' if meta else 'rule'])
+                                      for row in records]
+                            for row in records:
+                                self.assertEqual(Path(row['file' if meta else 'path']).name, path.name, row)
+                                self.assertEqual(row['severity'], 'critical', row)
+                        else:
+                            self.assertEqual(report['version'], '2.1.0', report)
+                            actual = []
+                            for run in report['runs']:
+                                for row in run.get('results', []):
+                                    location = row['locations'][0]['physicalLocation']
+                                    region = location['region']
+                                    self.assertEqual(Path(location['artifactLocation']['uri']).name, path.name, row)
+                                    self.assertEqual(row['level'], 'error', row)
+                                    actual.append((region['startLine'], region['startColumn'], row['ruleId']))
+                        self.assertEqual(sorted(actual), sorted(expected), report)
+                        if partial:
+                            self.assertIn('formatted input', json.dumps(report), report)
 
 
 class OrdinaryDestinationWriteTests(packages.PackageTestCase):

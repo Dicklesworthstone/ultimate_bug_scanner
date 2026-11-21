@@ -225,22 +225,22 @@ class PythonCompletionTests(unittest.TestCase):
 
     def test_real_sql_limit_keeps_its_status_through_worker_transport(self):
         self.source.write_text(
-            'def report(con):\n    con.execute("select 1")\n'
-            '    return list(x for x in (y for y in (1, 2)))\n', encoding="utf-8")
+            'async def report(con):\n    con.execute("select 1")\n'
+            '    return list(x async for x in source)\n', encoding="utf-8")
         with patch.dict(os.environ, self.env, clear=True):
             _records, problems = py_scan._detector_process("sql_injection", [self.source], None)
         self.assertTrue(problems)
         self.assertEqual(py_scan.execution_status(problems)["module_error"], "ANALYSIS_INCOMPLETE")
         self.assertEqual(problems[0].exception_type, "SQLFlowLimit")
-        self.assertIn("nested generator iteration", problems[0].message)
+        self.assertIn("asynchronous generator consumption", problems[0].message)
 
     @unittest.skipUnless(shutil.which("jq") and shutil.which("rg"), "public UBS requires jq and ripgrep")
     def test_public_python_semantic_status_matches_text_json_and_partial_acceptance(self):
         project = self.root / "status-project"
         project.mkdir()
         source = project / "boundary.py"
-        base = ('def report(con):\n    con.execute("select 1")\n'
-                '    return list(x for x in (y for y in (1, 2)))\n')
+        base = ('async def report(con):\n    con.execute("select 1")\n'
+                '    return list(x async for x in source)\n')
         env = {**self.env, "UBS_KEEP_TEMP": "1", "UBS_NO_CACHE": "1"}
         for finding in (False, True):
             source.write_text(base + ("eval(input())\n" if finding else ""), encoding="utf-8")
@@ -277,8 +277,8 @@ class PythonCompletionTests(unittest.TestCase):
         project = self.root / "mixed-status-project"
         project.mkdir()
         (project / "boundary.py").write_text(
-            'def report(con):\n    con.execute("select 1")\n'
-            '    return list(x for x in (y for y in (1, 2)))\n'
+            'async def report(con):\n    con.execute("select 1")\n'
+            '    return list(x async for x in source)\n'
             'eval(input())\n', encoding="utf-8")
         (project / "requirements.txt").write_text("example-package==1.0\n", encoding="utf-8")
         summary = self.root / "mixed-status-summary.json"

@@ -3007,6 +3007,74 @@ class FormattedStringCompletionTests(SourceTest):
 
 
 class ImmediateGeneratorExpressionTests(SourceTest):
+    def test_nested_forwarding_generators_keep_values_and_lexical_names(self):
+        for collector in ('list', 'tuple'):
+            for value, expected in (('input()', ('eval',)), ("'fixed'", ())):
+                with self.subTest(collector=collector, value=value):
+                    self.assert_rules(f'''
+                        source = {value}
+                        selected = 'unrelated'
+                        values = {collector}(selected for selected in
+                            (item for item in (piece for piece in [source])))
+                        source = 'later overwrite'
+                        eval(values[0])
+                    ''', *expected)
+        self.assert_rules("eval(''.join(x for x in (x for x in [input()])))\n", 'eval')
+        self.assert_rules("eval(''.join(x for x in (y for y in ['fixed'])))\n")
+        self.assert_rules('values = list(x for x in (y for y in (1, 2)))\n')
+
+    def test_nested_forwarding_generators_preserve_native_stop_order(self):
+        for consumer, first, calls in (
+                ('any', 'stop', 0), ('any', '', 1),
+                ('all', '', 0), ('all', 'stop', 1)):
+            source = f'''
+                {consumer}(selected for selected in
+                    ({first!r} if initial else input() for initial in [True, False]))
+            '''
+            with self.subTest(consumer=consumer, first=first):
+                observed = []
+                exec(textwrap.dedent(source), {'input': lambda: observed.append('read') or 'MARKER'})
+                self.assertEqual(len(observed), calls)
+                self.assert_rules(source)
+
+    def test_nested_forwarding_preserves_existing_helper_frame_limit(self):
+        for expression in (
+                'any(record(value) for value in ["stop", input()])',
+                'any(selected for selected in (record(value) for value in ["stop", input()]))'):
+            source = f'''
+                code = 'fixed'
+                def record(value):
+                    global code
+                    code = value
+                    return value == 'stop'
+                {expression}
+                eval(code)
+            '''
+            observed = []
+            exec(textwrap.dedent(source), {'input': lambda: 'MARKER', 'eval': observed.append})
+            self.assertEqual(observed, ['stop'])
+            with self.subTest(expression=expression), self.assertRaisesRegex(
+                    taint_py.AnalysisLimit, 'helper frame lifetime.*incomplete'):
+                self.scan(source)
+
+    def test_nested_forwarding_keeps_unproved_protocol_boundaries(self):
+        for expression in (
+                'list(selected for selected in (item for item in unknown))',
+                'list(selected for selected in (Release() for unused in [0]))',
+                'list(selected for selected in (item for item in [0]) if selected)',
+                'any(True for selected in (item for item in [0]))'):
+            with self.subTest(expression=expression), self.assertRaisesRegex(
+                    taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(f'''
+                    code = 'fixed'
+                    class Release:
+                        def __del__(self):
+                            global code
+                            code = input()
+                    {expression}
+                    eval(code)
+                ''')
+
     def test_string_join_captures_values_before_later_rebinding(self):
         for receiver in ("''", 'separator'):
             for initial, later, expected in (

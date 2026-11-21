@@ -2649,6 +2649,131 @@ class SQLValueCaptureTests(unittest.TestCase):
                     with self.assertRaisesRegex(detector.SQLFlowLimit, 'collection key callbacks.*incomplete'):
                         list(detector.find([path]))
 
+    def test_nested_generator_scalar_composition(self):
+        cases = (
+            ('constant', '    cursor.execute("SELECT 1")\n'
+             '    return list(x for x in (y for y in (1, 2)))\n', ()),
+            ('three-levels', '    cursor.execute("SELECT 1")\n'
+             '    return tuple(x for x in (y for y in (z for z in (1, 2))))\n', ()),
+            ('sql-value', '    query = "".join(piece for piece in '
+             '(part for part in [f"SELECT {user}"]))\n'
+             '    cursor.execute(query)\n', ((CRITICAL, 3),)),
+            ('sql-clean', '    query = "".join(piece for piece in '
+             '(part for part in ["SELECT 1"]))\n'
+             '    cursor.execute(query)\n', ()),
+            ('eager', '    queries = [selected for selected in '
+             '(item for item in [f"SELECT {user}"])]\n'
+             '    cursor.execute(queries[0])\n', ((CRITICAL, 3),)),
+            ('mapping', '    queries = {0: selected for selected in '
+             '(item for item in [f"SELECT {user}"])}\n'
+             '    cursor.execute(queries[0])\n', ((CRITICAL, 3),)),
+            ('filtered-out', '    query = "SELECT 1"\n'
+             '    list((query := f"SELECT {user}") for selected in '
+             '(item for item in (1, 2)) if False)\n'
+             '    cursor.execute(query)\n', ()),
+        )
+        for name, body, expected in cases:
+            with self.subTest(case=name):
+                self.inspect('nested-generator-' + name, program(body), expected)
+
+    def test_sqlite_nested_generator_effect_order(self):
+        unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
+        safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
+        cases = (
+            ('result-unsafe', f'    inner = ({unsafe} for marker in (0,))\n'
+             '    query = list(selected for selected in inner)[0]\n', 2, CRITICAL),
+            ('result-safe', f'    inner = ({safe} for marker in (0,))\n'
+             '    query = list(selected for selected in inner)[0]\n', 1, None),
+            ('late-clean', f'    query = {unsafe}\n'
+             '    inner = (query for marker in (0,))\n'
+             '    outer = (selected for selected in inner)\n'
+             f'    query = {safe}\n    query = list(outer)[0]\n', 1, None),
+            ('captured-unsafe', f'    query = {unsafe}\n'
+             '    inner = (item for item in (query,))\n'
+             '    outer = (selected for selected in inner)\n'
+             f'    query = {safe}\n    query = list(outer)[0]\n', 2, CRITICAL),
+            ('interleaved-live-read', f'    query = {safe}\n'
+             '    inner = (query for marker in (0, 1))\n'
+             f'    selected = [(item, (query := {unsafe}))[0] for item in inner]\n'
+             '    query = selected[-1]\n', 2, CRITICAL),
+            ('interleaved-clean-control', f'    query = {safe}\n'
+             '    inner = (query for marker in (0, 1))\n'
+             f'    selected = [(item, (query := {safe}))[0] for item in inner]\n'
+             '    query = selected[-1]\n', 1, None),
+            ('producer-then-consumer-clean', f'    query = {safe}\n'
+             f'    inner = ((query := {unsafe}) for marker in (0, 1))\n'
+             f'    list((query := {safe}) for selected in inner)\n', 1, None),
+            ('producer-then-consumer-unsafe', f'    query = {unsafe}\n'
+             f'    inner = ((query := {safe}) for marker in (0, 1))\n'
+             f'    list((query := {unsafe}) for selected in inner)\n', 2, CRITICAL),
+            ('empty-does-not-write', f'    query = {unsafe}\n'
+             '    inner = (item for item in ())\n'
+             f'    list((query := {safe}) for selected in inner)\n', 2, CRITICAL),
+            ('exhausted-does-not-restart', f'    inner = ({unsafe} for marker in (0,))\n'
+             '    list(selected for selected in inner)\n'
+             f'    query = {unsafe}\n'
+             f'    list((query := {safe}) for selected in inner)\n', 2, CRITICAL),
+            ('short-circuit-prefix', f'    query = {safe}\n'
+             f'    inner = ((query := {unsafe}) for marker in (0, 1))\n'
+             '    any(True for selected in inner)\n', 2, CRITICAL),
+        )
+        for name, body, count, rule in cases:
+            with self.subTest(case=name):
+                source = program(body + '    return cursor.execute(query).fetchone()[0]\n')
+                witness = sqlite_witness(self.artifacts, 'nested-generator-' + name, source)
+                self.assertEqual(witness['rows'], count)
+                expected = () if rule is None else ((rule, len(source.splitlines())),)
+                self.inspect('sqlite-nested-generator-' + name, source, expected)
+
+    def test_nested_generator_cursor_and_scope_boundaries(self):
+        cases = (
+            ('partial-inner', '    pending = (item for item in (1, 2))\n'
+             '    next(pending)\n'
+             '    list(selected for selected in pending)\n'),
+            ('short-circuit-resume', '    pending = (item for item in (1, 2))\n'
+             '    any(True for selected in pending)\n'
+             '    list(pending)\n'),
+            ('same-named-locals', '    list(item for item in (item for item in (1, 2)))\n'),
+            ('captured-shadow', '    query = f"SELECT {user}"\n'
+             '    inner = (query for marker in (1, 2))\n'
+             '    list(query for query in inner)\n'),
+            ('helper-captured-shadow', '    query = f"SELECT {user}"\n'
+             '    def read():\n        return query\n'
+             '    inner = (read() for marker in (1, 2))\n'
+             '    list(query for query in inner)\n'),
+            ('producer-local-write', '    inner = (marker for marker in (1, 2))\n'
+             '    list((marker := user) for selected in inner)\n'),
+            ('opaque-consumer', '    list(consume(selected) for selected in '
+             '(item for item in (1, 2)))\n'),
+            ('cursor-close', '    inner = (item for item in (1, 2))\n'
+             '    list(inner.close() for selected in inner)\n'),
+        )
+        for name, body in cases:
+            with self.subTest(case=name):
+                source = program('    cursor.execute("SELECT 1")\n' + body)
+                path = self.artifacts / ('nested-generator-boundary-' + name + '.py')
+                path.write_text(source, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'incomplete'):
+                    list(detector.find([path]))
+
+    @unittest.skipUnless((ROOT / 'ubs').is_file(), 'real CLI requires full checkout')
+    def test_real_cli_nested_generator_composition(self):
+        cases = (
+            ('nested-cli-clean', 'cursor.execute("SELECT 1")\n'
+             'values = list(x for x in (y for y in (1, 2)))\n', ()),
+            ('nested-cli-sql', 'value = input()\n'
+             'query = list(selected for selected in '
+             '(f"SELECT {value}" for marker in (1,)))[0]\n'
+             'cursor.execute(query)\n', ((CRITICAL, 3),)),
+            ('nested-cli-bound', 'value = input()\n'
+             'params = list(selected for selected in (value for marker in (1,)))\n'
+             'cursor.execute("SELECT ?", tuple(params))\n', ()),
+            ('nested-cli-constant', 'query = list(selected for selected in '
+             '("SELECT 1" for marker in (1,)))[0]\n'
+             'cursor.execute(query)\n', ()),
+        )
+        self.assert_real_cli_capture(cases, wrap=False)
+
     def test_generator_reducer_callbacks_remain_incomplete(self):
         for name, source in reducer_callback_programs():
             with self.subTest(case=name):

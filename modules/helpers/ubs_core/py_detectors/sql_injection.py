@@ -4301,7 +4301,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return restored
 
     def visit_ListComp(self, node, *, captured=None, consumer_can_raise=False, hash_keys=False,
-                       short_circuit=None, reducer=None):
+                       short_circuit=None, reducer=None, on_yield=None):
         """Evaluate eager comprehensions in loop/filter order and local scope.
 
         Literal lists/tuples have exact iteration counts. Dynamic iterables
@@ -4328,9 +4328,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self.bind_value_facts(local_names, (None, None, None, False, 'unknown'))
         produced = None
         stopped = None
+        consumer_raise = None
 
         def emit():
-            nonlocal produced, stopped
+            nonlocal produced, stopped, consumer_raise
             if isinstance(node, ast.DictComp):
                 self.visit(node.key)
                 key = self.value_facts(node.key)
@@ -4379,6 +4380,34 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     self.generator_phases[node] = phase
                 if truth is not None and truth is not continuing:
                     return None
+            if on_yield is not None:
+                # A nested generator yields into its consumer before its
+                # next iteration runs. Draining it up front would reorder
+                # SQL stores/sinks and lose early-stop cursor state.
+                suspended = self.sql_state()
+                self.generator_phases[node] = frozenset({'partial'})
+                caller = self.restore_local_facts(self.sql_state(), enclosing, local_names)
+                self.restore_sql_state(caller)
+                inner_raise, self._pending_raise = self._pending_raise, None
+                try:
+                    resumed = on_yield(facts)
+                finally:
+                    # Consumer failures have already left the producer's
+                    # local frame. Do not restore its local names over those
+                    # exception stores during the producer's final unwind.
+                    consumer_raise = self.join_sql_states(consumer_raise, self._pending_raise)
+                    self._pending_raise = inner_raise
+                for state in (resumed, consumer_raise):
+                    if (state is not None
+                            and self.restore_local_facts(state, caller, local_names) != state):
+                        raise SQLFlowLimit('SQL nested generator lexical writes are unsupported; analysis is incomplete')
+                if resumed is None:
+                    self.restore_sql_state(suspended)
+                    return None
+                if resumed[7].get(node) != frozenset({'partial'}):
+                    raise SQLFlowLimit('SQL nested generator cursor mutation is unsupported; analysis is incomplete')
+                self.restore_sql_state(self.restore_local_facts(resumed, suspended, local_names))
+                self.generator_phases[node] = suspended[7][node]
             return self.sql_state()
 
         def filtered(index):
@@ -4413,8 +4442,30 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 self.visit(generator.iter)
             entered = self.sql_state()
             iterable = generator.iter
-            if self.generator_refs(self.value_facts(iterable)):
-                raise SQLFlowLimit('SQL nested generator iteration is unsupported; analysis is incomplete')
+            references = self.generator_refs(self.value_facts(iterable))
+            if references:
+                # These comprehension locals live in a different lexical
+                # frame from a producer created in the enclosing scope.
+                # Until overlapping frames have separate stores, reject
+                # direct and helper-mediated shadowing instead of reading
+                # a consumer's variable as the producer's captured cell.
+                self.check_nested_generator_frames(references)
+                self.check_generator_callback_writes()
+                bindings = self.ownership_bindings()
+                if (bindings.dynamic_namespace or bindings.builtin_namespace
+                        or '__del__' in self.generator_protocol_names()):
+                    raise SQLFlowLimit('SQL nested generator lifetime effects are unresolved; analysis is incomplete')
+
+                def consume(facts):
+                    for target, projected in self.unpacking_bindings(generator.target, facts):
+                        self.store_assignment(target, projected)
+                    return filtered(index)
+
+                try:
+                    self.materialize_generators(references, on_yield=consume)
+                except SQLNoNormalReturn:
+                    return None
+                return self.sql_state()
             if record_reducer:
                 kind, element = self.value_kind(iterable)
                 if not (self.hash_safe_shape(self.element_shape((kind, element)))
@@ -4466,7 +4517,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             # The admitted mutable-record subset also needs the guarded
             # visitor: filter/operator/property/call callbacks can mutate
             # SQL even when the final yielded record has primitive fields.
-            self._short_circuiting = enclosing_short_circuit or short_circuit is not None or record_reducer
+            self._short_circuiting = (enclosing_short_circuit or short_circuit is not None
+                                     or record_reducer or on_yield is not None)
             result = level(0, self.sql_state())
             result = self.join_sql_states(result, stopped)
             if result is None:
@@ -4485,7 +4537,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             state = self.restore_local_facts(self.sql_state(), enclosing, local_names)
             raised = self.restore_local_facts(self._pending_raise, enclosing, local_names)
             self.restore_sql_state(state)
-            self._pending_raise = self.join_sql_states(enclosing_raise, raised)
+            self._pending_raise = self.join_sql_states(enclosing_raise, raised, consumer_raise)
 
     visit_SetComp = visit_ListComp
     visit_DictComp = visit_ListComp
@@ -4531,8 +4583,26 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                          if child in self._evaluated_values})
         return not any(node in self.generator_refs(facts) for captured in captures for facts in captured.values())
 
+    def check_nested_generator_frames(self, references):
+        """Keep producer captures distinct from active comprehension locals."""
+        bindings = self.ownership_bindings()
+        pending, seen = list(references), set()
+        while pending:
+            identity = pending.pop()
+            if identity is None or identity in seen:
+                continue
+            seen.add(identity)
+            for child in ast.walk(identity):
+                self.step()
+                if isinstance(child, ast.Name) and child.id in self._comprehension_locals:
+                    raise SQLFlowLimit('SQL nested generator lexical frames overlap; analysis is incomplete')
+                if isinstance(child, ast.Call):
+                    target = bindings.resolve(child.func)
+                    if target and target[0] == 'function':
+                        pending.append(target[1])
+
     def materialize_generators(self, references, *, consumer_can_raise=False, hash_keys=False,
-                               short_circuit=None, reducer=None):
+                               short_circuit=None, reducer=None, on_yield=None):
         """Consume selected same-scope generators using the comprehension engine.
 
         Generator identity and completion are stateful, whereas projected
@@ -4564,7 +4634,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     self._generator_running.add(identity)
                     try:
                         self.visit_ListComp(identity, captured=captured, consumer_can_raise=consumer_can_raise,
-                                            hash_keys=hash_keys, short_circuit=short_circuit, reducer=reducer)
+                                            hash_keys=hash_keys, short_circuit=short_circuit, reducer=reducer,
+                                            on_yield=on_yield)
                         value = self.value_facts(identity)
                         if self.generator_refs(value):
                             raise SQLFlowLimit('SQL generator-valued projection is unsupported; analysis is incomplete')
@@ -5707,6 +5778,14 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         return facts, probe
 
     def generator_has_writes_or_sinks(self, identity):
+        specification = self._generator_specs.get(identity)
+        if specification is not None and any(self.generator_refs(facts)
+                                             for facts in specification[1].values()):
+            # Advancing a captured producer is an observable cursor effect,
+            # even when this outer projection itself returns a constant.
+            # any/all must retain the stopped prefix instead of applying a
+            # read-only projection and discarding the producer's writes.
+            return True
         deferred = [identity.elt]
         deferred.extend(condition for generator in identity.generators for condition in generator.ifs)
         deferred.extend(generator.iter for generator in identity.generators[1:])

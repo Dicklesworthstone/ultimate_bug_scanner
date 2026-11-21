@@ -7995,16 +7995,35 @@ class _Flow:
             first = node.generators[0]
             consumer = self.generator_exhaustion_consumer(node, state)
             if consumer:
-                if any(generator.is_async for generator in node.generators):
+                materialized = node
+                while (len(materialized.generators) == 1
+                       and not materialized.generators[0].is_async
+                       and not materialized.generators[0].ifs
+                       and isinstance(materialized.generators[0].target, ast.Name)
+                       and isinstance(materialized.elt, ast.Name)
+                       and materialized.elt.id == materialized.generators[0].target.id
+                       and isinstance(materialized.generators[0].iter, ast.GeneratorExp)):
+                    # A private forwarding frame only passes each yielded
+                    # primitive to the same already-proved consumer. Remove
+                    # that frame, preserving the producer's execution order
+                    # and any/all stopping policy. This is not an eager drain
+                    # of arbitrary nested producers or a saved-cursor proof.
+                    self.engine.budget.spend()
+                    materialized = materialized.generators[0].iter
+                if any(generator.is_async for generator in materialized.generators):
                     raise AnalysisLimit('asynchronous generator materialization is unmodeled; analysis is incomplete')
                 # Iterator construction can own temporary helper frames too.
                 # Check calls before either normal or exceptional completion.
                 self.materialized_generator_depth += 1
                 try:
-                    iterable = self.expr(first.iter, state)
-                    return self.comprehension(node, state, iterable=iterable, synchronous_generator=True,
+                    iterable = self.expr(materialized.generators[0].iter, state)
+                    fact = self.comprehension(materialized, state, iterable=iterable, synchronous_generator=True,
                                               string_result=consumer == 'str.join',
                                               predicate=consumer if consumer in {'any', 'all'} else None)
+                    if materialized is not node:
+                        self.expression_bindings[node] = self.expression_bindings.get(materialized)
+                        self.expression_references[node] = self.expression_references.get(materialized, NO_REFERENCES)
+                    return fact
                 finally:
                     self.materialized_generator_depth -= 1
             discarded = self.discarded_generator_argument(node, state)

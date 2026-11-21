@@ -17,6 +17,7 @@ https://www.postgresql.org/docs/current/sql-select.html
 https://www.postgresql.org/docs/current/app-psql.html
 https://coverage.postgresql.org/src/fe_utils/psqlscan.l.gcov.html
 https://doxygen.postgresql.org/scansup_8c_source.html
+https://doxygen.postgresql.org/alter_8c_source.html
 """
 from __future__ import annotations
 
@@ -577,6 +578,172 @@ CASES = (
         REVOKE ALL ON FUNCTION app."Ä"() FROM PUBLIC;
         COMMIT;
     """),
+    Case("rename_then_revoke_uses_new_function_identity", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() RENAME TO renamed;
+        REVOKE ALL ON FUNCTION app.renamed() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("schema_transfer_then_revoke_uses_new_function_identity", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() SET SCHEMA api;
+        REVOKE ALL ON FUNCTION api.f() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("identity_changes_preserve_acl_for_replacement", """
+        BEGIN;
+        CREATE FUNCTION app.f(integer) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f(integer) FROM PUBLIC;
+        ALTER FUNCTION app.f(int4) RENAME TO renamed;
+        ALTER FUNCTION app.renamed(integer) SET SCHEMA api;
+        CREATE OR REPLACE FUNCTION api.renamed(int) RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 2 $$;
+        COMMIT;
+    """),
+    Case("rename_does_not_revoke_public", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() RENAME TO renamed;
+        COMMIT;
+    """),
+    Case("schema_transfer_does_not_fix_function_search_path", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        ALTER FUNCTION app.f() SET SCHEMA pg_catalog;
+        COMMIT;
+    """),
+    Case("schema_wide_revoke_follows_moved_function", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() SET SCHEMA api;
+        REVOKE ALL ON ALL FUNCTIONS IN SCHEMA api FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("old_schema_revoke_cannot_harden_moved_function", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() SET SCHEMA api;
+        REVOKE ALL ON ALL FUNCTIONS IN SCHEMA app FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("rename_changes_only_selected_overload", """
+        BEGIN;
+        CREATE FUNCTION app.f(integer) RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE FUNCTION app.f(text) RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 2 $$;
+        ALTER FUNCTION app.f(int4) RENAME TO renamed;
+        REVOKE ALL ON FUNCTION app.renamed(integer) FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("renamed_function_can_share_another_overloads_name", """
+        BEGIN;
+        CREATE FUNCTION app.f(integer) RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE FUNCTION app.renamed(text) RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$;
+        ALTER FUNCTION app.f(integer) RENAME TO renamed;
+        REVOKE ALL ON FUNCTION app.renamed(int) FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("quoted_rename_and_schema_are_single_identifiers", """
+        BEGIN;
+        CREATE FUNCTION app."f.old"(integer) RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app."f.old"(int) RENAME TO "f.new";
+        ALTER FUNCTION app."f.new"(int4) SET SCHEMA "API.v2";
+        REVOKE ALL ON FUNCTION "API.v2"."f.new"(integer) FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("quoted_renamed_identity_keeps_case", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() RENAME TO "F";
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("rollback_to_savepoint_restores_renamed_identity", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        SAVEPOINT before_rename;
+        ALTER FUNCTION app.f() RENAME TO renamed;
+        REVOKE ALL ON FUNCTION app.renamed() FROM PUBLIC;
+        ROLLBACK TO before_rename;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("rollback_to_savepoint_restores_moved_acl", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        SAVEPOINT before_move;
+        ALTER FUNCTION app.f() SET SCHEMA api;
+        GRANT EXECUTE ON FUNCTION api.f() TO PUBLIC;
+        ROLLBACK TO before_move;
+        ALTER FUNCTION app.f() OWNER TO app_owner;
+        COMMIT;
+    """),
+    Case("transaction_rollback_restores_function_identity", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        COMMIT;
+        BEGIN;
+        ALTER FUNCTION app.f() RENAME TO renamed;
+        ALTER FUNCTION app.renamed() SET SCHEMA api;
+        GRANT EXECUTE ON FUNCTION api.renamed() TO PUBLIC;
+        ROLLBACK;
+        ALTER FUNCTION app.f() OWNER TO app_owner;
+    """),
+    Case("identity_changes_do_not_duplicate_committed_exposure", """
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() RENAME TO renamed;
+        ALTER FUNCTION app.renamed() SET SCHEMA api;
+        REVOKE ALL ON FUNCTION api.renamed() FROM PUBLIC;
+        DROP FUNCTION api.renamed();
+    """),
+    Case("reusing_old_name_creates_independent_acl", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        ALTER FUNCTION app.f() RENAME TO renamed;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 2 $$;
+        CREATE OR REPLACE FUNCTION app.renamed() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 3 $$;
+        COMMIT;
+    """),
+    Case("unqualified_selected_function_can_move_to_explicit_schema", """
+        BEGIN;
+        CREATE FUNCTION f() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION f() RENAME TO renamed;
+        ALTER FUNCTION renamed() SET SCHEMA api;
+        REVOKE ALL ON FUNCTION api.renamed() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("same_schema_transfer_is_a_no_op", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        ALTER FUNCTION app.f() SET SCHEMA app;
+        COMMIT;
+    """),
 )
 
 # Unknown deployment/dialect/control-flow inputs and malformed source cannot
@@ -764,6 +931,88 @@ INCOMPLETE_CASES = (
         CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
         LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
     """),
+    Case("rename_requires_selected_function", "ALTER FUNCTION app.unseen() RENAME TO renamed;\n"),
+    Case("schema_transfer_requires_selected_function", "ALTER FUNCTION app.unseen() SET SCHEMA api;\n"),
+    Case("rename_requires_one_unqualified_identifier", """
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() RENAME TO api.renamed;
+    """),
+    Case("schema_transfer_requires_one_schema_identifier", """
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() SET SCHEMA 'api';
+    """),
+    Case("rename_cannot_hide_security_change", """
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() RENAME TO renamed SECURITY DEFINER;
+    """),
+    Case("schema_transfer_cannot_hide_security_change", """
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() SET SCHEMA api SECURITY DEFINER;
+    """),
+    Case("rename_cannot_overwrite_another_function", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE FUNCTION app.renamed() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 2 $$;
+        ALTER FUNCTION app.f() RENAME TO renamed;
+        COMMIT;
+    """),
+    Case("schema_transfer_cannot_overwrite_another_function", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        CREATE FUNCTION api.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 2 $$;
+        ALTER FUNCTION app.f() SET SCHEMA api;
+        COMMIT;
+    """),
+    Case("old_name_no_longer_resolves_after_rename", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() RENAME TO renamed;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("old_schema_no_longer_resolves_after_transfer", """
+        BEGIN;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() SET SCHEMA api;
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        COMMIT;
+    """),
+    Case("identity_change_keeps_unknown_replacement_acl", """
+        BEGIN;
+        CREATE OR REPLACE FUNCTION app.f() RETURNS integer
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() RENAME TO renamed;
+        ALTER FUNCTION app.renamed() SET SCHEMA api;
+        COMMIT;
+    """),
+    Case("renamed_format_function_is_not_builtin", """
+        CREATE FUNCTION app.custom_format(text, name) RETURNS text
+        LANGUAGE sql AS $$ SELECT 'SELECT dangerous()' $$;
+        ALTER FUNCTION app.custom_format(text, name) RENAME TO format;
+        DO $$ BEGIN EXECUTE format('GRANT app TO %I', current_user); END $$;
+    """),
+    Case("moved_format_function_is_not_builtin", """
+        CREATE FUNCTION app.format(text, name) RETURNS text
+        LANGUAGE sql AS $$ SELECT 'SELECT dangerous()' $$;
+        ALTER FUNCTION app.format(text, name) SET SCHEMA pg_catalog;
+        DO $$ BEGIN EXECUTE pg_catalog.format('GRANT app TO %I', current_user); END $$;
+    """),
+    Case("unqualified_rename_after_search_path_change_is_unresolved", """
+        CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;
+        SET search_path = other_schema, pg_catalog;
+        ALTER FUNCTION f() RENAME TO renamed;
+    """),
+    Case("same_name_rename_conflicts_with_existing_function", """
+        CREATE FUNCTION app.f() RETURNS integer -- expect:public
+        LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        ALTER FUNCTION app.f() RENAME TO f;
+    """),
 )
 
 
@@ -793,6 +1042,31 @@ class EvidenceTest(unittest.TestCase):
 
 
 class SQLNativeTests(EvidenceTest):
+    def test_same_line_redefinitions_keep_distinct_publication_evidence(self):
+        # Both definitions can be observed by another session in autocommit
+        # mode, even though the same spelling and line number are reused.
+        declaration = ("CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql "
+                       "SECURITY DEFINER SET search_path = pg_catalog, pg_temp "
+                       "AS $$ SELECT 1 $$;")
+        prefix = declaration + " DROP FUNCTION app.f(); "
+        case = Case("same_line_redefinitions", prefix + declaration)
+        directory = self.materialize((case,), case.name)
+        source = directory / case.filename
+        analyzer = importlib.import_module("ubs_core.sql_scan")
+        records, errors = analyzer.analyze_source(case.source, str(source))
+        actual = sorted((row["rule"], row["line"], row["col"]) for row in records)
+        expected = [(RULES["public"], 1, 1),
+                    (RULES["public"], 1, len(prefix) + 1)]
+        (directory / "receipt.json").write_text(json.dumps({
+            **self.identity, "case": case.name, "expected": expected,
+            "actual": actual, "findings": records, "errors": errors,
+            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "analyzer_sha256": hashlib.sha256(Path(analyzer.__file__).read_bytes()).hexdigest(),
+            "elapsed_s": time.monotonic() - self.started,
+        }, indent=2) + "\n", encoding="utf-8")
+        self.assertEqual(errors, [], (records, errors))
+        self.assertEqual(actual, expected, records)
+
     def check_native(self, case, incomplete=False):
         analyzer = importlib.import_module("ubs_core.sql_scan")
         directory = self.materialize((case,), case.name)
@@ -810,6 +1084,8 @@ class SQLNativeTests(EvidenceTest):
         context = (case.source, records, errors)
         if incomplete:
             self.assertTrue(errors, context)
+            if case.expected:
+                self.assertEqual(actual, case.expected, context)
         else:
             self.assertEqual(errors, [], context)
             self.assertEqual(actual, case.expected, context)
@@ -905,7 +1181,7 @@ class SQLPublicTests(EvidenceTest):
         attempt = self.artifact / ("command-" + uuid.uuid4().hex[:8])
         attempt.mkdir()
         env = dict(os.environ, UBS_NO_AUTO_UPDATE="1", UBS_ENABLE_AUTO_UPDATE="0",
-                   ENABLE_UV_TOOLS="0", PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1",
+                   ENABLE_UV_TOOLS="0", PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", UBS_KEEP_TEMP="1",
                    UBS_NO_CACHE="0" if cached else "1", UBS_CACHE_DIR=str(self.artifact / "cache"),
                    TMPDIR=str(attempt), XDG_CACHE_HOME=str(self.artifact / "xdg-cache"),
                    XDG_CONFIG_HOME=str(self.artifact / "xdg-config"),
@@ -983,6 +1259,17 @@ class SQLPublicTests(EvidenceTest):
         cases = (CASES[0], CASES[2], INCOMPLETE_CASES[0])
         directory = self.materialize(cases, "partial")
         for mode in ("module-json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
+
+    def test_identity_boundaries_preserve_selected_function_findings(self):
+        supported = {case.name: case for case in CASES}
+        unsupported = {case.name: case for case in INCOMPLETE_CASES}
+        cases = (supported["rename_then_revoke_uses_new_function_identity"],
+                 unsupported["rename_cannot_overwrite_another_function"],
+                 unsupported["old_schema_no_longer_resolves_after_transfer"])
+        directory = self.materialize(cases, "identity-partial")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
             with self.subTest(mode=mode):
                 self.assert_report(*self.execute(directory, mode), mode, cases, partial=True)
 

@@ -3,7 +3,8 @@
 This is a selected-file DDL model, not a catalog or a PL/pgSQL interpreter.
 Function bodies are opaque; DO bodies accept only proven role-membership
 grants. Function identity includes input argument types; privilege changes
-take effect at transaction publication boundaries.
+take effect at transaction publication boundaries. Selected function renames
+and schema transfers preserve the object's privileges and local settings.
 Ordinary WITH queries and literal psql error/display controls preserve this
 state; client substitution and effectful commands remain explicit boundaries.
 Unknown DDL context is reported explicitly and is never cached as complete.
@@ -802,7 +803,11 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
                     "extras": {"dialect": "postgresql", "function": name,
                                "scope": "selected migration; external schema ownership and ACLs are not proved"},
                 }
-                identity = (function.key, function.anchor.line, rule)
+                # Names can change while the dangerous definition and its
+                # evidence location remain the same. Key by the statement
+                # offset so rename/schema moves do not duplicate a committed
+                # exposure, while distinct statements on one line stay distinct.
+                identity = (function.anchor.start, rule)
                 findings.setdefault(identity, record)
                 finding_spans.setdefault(identity, (function.anchor.start, function.end, function.anchor.line))
 
@@ -969,6 +974,26 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
                 # reset PUBLIC grants, SECURITY DEFINER, or local search_path.
                 # Keep their original evidence location as well as their
                 # values. The new owner's deployed privileges are not proved.
+            elif sequence(tail, "rename") or sequence(tail, "set", "schema"):
+                rename = sequence(tail, "rename")
+                if (len(tail) != 3 or (rename and not tail[1].is_word("to"))
+                        or tail[2].kind not in {"word", "quoted"} or not tail[2].value):
+                    raise Incomplete("ALTER FUNCTION identity change requires one literal name or schema")
+                if len(key[0]) == 1 and state.session_path_changed:
+                    raise Incomplete("unqualified function identity depends on the session search_path")
+                names = ((*key[0][:-1], tail[2].value) if rename
+                         else (tail[2].value, key[0][-1]))
+                new_key = (names, key[1])
+                # SET SCHEMA to the current schema is a PostgreSQL no-op;
+                # RENAME TO the current name still fails the duplicate check.
+                if new_key in state.functions and (rename or new_key != key):
+                    raise Incomplete("ALTER FUNCTION destination conflicts with a selected function")
+                # Move the same object only after validating the entire clause.
+                # Its ACL, path, body and original finding anchor survive, as
+                # do the copies held by transaction/savepoint snapshots.
+                function.key = new_key
+                state.functions.pop(key)
+                state.functions[new_key] = function
             else:
                 if any(token.is_word("rename") or token.is_word("schema") or token.is_word("owner") for token in tail):
                     raise Incomplete("ALTER FUNCTION identity change requires additional catalog context")

@@ -1,6 +1,62 @@
 # PostgreSQL function-identity checkpoint
 
-**Status: implemented in the disconnected workspace, archived here without activation.** Regression execution was interrupted and its result could not be retrieved. This checkpoint does not change the production scanner.
+**Historical checkpoint:** the November 15 implementation was archived without activation after interrupted execution. The November 20 recovery and qualification results are recorded below; the original interrupted run is still not a passing result.
+
+## November 20 recovery and source qualification
+
+The candidate was restored against `06222fb6b9069ec95d2c72d6f753403613804702`.
+Before changing the analyzer, the restored independent oracle ran through DSR's
+native quality executor: **179 source tests, 20 failures**. After restoring the
+identity transfer, all original cases passed. A new regression additionally
+checks that two autocommit definitions on the same physical line retain
+separate publication evidence after dropping and recreating the same name.
+
+The final native/helper cohort passed **181 tests, no skips**, including exact
+finding identities and helper JSON/SARIF completion. Public coverage now also
+checks that a rejected destination collision or stale old identity retains
+known findings in both module and runner JSON/SARIF output. Public scanner
+tests explicitly retain their scratch files with `UBS_KEEP_TEMP=1`.
+
+Retained DSR receipts and full logs are under
+`test-suite/artifacts/sql-identity-session/`:
+
+- `baseline-native.log`: 179 tests, 20 failures; SHA-256
+  `472dca07ea9b25cc1acab4fcd1e2b53d0fc00e7f0ef4bd1d9836b89bb57fcbae`.
+- `final-native.log`: 181 tests passed; SHA-256
+  `9825f3d2d21532bc7e972b7e04b621b69b024aed82b287dd21cc067e62af745a`.
+
+The source change is activated in development version **5.5.88**. An independent
+20-case oracle passed all exact rule/location/completion assertions; the incumbent
+passed only 3 of those 20 cases. Independent candidate log SHA-256:
+`0b462f7b9ffa44fd87fcce3b6ac3741cecb46ead7ba8d2403088421aa1b94dd9`.
+
+An isolated integration checkout ran the ordinary module and meta-runner against
+the complete native fixture corpus in both JSON and SARIF: all four legs passed,
+including every new rename/schema-transfer fixture. Retrieved public logs also
+show passing retained-finding identity boundaries, CTE/psql boundaries, neighboring
+partial files, category selection, baseline comparison, JSONL/occurrence sidecars
+and project configuration. No observed assertion failure occurred in these
+completed integration cases.
+
+Canonical module/helper checksums, SHA256SUMS, runner Bash syntax and whitespace
+checks passed through DSR (17,900 ms; log SHA-256
+`ee4d2e19677e37ff23e913fefcdbe0fc17867cd190c6a2ae4f9cf12633093241`).
+The production scanner and test blobs were uploaded through GitHub and matched
+the exact local Git object hashes before publication.
+
+Qualification limits remain explicit. The initial 120-second combined source/
+public run timed out; a subsequent public run lost its execution transport after
+25 actual CLI calls, before the full class returned. The remaining selection,
+cache, suppression and staged-index methods were submitted separately, but their
+final result was not recovered before the environment became unavailable.
+The prescribed full suite and changed-source self-scan were also submitted
+through DSR with retained scratch and the repository's deletion guard; no final
+result was observed. Full ShellCheck was killed with exit 137. An earlier
+integrity attempt timed out before the successful unchanged-gate rerun.
+
+These are bounded source and observed CLI results, not a complete public-suite,
+full-repository, live PostgreSQL, platform or release qualification. The original
+acceptance gates and umbrella beads remain open.
 
 ## Recoverable implementation
 

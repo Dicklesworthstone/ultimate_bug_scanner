@@ -232,7 +232,10 @@ active implementations were checked again before selecting these gaps.
 - [x] Freeze 14 native witnesses and exact scanner outcomes: the incumbent has five unsafe misses and four clean-control false positives, all incorrectly reported as complete.
 - [x] Implement `reduce` and `reduceRight` through the common native array traversal and callback summaries, preserving accumulator identity, strong replacement, sparse directional traversal, seed semantics, source mutation, callback writes and throws.
 - [x] Pass all 56 focused source/native methods, including existing map/forEach/flatMap behavior and the 18 new reduction methods. DSR log SHA256 `3021451279f884534137365c0a918c69fde251a78bb96ef115c2b1d4e115208d`.
-- [ ] Complete independent review and pinned public formats, selection, suppression and cache checks, then publish with canonical integrity pins.
+- [x] Pass an independent 21-case source/native corpus, including mutable accumulator aliases, live shrink/regrow/shift/unshift traversal, finally/throw paths and own-method evaluation order. Exact findings and complete status match every case; DSR log SHA256 `4bb880f903f17539634d22ef28ff44e82d50f130bd05381c1c00e5b226a94e85`.
+- [x] Pass all 17 planned public calls on pinned development version 5.5.95: 12 module/runner JSON/SARIF unsafe, clean and partial/selection checks plus five cold/warm/edit/suppression checks. The formats replay log SHA256 is `b40747fa2de6b50206f5d36ad50d3b63c9cb498be7985a8710c65e234cea17df`; cache checks passed in retained initial receipt `js-reduce-public.jWk7sIyy`.
+- [x] Retain the initial four clean-format failures caused by the correct existing empty-catch warning. Replace the empty catch in that new fixture with an observable fixed output, verify its exact native output, and rerun all 12 format calls without changing production code or weakening assertions.
+- [x] Publish the implementation directly to main with version 5.5.95 and canonical integrity pins; syntax and whitespace pass. Integrity DSR log SHA256 `fafd5570f1a0f182d9996d897e09db393405f13911021dc861b00d073f2a8edc`. Unknown callbacks, ambiguous defaults/this/escaped contexts and opaque array property protocols remain explicit; predicate-based array operations are outside this slice.
 
 ### Go buffered input and native Reader payloads (`1b9j.6.6`)
 

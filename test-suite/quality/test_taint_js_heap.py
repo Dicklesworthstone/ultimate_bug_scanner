@@ -2167,6 +2167,304 @@ class HeapTaintTests(unittest.TestCase):
                 self.scan('const items = [req.query.html]; ' + override
                           + 'items.fill("safe"); res.send(items[0]);', 'xss')
 
+    def test_reduce_executes_captured_writes_and_uses_returned_accumulator(self):
+        for method in ('reduce', 'reduceRight'):
+            with self.subTest(method=method):
+                source = ('let saved = "safe"; const box = {html:"safe"}; '
+                          f'const out = [req.query.html].{method}((acc, value) => {{ '
+                          'saved = value; box.html = value; }, "seed"); '
+                          'res.send(saved); res.send(box.html); res.send(out);')
+                self.assert_runtime_sends(source, ['review-input', 'review-input', None])
+                self.scan_sort(source, 'xss', 'xss')
+
+    def test_reduce_preserves_accumulator_writes_and_borrowed_identity(self):
+        for method in ('reduce', 'reduceRight'):
+            with self.subTest(method=method):
+                source = ('const box = {html:"safe", label:"safe"}; '
+                          f'const out = [req.query.html].{method}((acc, value) => {{ '
+                          'acc.html = value; return acc; }, box); '
+                          'res.send(box.html); res.send(out.html); res.send(out.label);')
+                self.assert_runtime_sends(source, ['review-input', 'review-input', 'safe'])
+                self.scan_sort(source, 'xss', 'xss')
+                source = ('const box = {html:"safe"}; '
+                          f'const out = ["value"].{method}((acc, value) => acc, box); '
+                          'out.html = req.query.html; res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+                source = ('const box = {html:req.query.html}; '
+                          f'const out = ["safe"].{method}((acc, value) => {{ '
+                          'acc.html = value; return acc; }, box); res.send(box.html); res.send(out.html);')
+                self.assert_runtime_sends(source, ['safe', 'safe'])
+                self.scan_sort(source)
+
+    def test_reduce_uses_direction_and_distinguishes_omitted_seed(self):
+        for method, expected, rules in (('reduce', 'safe', ()),
+                                        ('reduceRight', 'review-input', ('xss',))):
+            with self.subTest(method=method):
+                source = (f'const out = [req.query.html, "safe"].{method}((acc, value) => value); '
+                          'res.send(out);')
+                self.assert_runtime_sends(source, [expected])
+                self.scan_sort(source, *rules)
+        for method in ('reduce', 'reduceRight'):
+            for seed, expected, rules in (('', 'seed', ()),
+                                          (', undefined', 'review-input', ('xss',))):
+                with self.subTest(method=method, seed=seed):
+                    source = (f'const out = ["seed"].{method}((acc, value) => req.query.html{seed}); '
+                              'res.send(out);')
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan_sort(source, *rules)
+
+    def test_reduce_constant_replacement_and_sanitizer_domains(self):
+        for method in ('reduce', 'reduceRight'):
+            for callback, rules in (
+                ('(acc, value) => "safe"', ()),
+                ('(acc, value) => DOMPurify.sanitize(value)', ('eval', 'sql', 'command')),
+                ('(acc, value) => value', ('xss', 'eval', 'sql', 'command')),
+            ):
+                with self.subTest(method=method, callback=callback):
+                    self.scan_sort(f'const out = [req.query.html].{method}({callback}, req.query.html); '
+                                   'res.send(out); eval(out); db.query(out); shell.exec(out);', *rules)
+            source = (f'const out = [req.query.html].{method}((acc, value) => acc, "safe"); '
+                      'res.send(out);')
+            self.assert_runtime_sends(source, ['safe'])
+            self.scan_sort(source)
+
+    def test_reduce_empty_and_sparse_arrays_skip_callback_execution(self):
+        for method in ('reduce', 'reduceRight'):
+            for initial, seed in (('[]', ', req.query.html'), ('[,,]', ', req.query.html'),
+                                  ('[,req.query.html,,]', '')):
+                with self.subTest(method=method, initial=initial, seed=seed):
+                    source = ('let saved = "safe"; '
+                              f'const out = {initial}.{method}((acc, value) => {{ '
+                              'saved = req.query.html; res.send(req.query.html); return "safe"; }'
+                              + seed + '); res.send(saved); res.send(out);')
+                    self.assert_runtime_sends(source, ['safe', 'review-input'])
+                    self.scan_sort(source, 'xss')
+
+    def test_reduce_without_seed_throws_on_empty_arrays_and_holes(self):
+        for method, initial in itertools.product(('reduce', 'reduceRight'), ('[]', '[,,]')):
+            with self.subTest(method=method, initial=initial):
+                source = ('let saved = "safe"; try { '
+                          f'{initial}.{method}((acc, value) => {{ res.send(req.query.html); return value; }}); '
+                          'saved = req.query.html; } catch (error) { res.send("caught"); } res.send(saved);')
+                self.assert_runtime_sends(source, ['caught', 'safe'])
+                self.scan_sort(source)
+                source = ('try { ' + initial + f'.{method}((acc, value) => value); '
+                          '} catch (error) { res.send(req.query.html); }')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+
+    def test_reduce_callback_throws_preserve_prior_writes_and_thrown_values(self):
+        for method in ('reduce', 'reduceRight'):
+            with self.subTest(method=method):
+                source = ('const box = {html:"safe"}; try { '
+                          f'[req.query.html].{method}((acc, value) => {{ '
+                          'acc.html = value; throw value; }, box); box.html = "safe"; '
+                          '} catch (error) { res.send(box.html); res.send(error); }')
+                self.assert_runtime_sends(source, ['review-input', 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+
+    def test_reduce_reads_live_future_slots_and_snapshots_length(self):
+        for method, initial, future in (('reduce', '["safe", req.query.html]', 1),
+                                         ('reduceRight', '[req.query.html, "safe"]', 0)):
+            with self.subTest(method=method):
+                source = (f'const items = {initial}; const out = items.{method}((acc, value, index, source) => {{ '
+                          f'source[{future}] = "safe"; source.push(req.query.html); return value; '
+                          '}, "seed"); res.send(out);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+                source = (f'const items = {initial}; const out = items.{method}((acc, value, index, source) => {{ '
+                          f'delete source[{future}]; return value; }}, "seed"); res.send(out);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+        for method, initial, future in (('reduce', '["safe", ,]', 1),
+                                         ('reduceRight', '[, "safe"]', 0)):
+            with self.subTest(method=method, insertion=True):
+                source = (f'const items = {initial}; const out = items.{method}((acc, value, index, source) => {{ '
+                          f'source[{future}] = req.query.html; return value; }}, "seed"); res.send(out);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+
+    def test_reduce_optional_slots_keep_seed_and_first_element_alternatives(self):
+        for method, initial, index in (('reduce', '[, "safe"]', 0),
+                                        ('reduceRight', '["safe", ,]', 1)):
+            with self.subTest(method=method):
+                source = (f'const items = {initial}; if (flag) items[{index}] = req.query.html; '
+                          f'const out = items.{method}((acc, value) => acc); res.send(out);')
+                for flag, expected in (('true', 'review-input'), ('false', 'safe')):
+                    self.assert_runtime_sends(f'const flag = {flag}; ' + source, [expected])
+                self.scan_sort(source, 'xss')
+        for method in ('reduce', 'reduceRight'):
+            for seed in ('', ', req.query.html'):
+                with self.subTest(method=method, seed=seed):
+                    source = ('const items = [,]; if (flag) items[0] = req.query.html; try { '
+                              f'const out = items.{method}((acc, value) => "safe"{seed}); res.send(out); '
+                              '} catch (error) { res.send("empty"); }')
+                    for flag, expected in (('true', 'safe' if seed else 'review-input'),
+                                            ('false', 'review-input' if seed else 'empty')):
+                        self.assert_runtime_sends(f'const flag = {flag}; ' + source, [expected])
+                    self.scan_sort(source, 'xss')
+
+    def test_reduce_binds_all_four_arguments_without_flattening(self):
+        for method in ('reduce', 'reduceRight'):
+            with self.subTest(method=method):
+                source = ('const box = {html:"seed"}; const items = [req.query.html]; '
+                          f'const out = items.{method}((acc, value, index, source) => [acc, value, index, source], box); '
+                          'res.send(out[0].html); res.send(out[1]); res.send(out[2]); res.send(out[3][0]);')
+                self.assert_runtime_sends(source, ['seed', 'review-input', 0, 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+
+    def test_reduce_resolves_named_callbacks_and_helper_contexts(self):
+        for method in ('reduce', 'reduceRight'):
+            with self.subTest(method=method):
+                source = ('function write(acc, value) { acc.html = value; return acc; } '
+                          f'function collect(items, target) {{ return items.{method}(write, target); }} '
+                          'const dirty = {html:"safe"}; const clean = {html:"safe"}; '
+                          'collect([req.query.html], dirty); collect(["safe"], clean); '
+                          'res.send(dirty.html); res.send(clean.html);')
+                self.assert_runtime_sends(source, ['review-input', 'safe'])
+                self.scan_sort(source, 'xss')
+
+    def test_reduce_composes_literal_computed_postfix_and_nested_calls(self):
+        for source in (
+            'res.send([req.query.html].reduce((acc, value) => value, "seed"));',
+            'function make() { return [req.query.html]; } res.send(make().reduceRight((acc, value) => value));',
+            'const items = [req.query.html]; const out = items["reduce"]((acc, value) => value, "seed"); res.send(out);',
+            'const out = ([req.query.html]).map(value => value).reduceRight((acc, value) => [value], []); res.send(out[0]);',
+            'const box = {html:"safe"}; ["safe"].reduce((acc, value) => [req.query.html].reduceRight((inner, item) => { box.html = item; return inner; }, acc), "seed"); res.send(box.html);',
+        ):
+            with self.subTest(source=source):
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+
+    def test_reduce_keeps_evaluated_receiver_before_seed_side_effects(self):
+        for method in ('reduce', 'reduceRight'):
+            with self.subTest(method=method):
+                source = ('let items = ["safe"]; '
+                          f'const out = items.{method}((acc, value) => value, items = [req.query.html]); '
+                          'res.send(out); res.send(items[0]);')
+                self.assert_runtime_sends(source, ['safe', 'review-input'])
+                self.scan_sort(source, 'xss')
+                source = ('const items = ["safe"]; '
+                          f'const out = items.{method}((acc, value) => value, (items[0] = req.query.html, "seed")); '
+                          'res.send(out);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+
+    def test_reduce_preserves_sparse_extents_without_dense_visitation(self):
+        for method in ('reduce', 'reduceRight'):
+            with self.subTest(method=method):
+                self.scan_sort('const items = []; items.length = 4294967294; '
+                               f'items[4000000000] = req.query.html; const out = items.{method}((acc, value) => value); '
+                               'res.send(out);', 'xss')
+
+    def test_reduce_honors_selected_own_methods_and_ignores_species(self):
+        for method in ('reduce', 'reduceRight'):
+            for returned, expected, rules in (('"safe"', 'safe', ()),
+                                              ('req.query.html', 'review-input', ('xss',))):
+                with self.subTest(method=method, returned=returned):
+                    source = ('const items = [req.query.html]; '
+                              f'items.{method} = function(callback) {{ return {returned}; }}; '
+                              f'const out = items.{method}((acc, value) => req.query.html); res.send(out);')
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan_sort(source, *rules)
+            self.scan_sort('const items = [req.query.html]; items.constructor = foreign; '
+                           f'const out = items.{method}((acc, value) => value); res.send(out);', 'xss')
+
+    def test_reduce_unknown_callback_and_property_protocols_stay_explicit(self):
+        for method in ('reduce', 'reduceRight'):
+            for callback in ('external', 'async (acc, value) => value',
+                              'function* (acc, value) { yield value; }'):
+                with self.subTest(method=method, callback=callback):
+                    self.scan_sort('res.send(req.query.html); const items = ["safe"]; '
+                                   f'items.{method}({callback}, "seed");', 'xss', partial=f'Array.{method}')
+            for setup in ('Object.defineProperty(items, "0", {get() { return req.query.html; }});',
+                          'Object.setPrototypeOf(items, foreign);', f'Array.prototype.{method} = external;',
+                          f'items.{method} = external;', 'items[method] = external;'):
+                with self.subTest(method=method, setup=setup):
+                    self.scan_sort('res.send(req.query.html); const items = ["safe"]; ' + setup
+                                   + f'items.{method}((acc, value) => value, "seed");',
+                                   'xss', partial=f'{method}|Object[.]')
+            self.scan_sort('res.send(req.query.html); const items = [...unknown]; '
+                           f'items.{method}((acc, value) => "safe", "seed");', 'xss', partial=f'Array.{method}')
+
+    def test_reduce_callback_defaults_this_and_escaped_closures_stay_explicit(self):
+        for method in ('reduce', 'reduceRight'):
+            for callback in ('(acc = req.query.html, value) => res.send(acc)',
+                              '(acc, value = req.query.html) => res.send(value)'):
+                with self.subTest(method=method, callback=callback):
+                    self.scan_sort(f'[undefined].{method}({callback}, undefined);',
+                                   'xss', partial=f'Array.{method}.*default')
+            self.scan_sort('res.send(req.query.html); const items = ["safe"]; '
+                           f'items.{method}(function(acc, value) {{ return this.html; }}, {{html:"safe"}});',
+                           'xss', partial=f'Array.{method}.*this')
+            self.scan_sort(f'const out = [req.query.html].{method}((acc, value) => () => value, "seed"); '
+                           'res.send(out());', partial='escaped closure')
+
+    def test_reduce_does_not_hide_escaped_empty_callback_entrypoints(self):
+        for method in ('reduce', 'reduceRight'):
+            with self.subTest(method=method):
+                self.scan_sort(f'let saved; [].{method}(saved = () => {{ '
+                               'res.send(req.query.html); return "safe"; }, "seed"); external(saved);', 'xss')
+                self.scan_sort(f'[].{method}(() => {{ res.send(req.query.html); return "safe"; }}, "seed"); '
+                               'external("safe");')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_reduce_public_values_exceptions_and_partial_status(self):
+        cases = (
+            ('effects', 'const box={html:"safe"};\n'
+             'const out=[req.query.html].reduce((acc,value)=>{acc.html=value;return acc;},box);\n'
+             'res.send(box.html);\nres.send(out.html);\n'
+             'const right=[req.query.html,"safe"].reduceRight((acc,value)=>value);\nres.send(right);\n',
+             [('javascript.taint.xss', line, 1) for line in (3, 4, 6)], False),
+            ('clean', 'const out=[req.query.html].reduce((acc,value)=>"safe",req.query.html);\n'
+             'res.send(out);\nlet saved="safe";\n'
+             'try {[,,].reduceRight((acc,value)=>value);saved=req.query.html;}catch(error){res.send("caught");}\n'
+             'res.send(saved);\n'
+             '[].reduce((acc,value)=>{res.send(req.query.html);return value;},"seed");\n', [], False),
+            ('partial', 'res.send(req.query.html);\n'
+             'const items=["safe"];items.reduce(external,"seed");\n',
+             [('javascript.taint.xss', 1, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-reduce-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            if name == 'clean':
+                self.assert_runtime_sends(source, ['safe', 'caught', 'safe'])
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Array.reduce')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_reduce_public_cache_edit_and_suppression(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-reduce-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const box={html:"safe"};\n'
+                  '[req.query.html].reduce((acc,value)=>{acc.html=value;return acc;},box);\n'
+                  'res.send(box.html);\n')
+        clean = unsafe.replace('[req.query.html]', '["safe"]')
+        suppressed = unsafe.replace('res.send(box.html);', 'res.send(box.html); // ubs:ignore')
+        for index, (source, expected) in enumerate((
+                (unsafe, [('javascript.taint.xss', 3, 1)]),
+                (unsafe, [('javascript.taint.xss', 3, 1)]),
+                (clean, []), (suppressed, []), (unsafe, [('javascript.taint.xss', 3, 1)]))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                                expected=expected, cache=True)
+                self.assertEqual(report['profile']['cache_hits'], 1 if index in (1, 4) else 0, report)
+
     def test_map_returns_callback_values_in_separate_indexed_slots(self):
         source = ('const items = ["safe", req.query.html];\n'
                   'const out = items.map(value => value);\n'

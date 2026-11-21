@@ -20,6 +20,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
   The retained DSR release recipe also requires repository lint and test gates
   before signing and assembles artifacts from the release tag's exact tree.
 
+- Preserve already established Go SQL-injection, XSS and command-injection
+  findings when a later operation cannot be analyzed. Continue independent
+  sink domains and selected packages, retain concrete initializer and closure
+  effects, and keep the report explicitly partial with exit code 2. Incomplete
+  helper summaries are never reused and partial scans never become cache hits.
+
 - Track Python `urllib.request` destinations through native `urlopen`,
   `urlretrieve`, `Request` aliases/readers and default opener methods. Preserve
   URL provenance through helpers and closures while keeping request handles,

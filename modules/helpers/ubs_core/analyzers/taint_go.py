@@ -1849,8 +1849,21 @@ class _Analysis:
                         key = closure_scope.declare(name, offset + match.start())
                         closure_state[key] = _CLEAN
                         closure_state[_NativeKey(key)] = _UNKNOWN_NATIVE
-                closure_flow = nested.block(_Parser(self.code).block(offset + opening + 1, offset + close),
-                                            closure_state, closure_scope)
+                try:
+                    closure_flow = nested.block(_Parser(self.code).block(offset + opening + 1, offset + close),
+                                                closure_state, closure_scope)
+                except AnalysisLimit as error:
+                    # A failed closure has no reusable return/write summary,
+                    # but sinks reached before its boundary are still facts.
+                    # Copy effects only; do not continue the enclosing call.
+                    for effects in (nested.effects, error.effects):
+                        for (sink_offset, label), fact in effects.items():
+                            self.effect(sink_offset, label, fact)
+                    raise
+                # The body completed even if its resulting capabilities or
+                # captured writes cannot be transported by the outer call.
+                for (sink_offset, label), fact in nested.effects.items():
+                    self.effect(sink_offset, label, fact)
                 if immediate:
                     for cell in nested.native_mutations & enclosing_sources.keys():
                         replacement = (closure_flow.normal.get(_NativeKey(cell))
@@ -1886,8 +1899,6 @@ class _Analysis:
                             self.reader_cell_writes[cell] = (
                                 _join_readers(self.reader_cell_writes[cell], reader)
                                 if cell in self.reader_cell_writes else reader)
-                for (sink_offset, label), fact in nested.effects.items():
-                    self.effect(sink_offset, label, fact)
                 captured_scans = {target: fact for target, fact in nested.scan_writes.items()
                                   if target.cell in state}
                 if captured_scans and not immediate:
@@ -2291,6 +2302,18 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                 dependents[match.group(1)].add('@globals')
     pending, queued = deque(['@globals', *summaries]), {'@globals', *summaries}
     current = '@globals'
+    global_analysis = None
+
+    def incomplete(error, active, variants=()):
+        """Retain effects, never incomplete returns or native capabilities."""
+        effects = {}
+        completed = [summary.effects for summary in (*summaries.values(), *contexts.values(), *variants)]
+        if global_analysis is not None:
+            completed.append(global_analysis.effects)
+        for observed in (*completed, active.effects, error.effects):
+            for key, fact in observed.items():
+                effects[key] = _join(effects.get(key, _CLEAN), fact)
+        return AnalysisLimit(str(error), effects=effects, components=error.components)
 
     def enqueue(key):
         if key not in queued:
@@ -2333,7 +2356,10 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
         if current == '@globals':
             global_analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals,
                                         global_cells, resolve_summary)
-            updated = global_analysis.block(global_nodes, dict(global_state), globals_scope).normal or {}
+            try:
+                updated = global_analysis.block(global_nodes, dict(global_state), globals_scope).normal or {}
+            except AnalysisLimit as error:
+                raise incomplete(error, global_analysis) from error
             updated = _join_states(global_state, updated)
             newly_uncertain = (global_analysis.native_escapes & global_cells) - uncertain_globals
             uncertain_globals.update(newly_uncertain)
@@ -2377,7 +2403,10 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                     state[key] = _CLEAN
                     state[_NativeKey(key)] = _UNKNOWN_NATIVE
             analysis.named_returns = function.results
-            analysis.block(function.body, state, scope)
+            try:
+                analysis.block(function.body, state, scope)
+            except AnalysisLimit as error:
+                raise incomplete(error, analysis, variants) from error
             mutations.update(analysis.native_mutations)
             variants.append(_Summary(analysis.returns, analysis.effects, function.variadic,
                                      analysis.writes, analysis.value_returns, analysis.native_writes,
@@ -2406,10 +2435,21 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
 def _source_hits(source, code, functions, global_nodes, imports):
     """Analyze a package image; offsets are mapped back to files by its owner."""
     hits = {}
+    errors = []
+    components = []
     for rule in dict.fromkeys(rule for _regex, rule, _label in SINKS):
-        summaries, globals_effects = _summaries(source, code, functions, _Parser(code), rule, imports,
-                                               global_nodes=global_nodes)
-        for effects in [globals_effects, *(summary.effects for summary in summaries.values())]:
+        try:
+            summaries, globals_effects = _summaries(source, code, functions, _Parser(code), rule, imports,
+                                                   global_nodes=global_nodes)
+            completed = [globals_effects, *(summary.effects for summary in summaries.values())]
+        except AnalysisLimit as error:
+            # Each sink domain owns its own state and sanitizer semantics.
+            # Continue the others, while retaining only reached concrete
+            # sources from the interrupted domain's effect table.
+            completed = [error.effects]
+            errors.append(str(error))
+            components.extend(error.components)
+        for effects in completed:
             for (offset, label), fact in effects.items():
                 concrete = [trace for trace in fact if trace.parameter is None]
                 if not concrete:
@@ -2419,6 +2459,8 @@ def _source_hits(source, code, functions, global_nodes, imports):
                 hits[(offset, rule)] = path_desc
     for (offset, rule), path_desc in sorted(hits.items()):
         yield rule, offset, path_desc
+    if errors:
+        raise AnalysisLimit('; '.join(dict.fromkeys(errors)), components=components)
 
 
 def _shift_statement(node: _Statement, offset: int) -> _Statement:
@@ -2454,6 +2496,8 @@ def iter_project_hits(files: Iterable[Path], base_dir: Path):
         package = clause.group(1) if clause and clause.group(1) != '_' else identity
         packages[(identity.parent, package)].append((path, source, code))
 
+    errors = []
+    components = []
     for units in packages.values():
         # Package initialization and synthetic offsets must still be stable
         # when the caller presents the same package files in another order.
@@ -2481,13 +2525,22 @@ def iter_project_hits(files: Iterable[Path], base_dir: Path):
             codes.append(code + '\n;\n')
             offset += len(source) + 3
         contexts = _ImportContexts(tuple(starts), tuple(imports))
-        for rule, position, path_desc in _source_hits(''.join(sources), ''.join(codes), functions, global_nodes, contexts):
-            index = bisect_right(starts, position) - 1
-            path, line_starts = locations[index]
-            position -= starts[index]
-            line = bisect_right(line_starts, position)
-            # line_starts[0] == 0 <= position, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
-            yield rule, path, line, position - line_starts[line - 1] + 1, path_desc
+        try:
+            for rule, position, path_desc in _source_hits(''.join(sources), ''.join(codes), functions, global_nodes, contexts):
+                index = bisect_right(starts, position) - 1
+                path, line_starts = locations[index]
+                position -= starts[index]
+                line = bisect_right(line_starts, position)
+                # line_starts[0] == 0 <= position, so line >= 1 — ubs:ignore[py.collections.index-arithmetic]
+                yield rule, path, line, position - line_starts[line - 1] + 1, path_desc
+        except AnalysisLimit as error:
+            # Packages share neither summaries nor globals. Finish the other
+            # selected packages, then report failure so adapters retain the
+            # findings without caching or advertising a complete scan.
+            errors.append(str(error))
+            components.extend(error.components)
+    if errors:
+        raise AnalysisLimit('; '.join(dict.fromkeys(errors)), components=components)
 
 
 def iter_file_hits(path: Path, base_dir: Path):

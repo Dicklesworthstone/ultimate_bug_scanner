@@ -272,3 +272,48 @@ active implementations were checked again before selecting these gaps.
 The broad D6 and release umbrellas remain open. All public scanner matrices are
 serialized against isolated, canonically pinned feature trees; source checks may
 run concurrently. Failed and interrupted receipts remain retained.
+
+## 12. November 21, 2026: preserve real source flows and partial findings
+
+Base: `7711639529bb1ff289aed854f5b96d417cdb17d5`. The comprehensive feedback
+plan, current Beads and active implementations were reviewed before selecting
+these gaps. Existing broad detector and release goals remain open.
+
+### Go retained findings (`1b9j.6.8`)
+
+- [x] Reproduce all eight original source/adapter regressions on the baseline.
+- [x] Preserve reached concrete effects from initializers, helpers, build
+  variants and closures without publishing incomplete callable summaries.
+- [x] Continue independent sink domains and selected packages before reporting
+  an explicit incomplete-analysis error; never resume the failed body.
+- [x] Preserve symbolic-parameter exclusions, bound-query and sanitizer controls.
+- [x] Verify actual module and runner JSON/SARIF retain exact source locations,
+  partial status and exit 2; repeated partial scans have zero cache hits.
+- [x] Finish all 18 actual module/runner calls, including selected-file,
+  suppression and clean-repair controls; original timed/missing-tool attempts
+  remain retained and the complete matrix passes with ast-grep available.
+- [x] Publish the bounded fix with canonical integrity pins.
+- [x] Replay the three unchanged cache tests under their original deadlines:
+  all three pass in 28.954 seconds. Across the original 390-test cohort and
+  these replays, all 371 executed methods pass and 19 opt-in methods skip.
+  The original run's timeout receipts are retained.
+- [ ] Complete repository-wide qualification. The changed-source self-scan
+  reports partial analysis with exit 2; full-suite and release gates remain open.
+
+### Native JavaScript filter (`1b9j.6`)
+
+- [x] Freeze missed callback effects and false-positive controls against Node.
+- [x] Implement native filter through the shared finite array callback engine.
+- [ ] Verify independent cases, ordinary output formats, cache and suppression.
+- [ ] Publish the bounded feature; retain the existing computed-index precision
+  limitation and unresolved repository-wide qualification.
+
+### Native Python stdin enumeration (`stdin-provenance`)
+
+- [x] Reproduce complete-clean misses through enumerate, next and helper flow.
+- [x] Preserve consumed payloads and clean numeric indices through native
+  aliases, pairs, materialization and bounded helpers.
+- [x] Independently review mutation, default-value and producer authority.
+- [ ] Verify mixed valid/invalid iterator alternatives and opaque expansions.
+- [ ] Verify actual JSON/SARIF, clean controls and explicit partial results.
+- [ ] Publish the bounded feature with canonical integrity pins.

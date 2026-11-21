@@ -265,6 +265,296 @@ class PackageFlowTests(PackageTestCase):
         self.assertEqual([json.loads(line)['rule'] for line in output.getvalue().splitlines()], ['go.taint.sql'])
 
 
+class PartialPackageFlowTests(PackageTestCase):
+    """Reached concrete sinks survive an explicit, uncached analysis boundary."""
+
+    def setUp(self):
+        self.started = time.monotonic()
+        artifacts = ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix='go-partial-findings-', dir=artifacts))
+        self.sources = {}
+        print(f'[{self.id()}] RUN', flush=True)
+
+    def partial_findings(self, expected, selected=None, error='reader'):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        findings = []
+        paths = list(self.sources.values()) if selected is None else selected
+        with self.assertRaises(AnalysisLimit) as failure:
+            findings.extend(taint_go.run(RunContext(lang='go', files=paths)))
+        self.assertIn(error, str(failure.exception))
+        actual = [(str(Path(row['path']).relative_to(self.root)), row['line'], row['col'], row['rule'])
+                  for row in findings]
+        sites = []
+        for filename, marker, sink, rule in expected:
+            matching = [(number, line) for number, line in enumerate(self.sources[filename].read_text().splitlines(), 1)
+                        if '// ' + marker in line]
+            self.assertEqual(len(matching), 1, (filename, marker))
+            number, line = matching[0]
+            sites.append((filename, number, line.index(sink) + 1, 'go.taint.' + rule))
+        self.assertEqual(sorted(actual), sorted(sites), findings)
+        (self.root / 'retained-findings.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+        return findings
+
+    def test_reached_sinks_survive_in_every_domain_without_resuming_failed_body(self):
+        self.source('handler.go', '''
+            package app
+            import "bufio"
+            func h() {
+                db.Query(r.FormValue("q")) // sql
+                fmt.Fprint(w, r.FormValue("html")) // html
+                exec.Command("sh", "-c", r.FormValue("cmd")) // command
+                _ = bufio.NewScanner(custom)
+                db.Query(r.FormValue("unreached"))
+            }
+        ''')
+        self.partial_findings([('handler.go', 'sql', 'db.Query', 'sql'),
+                               ('handler.go', 'html', 'fmt.Fprint', 'xss'),
+                               ('handler.go', 'command', 'exec.Command', 'command')])
+
+    def test_completed_helpers_survive_but_symbolic_parameters_are_not_sources(self):
+        self.source('helper.go', '''
+            package app
+            import "bufio"
+            func concrete() { db.Query(r.FormValue("q")) } // source
+            func symbolic(query string) { db.Query(query) }
+            func broken() { _ = bufio.NewScanner(custom) }
+        ''')
+        self.partial_findings([('helper.go', 'source', 'db.Query', 'sql')])
+
+    def test_independent_packages_before_and_after_a_failure_are_scanned(self):
+        self.source('first/main.go', 'package app\nfunc h() { db.Query(r.FormValue("q")) } // first\n')
+        self.source('broken/main.go', '''
+            package app
+            import "bufio"
+            func h() { _ = bufio.NewScanner(custom) }
+        ''')
+        self.source('last/main.go', 'package app\nfunc h() { exec.Command("sh", "-c", r.FormValue("q")) } // last\n')
+        self.partial_findings([('first/main.go', 'first', 'db.Query', 'sql'),
+                               ('last/main.go', 'last', 'exec.Command', 'command')])
+
+    def test_reached_package_initializers_survive_later_initializer_failure(self):
+        self.source('main.go', '''
+            package app
+            import "bufio"
+            var _, queryError = db.Query(r.FormValue("q")) // initializer
+            var scanner = bufio.NewScanner(custom)
+        ''')
+        self.partial_findings([('main.go', 'initializer', 'db.Query', 'sql')])
+
+    def test_native_sanitization_and_bound_queries_keep_their_domains(self):
+        self.source('main.go', '''
+            package app
+            import ("bufio"; "html")
+            func h() {
+                value := r.FormValue("q")
+                db.Query("SELECT $1", value)
+                fmt.Fprint(w, html.EscapeString(value))
+                db.Query(html.EscapeString(value)) // sql
+                _ = bufio.NewScanner(custom)
+            }
+        ''')
+        self.partial_findings([('main.go', 'sql', 'db.Query', 'sql')])
+
+    def test_unfinished_helper_return_is_not_installed_as_a_summary(self):
+        self.source('main.go', '''
+            package app
+            import "bufio"
+            func unfinished() string {
+                db.Query(r.FormValue("q")) // reached
+                if choice { return r.FormValue("result") }
+                _ = bufio.NewScanner(custom)
+                return "fixed"
+            }
+            func later() { db.Query(unfinished()) }
+        ''')
+        self.partial_findings([('main.go', 'reached', 'db.Query', 'sql')])
+
+    def test_nested_closure_effects_survive_its_own_failure(self):
+        self.source('main.go', '''
+            package app
+            import "bufio"
+            func h() {
+                func() {
+                    db.Query(r.FormValue("q")) // nested
+                    _ = bufio.NewScanner(custom)
+                }()
+            }
+        ''')
+        self.partial_findings([('main.go', 'nested', 'db.Query', 'sql')])
+
+    def test_completed_build_variant_effects_survive_an_incomplete_variant(self):
+        self.source('a.go', '''
+            package app
+            func variant() { db.Query(r.FormValue("q")) } // concrete
+        ''')
+        self.source('b.go', '''
+            package app
+            import "bufio"
+            func variant() { _ = bufio.NewScanner(custom) }
+        ''')
+        self.partial_findings([('a.go', 'concrete', 'db.Query', 'sql')])
+
+    def test_completed_closure_sinks_survive_enclosing_native_authority_failure(self):
+        self.source('main.go', '''
+            package app
+            import "os"
+            func constant(key string) string { return "fixed" }
+            func h() {
+                getter := os.Getenv
+                db.Query(getter(func() string {
+                    db.Query(r.FormValue("q")) // nested
+                    getter = constant
+                    return "QUERY"
+                }()))
+            }
+        ''')
+        self.partial_findings([('main.go', 'nested', 'db.Query', 'sql')], error='environment')
+
+    def test_module_adapter_keeps_partial_findings_and_never_caches_them(self):
+        from ubs_core.findings_merge import to_sarif
+
+        self.source('broken/main.go', '''
+            package app
+            import "bufio"
+            func h() {
+                db.Query(r.FormValue("q")) // retained
+                _ = bufio.NewScanner(custom)
+            }
+        ''')
+        self.source('other/main.go', '''
+            package other
+            func h() { db.Query(r.FormValue("q")) } // independent
+        ''')
+        expected = self.partial_findings([('broken/main.go', 'retained', 'db.Query', 'sql'),
+                                          ('other/main.go', 'independent', 'db.Query', 'sql')])
+        listing = self.root / 'files.nul'
+        listing.write_bytes(b'\0'.join(os.fsencode(path) for path in self.sources.values()) + b'\0')
+        sink, report, stats = (self.root / name for name in ('findings.ndjson', 'summary.json', 'cache-stats.json'))
+        environment = dict(UBS_CACHE_DIR=str(self.root / 'cache'), UBS_NO_CACHE='0',
+                           UBS_CACHE_FILE=str(stats), UBS_NO_AUTO_UPDATE='1', UBS_KEEP_TEMP='1')
+        with patch.dict(os.environ, environment):
+            for attempt in range(2):
+                with self.subTest(attempt=attempt), contextlib.redirect_stderr(io.StringIO()):
+                    status = go_scan.main(['--files-from', str(listing), '--sink', str(sink),
+                                           '--project-dir', str(self.root), '--json-out', str(report)])
+                    document = json.loads(report.read_text())
+                    cache = json.loads(stats.read_text())
+                    self.assertEqual((status, document['status'], document['module_error']),
+                                     (2, 'partial', 'ANALYZER_ERROR'), document)
+                    self.assertIn('reader', document['message'])
+                    actual = [row for row in document['findings'] if row['rule'].startswith('go.taint.')]
+                    self.assertEqual([(row['path'], row['line'], row['col'], row['rule']) for row in actual],
+                                     [(row['path'], row['line'], row['col'], row['rule']) for row in expected])
+                    self.assertEqual((cache['hits'], cache['misses']), (0, 2), cache)
+                    sarif = to_sarif(document)
+                    self.assertEqual(sum(len(run['results']) for run in sarif['runs']),
+                                     len(document['findings']))
+                    for run in sarif['runs']:
+                        invocation = run['invocations'][0]
+                        self.assertFalse(invocation['executionSuccessful'])
+                        self.assertEqual(invocation['exitCode'], 2)
+
+    @unittest.skipUnless(os.environ.get('UBS_GO_PARTIAL_E2E') == '1',
+                         'set UBS_GO_PARTIAL_E2E=1 for partial Go module/runner reports')
+    def test_public_partial_formats_suppression_and_repeated_cache_misses(self):
+        from test_keep_temp import prevent_child_deletion
+
+        broken = self.source('broken/main.go', '''
+            package app
+            import "bufio"
+            func h() {
+                db.Query(r.FormValue("q")) // retained
+                _ = bufio.NewScanner(custom)
+            }
+        ''')
+        healthy = self.source('healthy/main.go', '''
+            package other
+            func h() { db.Query(r.FormValue("q")) } // independent
+        ''')
+        listing = self.root / 'files.nul'
+        listing.write_bytes(b'\0'.join(os.fsencode(path) for path in (broken, healthy)) + b'\0')
+        sites = []
+        for path in (broken, healthy):
+            for number, line in enumerate(path.read_text().splitlines(), 1):
+                if 'db.Query' in line:
+                    sites.append((str(path.relative_to(self.root)), number,
+                                  line.index('db.Query') + 1, 'go.taint.sql'))
+        skipped = ','.join(str(category) for category in range(1, 23) if category != 9)
+        environment = dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1',
+                           UBS_ENABLE_AUTO_UPDATE='0', UBS_NO_CACHE='0', UBS_ALLOW_PARTIAL='0',
+                           UBS_PROFILE='1', UBS_CACHE_DIR=str(self.root / 'public-cache'))
+        for suppressed in (False, True):
+            if suppressed:
+                self.source('broken/main.go', '''
+                    package app
+                    import "bufio"
+                    func h() {
+                        db.Query(r.FormValue("q")) // ubs:ignore[go.taint.sql]
+                        _ = bufio.NewScanner(custom)
+                    }
+                ''')
+            expected = sorted(sites[1:] if suppressed else sites)
+            for meta in (False, True):
+                for output, attempt in (('json', 0), ('json', 1), ('sarif', 0)):
+                    with self.subTest(suppressed=suppressed, meta=meta, format=output, attempt=attempt):
+                        command = [str(ROOT / ('ubs' if meta else 'modules/ubs-golang.sh')),
+                                   '--ci', '--no-color', '--format=' + output, '--skip=' + skipped]
+                        if meta:
+                            command.extend(('--only=golang', '--module-dir=' + str(ROOT / 'modules'),
+                                            str(broken), str(healthy)))
+                        else:
+                            command.extend(('--files-from=' + str(listing), str(self.root)))
+                        prefix = self.root / f'public-{suppressed}-{meta}-{output}-{attempt}'
+                        result = subprocess.run(command, cwd=self.root, capture_output=True, text=True,
+                                                timeout=45, preexec_fn=prevent_child_deletion,
+                                                env=environment)
+                        prefix.with_suffix('.stdout.log').write_text(result.stdout)
+                        prefix.with_suffix('.stderr.log').write_text(result.stderr)
+                        self.assertEqual(result.returncode, 2, (command, result.stdout, result.stderr))
+                        document = json.loads(result.stdout)
+                        if output == 'json':
+                            self.assertEqual(document['status'], 'partial', document)
+                            scanner = document['scanners'][0] if meta else document
+                            self.assertEqual(scanner['module_error'], 'ANALYZER_ERROR', scanner)
+                            self.assertIn('reader', scanner['message'])
+                            if meta:
+                                self.assertEqual(len(document['scanners']), 1, document)
+                                self.assertEqual(len(document['failed_modules']), 1, document)
+                                self.assertEqual(document['failed_modules'][0]['module_error'],
+                                                 'ANALYZER_ERROR', document)
+                            counts = document['totals'] if meta else document
+                            self.assertEqual([counts[key] for key in ('files', 'critical', 'warning', 'info')],
+                                             [2, len(expected), 0, 0], document)
+                            profile = scanner['extras']['profile']
+                            self.assertEqual((profile['cache_hits'], profile['cache_misses']), (0, 2), profile)
+                            actual = [('/'.join(Path(row['file' if meta else 'path']).parts[-2:]),
+                                       row['line'], row['col'], row['rule_id' if meta else 'rule'])
+                                      for row in document['findings']]
+                        else:
+                            self.assertEqual(document['version'], '2.1.0', document)
+                            actual = []
+                            self.assertTrue(document['runs'], document)
+                            for run in document['runs']:
+                                failures = [invocation for invocation in run.get('invocations', [])
+                                            if invocation['executionSuccessful'] is False]
+                                self.assertTrue(failures, run)
+                                self.assertTrue(any('reader' in notice.get('message', {}).get('text', '')
+                                                    for invocation in failures
+                                                    for notice in invocation.get('toolExecutionNotifications', [])), run)
+                                for invocation in failures:
+                                    if 'exitCode' in invocation:
+                                        self.assertEqual(invocation['exitCode'], 2, invocation)
+                                for row in run['results']:
+                                    location = row['locations'][0]['physicalLocation']
+                                    region = location['region']
+                                    actual.append(('/'.join(Path(location['artifactLocation']['uri']).parts[-2:]),
+                                                   region['startLine'], region['startColumn'], row['ruleId']))
+                        self.assertEqual(sorted(actual), expected, document)
+                        print('GO_PARTIAL_PUBLIC_PASS', suppressed, meta, output, attempt, flush=True)
+
+
 class PackageCacheTests(PackageTestCase):
     """Use the actual Go orchestrator and on-disk incremental cache."""
 

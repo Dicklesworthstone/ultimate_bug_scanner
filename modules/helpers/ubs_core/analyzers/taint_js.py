@@ -1673,7 +1673,7 @@ class _Flow:
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
                                        'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed',
                                        'toSpliced', 'with', 'entries', 'map', 'flatMap', 'forEach',
-                                       'reduce', 'reduceRight'):
+                                       'reduce', 'reduceRight', 'some', 'every'):
                             slots[method] = _alternatives(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
@@ -2895,6 +2895,89 @@ class _Flow:
         cached[callee] = kind
         return kind
 
+    def predicate_result_truth(self, callee):
+        """Prove a fixed Boolean conversion of normal callback returns.
+
+        Source facts do not retain scalar values. In particular, clean is not
+        false and a tainted value is not necessarily true. Only an independent
+        syntactic proof can remove the stop or continue path; other results
+        retain both paths after executing the ordinary callback summary.
+        """
+        cached = self.engine.predicate_result_truths
+        if callee in cached:
+            return cached[callee]
+        code, text = callee.code, self.engine.text
+        pairs = _pairs(code, callee.body_start, callee.body_end)
+
+        def expression_truth(start, end):
+            while start < end and text[start].isspace():
+                start += 1
+            while start < end and text[end - 1].isspace():
+                end -= 1
+            while start < end and code[start] == '(' and pairs.get(start) == end - 1:
+                if text[start] == '`':
+                    return None
+                start, end = start + 1, end - 1
+                while start < end and text[start].isspace():
+                    start += 1
+                while start < end and text[end - 1].isspace():
+                    end -= 1
+            if start == end:
+                return False  # a bare return supplies undefined
+            raw, literal = code[start:end], text[start:end]
+            if re.fullmatch(r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')''', literal, re.S):
+                # An escaped line continuation contributes no string content.
+                return bool(re.sub(r'\\(?:\r\n|[\r\n\u2028\u2029])', '', literal[1:-1]))
+            if raw == 'true':
+                return True
+            if raw in {'false', 'null'}:
+                return False
+            if re.fullmatch(r'[+-]?[0-9]+|\-?[0-9]+n', raw):
+                return any(char in '123456789' for char in raw)
+            if raw[:1] in {'[', '{'} and pairs.get(start) == end - 1:
+                return True  # ToBoolean never calls an object's coercion hooks.
+            return None
+
+        def returns(statements):
+            truths, live = set(), True
+            for node in statements:
+                if not live:
+                    break
+                self.engine.budget.spend()
+                if node.kind == 'return':
+                    truths.add(expression_truth(node.start, node.end))
+                    live = False
+                elif node.kind == 'throw':
+                    live = False
+                elif node.kind == 'block':
+                    nested, live = returns(node.body)
+                    truths.update(nested)
+                elif node.kind == 'if':
+                    condition = code[node.start:node.end].strip()
+                    left, left_live = returns(node.body) if condition != 'false' else (set(), False)
+                    right, right_live = returns(node.alternate) if condition != 'true' else (set(), False)
+                    truths.update(left | right)
+                    live = left_live or right_live
+                elif node.body or node.alternate or node.kind == 'try':
+                    # Loops and finalizers may replace completion. Their heap
+                    # effects still execute, but this proof does not choose a
+                    # short-circuit outcome for them.
+                    truths.add(None)
+            return truths, live
+
+        try:
+            if callee.concise:
+                truth = expression_truth(callee.body_start, callee.body_end)
+            else:
+                truths, live = returns(self.engine.scope_statements(callee))
+                if live:
+                    truths.add(False)  # falling off the body returns undefined
+                truth = next(iter(truths)) if len(truths) == 1 else None
+        finally:
+            returns = None
+        cached[callee] = truth
+        return truth
+
     def flatmap_values(self, value, state, result_kind):
         """Flatten actual arrays once; ordinary objects remain single values.
 
@@ -2948,10 +3031,13 @@ class _Flow:
         bounded heap summaries as ordinary local calls. Map preserves source
         indices and holes; flatMap flattens once; forEach discards return values.
         Reductions carry the returned accumulator in either traversal direction.
+        Some/every return clean booleans and retain early-stop states separately
+        from subsequent iterations so later writes cannot clean stopped paths.
         """
         actual, uncertain, _missing, _kinds = prepared
         callee = (_function_target(actual[0][0]) or callback) if actual else None
         reducing = method in {'reduce', 'reduceRight'}
+        testing = method in {'some', 'every'}
         reverse = method == 'reduceRight'
         produces_array = method in {'map', 'flatMap'}
         result = (self.scope, location, 'array-' + method)
@@ -2980,6 +3066,7 @@ class _Flow:
             return returned
         this_arg = actual[1][0] if not reducing and len(actual) > 1 else frozenset()
         result_kind = self.flatmap_result_kind(callee) if method == 'flatMap' else None
+        predicate_truth = self.predicate_result_truth(callee) if testing else None
         if (not callee.arrow and not _refs(this_arg)
                 and re.search(r'\bthis\b', callee.code[callee.body_start:callee.body_end])):
             self.incomplete.add(f'Array.{method} callback requires a known this receiver')
@@ -3018,6 +3105,7 @@ class _Flow:
             uninitialized = reducing and not initialized
             accumulator = actual[1][0] if initialized else frozenset()
             seed_state = branch.copy() if uninitialized else None
+            stopped = None
             while 0 <= cursor < limit:
                 source = branch.heap[ref]
                 self.engine.budget.spend(1 + len(source))
@@ -3065,6 +3153,20 @@ class _Flow:
                     if reducing:
                         accumulator = _join(retained, seed)
                 else:
+                    if testing:
+                        stop_when = method == 'some'
+                        if predicate_truth is None or predicate_truth == stop_when:
+                            stopped = _join_states(stopped, branch)
+                        if predicate_truth is not None and predicate_truth == stop_when:
+                            # An optional hole still continues without calling
+                            # the predicate, even when every actual call stops.
+                            branch = bypass
+                            if branch is None:
+                                break
+                        elif bypass is not None:
+                            branch = _join_states(branch, bypass)
+                        cursor = next_cursor
+                        continue
                     values, exact = (self.flatmap_values(mapped, branch, result_kind)
                                      if method == 'flatMap' else ([], True))
                     if bypass is not None:
@@ -3086,6 +3188,8 @@ class _Flow:
                             size = None
                 uninitialized = uninitialized and not definite
                 cursor = next_cursor
+            if testing:
+                branch = _join_states(stopped, branch)
             if uninitialized:
                 # No callback runs on the path where every indexed property
                 # is absent. Native reduce/reduceRight throw a clean TypeError.
@@ -3116,7 +3220,7 @@ class _Flow:
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
         if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin',
                        'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flatMap', 'map', 'forEach',
-                       'reduce', 'reduceRight'}
+                       'reduce', 'reduceRight', 'some', 'every'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
@@ -3134,7 +3238,7 @@ class _Flow:
                 if unknown:
                     fact = _join(fact, selected)
             cursor = selected_end
-            match = re.match(r'\s*\.\s*(flatMap|map|forEach|reduce|reduceRight|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
+            match = re.match(r'\s*\.\s*(flatMap|map|forEach|reduce|reduceRight|some|every|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
             if match is None:
                 break
             opening = cursor + match.end() - 1
@@ -3222,7 +3326,7 @@ class _Flow:
             return self.array_sort(receiver, arguments, prepared, state, callback)
         if kind == 'array' and method in {'toSorted', 'toReversed', 'toSpliced', 'with'}:
             return self.array_copy(receiver, method, arguments, prepared, state, location, callback)
-        if kind == 'array' and method in {'flatMap', 'map', 'forEach', 'reduce', 'reduceRight'}:
+        if kind == 'array' and method in {'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every'}:
             return self.array_iteration(receiver, method, arguments, prepared, state, location, callback)
         if values and (kind == 'reflect' or (kind == 'object' and method in {
                 'defineProperty', 'defineProperties', 'freeze', 'seal', 'preventExtensions', 'setPrototypeOf'})):
@@ -3560,7 +3664,7 @@ class _Flow:
                 return None, receiver
             return candidate, receiver
         if (report and key in {'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed', 'toSpliced',
-                              'with', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight'}
+                              'with', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every'}
                 and _refs(receiver)
                 and all(ref in state.array_lengths for ref in _refs(receiver))
                 and self.native_target(name, state) is None):
@@ -4118,7 +4222,7 @@ class _Flow:
         cursor = start
         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
         if (primary_end is not None and primary_end < end - 1
-                and re.match(r'\s*\.\s*(?:flatMap|map|forEach|reduce|reduceRight|sort|toSorted|toReversed|toSpliced|with)\s*\(',
+                and re.match(r'\s*\.\s*(?:flatMap|map|forEach|reduce|reduceRight|some|every|sort|toSorted|toReversed|toSpliced|with)\s*\(',
                              code[primary_end + 1:end])):
             primary = self.value(start, primary_end + 1, state)
             primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)
@@ -4192,7 +4296,7 @@ class _Flow:
             sink = self.engine.call_sinks.get(match_start)
             callback = (self.callable(*arguments[0], state)
                         if native is not None and native[0] == 'array' and native[2] in {
-                            'sort', 'toSorted', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight'}
+                            'sort', 'toSorted', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every'}
                         and arguments else None)
             if arguments and callback is None:
                 unmodeled = self.callable(*arguments[0], state)
@@ -4894,8 +4998,9 @@ class _Engine:
         self.modeled_callbacks = set()
         self.escaped_callbacks = set()
         self.flatmap_result_kinds = {}
+        self.predicate_result_truths = {}
         self.has_array_callbacks = any(name in self.text for name in (
-            'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'sort', 'toSorted'))
+            'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'sort', 'toSorted'))
         self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
         self.current_task = None
         self.heap_solve_depth = 0
@@ -5312,12 +5417,41 @@ class _Engine:
         # Copy only reachable objects, preserving borrowed identities and cycles.
         pending = [*(ref for ref in incoming.heap if ref[0] == 'builtin'),
                    *frozenset().union(*(_refs(fact) for fact in (*bound.values(), *state.cells.values())))]
+        if self.has_array_callbacks:
+            # Hoisted declarations keep their selected function in bindings
+            # until read as a value, so they may not have a heap reference yet.
+            pending.extend((target, target.start, 'function') for target in state.bindings.values()
+                           if isinstance(target, _Scope))
         while pending:
             ref = pending.pop()
             if ref in state.heap:
                 continue
             self.budget.spend(_heap_work({ref: incoming.heap.get(ref, {})}))
             state.heap[ref] = dict(incoming.heap.get(ref, {}))
+            target = _function_scope(ref) if self.has_array_callbacks else None
+            if target is not None:
+                # A selected callable's lexical cells are reachable inputs,
+                # even when it travels through an alias, object or formal
+                # parameter rather than a direct call to its declared name.
+                # Transport the caller's live cells without executing the
+                # function or reconstructing an escaped closure environment.
+                self.budget.spend(1 + len(self.capture_keys[target]))
+                for key in self.capture_keys[target]:
+                    if (key in state.cells or key not in available
+                            or (key[0] not in ancestors and key[0].parent is not None)):
+                        continue
+                    fact = _cell_value(key, incoming)
+                    state.cells[key] = fact
+                    state.binding_kinds[key] = incoming.binding_kinds.get(key)
+                    name = key[2]
+                    if incoming.owners.get(name) == key:
+                        binding = incoming.bindings.get(name)
+                        if isinstance(binding, _Scope):
+                            pending.append((binding, binding.start, 'function'))
+                        if self.binding(callee, name) == key:
+                            state[name], state.owners[name] = fact, key
+                            state.bindings[name] = binding
+                    pending.extend(_refs(fact) - state.heap.keys())
             for fact in state.heap[ref].values():
                 pending.extend(_refs(fact) - state.heap.keys())
             if ref in incoming.array_lengths:

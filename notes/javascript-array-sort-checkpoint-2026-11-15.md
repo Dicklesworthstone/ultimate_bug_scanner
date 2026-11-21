@@ -1,4 +1,104 @@
-# Native JavaScript array sorting and copying
+# Native JavaScript array operations
+
+## Predicate callbacks — development version 5.5.100
+
+Native `Array.some` and `Array.every` now execute selected synchronous callbacks
+through the existing finite heap/call machinery. Both return clean boolean
+facts while preserving callback sinks, captured scalar/object writes, aliases,
+supported `thisArg`, and exceptions. Traversal snapshots the initial length,
+skips holes and reads live indexed changes. Sparse large extents do not require
+dense iteration. Proven fixed callback returns choose stopping or continuation;
+unknown truth retains both. Stopped heap states are kept separate so a later
+iteration's overwrite cannot erase taint from an earlier stopped path.
+
+Reachable callable identities now transport their available live lexical cells
+across helper calls. This covers anonymous/named function expressions, aliases,
+formal callback arguments, named arrows and hoisted declarations. The traversal
+does not execute unused callbacks or invent an escaped closure environment. It
+retains visited-reference guards, charged work, and borrowed strong/weak object
+identity. Incoming native reductions, maps, iteration and copy operations remain
+covered by the broader maintained regressions.
+
+The initial 16-method predicate oracle was frozen on immutable main's JS helper
+`e0cf4433be1eb3493b14e8a9768e4666addc8ebf9a7a33574eaf6d2c65f2aa77`
+before implementation: 46 assertions failed, while the 71 native observations
+reached before those assertions all passed. Later callback-capture cases were
+frozen before their fixes. The final eight-case capture probe showed eight
+scanner misses with eight matching native outcomes on the earlier candidate;
+the runtime capture traversal fixes all eight without changing those labels.
+
+### Exact final-source evidence
+
+| Population | Observed result |
+| --- | --- |
+| Focused predicate source cohort | 18/18 methods, 98 native Node calls; no skips/errors |
+| Maintained heap source cohort | 347/347 methods, 668 native Node calls; no skips/errors |
+| Public module/runner integration | 17/17 actual calls: 12 JSON/SARIF and selection, five cache/edit/suppression |
+| Original independent frozen corpus | 27/29 scanner outcomes, including all 26 exact cases; 29/29 native observations |
+| Separately frozen source-bearing boundaries | 2/2 scanner and native outcomes |
+
+The original independent corpus is **not aggregate green**. Its unknown-callback
+and changed-prototype boundary expectations remain failed because neither source
+program contains a recognized input source; the unchanged incumbent source-free
+fast path ends before operation analysis. The original oracle and failed receipt
+remain intact. Separate source-bearing versions exercise the actual operation
+guards and pass; they do not replace the failed expectations. General escaped
+closures, custom indexed-property protocols and unresolved callbacks retain their
+existing bounds. No broader accuracy or performance estimate follows from these
+finite cases.
+
+The candidate 5.5.99 integration also passes all 18 predicate source methods and
+17 public calls, the complete maintained HTTP cohort (97 pass, nine unrelated
+public opt-ins skipped), 238 SQL source/helper methods and eight schema-default
+public calls. Canonical integrity, shell syntax and whitespace checks pass. All
+checks use the unchanged DSR executor and retained artifacts. Public subprocess
+deadlines remain 45 seconds. An earlier public attempt's PATH setup failure is
+retained; adding the verified ast-grep directory to PATH fixed runner preflight
+without changing source, assertions or deadlines.
+
+| DSR check | Log SHA256 |
+| --- | --- |
+| Frozen predicate baseline | `da8971115d146168325e2c0ee4c7278b8a6def8ca278ef2f6b520ac90379ae6e` |
+| Eight capture misses before repair | `9db625fe52864f93e9ef1eeb606837ee6f5a1fe02ba6e4939e84a2dd7f3c3080` |
+| Final focused source/native | `cdd8e777879c68493b5247abed48fdbfe6d93beda4cbc05aab443412c1b15c5b` |
+| Final maintained heap source/native | `a3c83acfbfc9f59036039e734712f9be3c5eabd4f76e5e8fe3a20755e66db6f6` |
+| Original independent corpus, 27/29 | `410862f9504deaa5fd50bb96d8bfe223266b027b6dca9b5f74fa3bb0bebfad46` |
+| Source-bearing boundaries, 2/2 | `f3340781dfeed5270226702ebbec1d296f3b53aeb6de2f7c32653d62d8b4b1ac` |
+| Final isolated public, 17 calls | `c97a76df6b2d5c50e72309f6895bd63a47f130928724878190a7c2f6fc0a37d5` |
+| Final integrated JS/HTTP/SQL | `6984eab3a8dd72b60a5eff0669f41e1b28017baf661da231a131fa993af284ae` |
+| Final integrated canonical integrity and syntax | `a1b4f7473c8669f4d22a56358cf71414d7e85e91dd1b7982da35166d518e01ba` |
+| Repository-wide ShellCheck, memory failure | `4c03b67e46852fda3bfc92acc224f84140aeef9be3a3f54c36e27d15d72c1dde` |
+| Full-suite attempt, timeout / existing fixture failure | `9b49e7db96379afe3d57c2414a3687c24b0f666035c841c3e57c485698e09b87` |
+| Publication merged with concurrent Go: integrity and 49 CLI calls | `2bb6511f59bd083c7d2137bf0424ab26befa971da1816028c2298e34a8440afe` |
+
+Publication preserves the concurrent native Go Reader feature in
+`5fe418229546c4fe5396e67dc04249001ad28aaf` and uses development version 5.5.100.
+The qualified JavaScript source/tests are byte-identical; existing SQL, HTTPX,
+Go source, Go tests and work-graph changes remain intact. Canonical generators
+rebuild the combined integrity chain. The merged tree passes both verifiers,
+shell syntax, whitespace and **49 actual CLI calls**: all 17 JavaScript predicate
+checks and all 32 incoming Go buffered-reader JSON/SARIF checks. The broad
+repository attempts below belong to the preceding candidate integration;
+they do not establish whole-repository qualification for the merged publication.
+
+Repository-wide qualification remains incomplete. ShellCheck of all runner,
+module and script files exited 251 with an out-of-memory report under a 1.5 GiB
+address-space cap; the cap prevents another workspace-wide memory kill and is
+not a passing lint result. The unchanged full-suite entrypoint reproduced the
+existing Swift security-fixture pairing failure and then reached the 120-second
+DSR limit during unittest discovery (exit 124). Its interim errors are not
+classified as passing tests. The inherited no-deletion guard retained temporary
+probe files, which were preserved under the artifacts directory. No assertions,
+coverage thresholds or subprocess deadlines were weakened to admit this change.
+
+Final analyzer SHA256:
+`b2ec6d9de53d5e43fc2799c098322d81ab919bca3ea2dd2a6def207da744e330`.
+Final maintained tests SHA256:
+`21e9f00e53e2dc45e5d2db4b9dd84248b342e46c9a43b332f8d7fa15be73bb2b`.
+Evidence remains in `test-suite/artifacts/javascript-predicates-session/` and
+`test-suite/artifacts/predicates-publication-20261120/` in the retained checkouts.
+The broader dataflow/quality umbrellas remain open; this does not claim release
+or complete repository qualification.
 
 ## Copying methods — November 21, 2026
 

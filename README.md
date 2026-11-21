@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.99-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.100-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -2045,6 +2045,33 @@ The rejection must dominate the write, and rebinding or shadowing revokes the
 proof. Arbitrary sanitizers and general interprocedural mutation effects remain
 outside this local model. Existing rule-specific statement suppressions apply
 at the sink; suppressing a source-line diagnostic does not clear its taint.
+
+### JavaScript array predicate callbacks
+
+Native `Array.some` and `Array.every` callbacks participate in taint and heap
+analysis. Their boolean result stays clean, while writes and sinks inside an
+executed callback retain the element's source:
+
+```javascript
+const result = { html: "safe" };
+[req.query.html].some(value => {
+  result.html = value;
+  return true;
+});
+res.send(result.html); // The callback's write reaches this output.
+```
+
+`some` stops on a truthy return and `every` stops on a falsy return. Proven literal
+returns select the appropriate path; unknown truth values retain both stopped
+and continuing states so a later overwrite cannot erase an earlier stopped
+path's taint. The traversal skips holes, reads live element writes and keeps
+the initial length bound. Exceptions retain effects that occurred before the
+throw. Selected callback identities carry their live captured cells through
+helper calls, aliases and callback arguments without executing unused callbacks.
+
+These transfers require a native array and a resolved callback. Own methods keep
+their selected behavior; activated scans retain explicit incomplete boundaries
+for unproved callbacks, indexed-property protocols and modified native methods.
 
 ### Python HTTPX request destinations
 

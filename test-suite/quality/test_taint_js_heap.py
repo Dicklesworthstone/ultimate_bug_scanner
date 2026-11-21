@@ -2167,6 +2167,305 @@ class HeapTaintTests(unittest.TestCase):
                 self.scan('const items = [req.query.html]; ' + override
                           + 'items.fill("safe"); res.send(items[0]);', 'xss')
 
+    def test_predicates_preserve_captured_scalar_and_heap_writes(self):
+        for method, result in (('some', 'false'), ('every', 'true')):
+            with self.subTest(method=method):
+                source = ('let saved = "safe"; const box = {html:"safe"}; '
+                          f'[req.query.html].{method}(value => {{ saved = value; box.html = value; '
+                          f'return {result}; }}); res.send(saved); res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input', 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+
+    def test_predicates_return_clean_booleans(self):
+        for method in ('some', 'every'):
+            with self.subTest(method=method):
+                source = f'res.send([req.query.html].{method}(value => value));'
+                self.assert_runtime_sends(source, [True])
+                self.scan_sort(source)
+
+    def test_predicates_continue_in_order_and_replace_prior_writes(self):
+        for method, result in (('some', 'false'), ('every', 'true')):
+            for values, expected, rules in (
+                    ('[req.query.html,"safe"]', 'safe', ()),
+                    ('["safe",req.query.html]', 'review-input', ('xss',))):
+                with self.subTest(method=method, values=values):
+                    source = ('let saved = "safe"; '
+                              f'{values}.{method}(value => {{ saved = value; return {result}; }}); '
+                              'res.send(saved);')
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan_sort(source, *rules)
+
+    def test_predicates_stop_before_later_writes_or_cleanup(self):
+        for method, result in (('some', 'true'), ('every', 'false')):
+            for values, expected, rules in (
+                    ('["safe",req.query.html]', 'safe', ()),
+                    ('[req.query.html,"safe"]', 'review-input', ('xss',))):
+                with self.subTest(method=method, values=values):
+                    source = ('const box = {html:"safe"}; '
+                              f'{values}.{method}(value => {{ box.html = value; return {result}; }}); '
+                              'res.send(box.html);')
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan_sort(source, *rules)
+
+    def test_predicates_apply_boolean_conversion_to_literal_returns(self):
+        for returned, truth in (('true', True), ('false', False), ('null', False),
+                                ('0', False), ('-0', False), ('0n', False), ('1', True),
+                                ('""', False), ('"yes"', True), ('[]', True), ('{}', True)):
+            for method in ('some', 'every'):
+                with self.subTest(method=method, returned=returned):
+                    stopping = truth == (method == 'some')
+                    source = ('let saved = "safe"; '
+                              f'["safe",req.query.html].{method}(value => {{ '
+                              f'saved = value; return {returned}; }}); res.send(saved);')
+                    self.assert_runtime_sends(source, ['safe' if stopping else 'review-input'])
+                    self.scan_sort(source, *(() if stopping else ('xss',)))
+
+    def test_predicates_implicit_return_is_false_and_unreachable_returns_do_not_count(self):
+        for method, expected, rules in (('some', 'review-input', ('xss',)), ('every', 'safe', ())):
+            with self.subTest(method=method):
+                source = ('let saved = "safe"; '
+                          f'["safe",req.query.html].{method}(value => {{ saved = value; }}); res.send(saved);')
+                self.assert_runtime_sends(source, [expected])
+                self.scan_sort(source, *rules)
+        for method, result in (('some', 'true'), ('every', 'false')):
+            with self.subTest(method=method, unreachable=True):
+                source = ('let saved = "safe"; '
+                          f'["safe",req.query.html].{method}(value => {{ saved = value; '
+                          f'if (true) {{ return {result}; }} return !{result}; }}); res.send(saved);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+
+    def test_predicates_skip_holes_empty_arrays_and_unexecuted_callback_sinks(self):
+        for method in ('some', 'every'):
+            for values in ('[]', '[,,,]'):
+                with self.subTest(method=method, values=values):
+                    source = (f'{values}.{method}(value => {{ res.send(req.query.html); return true; }}); '
+                              'res.send("safe");')
+                    self.assert_runtime_sends(source, ['safe'])
+                    self.scan_sort(source)
+            source = (f'[,req.query.html].{method}(value => {{ res.send(value); return true; }});')
+            self.assert_runtime_sends(source, ['review-input'])
+            self.scan_sort(source, 'xss')
+
+    def test_predicates_read_live_slots_and_snapshot_length(self):
+        for method, result in (('some', 'false'), ('every', 'true')):
+            for values, mutation, expected, rules in (
+                    ('["safe",req.query.html]', 'items[1] = "safe";', 'safe', ()),
+                    ('["safe","safe"]', 'items[1] = req.query.html;', 'review-input', ('xss',)),
+                    ('["safe",,]', 'items[1] = req.query.html;', 'review-input', ('xss',)),
+                    ('["safe",req.query.html]', 'items.length = 1;', 'safe', ()),
+                    ('["safe",req.query.html]', 'delete items[1];', 'safe', ()),
+                    ('["safe"]', 'items.push(req.query.html);', 'safe', ())):
+                with self.subTest(method=method, values=values, mutation=mutation):
+                    source = (f'const items = {values}; let saved = "safe"; '
+                              f'items.{method}(value => {{ saved = value; {mutation} return {result}; }}); '
+                              'res.send(saved);')
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan_sort(source, *rules)
+
+    def test_predicates_bind_element_index_source_this_and_rest_parameters(self):
+        for method, result in (('some', 'false'), ('every', 'true')):
+            with self.subTest(method=method):
+                source = ('const box = {}; const items = [{html:req.query.html}]; '
+                          f'items.{method}(function({{html}}, index, source) {{ this.html = html; '
+                          f'res.send(index); res.send(source[0].html); return {result}; }}, box); '
+                          'res.send(box.html);')
+                self.assert_runtime_sends(source, [0, 'review-input', 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+                source = (f'[req.query.html].{method}((...args) => {{ res.send(args[0]); '
+                          f'res.send(args[1]); res.send(args[2][0]); return {result}; }});')
+                self.assert_runtime_sends(source, ['review-input', 0, 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+
+    def test_predicates_preserve_callback_throws_and_prior_effects(self):
+        for method in ('some', 'every'):
+            with self.subTest(method=method):
+                source = ('const box = {html:"safe"}; try { '
+                          f'[req.query.html].{method}(value => {{ box.html = value; throw value; }}); '
+                          'res.send(req.query.html); } catch (error) { res.send(error); } res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input', 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+
+    def test_predicates_keep_unknown_stop_and_continue_states_separate(self):
+        for method, result in (('some', 'true'), ('every', 'false')):
+            with self.subTest(method=method):
+                source = (f'const stop = {result}; let saved = "safe"; '
+                          f'[req.query.html,"safe"].{method}(value => {{ saved = value; return stop; }}); '
+                          'res.send(saved);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+                source = (f'const stop = {result}; let saved = req.query.html; '
+                          f'["safe","safe"].{method}(value => {{ saved = value; return stop; }}); '
+                          'res.send(saved);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+
+    def test_predicates_optional_slots_preserve_skipped_callback_paths(self):
+        for method, result in (('some', 'true'), ('every', 'false')):
+            with self.subTest(method=method):
+                source = ('const items = [,req.query.html]; if (flag) { items[0] = "safe"; } '
+                          'let saved = "safe"; '
+                          f'items.{method}(value => {{ saved = value; return {result}; }}); res.send(saved);')
+                self.assert_runtime_sends('const flag = false; ' + source, ['review-input'])
+                self.assert_runtime_sends('const flag = true; ' + source, ['safe'])
+                self.scan_sort(source, 'xss')
+                source = ('const items = [,]; if (flag) { items[0] = "safe"; } '
+                          'let saved = req.query.html; '
+                          f'items.{method}(value => {{ saved = "safe"; return {result}; }}); res.send(saved);')
+                self.assert_runtime_sends('const flag = false; ' + source, ['review-input'])
+                self.assert_runtime_sends('const flag = true; ' + source, ['safe'])
+                self.scan_sort(source, 'xss')
+
+    def test_predicates_resolve_named_callbacks_helpers_and_nested_visits(self):
+        for method, result in (('some', 'false'), ('every', 'true')):
+            with self.subTest(method=method):
+                source = ('const box = {html:"safe"}; '
+                          f'function visit(value) {{ box.html = value; return {result}; }} '
+                          f'function run(items) {{ return items.{method}(visit); }} '
+                          'run([req.query.html]); res.send(box.html); run(["safe"]); res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input', 'safe'])
+                self.scan_sort(source, 'xss')
+                source = ('let saved = "safe"; '
+                          f'[[req.query.html]].{method}(values => {{ values.forEach(value => {{ saved = value; }}); '
+                          f'return {result}; }}); res.send(saved);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+
+    def test_predicates_keep_native_identity_own_methods_and_argument_order(self):
+        for method in ('some', 'every'):
+            with self.subTest(method=method):
+                source = ('const box = {html:"safe"}; const items = [req.query.html]; '
+                          f'items.{method} = function(callback) {{ return "safe"; }}; '
+                          f'res.send(items.{method}(value => {{ box.html = value; }})); res.send(box.html);')
+                self.assert_runtime_sends(source, ['safe', 'safe'])
+                self.scan_sort(source)
+                source = ('const items = ["safe"]; '
+                          f'items.{method} = function() {{ return req.query.html; }}; '
+                          f'res.send(items.{method}(() => true));')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+                source = ('const box = {html:req.query.html}; const items = ["safe"]; '
+                          f'function replace() {{ items.{method} = function() {{ box.html = req.query.html; }}; '
+                          'return {}; } '
+                          f'items.{method}(value => {{ box.html = value; return true; }}, replace()); res.send(box.html);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+                self.scan_sort('const items = [req.query.html]; items.constructor = foreign; '
+                               f'items.{method}(value => {{ res.send(value); return true; }});', 'xss')
+
+    def test_predicates_transport_sibling_arrow_captures_without_executing_unused_callbacks(self):
+        for method, result in (('some', 'false'), ('every', 'true')):
+            for values, expected, rules in (('[req.query.html]', 'review-input', ('xss',)), ('[]', 'safe', ())):
+                with self.subTest(method=method, values=values):
+                    source = ('const box = {html:"safe"}; '
+                              f'const visit = value => {{ box.html = value; return {result}; }}; '
+                              f'function run(items) {{ return items.{method}(visit); }} '
+                              f'run({values}); res.send(box.html);')
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan_sort(source, *rules)
+            source = ('const box = {html:"safe"}; '
+                      'function unused(value) { box.html = req.query.html; } '
+                      f'function run(items) {{ const local = unused; return items.{method}(value => true); }} '
+                      'run(["safe"]); res.send(box.html);')
+            self.assert_runtime_sends(source, ['safe'])
+            self.scan_sort(source)
+
+    def test_predicates_transport_function_expression_alias_and_parameter_captures(self):
+        for method, result in (('some', 'false'), ('every', 'true')):
+            body = f'{{ box.html = value; return {result}; }}'
+            for label, declaration, target, parameter in (
+                    ('expression', f'const visit = function(value) {body};', 'visit', ''),
+                    ('named-expression', f'const visit = function write(value) {body};', 'visit', ''),
+                    ('alias', f'const visit = value => {body}; const alias = visit;', 'alias', ''),
+                    ('parameter', f'const visit = value => {body};', 'predicate', ', predicate')):
+                with self.subTest(method=method, callback=label):
+                    argument = ', visit' if parameter else ''
+                    source = ('const box = {html:"safe"}; ' + declaration
+                              + f'function run(items{parameter}) {{ return items.{method}({target}); }} '
+                              + f'run([req.query.html]{argument}); res.send(box.html); '
+                              + f'run(["safe"]{argument}); res.send(box.html);')
+                    self.assert_runtime_sends(source, ['review-input', 'safe'])
+                    self.scan_sort(source, 'xss')
+
+    def test_predicates_keep_unknown_callbacks_and_property_protocols_explicit(self):
+        for method in ('some', 'every'):
+            for callback in ('external', 'async value => value', 'function* (value) { yield value; }'):
+                with self.subTest(method=method, callback=callback):
+                    self.scan_sort('res.send(req.query.html); '
+                                   f'["safe"].{method}({callback});', 'xss',
+                                   partial=f'Array.{method}.*synchronous callback')
+            for change in ('items[unknown] = external;', f'items.{method} = external;',
+                           f'Array.prototype.{method} = external;', 'Object.setPrototypeOf(items, foreign);'):
+                with self.subTest(method=method, change=change):
+                    self.scan_sort('res.send(req.query.html); const items = ["safe"]; ' + change
+                                   + f'items.{method}(value => true);', 'xss', partial=f'Array.{method}|Own method')
+            self.scan_sort('res.send(req.query.html); const items = [...unknown]; '
+                           f'items.{method}(value => true);', 'xss', partial=f'Array.{method}.*finite')
+
+    def test_predicates_preserve_escaped_callbacks_and_sparse_maximum_extent(self):
+        for method in ('some', 'every'):
+            with self.subTest(method=method):
+                self.scan_sort(f'let saved; [].{method}(saved = () => {{ res.send(req.query.html); }}); saved();', 'xss')
+                self.scan_sort('const items = []; items.length = 4294967294; items[4294967293] = req.query.html; '
+                               f'items.{method}(value => {{ res.send(value); return true; }});', 'xss')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_predicates_public_values_exceptions_and_short_circuit_status(self):
+        cases = (
+            ('effects', 'const box={html:"safe"};\n'
+             'function write(value){box.html=value;return true;}\n'
+             'function run(items){return items.every(write);}\nrun([req.query.html]);\n'
+             'res.send(box.html);\ntry{\n[req.query.html].some(value=>{throw value;});\n'
+             '}catch(error){\nres.send(error);\n}\n',
+             [('javascript.taint.xss', line, 1) for line in (5, 9)], False),
+            ('clean', 'let saved="safe";\n'
+             '["safe",req.query.html].some(value=>{saved=value;return true;});\nres.send(saved);\n'
+             '["safe",req.query.html].every(value=>{saved=value;return false;});\nres.send(saved);\n'
+             'res.send([req.query.html].some(value=>value));\n'
+             'res.send([req.query.html].every(value=>value));\n'
+             '[].every(()=>{res.send(req.query.html);return true;});\n', [], False),
+            ('partial', 'res.send(req.query.html);\nconst items=["safe"];\nitems.some(external);\n',
+             [('javascript.taint.xss', 1, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-predicates-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            if name != 'partial':
+                self.assert_runtime_sends(source, ['review-input', 'review-input'] if name == 'effects'
+                                          else ['safe', 'safe', True, True])
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Array.some')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_predicates_public_cache_edit_and_suppression(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-predicates-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('let saved="safe";\n'
+                  '[req.query.html].some(value=>{saved=value;return true;});\nres.send(saved);\n')
+        clean = unsafe.replace('[req.query.html]', '["safe"]')
+        suppressed = unsafe.replace('res.send(saved);', 'res.send(saved); // ubs:ignore')
+        for index, (source, expected) in enumerate((
+                (unsafe, [('javascript.taint.xss', 3, 1)]),
+                (unsafe, [('javascript.taint.xss', 3, 1)]),
+                (clean, []), (suppressed, []), (unsafe, [('javascript.taint.xss', 3, 1)]))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                                expected=expected, cache=True)
+                self.assertEqual(report['profile']['cache_hits'], 1 if index in (1, 4) else 0, report)
+
     def test_reduce_executes_captured_writes_and_uses_returned_accumulator(self):
         for method in ('reduce', 'reduceRight'):
             with self.subTest(method=method):

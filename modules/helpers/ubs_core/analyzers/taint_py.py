@@ -195,6 +195,8 @@ _HTTP_CLIENT_CONSTRUCTORS = {
 _AIOHTTP_REQUEST_APIS = frozenset({'aiohttp.request', 'aiohttp.client.request'})
 _AIOHTTP_API_NAMES = frozenset({'aiohttp', 'aiohttp.client', 'aiohttp.ClientSession',
                               'aiohttp.client.ClientSession', *_AIOHTTP_REQUEST_APIS})
+_HTTPX_API_NAMES = frozenset({'httpx', 'httpx.Client', 'httpx.AsyncClient',
+                            'httpx.Request', 'httpx.URL'})
 _HTTP_CLIENT_METHODS = {
     kind: {**{method: 0 for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options')},
            'request': 1, **({'stream': 1} if kind.startswith('httpx') else {})}
@@ -215,6 +217,7 @@ _HTTP_CLIENT_MEMBERS = {
     'urllib.request.OpenerDirector': frozenset({'__init__', 'open', 'add_handler'}),
     'aiohttp': frozenset({'ClientSession', 'request', 'client'}),
     'aiohttp.client': frozenset({'ClientSession', 'request'}),
+    'httpx': frozenset({'Client', 'AsyncClient', 'Request', 'URL'}),
 }
 _URLLIB_APIS = frozenset(f'urllib.request.{name}' for name in
                        ('Request', 'urlopen', 'urlretrieve', 'build_opener', 'install_opener'))
@@ -417,6 +420,11 @@ class _HTTPPending:
 
 
 @dataclass(frozen=True)
+class _HTTPPrepared:
+    """An HTTPX Request's destination is fixed at native construction."""
+
+
+@dataclass(frozen=True)
 class _UrllibRequest:
     """A native Request carries its URL separately from inert handle data."""
 
@@ -426,7 +434,7 @@ class _UrllibOpener:
     """Only build_opener() with the native default handlers has authority."""
 
 
-def _http_contract(value, contract=(_HTTPClient, _HTTPPending, _UrllibRequest, _UrllibOpener)):
+def _http_contract(value, contract=(_HTTPClient, _HTTPPending, _HTTPPrepared, _UrllibRequest, _UrllibOpener)):
     return isinstance(value, _BoundCallable) and isinstance(value.receiver_binding, contract)
 
 
@@ -1133,7 +1141,7 @@ _QUALIFIER_WIDTH = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS
 _KNOWN_QUALIFIER_PREFIXES = frozenset(
     '.'.join(qualified.split('.')[:size])
     for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_HTTP_CLIENT_CONSTRUCTORS,
-                      *_AIOHTTP_REQUEST_APIS, *_URLLIB_APIS, 'httpx.URL',
+                      *_AIOHTTP_REQUEST_APIS, *_URLLIB_APIS, *_HTTPX_API_NAMES,
                       *_ALL_FRAMEWORK_NAMES, *_REQUEST_TYPES)
     for size in range(1, len(qualified.split('.')) + 1))
 
@@ -1958,6 +1966,9 @@ class FunctionSummary:
     # A symbolic readinto buffer needs a concrete writable-storage context.
     # Defer this obligation instead of quarantining every helper context.
     buffer_parameters: frozenset[str] = frozenset()
+    # A generic prepared-request helper must be revisited with native input
+    # identities. Keep that obligation instead of inventing a clean Request.
+    http_parameters: frozenset[str] = frozenset()
     # Final contents of written incoming cells and newly escaping cells.
     # Unlike object mutations, these may replace a value or delete its name.
     cells: tuple = ()
@@ -2084,6 +2095,7 @@ class _Flow:
         self.capture_globals = set()
         self.value_parameters = set()
         self.buffer_parameters = set()
+        self.http_parameters = set()
         self.observed_global_writes = None
         self.deferred_generator_depth = 0
         self.materialized_generator_depth = 0
@@ -2416,8 +2428,8 @@ class _Flow:
                 if not _http_contract(value):
                     raise AnalysisLimit('ambiguous HTTP context manager; analysis is incomplete')
                 contract = value.receiver_binding
-                if isinstance(contract, (_UrllibRequest, _UrllibOpener)):
-                    raise AnalysisLimit('urllib handle has no context manager protocol; analysis is incomplete')
+                if isinstance(contract, (_UrllibRequest, _UrllibOpener, _HTTPPrepared)):
+                    raise AnalysisLimit('HTTP request handle has no context manager protocol; analysis is incomplete')
                 asynchronous = (contract.asynchronous if isinstance(contract, _HTTPPending)
                                 else contract.kind in {'httpx.async', 'aiohttp'})
                 if asynchronous != isinstance(node, ast.AsyncWith):
@@ -2477,6 +2489,8 @@ class _Flow:
                 raise AnalysisLimit('urllib namespace or API escape is unresolved; analysis is incomplete')
             if name in _AIOHTTP_API_NAMES:
                 raise AnalysisLimit('aiohttp namespace or API escape is unresolved; analysis is incomplete')
+            if name in _HTTPX_API_NAMES:
+                raise AnalysisLimit('HTTPX namespace or API escape is unresolved; analysis is incomplete')
             if (isinstance(value, _CsvReader) or isinstance(value, _BoundCallable)
                     and isinstance(value.receiver_binding, _CsvReader)):
                 raise AnalysisLimit('CSV reader storage or escape is unresolved; analysis is incomplete')
@@ -4448,13 +4462,24 @@ class _Flow:
                     self.expr(target.slice, state)
             namespace = self.expression_bindings.get(target.value)
             if any(_http_contract(choice) for choice in _binding_choices(namespace)):
-                raise AnalysisLimit('HTTP client mutation is unmodeled; analysis is incomplete')
+                # A native base setter does not rewrite already-built Requests.
+                # Keep its client invalidated for subsequent client operations,
+                # but do not discard independent requests sent by another client.
+                native_base = (isinstance(target, ast.Attribute) and target.attr == 'base_url'
+                               and not deleting and value is not None
+                               and all(_http_contract(choice, _HTTPClient)
+                                       and choice.receiver_binding.kind.startswith('httpx')
+                                       for choice in _binding_choices(namespace))
+                               and not target_references & state.mutated
+                               and self.httpx_native_input(value, state, text=True))
+                if not native_base:
+                    raise AnalysisLimit('HTTP client mutation is unmodeled; analysis is incomplete')
             if isinstance(target, ast.Attribute):
                 for choice in _binding_choices(namespace):
                     name = (choice if isinstance(choice, str) else choice.name
                             if isinstance(choice, _BoundCallable) and choice.namespace_proven else None)
                     if (target.attr in _HTTP_CLIENT_MEMBERS.get(name, ())
-                            or name in {'urllib.request.Request', 'urllib.request.OpenerDirector'}):
+                            or name in {'urllib.request.Request', 'urllib.request.OpenerDirector', 'httpx.Request'}):
                         raise AnalysisLimit('HTTP client API replacement is unmodeled; analysis is incomplete')
             if isinstance(target, ast.Attribute) and any(
                     target.attr in members for members in _SOURCE_MEMBERS.values()):
@@ -6462,7 +6487,36 @@ class _Flow:
                     isinstance(expression, ast.Constant) and expression.value is None
                     or isinstance(expression, ast.Dict) and not expression.keys):
                 raise AnalysisLimit('HTTP client custom transport or hooks are unresolved; analysis is incomplete')
-        self.http_auth(inputs.keyword_nodes.get('auth'))
+        if kind.startswith('httpx'):
+            self.httpx_auth(inputs.keyword_nodes.get('auth'), state)
+            base_expression = inputs.keyword_nodes.get('base_url')
+            if base_expression is not None and not self.httpx_native_input(base_expression, state, text=True):
+                raise AnalysisLimit('HTTPX client base URL protocol is unresolved; analysis is incomplete')
+            # BasicAuth credential encoding also runs during construction;
+            # it can mutate a standalone Request that already exists.
+            for option in ('headers', 'params', 'cookies'):
+                expression = inputs.keyword_nodes.get(option)
+                if expression is not None and not self.httpx_native_input(expression, state, containers=True):
+                    raise AnalysisLimit('HTTPX client metadata or credential protocol is unresolved; analysis is incomplete')
+            proved = {'auth', 'base_url', 'headers', 'params', 'cookies',
+                      'event_hooks', 'transport', 'mounts'}
+            scalar_options = {'verify', 'trust_env', 'http1', 'http2', 'follow_redirects',
+                              'max_redirects', 'default_encoding'}
+            for option, expression in inputs.keyword_nodes.items():
+                if option in proved:
+                    continue
+                if option == 'proxy' and isinstance(expression, ast.Constant) and expression.value is None:
+                    continue
+                # Client options may execute protocols now or when sending:
+                # timeout field reads, truth tests and redirect comparisons
+                # can all rewrite a separately constructed Request. Require
+                # inert native values for every supported supplied option.
+                # Custom limits, proxies and future options remain explicit.
+                if (option not in scalar_options | {'timeout', 'cert'}
+                        or not self.httpx_native_input(expression, state, containers=option in {'timeout', 'cert'})):
+                    raise AnalysisLimit('HTTPX client option protocol is unresolved; analysis is incomplete')
+        else:
+            self.http_auth(inputs.keyword_nodes.get('auth'))
         if aiohttp:
             self.aiohttp_options(inputs, state)
             base, _expression = self.http_destination(node, inputs, 0, 'base_url')
@@ -6542,6 +6596,166 @@ class _Flow:
             return
         raise AnalysisLimit('HTTP client custom authentication is unresolved; analysis is incomplete')
 
+    def httpx_auth(self, expression, state):
+        """HTTPX BasicAuth needs a native tuple with inert credential values."""
+        if expression is None or isinstance(expression, ast.Constant) and expression.value is None:
+            return
+        self.http_auth(expression)
+        references = self.expression_references.get(expression, NO_REFERENCES)
+        if not (isinstance(expression, ast.Tuple)
+                or references and all(isinstance(reference, ast.Tuple) for reference in references)):
+            # HTTPX rejects list credentials before sending. Tuple subclasses
+            # can also run custom indexing; a two-element shape is not enough.
+            raise AnalysisLimit('HTTPX authentication tuple identity is unresolved; analysis is incomplete')
+        # BasicAuth encodes strings during construction. A string subclass can
+        # run user code there and replace an already-built request's URL.
+        if not self.httpx_native_input(expression, state, containers=True):
+            raise AnalysisLimit('HTTPX credential protocol is unresolved; analysis is incomplete')
+
+    def httpx_native_input(self, expression, state, *, text=False, containers=False):
+        """Native request construction may invoke protocols on option data.
+
+        Admit exact primitive values and bounded native containers. Symbolic
+        formals request a concrete summary context and remain an explicit
+        obligation until that context has proved their actual identities.
+        """
+        binding = self.expression_bindings.get(expression)
+        references = self.expression_references.get(expression, NO_REFERENCES)
+        self.require_value(binding)
+        # Fresh syntax can prove an inert nested container even when storing
+        # it in another literal revoked its general alias-read contract. A
+        # named or captured container still needs the mutation guard below;
+        # each literal's elements are recursively proved in their own right.
+        if containers and isinstance(expression, (ast.List, ast.Tuple)):
+            return all(self.httpx_native_input(item, state, containers=True) for item in expression.elts)
+        if containers and isinstance(expression, ast.Dict):
+            return all(isinstance(key, ast.Constant)
+                       and type(key.value) in {str, bytes, int, float, bool, type(None)}
+                       and self.httpx_native_input(value, state, containers=True)
+                       for key, value in zip(expression.keys, expression.values))
+        if references & state.mutated:
+            return False
+        if text and isinstance(expression, ast.Call) and self.urllib_url_coercion(expression, state):
+            return True
+
+        def native(value, refs):
+            choices = _binding_choices(value)
+            self.engine.budget.spend(1 + len(choices))
+            if not choices or refs & state.mutated:
+                return False
+            for choice in choices:
+                if isinstance(choice, _SymbolicValue):
+                    self.http_parameters.add(choice.parameter)
+                elif isinstance(choice, (_LiteralString, _GeneratorString)) and choice.format_safe:
+                    continue
+                elif isinstance(choice, ast.Constant) and (
+                        type(choice.value) is str if text
+                        else self.formatted_string_scalar(choice.value)):
+                    continue
+                elif containers and isinstance(choice, _LiteralMapping):
+                    if (choice.keys is None or not all(type(key) in {str, bytes, int, float, bool, type(None)}
+                                                       for key in choice.keys)
+                            or choice.value_binding is not None and not native(choice.value_binding, NO_REFERENCES)):
+                        return False
+                elif containers and isinstance(choice, _ArgumentVector):
+                    if not all(native(operand, choice.references_at(index))
+                               for index, (operand, _fact) in enumerate(choice.operands)):
+                        return False
+                else:
+                    return False
+            return True
+
+        return native(binding, references)
+
+    def httpx_prepared(self, node, state, target, inputs):
+        """Build a Request, resolving a client's base now without sending."""
+        built = _http_contract(target, _HTTPClient)
+        allowed = {'method', 'url', 'content', 'data', 'json', 'params', 'headers',
+                   'cookies', 'files', 'extensions', 'timeout' if built else 'stream'}
+        if (None in inputs.keyword_nodes or not set(inputs.keyword_nodes) <= allowed
+                or len(node.args) > 2 or any(isinstance(argument, ast.Starred) for argument in node.args)
+                or any(len(node.args) > index and keyword in inputs.keyword_nodes
+                       for index, keyword in enumerate(('method', 'url')))):
+            raise AnalysisLimit('HTTPX request construction argument binding is unresolved; analysis is incomplete')
+        _method, method_node = self.http_destination(node, inputs, 0, 'method')
+        destination, url_node = self.http_destination(node, inputs, 1)
+        if not all(self.httpx_native_input(expression, state, text=True)
+                   for expression in (method_node, url_node)):
+            raise AnalysisLimit('HTTPX request method or URL protocol is unresolved; analysis is incomplete')
+        for option, expression in inputs.keyword_nodes.items():
+            if option in {'method', 'url'}:
+                continue
+            if option in {'files', 'extensions', 'stream'}:
+                if not (isinstance(expression, ast.Constant) and expression.value is None
+                        or option != 'stream' and isinstance(expression, ast.Dict) and not expression.keys):
+                    raise AnalysisLimit('HTTPX request stream, file or extension protocol is unresolved; '
+                                        'analysis is incomplete')
+            elif not self.httpx_native_input(expression, state, containers=option != 'content'):
+                raise AnalysisLimit('HTTPX request payload or metadata protocol is unresolved; analysis is incomplete')
+        if built:
+            value = self.expression_bindings.get(url_node)
+            literals = [_literal_text(choice) for choice in _binding_choices(value)]
+            if not literals or not all(text is not None and self.http_absolute_url(text) for text in literals):
+                destination = join_facts(destination, target.receiver)
+        # The Request owns its resolved URL. Sending it through another client
+        # must not merge that client's base a second time or taint body data.
+        self.expression_bindings[node] = _BoundCallable(
+            '@httpx.request', frozenset({node}), destination, True, receiver_binding=_HTTPPrepared())
+        self.expression_references[node] = frozenset({node})
+        self.possible_exception(state)
+        return CLEAN
+
+    def httpx_send(self, node, state, target, inputs):
+        """Send exactly the constructed request, or retain an async send."""
+        if (None in inputs.keyword_nodes
+                or not set(inputs.keyword_nodes) <= {'request', 'stream', 'auth', 'follow_redirects'}
+                or len(node.args) > 1 or any(isinstance(argument, ast.Starred) for argument in node.args)
+                or node.args and 'request' in inputs.keyword_nodes):
+            raise AnalysisLimit('HTTPX send argument binding is unresolved; analysis is incomplete')
+        auth = inputs.keyword_nodes.get('auth')
+        self.httpx_auth(auth, state)
+        for option in ('stream', 'follow_redirects'):
+            expression = inputs.keyword_nodes.get(option)
+            if expression is not None and not self.httpx_native_input(expression, state):
+                raise AnalysisLimit('HTTPX send option protocol is unresolved; analysis is incomplete')
+        _data, expression = self.http_destination(node, inputs, 0, 'request')
+        value = self.expression_bindings.get(expression)
+        self.require_value(value)
+        choices = _binding_choices(value)
+        destinations, references = [], target.references
+        # Async send evaluates auth/flags when consumed, after the caller
+        # can mutate an option alias. Retain their allocation identities
+        # along with the client and request for the existing resume guard.
+        for option in ('auth', 'stream', 'follow_redirects'):
+            option_node = inputs.keyword_nodes.get(option)
+            if option_node is not None:
+                references |= self.expression_references.get(option_node, NO_REFERENCES)
+        for request in choices:
+            if isinstance(request, _SymbolicValue):
+                self.http_parameters.add(request.parameter)
+                continue
+            if (not _http_contract(request, _HTTPPrepared) or request.name != '@httpx.request'
+                    or request.references & state.mutated):
+                raise AnalysisLimit('HTTPX send requires an unchanged native Request; analysis is incomplete')
+            destinations.append(request.receiver)
+            references |= request.references
+        if not choices:
+            raise AnalysisLimit('HTTPX send request identity is unresolved; analysis is incomplete')
+        destination = join_facts(*destinations)
+        if target.receiver_binding.kind == 'httpx.async':
+            self.expression_bindings[node] = _BoundCallable(
+                '@http.pending', references, destination, True,
+                receiver_binding=_HTTPPending(node, asynchronous=True, call_owner=self.engine.tree))
+            self.expression_references[node] = references
+            return CLEAN
+        # stream=True controls response-body reading; the network request is
+        # still sent here, unlike the context-only Client.stream() operation.
+        self.effect('ssrf', node, 'HTTP request URL', destination)
+        self.expression_bindings[node] = None
+        self.expression_references[node] = frozenset({node})
+        self.possible_exception(state)
+        return CLEAN
+
     def http_request(self, node, state, target, inputs):
         contract = target.receiver_binding
         method = target.name.rsplit('.', 1)[-1]
@@ -6551,6 +6765,11 @@ class _Flow:
             self.expression_bindings[node] = None
             self.possible_exception(state)
             return CLEAN
+        if contract.kind.startswith('httpx'):
+            if method == 'build_request':
+                return self.httpx_prepared(node, state, target, inputs)
+            if method == 'send':
+                return self.httpx_send(node, state, target, inputs)
         position = _HTTP_CLIENT_METHODS[contract.kind].get(method)
         if position is None:
             raise AnalysisLimit('HTTP client method is unmodeled; analysis is incomplete')
@@ -6630,12 +6849,16 @@ class _Flow:
             return self.http_request(node, state, target, inputs)
         if _http_contract(target, _HTTPPending):
             raise AnalysisLimit('pending HTTP request called as a function; analysis is incomplete')
+        if _http_contract(target, _HTTPPrepared):
+            raise AnalysisLimit('prepared HTTP request called as a function; analysis is incomplete')
         native_name = (target if isinstance(target, str) else target.name
                        if isinstance(target, _BoundCallable) and target.namespace_proven else None)
         if native_name in _URLLIB_APIS or _http_contract(target, (_UrllibRequest, _UrllibOpener)):
             return self.urllib_call(node, state, target, inputs)
         if native_name in _HTTP_CLIENT_CONSTRUCTORS:
             return self.http_client(node, state, native_name, inputs)
+        if native_name == 'httpx.Request':
+            return self.httpx_prepared(node, state, target, inputs)
         if native_name in _AIOHTTP_REQUEST_APIS:
             self.aiohttp_options(inputs, state)
             self.http_auth(inputs.keyword_nodes.get('auth'))
@@ -7076,6 +7299,13 @@ class _Flow:
                     self.buffer_parameters.update(value.parameter for value in choices)
                 else:
                     raise AnalysisLimit('stdin buffer mutation helper requires a proven writable buffer; '
+                                        'analysis is incomplete')
+            for name in summary.http_parameters:
+                choices = _binding_choices(values.get(name))
+                if choices and all(isinstance(value, _SymbolicValue) for value in choices):
+                    self.http_parameters.update(value.parameter for value in choices)
+                else:
+                    raise AnalysisLimit('HTTPX prepared-request helper requires proven native inputs; '
                                         'analysis is incomplete')
             substitute = _CallSubstitution(self.substitute_trace, bound, call_name, self.engine.budget)
             for kind, line, column, label, fact in summary.effects:
@@ -7638,7 +7868,7 @@ class _Flow:
                 function = base.function if isinstance(base, (_FunctionValue, _ClosureValue)) else base
                 native = (base if isinstance(base, str) else base.name
                           if isinstance(base, _BoundCallable) and base.namespace_proven else None)
-                if (native in _URLLIB_APIS or native in _AIOHTTP_API_NAMES
+                if (native in _URLLIB_APIS or native in _AIOHTTP_API_NAMES or native in _HTTPX_API_NAMES
                         or native in {'urllib', 'urllib.request', 'urllib.request.OpenerDirector'}) and node.attr in {
                         '__dict__', '__globals__', '__closure__', '__code__', '__defaults__',
                         '__kwdefaults__', '__class__', '__bases__'}:
@@ -7665,7 +7895,8 @@ class _Flow:
                     if base.references & state.mutated:
                         raise AnalysisLimit('HTTP client receiver was mutated; analysis is incomplete')
                     kind = base.receiver_binding.kind
-                    if node.attr in _HTTP_CLIENT_METHODS[kind] or node.attr in {'close', 'aclose'}:
+                    if (node.attr in _HTTP_CLIENT_METHODS[kind] or node.attr in {'close', 'aclose'}
+                            or kind.startswith('httpx') and node.attr in {'build_request', 'send'}):
                         candidates.append(_BoundCallable('@http.' + kind + '.' + node.attr,
                             base.references, base.receiver, True, receiver_binding=base.receiver_binding))
                     elif node.attr == 'base_url' and kind.startswith('httpx'):
@@ -7678,6 +7909,8 @@ class _Flow:
                     continue
                 if _http_contract(base, _HTTPPending):
                     raise AnalysisLimit('pending HTTP request attribute protocol is unmodeled; analysis is incomplete')
+                if _http_contract(base, _HTTPPrepared):
+                    raise AnalysisLimit('prepared HTTP request attribute protocol is unmodeled; analysis is incomplete')
                 if isinstance(base, _CsvReader):
                     if not base.format_safe or receiver_refs & state.mutated:
                         raise AnalysisLimit('CSV reader mutation or producer effects are unresolved; analysis is incomplete')
@@ -8565,6 +8798,8 @@ class _Flow:
                             if isinstance(binding, _BoundCallable) and binding.namespace_proven else None)
                     if name in {'aiohttp.ClientSession', 'aiohttp.client.ClientSession'}:
                         raise AnalysisLimit('aiohttp session subclass dispatch is unresolved; analysis is incomplete')
+                    if name in {'httpx.Client', 'httpx.AsyncClient', 'httpx.Request'}:
+                        raise AnalysisLimit('HTTPX client or request subclass dispatch is unresolved; analysis is incomplete')
             for keyword in node.keywords:
                 self.expr(keyword.value, state)
             namespace = state.copy()
@@ -8856,6 +9091,7 @@ class _Flow:
             capture_globals=frozenset(self.capture_globals),
             value_parameters=frozenset(self.value_parameters),
             buffer_parameters=frozenset(self.buffer_parameters),
+            http_parameters=frozenset(self.http_parameters),
             cells=cells,
             multiple_cells=frozenset(cell_state.cells.multiple)
             if cell_state is not None and cell_state.cells is not None else frozenset(),
@@ -10367,6 +10603,62 @@ class _Analysis:
         return tuple(self.scope_diagnostic(function, reason) for function in functions
                      if function not in qualified or not self.generator_helper_identity(function))
 
+    def http_diagnostics(self):
+        """Resolve prepared-request obligations after selected callers run."""
+        functions = [function for function in self.functions
+                     if self.summaries.get(function, FunctionSummary()).http_parameters]
+        if not functions:
+            return ()
+        self.budget.spend(len(self.summaries))
+        qualified = {key[0] for key, value in self.summaries.items()
+                     if isinstance(key, tuple) and not value.http_parameters and not value.incomplete}
+        reason = 'HTTPX prepared-request helper has unresolved native inputs; analysis is incomplete'
+        return tuple(self.scope_diagnostic(function, reason) for function in functions
+                     if function not in qualified or not (
+                         self.generator_helper_identity(function) or self.http_factory_callback(function)))
+
+    def http_factory_callback(self, function):
+        """A closed factory callback is invoked immediately at every use.
+
+        Its generic free-cell input is deliberately symbolic. A concrete
+        call supplies that cell, while returning the callback to an opaque
+        consumer must keep the generic obligation unresolved.
+        """
+        owner = self.enclosing(function)
+        if (not isinstance(function, ast.FunctionDef) or not isinstance(owner, ast.FunctionDef)
+                or function.decorator_list or owner.decorator_list
+                or function in self.generators or owner in self.generators
+                or not self.generator_helper_identity(owner)):
+            return False
+        args = function.args
+        if args.posonlyargs or args.args or args.kwonlyargs or args.vararg or args.kwarg:
+            return False
+        if any(engine.generator_namespace_exposed or engine.generator_frame_exposed
+               or engine.generator_builtin_reflection or engine.generator_literal_authority_exposed
+               or engine.generator_execution_capabilities
+               or engine.generator_attribute_writes & {'__code__', '__defaults__', '__kwdefaults__', '__closure__'}
+               for engine in self.generator_peers):
+            return False
+        returned = False
+        calls = 0
+        for reference, parent in self.parents.items():
+            self.budget.spend()
+            if not isinstance(reference, ast.Name):
+                continue
+            if reference.id == function.name and self.enclosing(reference) is owner:
+                if not (isinstance(reference.ctx, ast.Load) and isinstance(parent, ast.Return)
+                        and parent.value is reference):
+                    return False
+                returned = True
+            if reference.id == owner.name:
+                outer = self.parents.get(parent)
+                if not (isinstance(reference.ctx, ast.Load) and isinstance(parent, ast.Call)
+                        and parent.func is reference and isinstance(outer, ast.Call)
+                        and outer.func is parent and not outer.args and not outer.keywords):
+                    return False
+                calls += 1
+        return returned and bool(calls)
+
     def _escaping_namespace_factory(self):
         """Check settled return/capture bindings once, without executing code."""
         pending = list(self.escaping_callables)
@@ -10748,6 +11040,9 @@ class _Analysis:
                     buffer_diagnostics = self.buffer_diagnostics()
                     problems.extend(item['reason'] for item in buffer_diagnostics)
                     diagnostics.extend(buffer_diagnostics)
+                    http_diagnostics = self.http_diagnostics()
+                    problems.extend(item['reason'] for item in http_diagnostics)
+                    diagnostics.extend(http_diagnostics)
                 if self._escaping_namespace_factory():
                     reason = 'globals mapping factory stored in an object; analysis is incomplete'
                     problems.append(reason)
@@ -11226,6 +11521,15 @@ class _Project:
             except AnalysisLimit as exc:
                 unresolved_buffers.append(engine.scope_diagnostic(engine.tree, str(exc)))
         diagnostics.extend(unresolved_buffers)
+        unresolved_http = []
+        for _path, _text, engine, _offset in self.sources:
+            if engine not in self.ready or engine.project is None:
+                continue
+            try:
+                unresolved_http.extend(engine.http_diagnostics())
+            except AnalysisLimit as exc:
+                unresolved_http.append(engine.scope_diagnostic(engine.tree, str(exc)))
+        diagnostics.extend(unresolved_http)
         starts = [offset for _, _, _, offset in self.sources]
         indexes = {path: build_index(text, lang='python') for path, text, _, _ in self.sources}
         for (kind, line, column, label), trace in _sink_traces(effects):
@@ -11239,6 +11543,9 @@ class _Project:
         if unresolved_buffers:
             problems.append(f'{len(unresolved_buffers)} buffer scope(s): '
                             + '; '.join(item['reason'] for item in unresolved_buffers[:3]))
+        if unresolved_http:
+            problems.append(f'{len(unresolved_http)} HTTP scope(s): '
+                            + '; '.join(item['reason'] for item in unresolved_http[:3]))
         if self.failed_inputs:
             omitted = (f'; and {self.failed_inputs - len(self.input_failures)} more failed inputs'
                        if self.failed_inputs > len(self.input_failures) else '')

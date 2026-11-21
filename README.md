@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.97-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.98-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -2045,6 +2045,33 @@ The rejection must dominate the write, and rebinding or shadowing revokes the
 proof. Arbitrary sanitizers and general interprocedural mutation effects remain
 outside this local model. Existing rule-specific statement suppressions apply
 at the sink; suppressing a source-line diagnostic does not clear its taint.
+
+### Python HTTPX request destinations
+
+`python.taint.ssrf` follows native `httpx.Request` and
+`Client`/`AsyncClient.build_request` objects through aliases, saved methods and
+selected helper calls to `send`. Construction captures the destination and the
+builder's base URL. A different sending client's base URL does not replace it:
+
+```python
+import httpx
+
+builder = httpx.Client(base_url=input())
+request = builder.build_request("GET", "/status")
+httpx.Client(base_url="https://safe.example").send(request)  # SSRF at this send
+```
+
+Synchronous `send`, including `stream=True`, reaches the request sink immediately.
+An asynchronous send reaches it when awaited or scheduled; merely constructing a
+request or retaining an unused coroutine does not fabricate network execution.
+Known body, query, header and credential values remain separate from the URL.
+Fixed destinations and existing validated-URL proofs retain their clean controls.
+
+Native identities matter: custom credential/URL subclasses and constructor
+options can execute callbacks that change a request before transport. Unproved
+protocols, custom transports/hooks, request mutation and opaque escapes produce
+explicit incomplete analysis while preserving already established findings.
+Requests Session prepared sends remain outside this HTTPX slice.
 
 ### Python subprocess taint
 

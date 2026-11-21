@@ -340,7 +340,7 @@ requests.get(second)
         for name in ('py.taint.ssrf', 'python.taint.ssrf'):
             with self.subTest(rule=name):
                 self.assert_rules(f'import requests\n# ubs:ignore[{name}]\nrequests.get(input())\n')
-                with tempfile.TemporaryDirectory(prefix='ubs-http-disabled-') as temporary:
+                with temporary_directory(prefix='ubs-http-disabled-') as temporary:
                     path = Path(temporary, 'view.py')
                     path.write_text('import requests\nrequests.get(input())\n', encoding='utf-8')
                     ctx = RunContext(lang='python', files=[path], profile={'disabled_rules': [name]})
@@ -348,7 +348,7 @@ requests.get(second)
         self.assert_rules('import requests\n# ubs:ignore[python.taint.eval]\nrequests.get(input())\n', 'ssrf')
 
     def test_tabular_entrypoint_keeps_the_same_rule_and_site(self):
-        with tempfile.TemporaryDirectory(prefix='ubs-http-tabular-') as temporary:
+        with temporary_directory(prefix='ubs-http-tabular-') as temporary:
             path = Path(temporary, 'view.py')
             path.write_text('import requests\nrequests.get(input())\n', encoding='utf-8')
             output = io.StringIO()
@@ -358,7 +358,7 @@ requests.get(second)
             self.assertIn('HTTP request URL', output.getvalue())
 
     def test_cross_file_calls_and_local_module_shadowing(self):
-        with tempfile.TemporaryDirectory(prefix='ubs-http-modules-') as temporary:
+        with temporary_directory(prefix='ubs-http-modules-') as temporary:
             root = Path(temporary)
             main = root / 'app.py'
             helper = root / 'transport.py'
@@ -400,7 +400,7 @@ requests.get(target)
             ('guard-match', True, self.url_guard_source() +
              'match {input()}:\n    case HOSTS:\n        pass\n' + guarded_request),
         )
-        with tempfile.TemporaryDirectory(prefix='ubs-http-cli-') as temporary:
+        with temporary_directory(prefix='ubs-http-cli-') as temporary:
             path = Path(temporary, 'view.py')
             for case_name, unsafe, source in cases:
                 path.write_text(source, encoding='utf-8')
@@ -621,7 +621,7 @@ class PooledHTTPClientTests(SourceTest):
             'import httpx\nclient = httpx.Client()\nclient.get("https://safe.invalid", auth=custom_auth)\n',
             'import httpx\nclient = httpx.Client(transport=custom_transport)\n',
             'import httpx\nclient = httpx.Client(event_hooks={"request": [change_url]})\n',
-            'import httpx\nclient = httpx.Client()\nclient.send(client.build_request("GET", input()))\n',
+            'import httpx\nclient = httpx.Client()\nclient.send(client.build_request("GET", input()), auth=custom_auth)\n',
             'import httpx\nclient = httpx.Client()\npending = client.stream("GET", "/relative")\n'
             'client.base_url = input()\nwith pending:\n    pass\n',
             'import httpx\nasync def fetch():\n    client = httpx.AsyncClient()\n'
@@ -649,6 +649,506 @@ class PooledHTTPClientTests(SourceTest):
             with self.subTest(source=source):
                 with self.assertRaises(taint_py.AnalysisLimit):
                     self.scan(source)
+
+
+class HTTPXPreparedRequestTests(SourceTest):
+    """Native request construction fixes the URL; send consumes that URL."""
+
+    def test_native_request_constructors_and_builders(self):
+        for imports, build in (
+            ('import httpx', 'httpx.Request("GET", input())'),
+            ('import httpx as web', 'web.Request("GET", url=input())'),
+            ('from httpx import Request as prepare', 'prepare(method="GET", url=input())'),
+            ('import httpx', 'httpx.Client().build_request("GET", input())'),
+            ('import httpx', 'httpx.AsyncClient().build_request("GET", input())'),
+        ):
+            with self.subTest(build=build):
+                source = imports + '\nrequest = ' + build + '\n'
+                self.assert_rules(source)
+                found = self.assert_rules(source + 'import httpx\nhttpx.Client().send(request)\n', 'ssrf')
+                self.assertEqual((found[0]['line'], found[0]['col']), (4, 1))
+
+    def test_only_url_is_a_destination_and_literal_expansions_keep_slots(self):
+        self.assert_rules('''
+            import httpx
+            client = httpx.Client()
+            request = client.build_request(input(), "https://safe.invalid", content=input(),
+                                           params={"q": input()}, headers={"X-Value": input()})
+            client.send(request)
+        ''')
+        self.assert_rules('''
+            import httpx
+            request = httpx.Request("POST", "https://safe.invalid",
+                                    json={"nested": [input(), {"value": input()}]})
+            httpx.Client().send(request)
+        ''')
+        for build in ('httpx.Request(*["GET", input()])',
+                      'httpx.Request(**{"method": "GET", "url": input()})',
+                      'client.build_request(*["GET", input()])'):
+            with self.subTest(build=build):
+                self.assert_rules('import httpx\nclient = httpx.Client()\nrequest = ' + build +
+                                  '\nclient.send(request)\n', 'ssrf')
+
+    def test_destination_is_captured_before_rebinding(self):
+        self.assert_rules('''
+            import httpx
+            target = input()
+            request = httpx.Request("GET", target)
+            target = "https://safe.invalid"
+            httpx.Client().send(request)
+        ''', 'ssrf')
+        self.assert_rules('''
+            import httpx
+            target = "https://safe.invalid"
+            request = httpx.Request("GET", target)
+            target = input()
+            httpx.Client().send(request)
+        ''')
+
+    def test_build_uses_its_base_once_even_with_a_different_sender(self):
+        for relative in ('/path', 'path', '', '//other.invalid/path'):
+            with self.subTest(relative=relative):
+                self.assert_rules('import httpx\nbuilder = httpx.Client(base_url=input())\n'
+                                  f'request = builder.build_request("GET", {relative!r})\n'
+                                  'httpx.Client(base_url="https://safe.invalid").send(request)\n', 'ssrf')
+        self.assert_rules('''
+            import httpx
+            builder = httpx.Client(base_url="https://safe.invalid/base")
+            request = builder.build_request("GET", "/path")
+            builder.base_url = input()
+            httpx.Client(base_url=input()).send(request)
+        ''')
+        self.assert_rules('''
+            import httpx
+            builder = httpx.Client(base_url=input())
+            request = builder.build_request("GET", "https://safe.invalid/fixed")
+            httpx.Client().send(request)
+        ''')
+
+    def test_saved_methods_aliases_helpers_and_immediate_factory_callbacks(self):
+        self.assert_rules('''
+            import httpx
+            client = httpx.Client()
+            build = client.build_request
+            send = client.send
+            client = unrelated
+            request = build("GET", input())
+            alias = request
+            request = unrelated
+            send(alias)
+        ''', 'ssrf')
+        self.assert_rules('''
+            import httpx
+            def prepare(target):
+                return httpx.Request("GET", target)
+            def forward(client, request):
+                return client.send(request)
+            forward(httpx.Client(), prepare(input()))
+        ''', 'ssrf')
+        self.assert_rules('''
+            import httpx
+            def prepare(target):
+                request = httpx.Request("GET", target)
+                def send():
+                    return httpx.Client().send(request)
+                return send
+            prepare(input())()
+        ''', 'ssrf')
+
+    def test_send_sites_and_repeated_sends_are_exact(self):
+        found = self.assert_rules('import httpx\nclient = httpx.Client()\n'
+                                  'request = client.build_request("GET", input())\n'
+                                  'client.send(request)\nclient.send(request, stream=True)\n',
+                                  'ssrf', 'ssrf')
+        self.assertEqual([(row['line'], row['col']) for row in found], [(4, 1), (5, 1)])
+
+    def test_unused_and_overwritten_requests_are_clean(self):
+        self.assert_rules('''
+            import httpx
+            client = httpx.Client()
+            request = client.build_request("GET", input())
+            request = httpx.Request("GET", "https://safe.invalid")
+            client.send(request)
+        ''')
+        self.assert_rules('''
+            import httpx
+            client = httpx.AsyncClient()
+            request = client.build_request("GET", input())
+            pending = client.send(request)
+        ''')
+
+    def test_async_send_consumption_and_task_scheduling(self):
+        for consume in ('await pending', 'await asyncio.create_task(pending)'):
+            with self.subTest(consume=consume):
+                found = self.assert_rules('import asyncio, httpx\nasync def fetch():\n'
+                                          '    client = httpx.AsyncClient()\n'
+                                          '    request = client.build_request("GET", input())\n'
+                                          '    pending = client.send(request, stream=True)\n'
+                                          '    ' + consume + '\nasyncio.run(fetch())\n', 'ssrf')
+                self.assertEqual((found[0]['line'], found[0]['col']), (5, 15))
+
+    def test_async_helpers_and_independent_argument_effects(self):
+        self.assert_rules('''
+            import asyncio, httpx
+            async def prepare(target):
+                eval(input())
+                return httpx.Request("GET", target)
+            async def fetch():
+                client = httpx.AsyncClient()
+                request = await prepare(input())
+                await client.send(request)
+            asyncio.run(fetch())
+        ''', 'eval', 'ssrf')
+
+    def test_other_sanitizer_domains_do_not_clean_the_url(self):
+        for target in ('html.escape(input())', 'shlex.quote(input())'):
+            with self.subTest(target=target):
+                self.assert_rules('import httpx, html, shlex\nrequest = httpx.Request("GET", ' +
+                                  target + ')\nhttpx.Client().send(request)\n', 'ssrf')
+
+    def test_mutations_escapes_and_custom_protocols_are_explicit_boundaries(self):
+        for body in (
+            'request.url = input()\nclient.send(request)',
+            'alias = request\nalias.url = input()\nclient.send(request)',
+            'configure(request)\nclient.send(request)',
+            'items = [request]\nclient.send(items[0])',
+            'client.send(unknown_request)',
+            'request = httpx.Request("GET", "https://safe.invalid", stream=custom_stream)\nclient.send(request)',
+            'request = client.build_request("GET", "https://safe.invalid", params={"q": custom_value})\nclient.send(request)',
+            'values = {"q": custom_value}\nrequest = client.build_request("GET", "https://safe.invalid", params=values)\nclient.send(request)',
+            'request = client.build_request("GET", "https://safe.invalid", extensions={"trace": callback})\nclient.send(request)',
+        ):
+            with self.subTest(body=body), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan('import httpx\nclient = httpx.Client()\n'
+                          'request = client.build_request("GET", "https://safe.invalid")\n' + body + '\n')
+
+    def test_native_api_identity_mutation_and_subclasses_are_not_trusted(self):
+        for source in (
+            'import httpx\nhttpx.Request = replacement\nrequest = httpx.Request("GET", input())\n',
+            'import httpx\nsetattr(httpx.Request, "__init__", replacement)\nhttpx.Request("GET", input())\n',
+            'import httpx\nclass Request(httpx.Request):\n    pass\n',
+            'import httpx\nconfigure(httpx)\nhttpx.Request("GET", input())\n',
+        ):
+            with self.subTest(source=source), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan(source)
+
+    def test_lookalikes_and_shadowed_imports_do_not_borrow_the_contract(self):
+        for source in (
+            'request = Request("GET", input())\nclient.send(request)\n',
+            'from elsewhere import Request\nrequest = Request("GET", input())\nclient.send(request)\n',
+            'import httpx\nhttpx = other\nrequest = httpx.Request("GET", input())\nclient.send(request)\n',
+            'from httpx import Request\nRequest = other\nrequest = Request("GET", input())\nclient.send(request)\n',
+        ):
+            with self.subTest(source=source):
+                self.assert_rules(source)
+
+    def test_unproved_helper_entries_and_escaped_factory_callbacks_are_incomplete(self):
+        for source in (
+            'import httpx\ndef prepare(target):\n    return httpx.Request("GET", target)\n',
+            'import httpx\ndef prepare(target):\n'
+            '    request = httpx.Request("GET", target)\n'
+            '    def send():\n        return httpx.Client().send(request)\n'
+            '    return send\ncallback = prepare(input())\nopaque(callback)\n',
+        ):
+            with self.subTest(source=source), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan(source)
+
+    def test_a_completed_send_is_retained_before_later_mutation(self):
+        with temporary_directory(prefix='ubs-httpx-retained-') as temporary:
+            path = Path(temporary) / 'view.py'
+            path.write_text('import httpx\nclient = httpx.Client()\n'
+                            'request = client.build_request("GET", input())\nclient.send(request)\n'
+                            'request.url = input()\nclient.send(request)\n', encoding='utf-8')
+            findings = []
+            with self.assertRaises(taint_py.AnalysisLimit):
+                findings.extend(taint_py.run(RunContext(lang='python', files=[path])))
+            self.assertEqual([(row['rule'], row['line']) for row in findings],
+                             [('python.taint.ssrf', 4)])
+
+    def test_native_basic_credentials_are_data_including_saved_tuples(self):
+        for setup, auth in (('', '("user", input())'), ('auth = ("user", input())\n', 'auth')):
+            with self.subTest(auth=auth):
+                source = ('import httpx\nclient = httpx.Client()\n' + setup +
+                          'request = httpx.Request("GET", "https://safe.invalid")\n')
+                self.assert_rules(source + 'client.send(request, auth=' + auth + ')\n')
+                self.assert_rules(source.replace('"https://safe.invalid"', 'input()') +
+                                  'client.send(request, auth=' + auth + ')\n', 'ssrf')
+        self.assert_rules('import httpx\nrequest = httpx.Request("GET", "https://safe.invalid")\n'
+                          'client = httpx.Client(auth=("user", input()))\nclient.send(request)\n')
+
+    def test_opaque_credentials_cannot_run_unmodeled_encoding_callbacks(self):
+        for setup, auth in (('', '(credential, "pw")'),
+                            ('credentials = (credential, "pw")\n', 'credentials')):
+            for call in ('client = httpx.Client()\nclient.send(request, auth=' + auth + ')\n',
+                         'client = httpx.Client(auth=' + auth + ')\nclient.send(request)\n'):
+                with self.subTest(auth=auth, call=call), self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('import httpx\nrequest = httpx.Request("GET", "https://safe.invalid")\n' +
+                              setup + call)
+        with self.assertRaises(taint_py.AnalysisLimit):
+            self.scan('''
+                import asyncio, httpx
+                async def fetch():
+                    client = httpx.AsyncClient()
+                    request = client.build_request("GET", "https://safe.invalid")
+                    pending = client.send(request)
+                    request.url = input()
+                    await pending
+                asyncio.run(fetch())
+            ''')
+
+    def test_httpx_list_auth_and_base_url_protocols_are_not_native_strings(self):
+        for setup, options in (
+            ('', 'auth=["user", "pw"]'),
+            ('credentials = ["user", "pw"]\n', 'auth=credentials'),
+            ('', 'base_url=custom_base'),
+        ):
+            with self.subTest(options=options), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan('import httpx\nrequest = httpx.Request("GET", "https://safe.invalid")\n' +
+                          setup + 'client = httpx.Client(' + options + ')\nclient.send(request)\n')
+        for auth in ('["user", "pw"]', 'credentials'):
+            with self.subTest(auth=auth), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan('import httpx\nclient = httpx.Client()\ncredentials = ["user", "pw"]\n'
+                          'request = client.build_request("GET", input())\nclient.send(request, auth=' + auth + ')\n')
+        with self.assertRaises(taint_py.AnalysisLimit):
+            self.scan('import httpx\nclient = httpx.Client()\n'
+                      'request = client.build_request("GET", "https://safe.invalid")\n'
+                      'client.base_url = custom_base\nhttpx.Client().send(request)\n')
+
+    def test_nested_payload_aliases_keep_mutation_and_callback_boundaries(self):
+        for setup, payload in (
+            ('values = {"x": "safe"}\nvalues["x"] = opaque\n', '{"nested": [values]}'),
+            ('values = {"x": opaque}\n', '{"nested": [values]}'),
+            ('', '{"nested": [opaque]}'),
+            ('values = {"x": "safe"}\nconfigure(values)\n', '{"nested": [values]}'),
+        ):
+            with self.subTest(payload=payload, setup=setup), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan('import httpx\n' + setup + 'request = httpx.Request("POST", '
+                          '"https://safe.invalid", json=' + payload + ')\nhttpx.Client().send(request)\n')
+
+    def test_all_constructor_options_require_inert_native_protocols(self):
+        options = ('timeout', 'max_redirects', 'http2', 'http1', 'trust_env', 'verify',
+                   'follow_redirects', 'default_encoding', 'cert', 'limits', 'proxy', 'future_option')
+        for option in options:
+            with self.subTest(option=option), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan('import httpx\nrequest = httpx.Request("GET", "https://safe.invalid")\n'
+                          f'client = httpx.Client({option}=custom_value)\nclient.send(request)\n')
+        self.assert_rules('''
+            import httpx
+            request = httpx.Request("GET", "https://safe.invalid")
+            client = httpx.Client(timeout=5, max_redirects=3, http1=True, http2=False,
+                                  trust_env=False, verify=True, follow_redirects=False,
+                                  default_encoding="utf-8", cert=None, proxy=None,
+                                  headers={"X-Value": input()}, params={"q": input()})
+            client.send(request)
+        ''')
+        self.assert_rules('''
+            import httpx
+            request = httpx.Request("GET", input())
+            client = httpx.Client(timeout=(5, 5, 5, 5), cert=("client.crt", "client.key"))
+            client.send(request)
+        ''', 'ssrf')
+
+    def test_selected_cross_file_prepared_send_keeps_helper_origin(self):
+        for suppressed in (False, True):
+            with temporary_directory(prefix='ubs-httpx-crossfile-') as temporary:
+                root = Path(temporary)
+                helper = root / 'transport.py'
+                caller = root / 'view.py'
+                helper.write_text('def prepare(client, request):\n'
+                                  '    return client.send(request)' +
+                                  ('  # ubs:ignore[python.taint.ssrf]' if suppressed else '') + '\n',
+                                  encoding='utf-8')
+                caller.write_text('import httpx\nfrom transport import prepare\nasync def fetch():\n'
+                                  '    client = httpx.AsyncClient()\n'
+                                  '    request = client.build_request("GET", input())\n'
+                                  '    await prepare(client, request)\n', encoding='utf-8')
+                for files in ([caller, helper], [helper, caller]):
+                    rows = list(taint_py.run(RunContext(lang='python', files=files,
+                                                       profile={'project_dir': str(root)})))
+                    self.assertEqual([(row['rule'], Path(row['path']).name, row['line'], row['col'])
+                                      for row in rows],
+                                     [] if suppressed else [('python.taint.ssrf', 'transport.py', 2, 12)])
+
+    def test_native_construction_and_send_timing_without_network(self):
+        try:
+            import httpx
+        except ImportError:
+            self.skipTest('HTTPX is required for the native prepared-request witness')
+        import asyncio
+        observed = []
+
+        def capture(request):
+            observed.append(str(request.url))
+            return httpx.Response(200, content=b'ok')
+
+        with httpx.Client(base_url='https://builder.invalid/base',
+                          transport=httpx.MockTransport(capture)) as builder:
+            request = builder.build_request('GET', '/path')
+            builder.base_url = 'https://changed.invalid'
+            self.assertEqual(observed, [])
+            with httpx.Client(base_url='https://sender.invalid',
+                              transport=httpx.MockTransport(capture)) as sender:
+                response = sender.send(request, stream=True)
+                self.assertEqual(observed, ['https://builder.invalid/base/path'])
+                response.close()
+
+        async def consume():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(capture)) as client:
+                pending = client.send(httpx.Request('GET', 'https://async.invalid/await'))
+                self.assertEqual(len(observed), 1)
+                await pending
+                await asyncio.create_task(client.send(httpx.Request('GET', 'https://async.invalid/task')))
+                unused = client.send(httpx.Request('GET', 'https://unused.invalid'))
+                unused.close()
+
+        asyncio.run(consume())
+        self.assertEqual(observed, ['https://builder.invalid/base/path',
+                                    'https://async.invalid/await', 'https://async.invalid/task'])
+        print('Native HTTPX prepared timing:', httpx.__version__, observed, flush=True)
+
+    def test_native_string_subclass_credentials_can_replace_a_prepared_url(self):
+        try:
+            import httpx
+        except ImportError:
+            self.skipTest('HTTPX is required for the native credential witness')
+        raw = 'https://untrusted.invalid/private'
+        observed = []
+
+        def capture(request):
+            observed.append(str(request.url))
+            return httpx.Response(200, content=b'ok')
+
+        for constructor_auth in (False, True):
+            request = httpx.Request('GET', 'https://safe.invalid')
+
+            class Credential(str):
+                def encode(self, *args, **kwargs):
+                    request.url = httpx.URL(raw)
+                    return b'user'
+
+            credentials = (Credential('user'), 'pw')
+            options = {'auth': credentials} if constructor_auth else {}
+            with httpx.Client(transport=httpx.MockTransport(capture), **options) as client:
+                self.assertEqual(str(request.url), raw if constructor_auth else 'https://safe.invalid')
+                client.send(request, **({} if constructor_auth else {'auth': credentials}))
+        self.assertEqual(observed, [raw, raw])
+        print('Native HTTPX credential callback:', httpx.__version__, observed, flush=True)
+
+    @unittest.skipUnless(os.environ.get('UBS_HTTPX_PREPARED_E2E') == '1',
+                         'opt-in prepared HTTPX scanner integration')
+    def test_public_constructed_and_async_destinations(self):
+        self._public_contract(('built', 'base', 'async-send'))
+
+    @unittest.skipUnless(os.environ.get('UBS_HTTPX_PREPARED_E2E') == '1',
+                         'opt-in prepared HTTPX scanner integration')
+    def test_public_clean_unused_and_suppressed_requests(self):
+        self._public_contract(('safe-body', 'unused', 'suppressed'))
+
+    @unittest.skipUnless(os.environ.get('UBS_HTTPX_PREPARED_E2E') == '1',
+                         'opt-in prepared HTTPX scanner integration')
+    def test_public_boundaries_and_cache_invalidation(self):
+        self._public_contract(('custom-stream', 'partial-retained'), cache=True)
+
+    def _public_contract(self, names, *, cache=False):
+        setup = 'import httpx\nclient = httpx.Client(timeout=5)\n'
+        cases = (
+            ('built', setup + 'request = client.build_request("GET", input())\nclient.send(request)\n',
+             4, 1, False),
+            ('base', setup.replace('Client(timeout=', 'Client(base_url=input(), timeout=') +
+             'request = client.build_request("GET", "/path")\nclient.send(request)\n', 4, 1, False),
+            ('async-send', 'import httpx\nasync def fetch():\n'
+             '    client = httpx.AsyncClient(timeout=5)\n'
+             '    request = client.build_request("GET", input())\n'
+             '    await client.send(request)\n', 5, 11, False),
+            ('safe-body', setup + 'request = client.build_request("POST", "https://safe.invalid", '
+             'content=input(), params={"q": input()}, headers={"X-Value": input()})\nclient.send(request)\n',
+             None, None, False),
+            ('unused', setup + 'request = client.build_request("GET", input())\n', None, None, False),
+            ('suppressed', setup + 'request = client.build_request("GET", input())\n'
+             'client.send(request)  # ubs:ignore[python.taint.ssrf]\n', None, None, False),
+            ('custom-stream', setup + 'request = httpx.Request("GET", "https://safe.invalid", '
+             'stream=custom_stream)\nclient.send(request)\n', None, None, True),
+            ('partial-retained', setup + 'request = client.build_request("GET", input())\n'
+             'client.send(request)\nrequest.url = input()\nclient.send(request)\n', 4, 1, True),
+        )
+        with temporary_directory(prefix='ubs-httpx-public-') as temporary:
+            directory = Path(temporary)
+            skip = '--skip=' + ','.join(str(value) for value in range(1, 25) if value != 7)
+            env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'ENABLE_UV_TOOLS': '0',
+                   'UBS_KEEP_TEMP': '1', 'UBS_ALLOW_PARTIAL': '0',
+                   'UBS_CACHE_DIR': str(directory / 'cache')}
+
+            def check(path, tag, line, column, partial, runner, output, *, cached=False):
+                entrypoint = ROOT / 'ubs' if runner else ROOT / 'modules' / 'ubs-python.sh'
+                command = [str(entrypoint), '--ci', '--no-color', skip, '--format=' + output]
+                command += ['--only=python'] if runner else ['--no-uv']
+                result = subprocess.run([*command, str(path)], cwd=directory,
+                                        env={**env, 'UBS_NO_CACHE': '0' if cached else '1'},
+                                        capture_output=True, text=True, timeout=60)
+                (directory / (tag + '.stdout')).write_text(result.stdout, encoding='utf-8')
+                (directory / (tag + '.stderr')).write_text(result.stderr, encoding='utf-8')
+                detail = (tag, result.returncode, result.stdout, result.stderr)
+                self.assertEqual(result.returncode, 2 if partial else 1 if line else 0, detail)
+                document = json.loads(result.stdout)
+                expected = [('python.taint.ssrf', path.name, line)] if line is not None else []
+                if output == 'json':
+                    self.assertEqual(document['status'], 'partial' if partial else 'ok', detail)
+                    totals = document['totals'] if runner else document
+                    self.assertEqual((totals['files'], totals['critical'], totals['warning'], totals['info']),
+                                     (1, len(expected), 0, 0), detail)
+                    rows = document.get('findings', []) if runner and not expected else document['findings']
+                    self.assertEqual(len(rows), len(expected), detail)
+                    if runner:
+                        if not expected:
+                            self.assertEqual([scanner['findings'] for scanner in document['scanners']], [[]], detail)
+                        actual = [(row['rule_id'], Path(row['file']).name, row['line']) for row in rows]
+                        self.assertTrue(all(row['col'] == column for row in rows), detail)
+                    else:
+                        self.assertTrue(all(row['count'] == 1 and len(row['samples']) == 1 for row in rows), detail)
+                        actual = [(row['rule_id'], Path(sample['file']).name, sample['line'])
+                                  for row in rows for sample in row['samples']]
+                    self.assertEqual(actual, expected, detail)
+                else:
+                    runs = document['runs']
+                    self.assertTrue(runs, detail)
+                    rows = [row for run in runs for row in run['results']]
+                    self.assertEqual(len(rows), len(expected), detail)
+                    actual = []
+                    for row in rows:
+                        self.assertEqual(len(row['locations']), 1, detail)
+                        location = row['locations'][0]['physicalLocation']
+                        self.assertTrue(location['artifactLocation']['uri'].endswith(path.name), detail)
+                        self.assertEqual(location['region']['startColumn'], column, detail)
+                        actual.append((row['ruleId'], path.name, location['region']['startLine']))
+                    self.assertEqual(actual, expected, detail)
+                    for run in runs:
+                        if partial:
+                            self.assertIs(run['invocations'][0]['executionSuccessful'], False, detail)
+                            self.assertEqual(run['invocations'][0]['exitCode'], 2, detail)
+                        else:
+                            self.assertTrue(all(inv['executionSuccessful'] is True
+                                                for inv in run.get('invocations', [])), detail)
+                print(f'[{tag}] PASS', flush=True)
+
+            self.assertTrue(set(names) <= {case[0] for case in cases})
+            for case, source, line, column, partial in cases:
+                if case not in names:
+                    continue
+                path = directory / (case + '.py')
+                path.write_text(source, encoding='utf-8')
+                for runner in (False, True):
+                    for output in ('json', 'sarif'):
+                        check(path, f'{case}-{"runner" if runner else "module"}-{output}',
+                              line, column, partial, runner, output)
+            if cache:
+                target = directory / 'selected.py'
+                target.write_text(setup + 'request = client.build_request("GET", "https://safe.invalid")\n'
+                                  'client.send(request)\n', encoding='utf-8')
+                check(target, 'selected-cold', None, None, False, True, 'json', cached=True)
+                check(target, 'selected-warm', None, None, False, True, 'json', cached=True)
+                target.write_text(setup + 'request = client.build_request("GET", input())\n'
+                                  'client.send(request)\n', encoding='utf-8')
+                check(target, 'selected-edited', 4, 1, False, True, 'json', cached=True)
 
 
 class UrllibDestinationTests(SourceTest):

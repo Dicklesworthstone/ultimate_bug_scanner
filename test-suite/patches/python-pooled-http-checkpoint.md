@@ -1,5 +1,94 @@
 # Pooled Python HTTP client SSRF checkpoint
 
+## November 20 activation: native HTTPX prepared requests
+
+Development version **5.5.98** adds native `httpx.Request`,
+`Client`/`AsyncClient.build_request`, `Client.send` and consumed
+`AsyncClient.send` analysis to the current production implementation. This
+activation uses freshly qualified source and maintained tests on main through
+`8dbd2999e83f6fd7eb0a642b90fba48377043905`. The interrupted patch descriptions
+below remain historical recovery records.
+
+A request retains its construction-time URL and builder base through aliases,
+saved methods, selected helpers and closed factory callbacks. Sending it through
+another client does not add that client's base. Synchronous `send(stream=True)`
+sends immediately; asynchronous sends remain deferred until await/scheduling.
+Reports preserve send-site coordinates and selected-project ownership. URL facts
+remain distinct from body, query, header and credential metadata, with fixed URL,
+validation, overwrite and unused-handle controls.
+
+Native HTTPX observations exposed credential encoding, URL subclass, timeout,
+boolean-option and redirect-comparison callbacks that can mutate a previously
+built request. The implementation proves inert native constructor/request/send
+inputs and keeps other protocols explicit incomplete boundaries. Pending async
+sends retain option aliases for resume-time mutation checks. Custom transports,
+hooks, proxies/limits, unknown option classes, prepared-object mutation and
+opaque escape remain incomplete; established findings survive. This does not
+implement Requests Session prepared sends.
+
+### Recreated and executed evidence
+
+After execution resumed, the maintained and independent tests were recreated
+with new identities; they are not claimed to be the lost earlier test bytes.
+The initial maintained class had 20 active methods and three opt-in public
+methods. Before source activation, immutable main's Python analyzer failed six
+assertions/subcases and raised 24 `AnalysisLimit` errors. Three later maintained
+methods cover the independently demonstrated identity/alias/constructor-option
+hazards. No expected findings or completion requirements were weakened.
+
+The final HTTP cohort collected **106 methods: 97 executed and passed, nine
+opt-in methods skipped**. The new feature's three public methods were separately
+enabled and passed **35 actual module/runner calls**, including JSON/SARIF,
+selection, suppression, retained findings on incomplete input, cache hits and
+helper-edit invalidation. The final feature class contains 23 active source/native
+methods and three opt-in methods.
+
+Two unchanged independent corpora pass **43/43 scanner outcomes** (27 exact
+results and 16 explicit boundaries) and **43/43 native HTTPX observations**,
+using in-process transports with network access blocked. The first 37-case
+corpus matched 14/37 on immutable main; native observations were already 37/37.
+The later six-case option corpus captured three concrete callback hazards and
+three primitive controls before the constructor guard was extended.
+
+The broader Python cohort is **not aggregate green**: 580 methods collected,
+570 passed, eight skipped, and two failed. Both unchanged failures reproduce
+on immutable `b577b7e`: the recursive-global `None` summary assertion and stdlib
+`argparse` generator-expression completeness. An initial staged CLI checksum
+failure disappeared in the isolated checkout with canonically refreshed pins;
+no integrity bypass or changed test expectation was used.
+
+| DSR check | Log SHA256 |
+| --- | --- |
+| Resumed frozen maintained baseline | `12635a091ae4f4e5669b9d01c059bdd1beb0fc44ff4dfff3890de3e7a08c13e7` |
+| Final HTTP cohort, 97 passed / nine opt-in skips | `883e34b3f43aed5c8156f8193c2e0fcd2f11134266ec120abc4f4c1d53e350f2` |
+| Independent 37 native/scanner cases | `47b20e3ff41626956592ffc624a4909d52252bf514d84e8b1c219bed1be7cd34` |
+| Independent six option native/scanner cases | `5e41e3b60616b9fd9d43fff2abdea53bf9d2d6467493ca61006603ce2cd4f709` |
+| Final 35 public calls | `eea1fc349bcd21dad6d37aabb2e71341b62d1a48f21167c33fb5d95332d83572` |
+| Broader cohort, two retained failures | `918f36502f7dbd6137462169aa1dcd005dba22f68bff04578f17aa135d81df17` |
+| Exact two failures on immutable baseline | `eb2e1c868c43d31c49d39c74c352e17221576b3440c882676b6afc38579d198c` |
+| Final integrated HTTP/SQL and integrity qualification | `ce2c584312fe3907d57190db1fea4c80de6502abe56ac93157eaa057b29fabca` |
+
+The final 5.5.98 integration preserves both SQL additions and passes canonical
+integrity, shell syntax and whitespace checks. Its combined HTTP/SQL invocation
+collected 346 methods: 340 passed and six unrelated public opt-ins were skipped.
+This includes re-executing all 35 new HTTPX public calls and eight schema-default
+public calls on the actual integrated tree.
+
+Source SHA256:
+`0c85924a88114bc8397ee6e5cb71ccf93c40a1612783272be8947ff7b8ce98a4`
+(Git blob `a735206dc3733e862f6b9b7e3ef3533431f71fa4`).
+Maintained test SHA256:
+`a65b19edccb9e0254d425cca4ca7bec868812a38cf1ee0f9d70352da3d5fd6d9`
+(Git blob `ffdf9f615ef3ffa8fcda51f650c86a78b8addd6a`).
+Independent corpus SHA256 values:
+`0fca07246952982641eb24842ede4dc728fa5c08d5193d17509a2930b6eae889`
+and `45cae57bb76a8ee15a63d5daafcad0cf9ca19c1ceed69b49becb77084b2b1086`.
+Receipts live under `test-suite/artifacts/httpx-prepared-resumed-20261121/`,
+`httpx-prepared-public-20261121/` and `independent-semantic-resume-20261121/`
+in the respective retained checkouts. Runtime: CPython 3.12.14, HTTPX 0.28.1.
+The pooled-HTTP and broader dataflow umbrellas remain open; no full-suite or
+release qualification is claimed.
+
 ## November 15 continuation on a603d20
 
 This remains an **unfinished, unactivated implementation**. The current

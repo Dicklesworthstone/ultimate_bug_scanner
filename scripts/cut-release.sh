@@ -7,13 +7,15 @@
 #
 # Steps (see docs/release.md):
 #   1. sanity: numeric X.Y.Z, tag not taken, clean tree on main (unless --allow-dirty),
-#      and the self-scan gate `./ubs . --ci --fail-on-warning` (no opt-out)
+#      a complete generation-capable candidate, and the self-scan gate
+#      `./ubs . --ci --fail-on-warning` (no opt-out)
 #   2. bump VERSION, UBS_VERSION in ubs, the README version badge
 #   3. regenerate MODULE_CHECKSUMS/HELPER_CHECKSUMS (in ubs) and SHA256SUMS
 #   4. roll CHANGELOG.md: "## [Unreleased]" becomes "## [v<version>] - <date> [Release]"
 #      and a fresh empty Unreleased section is inserted above it
-#   5. verify: checksum scripts, bash -n, ./ubs --version
-#   6. commit and annotated tag v<version>; requires --yes or an interactive
+#   5. verify: complete candidate, checksum scripts, bash -n, ./ubs --version
+#   6. validate the exact staged Git tree, commit it, verify the committed tree,
+#      and create annotated tag v<version>; requires --yes or an interactive
 #      confirmation, never pushes, prints the push commands
 set -Eeuo pipefail
 
@@ -75,6 +77,15 @@ if [[ -n "$(git status --porcelain --untracked-files=no)" && $ALLOW_DIRTY -eq 0 
 fi
 if ! grep -q '^## \[Unreleased\]' CHANGELOG.md; then
   echo "error: CHANGELOG.md has no '## [Unreleased]' section to roll into $TAG" >&2
+  exit 1
+fi
+
+# The installer deliberately rejects pre-generation runners such as v5.5.26.
+# Reject an incompatible or incomplete candidate before scanning or changing
+# version files, including for previews and --allow-dirty preparation.
+say "Candidate gate: validate the complete current source"
+if ! python3 scripts/build_release_candidate.py --version "$VERSION_OLD" --check-only; then
+  echo "error: release candidate is incompatible or incomplete; refusing to cut $TAG" >&2
   exit 1
 fi
 
@@ -184,6 +195,7 @@ PY
 bash -n ubs install.sh
 bash scripts/verify_checksums.sh >/dev/null
 bash scripts/verify_sha256sums.sh >/dev/null
+python3 scripts/build_release_candidate.py --version "$VERSION_NEW" --check-only
 if ! ./ubs --version | grep -q "v$VERSION_NEW"; then
   echo "error: ./ubs --version does not report $VERSION_NEW" >&2
   exit 1
@@ -196,9 +208,30 @@ if [[ $NO_COMMIT -eq 1 ]]; then
   exit 0
 fi
 git add VERSION ubs README.md SHA256SUMS CHANGELOG.md
+
+# Check the exact tree that Git will commit. --allow-dirty permits preparation;
+# it must never let hashes of unstaged or untracked runtime files enter a tag
+# without those bytes. Do not stage unrelated source changes on the user's
+# behalf: retain the prepared edits and explain how to repair the candidate.
+release_tree="$(git write-tree)"
+if ! python3 scripts/build_release_candidate.py --version "$VERSION_NEW" \
+    --check-only --source-ref "$release_tree" --require-working-tree-match; then
+  echo "error: staged release tree is incompatible or incomplete; no release commit or tag created" >&2
+  echo "  retain and review the prepared edits, then stage the matching runtime/source files" >&2
+  echo "  validate the reviewed tree before committing or tagging; do not reuse this version with the cutter" >&2
+  exit 1
+fi
 git commit -q -m "chore(release): bump version to $VERSION_NEW" \
   -m "VERSION, UBS_VERSION, the README badge, MODULE_CHECKSUMS/HELPER_CHECKSUMS and SHA256SUMS regenerated together by scripts/cut-release.sh so the $TAG tag matches main byte for byte."
-git tag -a "$TAG" -m "UBS $TAG"
+release_commit="$(git --no-replace-objects rev-parse --verify HEAD)"
+# Replacement refs are local views and are not shipped to clean clones. A
+# hook must not conceal different committed bytes behind a replacement tree.
+if [[ "$(git --no-replace-objects rev-parse --verify "$release_commit^{tree}")" != "$release_tree" ]]; then
+  echo "error: committed tree differs from the validated release tree; refusing to create $TAG" >&2
+  echo "  inspect commit $release_commit and any commit-hook or concurrent index changes" >&2
+  exit 1
+fi
+git --no-replace-objects tag -a "$TAG" "$release_commit" -m "UBS $TAG"
 say "committed and tagged $TAG (not pushed). Next:"
 say "  scripts/check-version-tag-drift.sh # should report all modules/helpers match $TAG"
 say "  # After publication approval, with GitHub Actions disabled per AGENTS.md:"

@@ -10,6 +10,16 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Gate release cutting on the complete generation-capable candidate and the
+  exact staged Git tree. Refuse mismatched or absent runtime files before
+  committing, and refuse tagging if a commit hook changes the validated tree.
+  Candidate assembly can now read immutable Git refs or validate without
+  writing files. Qualify default latest-release installs with real signatures,
+  empty caches, offline scans, and immutable v5.5.26 refusal/upgrade controls;
+  missing cryptographic or historical prerequisites fail strict qualification.
+  The retained DSR release recipe also requires repository lint and test gates
+  before signing and assembles artifacts from the release tag's exact tree.
+
 - Track Python `urllib.request` destinations through native `urlopen`,
   `urlretrieve`, `Request` aliases/readers and default opener methods. Preserve
   URL provenance through helpers and closures while keeping request handles,

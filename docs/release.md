@@ -22,7 +22,7 @@ pushing: the retained YAML still contains tag triggers.
   passing quality gates: ShellCheck, checksum verification, the test suite,
   the complete strict self-scan, and `nix flake check`. Retain these gates when
   routing execution through DSR.
-- Bash, Python, jq, ripgrep, Minisign, and the pinned build tooling in the recipe;
+- Bash, Python, jq, ripgrep, Minisign, ShellCheck, ast-grep 0.45.3, and the pinned build tooling in the recipe;
   Syft for the project SBOM. Host and optional scanner dependencies must be
   provisioned before offline installation tests.
 - The existing UBS Minisign private key on a trusted signer, matching
@@ -56,6 +56,8 @@ Run the release-focused tests as part of the DSR qualification job:
 
 ```bash
 export PYTHONDONTWRITEBYTECODE=1
+export UBS_RELEASE_QUALIFICATION=1
+export UBS_DAEMON_E2E=1
 python3 test-suite/quality/test_release_candidate.py -v
 python3 test-suite/quality/test_release_candidate_install.py -v
 python3 test-suite/shareable/test_release_generation.py -v
@@ -72,6 +74,13 @@ tool, skipped test, partial self-scan, or failure as an unmet prerequisite; it i
 not a passing release qualification. Fresh-install and upgrade tests must check
 that signature failures, corrupt/missing runtime assets, and targets without
 `UBS_RELEASE_GENERATIONS=1` preserve the previous runner, companion, and cache.
+`UBS_RELEASE_QUALIFICATION=1` makes missing Minisign or the immutable v5.5.26
+source a hard failure in candidate installation tests; developer-mode skips are
+not release evidence. Use a full-history checkout. The tests exercise the
+standalone installer's default latest-release resolution with fresh homes and
+real signed payloads, followed by a complete offline scan with transport
+disabled. The historical v5.5.26 runner must still be rejected as a latest
+target, and remain usable if an upgrade fails.
 
 Build a complete unsigned candidate in a new directory:
 
@@ -80,6 +89,17 @@ candidate_version="$(tr -d '\r\n' < VERSION)"
 candidate_parent="$(mktemp -d "${TMPDIR:-/tmp}/ubs-candidate.XXXXXX")"
 python3 scripts/build_release_candidate.py \
   --version "$candidate_version" --output "$candidate_parent/dist"
+```
+
+For an approved committed source, pass `--source-ref <commit-or-tag>` to read
+raw Git blobs from one resolved immutable tree. The JSON report includes its
+`source_tree`; local edits, index changes, export attributes, and later ref
+movement do not change the candidate bytes. Use `--check-only` instead of
+`--output` to perform the same complete validation without writing an artifact:
+
+```bash
+python3 scripts/build_release_candidate.py \
+  --version "$candidate_version" --source-ref HEAD --check-only
 ```
 
 The builder checks `VERSION`, the literal runner version, and the README badge;
@@ -112,7 +132,8 @@ scripts/cut-release.sh 5.5.44 --no-commit
 ```
 
 The first command previews; the second prepares reviewable working-tree edits
-without committing or tagging. Both require the strict self-scan first. The
+without committing or tagging. Both validate the current candidate and require
+the strict self-scan before changing files. The
 script synchronizes `VERSION`, `UBS_VERSION`, the README badge, module/helper
 checksums, and `SHA256SUMS`, then rolls the Unreleased changelog section. Rebuild
 and requalify the resulting candidate; version changes change authenticated
@@ -129,6 +150,19 @@ opt-out. Maintainers can enable `.githooks` with
 The cutter's normal `--yes` mode commits and creates an annotated tag. Use it
 only after that exact action has been approved; it never pushes. When preparing
 with `--no-commit`, create the reviewed tag separately only after approval.
+
+Before committing, the cutter validates the exact tree returned by
+`git write-tree`, including all runtime files, flat payloads, and nested pins.
+It also requires its complete installable payload to match the working
+candidate, including verification and hook scripts outside source `SHA256SUMS`.
+`--allow-dirty` cannot authorize a tag containing hashes for unstaged or
+untracked files. If the staged tree fails, the prepared edits remain available
+for review; no release commit or tag is created, and no additional source files
+are staged automatically. Stage the reviewed matching source and validate the
+new tree before a manual commit/tag; the cutter cannot be rerun with the same
+already prepared version. A commit hook or concurrent index edit that changes
+the committed tree also stops tag creation. The tag always targets the exact
+validated commit, independent of subsequent `HEAD` movement.
 
 ## Sign and authenticate the complete candidate
 

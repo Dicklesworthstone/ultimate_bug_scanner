@@ -60,6 +60,8 @@ jobs:
       TAG: ${{ needs.gather.outputs.tag }}
       VERSION: ${{ needs.gather.outputs.version }}
       PYTHONDONTWRITEBYTECODE: "1"
+      UBS_RELEASE_QUALIFICATION: "1"
+      UBS_DAEMON_E2E: "1"
     steps:
       - name: Ensure minisign secret is present
         env:
@@ -79,7 +81,11 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ca-certificates curl dpkg-dev coreutils minisign
+          sudo apt-get install -y --no-install-recommends ca-certificates curl dpkg-dev coreutils minisign shellcheck nodejs npm
+
+          # Required by the real installed pre-commit scan; do not silently
+          # qualify a release with this test skipped for a missing tool.
+          npm install -g @ast-grep/cli@0.45.3 >/dev/null
 
           # jq (static binary)
           curl -fsSLo /usr/local/bin/jq "https://github.com/jqlang/jq/releases/download/jq-${JQ_VERSION}/jq-linux-amd64"
@@ -100,11 +106,18 @@ jobs:
 
       - name: Verify tag matches VERSION file
         run: |
+          set -euo pipefail
           FILE_VERSION=$(tr -d '\r\n' < VERSION)
           if [ "$FILE_VERSION" != "$VERSION" ]; then
             echo "VERSION file ($FILE_VERSION) does not match tag ($VERSION)" >&2
             exit 1
           fi
+          RELEASE_COMMIT=$(git --no-replace-objects rev-parse --verify --end-of-options "refs/tags/${TAG}^{commit}")
+          if [ "$(git --no-replace-objects rev-parse HEAD)" != "$RELEASE_COMMIT" ] || [ -n "$(git status --porcelain)" ]; then
+            echo "Release qualification requires a clean checkout of the exact release tag" >&2
+            exit 1
+          fi
+          echo "RELEASE_COMMIT=$RELEASE_COMMIT" >> "$GITHUB_ENV"
 
       - name: Qualify release publication and verification
         run: |
@@ -114,13 +127,26 @@ jobs:
           python3 test-suite/shareable/test_release_generation.py -v
           python3 test-suite/shareable/test_installed_contract.py -v
           python3 test-suite/quality/test_verified_release.py -v
+          python3 test-suite/quality/test_release_self_scan.py -v
+
+      - name: Require repository quality gates
+        run: |
+          set -euo pipefail
+          shellcheck ubs modules/ubs-*.sh scripts/*.sh
+          bash scripts/verify_checksums.sh
+          bash scripts/verify_sha256sums.sh
+          bash test-suite/run_all.sh
 
       - name: Require complete clean self-scan
         run: python3 scripts/check_self_scan.py
 
       - name: Assemble complete generation-capable release payload
         run: |
-          python3 scripts/build_release_candidate.py --version "$VERSION" --output dist
+          set -euo pipefail
+          python3 scripts/build_release_candidate.py --version "$VERSION" \
+            --source-ref "$RELEASE_COMMIT" --check-only --require-working-tree-match
+          python3 scripts/build_release_candidate.py --version "$VERSION" \
+            --source-ref "$RELEASE_COMMIT" --output dist
 
       - name: Verify assembled canonical service
         run: |

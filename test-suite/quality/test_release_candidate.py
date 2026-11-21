@@ -112,6 +112,83 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("output already exists", result.stderr)
 
+    def test_cli_check_only_validates_without_creating_output(self) -> None:
+        before = set(self.root.iterdir())
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), "--version", self.version, "--check-only"],
+            cwd=self.root, capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["status"], "validated")
+        self.assertEqual(report["runner_sha256"], sha256(ROOT / "ubs"))
+        self.assertNotIn("output", report)
+        self.assertEqual(set(self.root.iterdir()), before)
+
+    def git(self, *args: str) -> str:
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        result = subprocess.run(["git", *args], cwd=self.source, env=env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout.strip()
+
+    def commit_source(self) -> str:
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.name", "UBS candidate test")
+        self.git("config", "user.email", "ubs-test@example.invalid")
+        self.git("config", "commit.gpgSign", "false")
+        self.git("add", ".")
+        self.git("commit", "-qm", "complete candidate")
+        return self.git("rev-parse", "HEAD^{tree}")
+
+    def test_git_candidate_uses_committed_bytes_despite_dirty_working_tree(self) -> None:
+        tree = self.commit_source()
+        helper = self.source / "modules" / self.helper
+        expected = helper.read_bytes()
+        helper.write_bytes(expected + b"\n# uncommitted source edit\n")
+        self.assert_rejected("checksum mismatch")
+        report = candidate.build_candidate(self.source, self.version, self.output, "HEAD")
+        self.assertEqual(report["source_tree"], tree)
+        self.assertEqual((self.output / "modules" / self.helper).read_bytes(), expected)
+        self.assertNotEqual(helper.read_bytes(), expected, "assembly must preserve the source edit")
+
+    def test_git_snapshot_retains_blob_identity_when_branch_and_index_move(self) -> None:
+        tree = self.commit_source()
+        source = candidate.GitSource(self.source, "HEAD")
+        expected = (self.source / "install.sh").read_bytes()
+        (self.source / "install.sh").write_bytes(expected + b"\n# later commit\n")
+        self.git("add", "install.sh")
+        self.git("commit", "-qm", "different installer")
+        self.assertEqual(source.tree, tree)
+        self.assertNotEqual(self.git("rev-parse", "HEAD^{tree}"), tree)
+        self.assertEqual(source.read("install.sh", candidate.generation.MAX_ASSET_BYTES), expected)
+
+    def test_git_reader_rejects_missing_and_oversize_inputs(self) -> None:
+        self.commit_source()
+        source = candidate.GitSource(self.source, "HEAD")
+        with self.assertRaisesRegex(candidate.CandidateError, "missing required input"):
+            source.read("missing.py", 1024)
+        with self.assertRaisesRegex(candidate.CandidateError, "exceeds size limit"):
+            source.read("ubs", 1)
+        with self.assertRaisesRegex(candidate.CandidateError, "could not read release Git tree"):
+            candidate.GitSource(self.source, "does-not-exist")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support")
+    def test_git_reader_rejects_committed_symlinks_even_with_regular_working_copy(self) -> None:
+        self.commit_source()
+        path = self.source / "scripts/verify.sh"
+        retained = path.with_name("verify-retained.sh")
+        path.rename(retained)
+        path.symlink_to(retained.name)
+        self.git("add", "scripts/verify.sh")
+        tree = self.git("write-tree")
+        path.rename(path.with_name("verify-rejected-link.sh"))
+        retained.rename(path)
+        with self.assertRaisesRegex(candidate.CandidateError, "not a regular file"):
+            candidate.build_candidate(self.source, self.version, self.output, tree)
+        self.assertFalse(self.output.exists())
+
     def test_requires_one_literal_supported_generation_marker(self) -> None:
         original = (self.source / "ubs").read_bytes()
         for replacement in (b"", b"UBS_RELEASE_GENERATIONS=0\n", b'UBS_RELEASE_GENERATIONS="1"\n',
@@ -357,6 +434,29 @@ class ReleaseCandidateTests(unittest.TestCase):
 
 
 class ReleaseWorkflowTests(unittest.TestCase):
+    def test_build_recipe_requires_install_and_repository_gates_before_signing(self) -> None:
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        build = workflow.split("\n  build-artifacts:\n", 1)[1].split("\n  oci-image:\n", 1)[0]
+        steps = re.split(r"^      - name: (.+)$", build, flags=re.M)
+        names = steps[1::2]
+        bodies = dict(zip(names, steps[2::2]))
+        signing = names.index("Sign checksums with minisign")
+        for name in ("Qualify release publication and verification", "Require repository quality gates",
+                     "Require complete clean self-scan", "Assemble complete generation-capable release payload"):
+            with self.subTest(gate=name):
+                self.assertLess(names.index(name), signing)
+                self.assertNotRegex(bodies[name], r"(?m)^\s+(?:if|continue-on-error):")
+        self.assertRegex(steps[0], r'(?m)^      UBS_RELEASE_QUALIFICATION: "1"$')
+        self.assertRegex(steps[0], r'(?m)^      UBS_DAEMON_E2E: "1"$')
+        for script in ("test_release_candidate_install.py", "test_release_self_scan.py"):
+            self.assertIn(script, bodies["Qualify release publication and verification"])
+        for command in ("shellcheck ubs modules/ubs-*.sh scripts/*.sh", "bash test-suite/run_all.sh",
+                        "bash scripts/verify_checksums.sh", "bash scripts/verify_sha256sums.sh"):
+            self.assertIn(command, bodies["Require repository quality gates"])
+        assembly = bodies["Assemble complete generation-capable release payload"]
+        self.assertIn('--source-ref "$RELEASE_COMMIT" --check-only --require-working-tree-match', assembly)
+        self.assertIn('--source-ref "$RELEASE_COMMIT" --output dist', assembly)
+
     def test_publication_waits_for_successful_candidate_and_nix_gates(self) -> None:
         # The image push is already public publication, before the later
         # GitHub Release job. Check the recipe's dependency contract without

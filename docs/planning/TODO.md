@@ -240,7 +240,34 @@ active implementations were checked again before selecting these gaps.
 ### Go buffered input and native Reader payloads (`1b9j.6.6`)
 
 - [x] Reproduce complete-clean misses through Scanner.Text, aliased Reader.ReadString, io.ReadAll(os.Stdin) and JSON decoding from stdin, plus a metadata false positive on a literal reader. Real Go 1.24.4 witnesses distinguish pre-Scan empty text, scanned stdin and fixed text.
-- [ ] Complete the shared native Reader capability and bufio contracts; verify source/native and related regression cohorts, then exact public formats and cache/selection/suppression controls before publication.
+- [x] Add a shared native Reader capability for stdin, strings/bytes readers and bufio receivers. Preserve Scanner lifecycle, saved methods, aliases, distinct helper allocations, input payload slots and clean metadata; reuse the proof in ReadAll, JSON/XML decoders and fmt scanning.
+- [x] Pass four Go suites and three actual Go compiler witnesses: 380 tests with 16 opt-in skips. DSR log SHA256 `c4dcd8047b9ca4e2819ae73ff71bef67b1dbd4c42994dcd837de39961921ac1e`. Preserve selected-helper fixed-point bottom until its Reader identity is available.
+- [x] Independently pass 19 supported source cases and all 21 native witnesses, then three selected-helper source/native follow-ups on the final implementation. Preserve two real failures where incomplete analysis loses earlier findings; those motivate the separate `1b9j.6.8` change, not a claim that the full independent review passed.
+- [x] Pass all 32 public module/runner JSON/SARIF combinations on the pinned reader tree, including exact locations/counts, pre-Scan and metadata cleanliness, suppression, selection and explicit custom/mutation boundaries. Data log SHA256 `3311cbc3f0e1f3a5cd8386258d0ddb0f1f98526a5cf71c5e106b49abb0f4104e`; controls log `381f4203618e8e66c153c9af430a167a3043bd51dfb31627eb05d83509589a44`. Publisher cache/selection log `3365b49badb89e29bd837ff49629b83b30521a58d285ccb5ced89f09b6f01ff3`.
+- [x] Correct the intended native safe fixture's missing strings import while preserving its body/assertion; retain unresolved and source-producing local-lookalike controls. Correct the new SARIF test's assumption that complete legacy runs require optional invocation metadata; partial reports still require failed invocation/error metadata and exit 2. Keep all initial failed receipts.
+- [x] Preserve concurrent SQL changes through `8dbd2999`, refresh canonical integrity and development version 5.5.98, and verify syntax/whitespace. Merged integrity log SHA256 `3dc4fe26e03dac75cf4b868a4f6412a240ae38d644b8d06d7661475f6831cdc5`.
+- [x] Pass all 32 unchanged public combinations again on that combined tree, plus eight unsafe/partial smoke calls (40 total); DSR log SHA256 `b542ed79a6f0bd8b1812487ec6cb1f58c32232b3dda148341ca6f8824fe56ba5`. Preserve the later HTTPX prepared-request commit `896158b4` for publication, with the exact same Go source/tests and canonical development version 5.5.99.
+- [ ] General mutable backing-buffer aliases remain outside this bounded Reader model; native destination/receiver mutation, unknown readers/splitters and unsupported handle transport remain explicit boundaries. Broad repository/release qualification is separate.
+
+### Rust executable provenance (`1b9j.6.7`)
+
+- [x] Freeze 21 exact source cases: 17 fail on the active name-based command detector, including arbitrary-name environment inputs, fixed assignments with suspicious names, helper contexts and import/namespace shadows.
+- [x] Compile and run a real Rust witness that inspects `Command::get_program` without spawning commands; environment/argument inputs and fixed-program controls match. Baseline DSR log SHA256 `c53b9532ef810c4273dbc0ad046e12f5fc8eccb49adcf2c8b97bdb5c6e4667e5`.
+- [ ] Reuse the structured Rust flow engine with command-specific source/sink and import proof, preserving lexical scope, overwrites and selected helper summaries. URL validation must never sanitize executable provenance.
+- [ ] Pass original command controls, shared redirect regressions, independent/native checks and exact public format/cache/selection checks before publication.
+
+### Go findings during partial analysis (`1b9j.6.8`)
+
+- [x] Freeze three exact losses: reached SQL/XSS/command findings before an unsupported reader, completed-helper findings before a failing helper, and selected packages on either side of a failed package. All three baseline assertions fail; DSR log SHA256 `dc832719096cd7610f36afee911af424c8ebce79a80fe0e59674ecd096593afe`.
+- [x] Preserve reached concrete effects without installing unfinished call summaries. Continue independent sink domains and selected packages, then raise the explicit incomplete-analysis error after emitting retained findings.
+- [x] Pass the three frozen probes and eight maintained source/module-adapter methods, including initializer effects, parameter-only exclusions, bound SQL, HTML sanitization and unfinished-helper return controls. The failed package is not resumed past its unsupported operation.
+- [x] Pass four Go source suites and native witnesses: 388 tests, 16 opt-in skips. DSR log SHA256 `9083bdd1fcaa88b2b17efd6b023735b55e295c27d5126b1981cca6b125213fe9`.
+- [ ] Verify actual public JSON/SARIF failure metadata, selection, suppression and repeated partial scans that remain uncached, then publish separately from native Reader support.
+
+### Continuation qualification
+
+- [x] Publish Python selected-module HTTP origins in `ce89ed53` and JavaScript reductions in `82687fc4` directly to main through GitHub, with exact blob hash checks and non-forced expected-parent updates.
+- [ ] Complete prescribed full ShellCheck. The unchanged command against the pinned 5.5.95 tree ended without diagnostics after 12.118 seconds (retained launcher exit 247). This is not a lint pass. DSR log SHA256 `fecef879c5b16be04085abf345ff8485e80a1b7681ea4ea816aabd0a16495eac`.
 
 The broad D6 and release umbrellas remain open. All public scanner matrices are
 serialized against isolated, canonically pinned feature trees; source checks may

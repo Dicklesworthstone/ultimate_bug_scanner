@@ -478,6 +478,553 @@ class NativeScanningFlowTests(packages.PackageTestCase):
         self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings), expected, findings)
 
 
+class BufferedReaderFlowTests(packages.PackageTestCase):
+    def check_readers(self, body, markers=(), helpers=''):
+        source = ('package app\nimport ("bufio"; "bytes"; "strings"; "os"; "io"; "fmt"; '
+                  '"encoding/json"; "encoding/xml"; "os/exec")\nfunc h() {\n'
+                  + textwrap.dedent(body) + '\n}\n')
+        self.source('handler.go', source)
+        if helpers:
+            self.source('helpers.go', 'package app\nimport ("bufio"; "strings"; "io")\n' + helpers)
+        expected = []
+        for marker, rule in markers:
+            lines = [(number, line) for number, line in enumerate(source.splitlines(), 1)
+                     if '// ' + marker in line]
+            self.assertEqual(len(lines), 1, (marker, source))
+            number, line = lines[0]
+            sink = {'sql': 'db.Query', 'xss': 'fmt.Fprint', 'command': 'exec.Command'}[rule]
+            expected.append((number, line.index(sink) + 1, 'go.taint.' + rule))
+        findings = self.scan()
+        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings),
+                         sorted(expected), findings)
+        return findings
+
+    def test_scanner_scan_changes_tokens_but_keeps_boolean_error_and_early_text_clean(self):
+        self.check_readers('''
+            scanner := bufio.NewScanner(os.Stdin)
+            db.Query(scanner.Text())
+            db.Query(string(scanner.Bytes()))
+            alias := scanner
+            ok := alias.Scan()
+            db.Query(scanner.Text()) // text
+            exec.Command("sh", "-c", string(alias.Bytes())) // command
+            fmt.Fprint(w, ok, scanner.Err())
+        ''', (('text', 'sql'), ('command', 'command')))
+
+    def test_scanner_loop_and_saved_bound_methods_share_native_state(self):
+        self.check_readers('''
+            scanner := bufio.NewScanner(r.Body)
+            text := scanner.Text
+            read := scanner.Scan
+            db.Query(text())
+            for read() {
+                db.Query(text()) // query
+            }
+        ''', (('query', 'sql'),))
+
+    def test_fixed_scanner_and_buffer_capacity_do_not_introduce_token_provenance(self):
+        self.check_readers('''
+            scanner := bufio.NewScanner(strings.NewReader("fixed"))
+            scanner.Buffer([]byte(r.FormValue("buffer")), len(r.FormValue("size")))
+            scanner.Scan()
+            db.Query(scanner.Text())
+            fmt.Fprint(w, scanner.Bytes(), scanner.Err())
+        ''')
+
+    def test_textual_readers_preserve_payload_and_separate_metadata_results(self):
+        cases = (('ReadString(10)', 'value, err', 'err'),
+                 ('ReadBytes(10)', 'value, err', 'err'),
+                 ('ReadSlice(10)', 'value, err', 'err'),
+                 ('Peek(8)', 'value, err', 'err'),
+                 ('ReadLine()', 'value, prefix, err', 'prefix, err'),
+                 ('ReadByte()', 'value, err', 'err'),
+                 ('ReadRune()', 'value, size, err', 'size, err'))
+        for operation, targets, metadata in cases:
+            with self.subTest(operation=operation):
+                self.check_readers('reader := bufio.NewReader(os.Stdin)\n'
+                                   + targets + ' := reader.' + operation + '\n'
+                                   'db.Query(string(value)) // query\n'
+                                   'fmt.Fprint(w, ' + metadata + ', reader.Size(), reader.Buffered())',
+                                   (('query', 'sql'),))
+
+    def test_native_import_aliases_and_saved_constructors_are_source_aware(self):
+        source = '''package app
+import (b "bufio"; o "os"; s "strings")
+func h() {
+    input := o.Stdin
+    factory := b.NewReaderSize
+    reader := factory(input, 4096)
+    read := reader.ReadString
+    text, err := read(10)
+    db.Query(text)
+    db.Query(err.Error())
+    fixed := factory(s.NewReader("fixed"), len(o.Getenv("SIZE")))
+    safe, _ := fixed.ReadString(10)
+    db.Query(safe)
+}
+'''
+        self.source('handler.go', source)
+        findings = self.scan()
+        self.assertEqual([(row['rule'], row['line'], row['col']) for row in findings],
+                         [('go.taint.sql', 9, 5)], findings)
+
+    def test_stdin_reader_capability_feeds_readall_decoders_and_formatted_input(self):
+        self.check_readers('''
+            input := os.Stdin
+            raw, err := io.ReadAll(input)
+            db.Query(string(raw)) // raw
+            var decoded, scanned string
+            json.NewDecoder(input).Decode(&decoded)
+            db.Query(decoded) // decoded
+            reader := bufio.NewReader(input)
+            count, scanErr := fmt.Fscan(reader, &scanned)
+            db.Query(scanned) // scanned
+            fmt.Fprint(w, err, count, scanErr)
+        ''', (('raw', 'sql'), ('decoded', 'sql'), ('scanned', 'sql')))
+
+    def test_stdin_alias_keeps_its_source_after_the_original_reader_is_replaced(self):
+        self.check_readers('''
+            var input io.Reader = os.Stdin
+            saved := input
+            input = strings.NewReader("fixed")
+            fixed, _ := io.ReadAll(input)
+            original, _ := io.ReadAll(saved)
+            db.Query(string(fixed))
+            db.Query(string(original)) // query
+        ''', (('query', 'sql'),))
+
+    def test_saved_method_keeps_its_original_receiver_after_rebinding(self):
+        self.check_readers('''
+            reader := bufio.NewReader(os.Stdin)
+            read := reader.ReadString
+            reader = bufio.NewReader(strings.NewReader("fixed"))
+            original, _ := read(10)
+            fixed, _ := reader.ReadString(10)
+            db.Query(original) // query
+            db.Query(fixed)
+        ''', (('query', 'sql'),))
+
+    def test_json_buffered_reader_retains_its_input_and_clean_read_error(self):
+        self.check_readers('''
+            decoder := json.NewDecoder(os.Stdin)
+            var value string
+            decoder.Decode(&value)
+            remaining := decoder.Buffered()
+            raw, err := io.ReadAll(remaining)
+            db.Query(string(raw)) // query
+            fmt.Fprint(w, err)
+        ''', (('query', 'sql'),))
+
+    def test_reader_backed_unknown_readall_alternative_cannot_borrow_clean_error_contract(self):
+        self.check_readers('''
+            read := io.ReadAll
+            if choice { read = customRead }
+            data, err := read(strings.NewReader(os.Getenv("TEXT")))
+            db.Query(string(data)) // data
+            db.Query(err.Error()) // error
+        ''', (('data', 'sql'), ('error', 'sql')))
+
+    def test_native_readers_reach_all_existing_sinks(self):
+        self.check_readers('''
+            reader := bufio.NewReader(strings.NewReader(os.Getenv("TEXT")))
+            value, err := reader.ReadString(10)
+            db.Query(value) // query
+            fmt.Fprint(w, value) // html
+            exec.Command("sh", "-c", value) // command
+            db.Query("SELECT $1", value)
+            fmt.Fprint(w, err)
+        ''', (('query', 'sql'), ('html', 'xss'), ('command', 'command')))
+
+    def test_bytes_buffer_contents_and_counts_have_distinct_meaning(self):
+        self.check_readers('''
+            buffer := bytes.NewBufferString(r.FormValue("text"))
+            db.Query(buffer.String()) // text
+            db.Query(string(buffer.Bytes())) // bytes
+            fmt.Fprint(w, buffer.Len(), buffer.Cap(), buffer.Available())
+            fixed := bytes.NewBuffer([]byte("fixed"))
+            db.Query(fixed.String())
+        ''', (('text', 'sql'), ('bytes', 'sql')))
+
+    def test_helper_factory_returns_input_capability_with_distinct_allocations(self):
+        self.check_readers('''
+            first := makeScanner("fixed")
+            second := makeScanner(os.Getenv("TEXT"))
+            first.Scan()
+            db.Query(second.Text())
+            second.Scan()
+            db.Query(second.Text()) // query
+            db.Query(first.Text())
+        ''', (('query', 'sql'),), helpers='''
+func makeScanner(value string) *bufio.Scanner {
+    return bufio.NewScanner(strings.NewReader(value))
+}
+''')
+
+    def test_helper_scan_effect_reaches_original_scanner_and_returned_alias(self):
+        self.check_readers('''
+            scanner := bufio.NewScanner(os.Stdin)
+            alias := identity(scanner)
+            advance(alias)
+            db.Query(scanner.Text()) // query
+        ''', (('query', 'sql'),), helpers='''
+func identity(scanner *bufio.Scanner) *bufio.Scanner { return scanner }
+func advance(scanner *bufio.Scanner) bool { return scanner.Scan() }
+''')
+
+    def test_helper_read_and_helper_wrapping_use_symbolic_reader_contents(self):
+        self.check_readers('''
+            reader := wrap(os.Stdin)
+            value, err := read(reader)
+            db.Query(value) // query
+            fmt.Fprint(w, err)
+            fixed, _ := read(wrap(strings.NewReader("fixed")))
+            db.Query(fixed)
+        ''', (('query', 'sql'),), helpers='''
+func wrap(reader io.Reader) *bufio.Reader { return bufio.NewReader(reader) }
+func read(reader *bufio.Reader) (string, error) { return reader.ReadString(10) }
+''')
+
+    def test_native_consumers_wait_for_selected_reader_factory_summaries(self):
+        self.check_readers('''
+            raw, err := io.ReadAll(open())
+            db.Query(string(raw)) // readall
+            reader := bufio.NewReader(open())
+            value, _ := reader.ReadString(10)
+            db.Query(value) // reader
+            scanner := bufio.NewScanner(open())
+            scanner.Scan()
+            db.Query(scanner.Text()) // scanner
+            var decoded string
+            json.NewDecoder(open()).Decode(&decoded)
+            db.Query(decoded) // decoder
+            fmt.Fprint(w, err)
+        ''', (('readall', 'sql'), ('reader', 'sql'), ('scanner', 'sql'), ('decoder', 'sql')),
+                           helpers='func open() io.Reader { return strings.NewReader(r.FormValue("body")) }\n')
+
+    def test_selected_factory_that_resolves_to_custom_reader_remains_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+        with self.assertRaisesRegex(AnalysisLimit, 'custom reader'):
+            self.check_readers('raw, _ := io.ReadAll(open())\ndb.Query(string(raw))',
+                               helpers='func open() io.Reader { return external() }\n')
+
+    def test_immediate_closure_scan_preserves_capture_and_argument_aliases(self):
+        self.check_readers('''
+            scanner := bufio.NewScanner(os.Stdin)
+            func(other *bufio.Scanner) { other.Scan() }(scanner)
+            db.Query(scanner.Text()) // query
+        ''', (('query', 'sql'),))
+
+    def test_immediate_closure_can_replace_a_reader_without_replacing_its_old_alias(self):
+        self.check_readers('''
+            scanner := bufio.NewScanner(strings.NewReader("fixed"))
+            previous := scanner
+            func() { scanner = bufio.NewScanner(os.Stdin) }()
+            scanner.Scan()
+            previous.Scan()
+            db.Query(scanner.Text()) // query
+            db.Query(previous.Text())
+        ''', (('query', 'sql'),))
+
+    def test_supported_native_split_choices_preserve_only_the_reader_input(self):
+        for split in ('ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'):
+            with self.subTest(split=split):
+                self.check_readers('scanner := bufio.NewScanner(os.Stdin)\n'
+                                   'split := bufio.' + split + '\nscanner.Split(split)\n'
+                                   'scanner.Scan()\ndb.Query(scanner.Text()) // query', (('query', 'sql'),))
+
+    def test_unknown_reader_protocols_and_mutations_are_explicit(self):
+        from ubs_core.taint_flow import AnalysisLimit
+        bodies = (
+            'scanner := bufio.NewScanner(customReader)\nscanner.Scan()',
+            'data, _ := io.ReadAll(customReader)\ndb.Query(string(data))',
+            'data, _ := io.ReadAll(external())\ndb.Query(string(data))',
+            'var value string\njson.NewDecoder(customReader).Decode(&value)\ndb.Query(value)',
+            'var value string\nxml.NewDecoder(external()).Decode(&value)\ndb.Query(value)',
+            'scanner := bufio.NewScanner(os.Stdin)\nscanner.Split(customSplit)',
+            'reader := bufio.NewReader(os.Stdin)\nreader.Reset(strings.NewReader("fixed"))',
+            'reader := bufio.NewReader(os.Stdin)\nreader.Read(destination)',
+            'os.Stdin.Read(destination)',
+            'r.Body.Read(destination)',
+            'scanner := bufio.NewScanner(os.Stdin)\nif choice { scanner = custom }\nscanner.Scan()',
+            'factory := bufio.NewScanner\nif choice { factory = customFactory }\nfactory(os.Stdin)',
+            'scanner := bufio.NewScanner(os.Stdin)\ndefer func() { scanner.Scan() }()',
+            'reader := bufio.NewReader(os.Stdin)\nexternal(reader)',
+            'reader := bufio.NewReader(os.Stdin)\nexternal(&reader)',
+            'reader := bufio.NewReader(os.Stdin)\nvalues := []io.Reader{reader}',
+            'values := []io.Reader{bufio.NewReader(os.Stdin)}',
+            'scanner := bufio.NewScanner(os.Stdin)\ncallback := func() { db.Query(scanner.Text()) }',
+        )
+        for body in bodies:
+            with self.subTest(body=body), self.assertRaisesRegex(AnalysisLimit, 'reader|scanner'):
+                self.check_readers(body)
+
+    def test_reader_output_parameter_replacement_remains_explicit(self):
+        from ubs_core.taint_flow import AnalysisLimit
+        self.source('helper.go', 'package app\nimport ("bufio"; "os")\n'
+                    'func replace(out **bufio.Scanner) { *out = bufio.NewScanner(os.Stdin) }\n')
+        with self.assertRaisesRegex(AnalysisLimit, 'reader output-parameter'):
+            self.scan()
+
+    def test_unimported_and_local_lookalike_reader_constructors_have_no_native_authority(self):
+        from ubs_core.taint_flow import AnalysisLimit
+        bodies = (
+            '''package app
+import codec "encoding/json"
+func h() {
+    var value string
+    codec.NewDecoder(strings.NewReader(`"fixed"`)).Decode(&value)
+    db.Query(value)
+}
+''',
+            '''package app
+import ("encoding/json"; "io"; "bytes"; "os")
+type customFactory struct{}
+func (customFactory) NewReader(_ string) io.Reader {
+    return bytes.NewReader([]byte(os.Getenv("READER_CONTENTS")))
+}
+var strings = customFactory{}
+func h() {
+    var value string
+    json.NewDecoder(strings.NewReader(`"fixed"`)).Decode(&value)
+    db.Query(value)
+}
+''',
+        )
+        for source in bodies:
+            with self.subTest(source=source), self.assertRaisesRegex(AnalysisLimit, 'custom reader'):
+                self.source('handler.go', source)
+                self.scan()
+
+    def run_native_reader(self, source, expected):
+        from test_keep_temp import prevent_child_deletion
+
+        path = self.source('main.go', source)
+        executable = self.root / 'reader-witness'
+        environment = dict(os.environ, GO111MODULE='off', GOWORK='off', GOTOOLCHAIN='local',
+                           UBS_GO_BUFFERED_INPUT='<supplied>')
+        compiler = os.environ.get('UBS_GO_COMPILER', 'go')
+        build = subprocess.run([compiler, 'build', '-work', '-o', str(executable), str(path)],
+                               cwd=self.root, env=environment, capture_output=True, text=True,
+                               timeout=180, preexec_fn=prevent_child_deletion)
+        (self.root / 'build.stdout.log').write_text(build.stdout)
+        (self.root / 'build.stderr.log').write_text(build.stderr)
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        result = subprocess.run([str(executable)], input='<stdin>\n', cwd=self.root, env=environment,
+                                capture_output=True, text=True, timeout=30, preexec_fn=prevent_child_deletion)
+        (self.root / 'native.stdout.log').write_text(result.stdout)
+        (self.root / 'native.stderr.log').write_text(result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout), expected)
+        return path
+
+    @unittest.skipUnless(os.environ.get('UBS_GO_BUFFERED_NATIVE') == '1',
+                         'set UBS_GO_BUFFERED_NATIVE=1 for real Go buffered-reader witnesses')
+    def test_native_reader_tokens_bound_methods_and_helper_state_match_source_findings(self):
+        source = textwrap.dedent('''
+            package main
+            import ("bufio"; "os"; "strings"; "encoding/json"; "io"; "strconv"; "fmt")
+            type Recorder struct { Queries []string }
+            func (db *Recorder) Query(query string) { db.Queries = append(db.Queries, query) }
+            func makeScanner(value string) *bufio.Scanner { return bufio.NewScanner(strings.NewReader(value)) }
+            func advance(scanner *bufio.Scanner) bool { return scanner.Scan() }
+            func main() {
+                db := &Recorder{}
+                scanner := bufio.NewScanner(os.Stdin)
+                db.Query(scanner.Text())
+                next, token := scanner.Scan, scanner.Text
+                scanner = bufio.NewScanner(strings.NewReader("fixed"))
+                next()
+                db.Query(token()) // stdin
+                scanner.Scan()
+                db.Query(scanner.Text())
+                first := makeScanner("fixed")
+                second := makeScanner(os.Getenv("UBS_GO_BUFFERED_INPUT"))
+                advance(first)
+                db.Query(second.Text())
+                advance(second)
+                db.Query(second.Text()) // helper
+                reader := bufio.NewReader(strings.NewReader(os.Getenv("UBS_GO_BUFFERED_INPUT") + "\\n"))
+                read := reader.ReadString
+                reader = bufio.NewReader(strings.NewReader("fixed\\n"))
+                value, err := read(10)
+                db.Query(value) // reader
+                db.Query(fmt.Sprint(err))
+                db.Query(strconv.Itoa(reader.Buffered()))
+                raw, readErr := io.ReadAll(strings.NewReader(os.Getenv("UBS_GO_BUFFERED_INPUT")))
+                if readErr != nil { panic(readErr) }
+                db.Query(string(raw)) // readall
+                var decoded string
+                json.NewDecoder(strings.NewReader(strconv.Quote(os.Getenv("UBS_GO_BUFFERED_INPUT")))).Decode(&decoded)
+                db.Query(decoded) // decoder
+                if err := json.NewEncoder(os.Stdout).Encode(db.Queries); err != nil { panic(err) }
+            }
+        ''').lstrip('\n')
+        self.run_native_reader(source, ['', '<stdin>', 'fixed', '', '<supplied>', '<supplied>\n',
+                                        '<nil>', '0', '<supplied>', '<supplied>'])
+        expected = sorted((number, line.index('db.Query') + 1, 'go.taint.sql')
+                          for number, line in enumerate(source.splitlines(), 1)
+                          if any('// ' + marker in line for marker in ('stdin', 'helper', 'reader', 'readall', 'decoder')))
+        findings = self.scan()
+        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings), expected, findings)
+
+    @unittest.skipUnless(os.environ.get('UBS_GO_BUFFERED_NATIVE') == '1',
+                         'set UBS_GO_BUFFERED_NATIVE=1 for real Go buffered-reader witnesses')
+    def test_native_local_lookalike_reader_can_supply_external_data(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        source = textwrap.dedent('''
+            package main
+            import ("encoding/json"; "io"; "os"; standard "strings")
+            type customFactory struct{}
+            func (customFactory) NewReader(_ string) io.Reader {
+                return standard.NewReader(os.Getenv("UBS_GO_BUFFERED_INPUT"))
+            }
+            var strings = customFactory{}
+            type Recorder struct { Queries []string }
+            func (db *Recorder) Query(query string) { db.Queries = append(db.Queries, query) }
+            func main() {
+                db := &Recorder{}
+                raw, err := io.ReadAll(strings.NewReader("fixed"))
+                if err != nil { panic(err) }
+                db.Query(string(raw))
+                if err := json.NewEncoder(os.Stdout).Encode(db.Queries); err != nil { panic(err) }
+            }
+        ''').lstrip('\n')
+        self.run_native_reader(source, ['<supplied>'])
+        with self.assertRaisesRegex(AnalysisLimit, 'custom reader'):
+            self.scan()
+
+
+class BufferedReaderCacheTests(packages.PackageTestCase):
+    scan_main = packages.PackageCacheTests.scan_main
+
+    def test_reader_factory_changes_invalidate_warm_package_findings(self):
+        helper = self.source('helper.go', 'package app\nimport ("strings"; "io")\n'
+                             'func open() io.Reader { return strings.NewReader("fixed") }\n')
+        handler = self.source('handler.go', 'package app\nimport "io"\n'
+                              'func h() { raw, _ := io.ReadAll(open()); db.Query(string(raw)) }\n')
+        (self.root / 'unselected.go').write_text('package app\nimport "os"\n'
+                                              'func unselected() { db.Query(os.Getenv("SQL")) }\n')
+        self.assertEqual(self.scan_main()[0], [])
+        warm, stats = self.scan_main()
+        self.assertEqual(warm, [])
+        self.assertEqual(stats['hits'], 2, stats)
+        self.source('helper.go', 'package app\nimport ("os"; "io")\n'
+                    'func open() io.Reader { return os.Stdin }\n')
+        changed, stats = self.scan_main()
+        self.assertEqual([(Path(row['path']).name, row['line'], row['col'], row['rule']) for row in changed],
+                         [('handler.go', 3, 42, 'go.taint.sql')], changed)
+        self.assertEqual(stats['misses'], 2, stats)
+        self.assertEqual(self.scan_main([helper])[0], [])
+        self.assertEqual(self.scan_main([helper, handler])[0], changed)
+
+
+@unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1',
+                     'set UBS_TAINT_E2E=1 for real Go buffered-reader reports')
+class BufferedReaderModuleTests(unittest.TestCase):
+    def test_public_unsafe_and_metadata_reports(self):
+        self.check_public_cases(0, 4)
+
+    def test_public_controls_and_protocol_boundaries(self):
+        self.check_public_cases(4, 8)
+
+    def check_public_cases(self, start, end):
+        from test_keep_temp import prevent_child_deletion
+
+        cases = (
+            ('scanner', 'scanner := bufio.NewScanner(os.Stdin)\nscanner.Scan()\n'
+             'db.Query(scanner.Text()) // query', True, False),
+            ('reader', 'factory := bufio.NewReader\nreader := factory(os.Stdin)\n'
+             'read := reader.ReadString\nvalue, err := read(10)\n'
+             'db.Query(value) // query\nfmt.Fprint(w, err)', True, False),
+            ('readall', 'input := os.Stdin\nvalue, err := io.ReadAll(input)\n'
+             'db.Query(string(value)) // query\nfmt.Fprint(w, err)', True, False),
+            ('metadata', 'scanner := bufio.NewScanner(os.Stdin)\ndb.Query(scanner.Text())\n'
+             'ok := scanner.Scan()\nreader := bufio.NewReader(os.Stdin)\n'
+             'fmt.Fprint(w, ok, scanner.Err(), reader.Buffered(), reader.Size())', False, False),
+            ('fixed', 'scanner := bufio.NewScanner(strings.NewReader("fixed"))\n'
+             'scanner.Scan()\ndb.Query(scanner.Text())', False, False),
+            ('suppressed', 'scanner := bufio.NewScanner(os.Stdin)\nscanner.Scan()\n'
+             'db.Query(scanner.Text()) // ubs:ignore[go.taint.sql]', False, False),
+            ('custom', 'value, err := io.ReadAll(customReader)\ndb.Query(string(value))', False, True),
+            ('mutation', 'reader := bufio.NewReader(os.Stdin)\nreader.Reset(strings.NewReader("fixed"))',
+             False, True),
+        )
+        artifacts = packages.ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='go-buffered-public-', dir=artifacts))
+        skipped = ','.join(str(category) for category in range(1, 23) if category != 9)
+        for name, body, unsafe, partial in cases[start:end]:
+            folder = root / name
+            folder.mkdir()
+            source = ('package app\nimport ("bufio"; "os"; "io"; "strings"; "fmt")\n'
+                      'func h() {\n' + body + '\n}\n')
+            path = folder / 'handler.go'
+            path.write_text(source)
+            (folder / 'unselected.go').write_text('package app\nfunc other() { db.Query(r.FormValue("q")) }\n')
+            expected = [(number, line.index('db.Query') + 1, 'go.taint.sql')
+                        for number, line in enumerate(source.splitlines(), 1) if '// query' in line]
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, format=output):
+                        command = [str(packages.ROOT / ('ubs' if meta else 'modules/ubs-golang.sh')),
+                                   str(path), '--ci', '--no-color', '--format=' + output, '--skip=' + skipped]
+                        if meta:
+                            command.append('--only=golang')
+                        result = subprocess.run(command, cwd=folder, capture_output=True, text=True,
+                                                timeout=45, preexec_fn=prevent_child_deletion,
+                                                env=dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1',
+                                                         UBS_NO_CACHE='1', UBS_CACHE_DIR=str(folder / 'cache')))
+                        prefix = folder / f'{meta}-{output}'
+                        prefix.with_suffix('.stdout.log').write_text(result.stdout)
+                        prefix.with_suffix('.stderr.log').write_text(result.stderr)
+                        self.assertEqual(result.returncode, 2 if partial else 1 if unsafe else 0,
+                                         (command, result.stdout, result.stderr))
+                        report = json.loads(result.stdout)
+                        if output == 'json':
+                            self.assertEqual(report['status'], 'partial' if partial else 'ok', report)
+                            totals = report['totals'] if meta else report
+                            self.assertEqual([totals[key] for key in ('files', 'critical', 'warning', 'info')],
+                                             [1, len(expected), 0, 0], report)
+                            actual = [(row['line'], row['col'], row['rule_id' if meta else 'rule'])
+                                      for row in report['findings']]
+                            for row in report['findings']:
+                                self.assertEqual(Path(row['file' if meta else 'path']).name, path.name, row)
+                                self.assertEqual(row['severity'], 'critical', row)
+                        else:
+                            self.assertEqual(report['version'], '2.1.0', report)
+                            analyzer_runs = [run for run in report['runs']
+                                             if run['tool']['driver']['name'] == 'ubs-golang-heuristics']
+                            self.assertTrue(analyzer_runs, report)
+                            if partial:
+                                for run in analyzer_runs:
+                                    failures = [invocation for invocation in run.get('invocations', [])
+                                                if not invocation['executionSuccessful']
+                                                and invocation.get('exitCode') == 2]
+                                    self.assertTrue(failures, run)
+                                    self.assertTrue(any(
+                                        notice.get('level') == 'error'
+                                        and notice.get('descriptor', {}).get('id') == 'ubs/module-partial'
+                                        and 'reader' in notice.get('message', {}).get('text', '')
+                                        for invocation in failures
+                                        for notice in invocation.get('toolExecutionNotifications', [])), run)
+                            actual = []
+                            for run in report['runs']:
+                                for invocation in run.get('invocations', []):
+                                    if not partial:
+                                        self.assertTrue(invocation['executionSuccessful'], invocation)
+                                for row in run.get('results', []):
+                                    location = row['locations'][0]['physicalLocation']
+                                    region = location['region']
+                                    self.assertEqual(Path(location['artifactLocation']['uri']).name, path.name, row)
+                                    self.assertEqual(row['level'], 'error', row)
+                                    actual.append((region['startLine'], region['startColumn'], row['ruleId']))
+                        self.assertEqual(sorted(actual), sorted(expected), report)
+                        if partial:
+                            self.assertIn('reader', json.dumps(report), report)
+                        print('GO_BUFFERED_PUBLIC_PASS', name, 'runner' if meta else 'module', output, flush=True)
+
+
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1',
                      'set UBS_TAINT_E2E=1 for real Go module and runner reports')
 class NativeScanningModuleTests(unittest.TestCase):
@@ -2269,7 +2816,7 @@ class ImportIdentityTests(packages.PackageTestCase):
     def test_clean_input_and_bound_sql_stay_clean_with_import_aliases(self):
         self.source('handler.go', '''
             package app
-            import codec "encoding/json"
+            import (codec "encoding/json"; "strings")
             func h() {
                 var clean, input Payload
                 codec.NewDecoder(strings.NewReader(`{"SQL":"SELECT 1"}`)).Decode(&clean)

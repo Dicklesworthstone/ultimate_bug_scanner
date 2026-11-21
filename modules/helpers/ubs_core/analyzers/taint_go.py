@@ -41,21 +41,31 @@ FIELD_PATH_LIMIT = 8
 _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
                     'io': 'io', 'io/ioutil': 'ioutil', 'html': 'html',
                     'html/template': 'template', 'text/template': 'template', 'os': 'os',
-                    'fmt': 'fmt', 'strings': 'strings', 'bytes': 'bytes'}
+                    'fmt': 'fmt', 'strings': 'strings', 'bytes': 'bytes', 'bufio': 'bufio'}
 _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
                    'io': {'ReadAll'}, 'ioutil': {'ReadAll'},
                    'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
                    'os': {'Getenv', 'LookupEnv', 'Stdin'},
                    'fmt': {'Scan', 'Scanln', 'Scanf', 'Fscan', 'Fscanln', 'Fscanf',
                            'Sscan', 'Sscanln', 'Sscanf'},
-                   'strings': {'NewReader'}, 'bytes': {'NewReader', 'NewBuffer', 'NewBufferString'}}
+                   'strings': {'NewReader'}, 'bytes': {'NewReader', 'NewBuffer', 'NewBufferString'},
+                   'bufio': {'NewReader', 'NewReaderSize', 'NewScanner',
+                             'ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'}}
 _ENVIRONMENT_OPERATIONS = frozenset({('os', 'Getenv'), ('os', 'LookupEnv')})
 _SCAN_OPERATIONS = frozenset(('fmt', member) for member in _NATIVE_MEMBERS['fmt'])
-_SOURCE_OPERATIONS = _ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS
+_READER_CONSTRUCTORS = {
+    ('strings', 'NewReader'): 'strings-reader', ('bytes', 'NewReader'): 'bytes-reader',
+    ('bytes', 'NewBuffer'): 'bytes-buffer', ('bytes', 'NewBufferString'): 'bytes-buffer',
+    ('bufio', 'NewReader'): 'bufio-reader', ('bufio', 'NewReaderSize'): 'bufio-reader',
+    ('bufio', 'NewScanner'): 'scanner',
+}
+_BUFFER_SPLITTERS = frozenset(('bufio', member) for member in ('ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'))
+_SOURCE_OPERATIONS = _ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _READER_CONSTRUCTORS.keys()
 
 
 def _source_boundary(operations, action):
-    family = 'formatted input' if operations & _SCAN_OPERATIONS else 'environment'
+    family = ('formatted input' if operations & _SCAN_OPERATIONS else
+              'reader' if operations & _READER_CONSTRUCTORS.keys() else 'environment')
     return AnalysisLimit(f'Go {family} callable {action} is unsupported; analysis is incomplete')
 
 SOURCE_PATTERNS = [
@@ -68,7 +78,6 @@ SOURCE_PATTERNS = [
     re.compile(r"mux\.Vars\s*\(", re.IGNORECASE),
     re.compile(r"chi\.URLParam\s*\(", re.IGNORECASE),
     re.compile(r"\.(?:QueryParam|FormParam|Param)\s*\(", re.IGNORECASE),
-    re.compile(r"bufio\.NewReader\(os\.Stdin\)", re.IGNORECASE),
     re.compile(r"\b(?:r|req|request)\.Body\b"),
 ]
 
@@ -334,6 +343,40 @@ class _DecoderInfo:
 
 
 @dataclass(frozen=True)
+class _ReaderKey:
+    cell: str
+
+
+@dataclass(frozen=True)
+class _ReaderOrigin:
+    # Allocation and call sites form a finite identity, never a call stack.
+    site: tuple[int, int]
+    parameter: int | None = None
+
+
+@dataclass(frozen=True)
+class _ReaderInfo:
+    source: _Fact = _CLEAN
+    kinds: frozenset[str] = frozenset()
+    origins: frozenset[_ReaderOrigin] = frozenset()
+    scanned: bool = False
+    definite: bool = True
+    methods: frozenset[str] = frozenset({''})
+
+
+def _join_readers(*readers):
+    present = [reader for reader in readers if reader is not None]
+    if not present:
+        return None
+    return _ReaderInfo(_join(*(reader.source for reader in present)),
+                       frozenset().union(*(reader.kinds for reader in present)),
+                       frozenset().union(*(reader.origins for reader in present)),
+                       any(reader.scanned for reader in present),
+                       len(present) == len(readers) and all(reader.definite for reader in present),
+                       frozenset().union(*(reader.methods for reader in present)))
+
+
+@dataclass(frozen=True)
 class _NativeKey:
     cell: str
 
@@ -352,6 +395,7 @@ class _ValueInfo:
     native: _NativeInfo | None = _UNKNOWN_NATIVE
     decoder: _DecoderInfo | None = None
     pointers: frozenset[_Target] = frozenset()
+    reader: _ReaderInfo | None = None
 
 
 def _join_value_info(*values):
@@ -366,7 +410,8 @@ def _join_value_info(*values):
     pointers = frozenset().union(*(value.pointers for value in values))
     if not all(value.pointers for value in values):
         pointers = frozenset(replace(target, whole=False) for target in pointers)
-    return _ValueInfo(_join_native(*(value.native for value in values)), decoder, pointers)
+    return _ValueInfo(_join_native(*(value.native for value in values)), decoder, pointers,
+                      _join_readers(*(value.reader for value in values)))
 
 
 def _join_native(*values):
@@ -440,6 +485,8 @@ def _join_states(*states):
             decoders = [state.get(name) for state in states]
             result[name] = _DecoderInfo(_join(*(item.source for item in decoders if item is not None)),
                                         all(item is not None and item.definite for item in decoders))
+        elif isinstance(name, _ReaderKey):
+            result[name] = _join_readers(*(state.get(name) for state in states))
         elif isinstance(name, _NativeKey):
             result[name] = _join_native(*(state.get(name) for state in states))
         elif isinstance(name, _ScanKindKey):
@@ -763,6 +810,7 @@ class _Summary:
     writes: dict[tuple[int, tuple[str, ...]], _Fact] = field(default_factory=dict)
     value_returns: tuple[_ValueInfo | None, ...] = ()
     native_writes: dict[tuple[int, tuple[str, ...]], _NativeInfo | None] = field(default_factory=dict)
+    reader_scans: frozenset[int] = frozenset()
 
 
 def _join_summaries(summaries: list[_Summary]) -> _Summary:
@@ -794,10 +842,14 @@ def _join_summaries(summaries: list[_Summary]) -> _Summary:
             value = summary.value_returns[index]
             decoder = (replace(value.decoder, source=widen(value.decoder.source))
                        if value.decoder is not None else None)
+            reader = (replace(value.reader, source=widen(value.reader.source), origins=frozenset(
+                replace(origin, parameter=min(origin.parameter, variadic))
+                if variadic is not None and origin.parameter is not None else origin
+                for origin in value.reader.origins)) if value.reader is not None else None)
             pointers = frozenset(replace(target, parameter=min(target.parameter, variadic))
                                  if variadic is not None and target.parameter is not None else target
                                  for target in value.pointers)
-            values.append(replace(value, decoder=decoder, pointers=pointers))
+            values.append(replace(value, decoder=decoder, pointers=pointers, reader=reader))
         value_returns.append(_join_value_info(*values))
     effects = {}
     writes = {}
@@ -811,7 +863,9 @@ def _join_summaries(summaries: list[_Summary]) -> _Summary:
         for (index, path), native in summary.native_writes.items():
             index = min(index, variadic) if variadic is not None else index
             native_writes[index, path] = _join_native(native_writes.get((index, path)), native)
-    return _Summary(returns, effects, variadic, writes, tuple(value_returns), native_writes)
+    reader_scans = frozenset(min(index, variadic) if variadic is not None else index
+                             for summary in summaries for index in summary.reader_scans)
+    return _Summary(returns, effects, variadic, writes, tuple(value_returns), native_writes, reader_scans)
 
 
 @dataclass
@@ -840,6 +894,8 @@ class _Analysis:
         self.native_mutations: set[str] = set()
         self.native_escapes: set[str] = set()
         self.scan_writes: dict[_Target, _Fact] = {}
+        self.reader_scans: set[_ReaderOrigin] = set()
+        self.reader_cell_writes: dict[str, _ReaderInfo | None] = {}
         self.uncertain_globals = uncertain_globals if uncertain_globals is not None else set()
         self.global_cells = global_cells
         self.resolve_summary = resolve_summary
@@ -992,8 +1048,19 @@ class _Analysis:
             if following < len(code) and code[following] == '(':
                 summary = self.summaries.get(root) if member is None and root not in scope.bindings else None
                 natives = (info.native for info in summary.value_returns if info is not None) if summary else ()
+                closing = _pairs(code).get(following)
+                tail = code[closing + 1:].lstrip() if closing is not None else ''
+                stored = tail.startswith((',', '}')) or (append and tail == ')')
+                native = self.native_callable(root, member, offset + match.start(), state, scope)
+                if stored and ((native is not None and native.operations & _READER_CONSTRUCTORS.keys())
+                               or (summary is not None and any(info is not None and info.reader is not None
+                                                               for info in summary.value_returns))):
+                    raise AnalysisLimit('Go reader aggregate storage is unsupported; analysis is incomplete')
             else:
                 natives = (self.native_callable(root, member, offset + match.start(), state, scope),)
+                info = self.value_info(match.group(), offset + match.start(), state, scope)
+                if info is not None and info.reader is not None:
+                    raise AnalysisLimit('Go reader aggregate storage is unsupported; analysis is incomplete')
             operations = frozenset().union(*(native.operations & _SOURCE_OPERATIONS
                                              for native in natives if native is not None))
             if operations:
@@ -1008,15 +1075,92 @@ class _Analysis:
         name = re.fullmatch(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?', code)
         if name:
             cell = scope.bindings.get(name.group(1), name.group(1))
-            return _ValueInfo(self.native_callable(name.group(1), name.group(2), offset, state, scope),
+            native = self.native_callable(name.group(1), name.group(2), offset, state, scope)
+            reader = state.get(_ReaderKey(cell))
+            if reader is not None and name.group(2) is not None:
+                reader = replace(reader, methods=frozenset({name.group(2)}))
+            elif reader is None and native is not None and native.operations == {('os', 'Stdin')} and not native.unknown:
+                reader = _ReaderInfo(frozenset({_Trace('os.Stdin', path=('os.Stdin',))}),
+                                     frozenset({'stdin'}), frozenset({_ReaderOrigin((-1, -1))}))
+            elif re.fullmatch(r'(?:r|req|request)\s*\.\s*Body', code):
+                reader = _ReaderInfo(frozenset({_Trace(code, path=(code,))}), frozenset({'request'}))
+            return _ValueInfo(native,
                               state.get(_DecoderKey(cell)) if name.group(2) is None else None,
-                              self.pointers(expr, state, scope))
+                              self.pointers(expr, state, scope), reader)
         call = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
         if call and _pairs(code).get(call.end() - 1) == len(expr) - 1:
             results = self.call_results.get(offset + call.start(1))
             if results:
                 return results[0]
         return _ValueInfo(pointers=self.pointers(expr, state, scope))
+
+    def reader_payload(self, expr, offset, fact, state, scope, *, require=False):
+        """Reader handles carry contents separately from ordinary value facts."""
+        info = self.value_info(expr, offset, state, scope)
+        if info is None or info.native is None:
+            # An unevaluated selected helper/global is fixed-point bottom,
+            # not evidence of a custom runtime Reader. Its dependent caller
+            # is revisited when result metadata arrives. Actual unknown
+            # returns use _UNKNOWN_NATIVE and still fail the proof below.
+            return fact
+        reader = info.reader if info is not None else None
+        if reader is not None:
+            if not reader.definite or reader.methods != {''} or 'scanner' in reader.kinds:
+                raise AnalysisLimit('Go reader protocol alternative is unsupported; analysis is incomplete')
+            return reader.source
+        if require:
+            # A generic summary is parameterized over its caller's Reader.
+            # Actual custom Readers must not silently become clean handles.
+            if fact and all(trace.parameter is not None for trace in fact):
+                return frozenset(replace(trace, projection='reader') for trace in fact)
+            raise AnalysisLimit('Go custom reader protocol is unsupported; analysis is incomplete')
+        return fact
+
+    def mark_scanned(self, origins, state):
+        if any(key.cell in self.global_cells and reader is not None and reader.origins & origins
+               for key, reader in state.items() if isinstance(key, _ReaderKey)):
+            raise AnalysisLimit('Go package scanner mutation is unsupported; analysis is incomplete')
+        self.reader_scans.update(origins)
+        for key, reader in list(state.items()):
+            if isinstance(key, _ReaderKey) and reader is not None and reader.origins & origins:
+                state[key] = replace(reader, scanned=True)
+
+    def reader_method(self, reader, method, arguments, values, state, scope):
+        """Native textual input and clean metadata; no custom split/heap model."""
+        if not reader.definite:
+            raise AnalysisLimit('Go reader method alternative is unsupported; analysis is incomplete')
+        if reader.kinds == {'scanner'}:
+            if method == 'Scan':
+                self.mark_scanned(reader.origins, state)
+                return (_CLEAN,)
+            if method in {'Text', 'Bytes'}:
+                return (reader.source if reader.scanned else _CLEAN,)
+            if method == 'Err':
+                return (_CLEAN,)
+            if method == 'Buffer':
+                # Buffer's contents are ignored by Scanner; only capacity is used.
+                return ()
+            if method == 'Split' and len(arguments) == 1:
+                info = self.value_info(*arguments[0], state, scope)
+                native = info.native if info is not None else None
+                if (native is not None and not native.unknown and native.operations
+                        and native.operations <= _BUFFER_SPLITTERS):
+                    return ()
+                raise AnalysisLimit('Go custom scanner split is unsupported; analysis is incomplete')
+        elif 'scanner' not in reader.kinds:
+            if method in {'ReadString', 'ReadBytes', 'ReadSlice', 'Peek', 'ReadByte'}:
+                return (reader.source, _CLEAN)
+            if method in {'ReadLine', 'ReadRune'}:
+                return (reader.source, _CLEAN, _CLEAN)
+            if method in {'Bytes', 'String', 'Next'} and reader.kinds <= {'bytes-buffer'}:
+                return (reader.source,)
+            if method in {'Buffered', 'Size', 'Len', 'Cap', 'Available', 'Name', 'Fd'}:
+                return (_CLEAN,)
+            if method in {'UnreadByte', 'UnreadRune', 'Close'}:
+                return (_CLEAN,)
+            if method in {'Discard', 'Seek', 'Stat'}:
+                return (_CLEAN, _CLEAN)
+        raise AnalysisLimit('Go reader ' + method + ' mutation or protocol is unsupported; analysis is incomplete')
 
     def scan_type(self, typename, scope):
         typename = re.sub(r'\s+', '', typename)
@@ -1092,19 +1236,10 @@ class _Analysis:
         else:
             payload = values[0]
             if reader:
-                input_expr, origin = self.unparenthesize(*arguments[0])
-                native_stdin = re.fullmatch(r'([A-Za-z_]\w*)\s*\.\s*Stdin', input_expr)
-                if native_stdin and self.native_identity(native_stdin.group(1), 'Stdin', origin, scope) == ('os', 'Stdin'):
-                    payload = frozenset({_Trace('os.Stdin', path=('os.Stdin',))})
-                else:
-                    constructor = re.fullmatch(r'([A-Za-z_]\w*)\s*\.\s*(NewReader|NewBuffer|NewBufferString)\s*\(.*\)',
-                                               input_expr, re.DOTALL)
-                    identity = (self.native_identity(constructor.group(1), constructor.group(2), origin, scope)
-                                if constructor else None)
-                    request_body = self.scan_kind(input_expr, origin, state, scope) == 'request-reader'
-                    if identity not in {('strings', 'NewReader'), ('bytes', 'NewReader'),
-                                        ('bytes', 'NewBuffer'), ('bytes', 'NewBufferString')} and not request_body:
-                        raise AnalysisLimit('Go formatted input reader protocol is unsupported; analysis is incomplete')
+                try:
+                    payload = self.reader_payload(*arguments[0], payload, state, scope, require=True)
+                except AnalysisLimit as error:
+                    raise AnalysisLimit('Go formatted input reader protocol is unsupported; analysis is incomplete') from error
         for index, verb in enumerate(verbs, first):
             if index >= len(arguments):
                 break
@@ -1190,6 +1325,8 @@ class _Analysis:
                     else:
                         state[destination.cell] = _join(state.get(destination.cell, _CLEAN), field_fact)
             if target.parameter is not None:
+                if info is not None and info.reader is not None:
+                    raise AnalysisLimit('Go reader output-parameter replacement is unsupported; analysis is incomplete')
                 key = (target.parameter, target.path)
                 self.writes[key] = _join(self.writes.get(key, _CLEAN), fact)
                 native = info.native if info is not None else None
@@ -1197,6 +1334,8 @@ class _Analysis:
             if target.path or target.indexed:
                 if info is not None and info.native is not None and info.native.operations & _SOURCE_OPERATIONS:
                     raise _source_boundary(info.native.operations, 'field/index storage')
+                if info is not None and info.reader is not None:
+                    raise AnalysisLimit('Go reader field/index storage is unsupported; analysis is incomplete')
                 continue
             native_key = _NativeKey(target.cell)
             native = info.native if info is not None else None
@@ -1214,6 +1353,12 @@ class _Analysis:
                 state[decoder_key] = _DecoderInfo(
                     _join(previous.source, fact, replacement.source if replacement is not None else _CLEAN),
                     False)
+            reader_key = _ReaderKey(target.cell)
+            replacement = info.reader if info is not None else None
+            state[reader_key] = replacement if strong else _join_readers(state.get(reader_key), replacement)
+            self.reader_cell_writes[target.cell] = (
+                _join_readers(self.reader_cell_writes[target.cell], replacement)
+                if target.cell in self.reader_cell_writes else replacement)
 
     def native_call(self, expression, match, state, scope, *, whole=False):
         """Known result shapes and output-parameter effects, never name-only Decode."""
@@ -1225,6 +1370,12 @@ class _Analysis:
         if end is None or code[:match.start()].rstrip().endswith('.'):
             return None
         receiver = state.get(_DecoderKey(scope.bindings.get(root, root)))
+        input_reader = state.get(_ReaderKey(scope.bindings.get(root, root)))
+        reader_method = member if input_reader is not None and member is not None else None
+        if input_reader is not None and member is None and input_reader.methods != {''}:
+            if len(input_reader.methods) != 1 or '' in input_reader.methods:
+                raise AnalysisLimit('Go reader method alternatives are unsupported; analysis is incomplete')
+            reader_method = next(iter(input_reader.methods))
         callable_source = state.get(scope.bindings.get(root, root), _CLEAN)
         native = self.native_callable(root, member, offset + match.start(1), state, scope)
         operations = native.operations if native is not None else frozenset()
@@ -1234,6 +1385,7 @@ class _Analysis:
         sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
         environment = operations & _ENVIRONMENT_OPERATIONS
         scanning = operations & _SCAN_OPERATIONS
+        reader_constructor = operations & _READER_CONSTRUCTORS.keys()
         methods = {'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
                    'UseNumber', 'DisallowUnknownFields', 'Buffered'}
         method = member if receiver is not None and member in methods else None
@@ -1247,16 +1399,24 @@ class _Analysis:
                 outer_end = pairs.get(opening)
                 if outer_end is None:
                     return None
-        if not (constructor or unmarshal or readall or sanitizer or environment or scanning or method):
+        if reader_constructor:
+            chain = re.match(r'\s*\.\s*([A-Za-z_]\w*)\s*\(', code[end + 1:])
+            if chain:
+                outer_end = pairs.get(end + chain.end())
+                if outer_end is None:
+                    return None
+        if not (constructor or unmarshal or readall or sanitizer or environment or scanning or method
+                or reader_constructor or reader_method):
             return None
         if whole and code[outer_end + 1:].strip():
             return None
         if sanitizer and re.match(r'\s*[.\[]', code[end + 1:]):
             return None
 
-        def finish(stop, facts, decoder=None):
+        def finish(stop, facts, decoder=None, reader=None):
             self.call_results[result_offset] = tuple(
-                _ValueInfo(decoder=decoder if index == 0 else None) for index in range(len(facts)))
+                _ValueInfo(decoder=decoder if index == 0 else None, reader=reader if index == 0 else None)
+                for index in range(len(facts)))
             return stop, facts
 
         def arguments(start, stop):
@@ -1268,6 +1428,8 @@ class _Analysis:
             return values, targets
 
         values, targets = arguments(match.end(), end)
+        raw_arguments = [(expr[match.end() + left:match.end() + right], offset + match.end() + left)
+                         for left, right in _parts(code[match.end():end])]
         if native is not None:
             # Argument effects can invalidate a captured callable. Ordinary
             # reads and calls need not have one total evaluation order in Go,
@@ -1286,11 +1448,36 @@ class _Analysis:
         operations = native.operations if native is not None else frozenset()
         environment = operations & _ENVIRONMENT_OPERATIONS
         scanning = operations & _SCAN_OPERATIONS
+        if reader_constructor:
+            if native.unknown or operations != reader_constructor:
+                raise AnalysisLimit('Go reader constructor alternative is unsupported; analysis is incomplete')
+            if not values:
+                raise AnalysisLimit('Go reader constructor argument shape is unsupported; analysis is incomplete')
+            kinds = frozenset(_READER_CONSTRUCTORS[operation] for operation in reader_constructor)
+            wrapped = any(package == 'bufio' for package, _operation in reader_constructor)
+            if wrapped and any(package != 'bufio' for package, _operation in reader_constructor):
+                raise AnalysisLimit('Go reader constructor argument alternatives are unsupported; analysis is incomplete')
+            payload = (self.reader_payload(*raw_arguments[0], values[0], state, scope, require=True)
+                       if wrapped else values[0])
+            input_reader = _ReaderInfo(payload, kinds, frozenset({_ReaderOrigin((result_offset, result_offset))}))
+            if not chain:
+                return finish(end, (_CLEAN,), reader=input_reader)
+            reader_method = chain.group(1)
+            start = end + chain.end() + 1
+            values, targets = arguments(start, outer_end)
+            raw_arguments = [(expr[start + left:start + right], offset + start + left)
+                             for left, right in _parts(code[start:outer_end])]
+        if reader_method:
+            # An argument can itself Scan a saved receiver. Preserve that
+            # mutation before reading Text/Bytes on the enclosing invocation.
+            current_reader = state.get(_ReaderKey(scope.bindings.get(root, root)))
+            if current_reader is not None and not reader_constructor:
+                input_reader = _join_readers(input_reader, current_reader)
+            facts = self.reader_method(input_reader, reader_method, raw_arguments, values, state, scope)
+            return finish(outer_end, facts)
         if scanning:
             if native.unknown or operations != scanning:
                 raise AnalysisLimit('Go formatted input unknown callable alternative is unsupported; analysis is incomplete')
-            raw_arguments = [(expr[match.end() + left:match.end() + right], offset + match.end() + left)
-                             for left, right in _parts(code[match.end():end])]
             self.scan_input(scanning, raw_arguments, values, targets, state, scope)
             return finish(end, (_CLEAN, _CLEAN))
         if environment:
@@ -1310,9 +1497,10 @@ class _Analysis:
         if constructor:
             if len(values) != 1:
                 return finish(end, (_CLEAN,))
-            receiver = _DecoderInfo(_join(values[0], callable_source), not native.unknown)
+            payload = self.reader_payload(*raw_arguments[0], values[0], state, scope, require=True)
+            receiver = _DecoderInfo(_join(payload, callable_source), not native.unknown)
             if not chain:
-                return finish(end, (fallback if native.unknown else _CLEAN,), receiver)
+                return finish(end, (_join(fallback, payload) if native.unknown else _CLEAN,), receiver)
             method = chain.group(1)
             values, targets = arguments(end + chain.end() + 1, outer_end)
         if unmarshal:
@@ -1321,7 +1509,10 @@ class _Analysis:
                                    root + '.Unmarshal' if member else root)
             return finish(end, (fallback if native.unknown else _CLEAN,))
         if readall:
-            return finish(end, (fallback, fallback if native.unknown else _CLEAN))
+            payload = (self.reader_payload(*raw_arguments[0], values[0], state, scope, require=True)
+                       if len(values) == 1 else fallback)
+            return finish(end, (_join(payload, callable_source),
+                                _join(payload, fallback) if native.unknown else _CLEAN))
         if sanitizer:
             # Only a definite native escaper grants HTML sanitization; unknown
             # alternatives retain argument effects and captured source data.
@@ -1336,6 +1527,10 @@ class _Analysis:
         elif method in {'Token', 'RawToken'}:
             result = (receiver.source, _CLEAN)
         elif method == 'Buffered':
+            if receiver.definite:
+                return finish(outer_end, (_CLEAN,), reader=_ReaderInfo(
+                    receiver.source, frozenset({'decoder-buffer'}),
+                    frozenset({_ReaderOrigin((result_offset, result_offset))})))
             result = (receiver.source,)
         else:
             result = (_CLEAN,)
@@ -1360,6 +1555,19 @@ class _Analysis:
                 if trace.projection == 'decoder':
                     info = infos[trace.parameter] if trace.parameter < len(infos) else None
                     argument = info.decoder.source if info is not None and info.decoder is not None else argument
+                elif trace.projection == 'reader':
+                    info = infos[trace.parameter] if trace.parameter < len(infos) else None
+                    if info is not None and info.reader is not None:
+                        if not info.reader.definite or info.reader.methods != {''} or 'scanner' in info.reader.kinds:
+                            raise AnalysisLimit('Go helper reader protocol is unsupported; analysis is incomplete')
+                        argument = info.reader.source
+                    elif not argument or any(item.parameter is None for item in argument):
+                        raise AnalysisLimit('Go helper custom reader protocol is unsupported; analysis is incomplete')
+                    else:
+                        argument = frozenset(replace(item, projection='reader') for item in argument)
+                elif trace.projection == 'reader-data':
+                    info = infos[trace.parameter] if trace.parameter < len(infos) else None
+                    argument = info.reader.source if info is not None and info.reader is not None else argument
                 bound = _advance(argument, name + '()')
                 for step in trace.path[1:]:
                     bound = _advance(bound, step)
@@ -1399,6 +1607,9 @@ class _Analysis:
         if self.resolve_summary is not None:
             summary = self.resolve_summary(name, infos)
         targets = [info.pointers if info is not None else frozenset() for info in infos]
+        for index in summary.reader_scans:
+            if index < len(infos) and infos[index] is not None and infos[index].reader is not None:
+                self.mark_scanned(infos[index].reader.origins, state)
         for (_sink_offset, label), fact in summary.effects.items():
             # Concrete sources are reported at the helper itself. Only an
             # input-dependent sink produces an additional call-site finding.
@@ -1436,6 +1647,18 @@ class _Analysis:
                 continue
             decoder = (replace(info.decoder, source=self.instantiate(info.decoder.source, arguments, name, infos))
                        if info.decoder is not None else None)
+            reader = info.reader
+            if reader is not None:
+                origins = set()
+                for origin in reader.origins:
+                    if origin.parameter is None:
+                        origins.add(_ReaderOrigin((call_offset, origin.site[1])))
+                    elif origin.parameter < len(infos):
+                        actual = infos[origin.parameter]
+                        if actual is not None and actual.reader is not None:
+                            origins.update(actual.reader.origins)
+                reader = replace(reader, source=self.instantiate(reader.source, arguments, name, infos),
+                                 origins=frozenset(origins))
             complete = all(target.parameter is not None and target.parameter < len(targets)
                            and targets[target.parameter] for target in info.pointers)
             pointers = frozenset(replace(_field_target(actual, target.path),
@@ -1444,7 +1667,7 @@ class _Analysis:
                                  for target in info.pointers
                                  if target.parameter is not None and target.parameter < len(targets)
                                  for actual in targets[target.parameter])
-            result_infos.append(replace(info, decoder=decoder, pointers=pointers))
+            result_infos.append(replace(info, decoder=decoder, pointers=pointers, reader=reader))
         self.call_results[call_offset] = tuple(result_infos)
         return tuple(self.instantiate(fact, arguments, name, infos) for fact in summary.returns)
 
@@ -1589,6 +1812,8 @@ class _Analysis:
                             # cell, not the value at the function literal.
                             # Package cells keep the package mutation proof.
                             closure_state[key] = _join_native(native, _UNKNOWN_NATIVE)
+                        elif isinstance(key, _ReaderKey) and native is not None:
+                            closure_state[key] = replace(native, definite=False)
                 for index, parameter in enumerate(parameters):
                     if parameter:
                         key = closure_scope.declare(parameter, offset + match.start())
@@ -1607,6 +1832,8 @@ class _Analysis:
                         if info is not None:
                             if info.decoder is not None:
                                 closure_state[_DecoderKey(key)] = info.decoder
+                            if info.reader is not None:
+                                closure_state[_ReaderKey(key)] = info.reader
                             closure_state[_PointerKey(key)] = info.pointers
                             if info.pointers and all(target.parameter is None for target in info.pointers):
                                 closure_state[key] = _CLEAN
@@ -1648,6 +1875,17 @@ class _Analysis:
                                                        else _join_native(state.get(_NativeKey(cell)), native))
                             self.native_cell_writes[cell] = _join_native(
                                 self.native_cell_writes.get(cell), native)
+                        if cell in nested.reader_cell_writes:
+                            if not immediate and (state.get(_ReaderKey(cell)) is not None
+                                                  or nested.reader_cell_writes[cell] is not None):
+                                raise AnalysisLimit('Go delayed reader replacement is unsupported; analysis is incomplete')
+                            reader = (closure_flow.normal.get(_ReaderKey(cell))
+                                      if closure_flow.normal is not None else nested.reader_cell_writes[cell])
+                            state[_ReaderKey(cell)] = (reader if closure_flow.normal is not None else
+                                                      _join_readers(state.get(_ReaderKey(cell)), reader))
+                            self.reader_cell_writes[cell] = (
+                                _join_readers(self.reader_cell_writes[cell], reader)
+                                if cell in self.reader_cell_writes else reader)
                 for (sink_offset, label), fact in nested.effects.items():
                     self.effect(sink_offset, label, fact)
                 captured_scans = {target: fact for target, fact in nested.scan_writes.items()
@@ -1657,6 +1895,12 @@ class _Analysis:
                 for target, fact in captured_scans.items():
                     self.write_targets((target,), fact, state, 'closure scanning')
                     self.scan_writes[target] = _join(self.scan_writes.get(target, _CLEAN), fact)
+                captured_readers = frozenset().union(*(reader.origins for key, reader in state.items()
+                                                       if isinstance(key, _ReaderKey) and reader is not None))
+                scanned_readers = nested.reader_scans & captured_readers
+                if scanned_readers and not immediate:
+                    raise AnalysisLimit('Go delayed scanner mutation is unsupported; analysis is incomplete')
+                self.mark_scanned(scanned_readers, state)
                 if immediate:
                     whole = (not code[:match.start()].strip()
                              and not code[pairs[invocation] + 1:].strip())
@@ -1705,9 +1949,33 @@ class _Analysis:
                                                   offset + match.start(), state, scope)
                     for start, stop in _parts(code[match.end():end]):
                         argument = expr[match.end() + start:match.end() + stop]
+                        callable_info = self.native_callable(match.group(1), match.group(2),
+                                                              offset + match.start(), state, scope)
+                        if callable_info is not None and not (
+                                match.group(2) is None and match.group(1) in self.summaries
+                                and match.group(1) not in scope.bindings):
+                            info = self.value_info(argument, offset + match.end() + start, state, scope)
+                            if info is not None and ((info.reader is not None and info.reader.kinds != {'request'}) or any(
+                                    state.get(_ReaderKey(target.cell)) is not None for target in info.pointers)):
+                                raise AnalysisLimit('Go reader opaque-call transport is unsupported; analysis is incomplete')
                         self.invalidate_native_targets(
                             self.pointers(argument, state, scope), state)
                         self.invalidate_address_cell(argument, state, scope)
+        # Direct standard input/request-body receivers have two selectors,
+        # outside the bounded root.method call matcher. Do not silently lose
+        # output writes such as os.Stdin.Read(buffer) or request.Body.Read.
+        for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)\s*\.\s*(Stdin|Body)\s*\.\s*'
+                                 r'([A-Za-z_]\w*)\s*\(', code):
+            if masked[match.start()].isspace():
+                continue
+            info = self.value_info(match.group(1) + '.' + match.group(2), offset + match.start(), state, scope)
+            if info.reader is not None:
+                if match.group(3) not in {'Close', 'Name', 'Fd', 'Stat'}:
+                    raise AnalysisLimit('Go reader ' + match.group(3) + ' mutation or protocol is unsupported; analysis is incomplete')
+                end = pairs.get(match.end() - 1)
+                if end is not None:
+                    self.value(expr[match.end():end], offset + match.end(), state, scope)
+                    cover(match.start(), end + 1)
         for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)\s*\(', code):
             name = match.group(1)
             end = pairs.get(match.end() - 1)
@@ -1865,6 +2133,7 @@ class _Analysis:
                     pointers = frozenset({_Target(key)})
                 updates[_PointerKey(key)] = pointers
                 updates[_DecoderKey(key)] = decoder
+                updates[_ReaderKey(key)] = info.reader if info is not None else None
                 updates[_NativeKey(key)] = native
                 declared_type = re.match(r'\s*(?:var|const)\s+'
                                          r'[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s+(.+?)\s*=', code, re.DOTALL)
@@ -1875,6 +2144,9 @@ class _Analysis:
                     updates[kind_key] = self.scan_kind(expression, expr_start, state, scope)
                 self.native_mutations.add(key)
                 self.native_cell_writes[key] = _join_native(self.native_cell_writes.get(key), native)
+                reader = info.reader if info is not None else None
+                self.reader_cell_writes[key] = (_join_readers(self.reader_cell_writes[key], reader)
+                                                 if key in self.reader_cell_writes else reader)
             assigned = {key for key in updates if isinstance(key, str)}
             for key in list(state):
                 if isinstance(key, _FieldKey) and key.cell in assigned:
@@ -2037,10 +2309,13 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
             # Forward/recursive results have not reached this call yet. Do
             # not promote fixed-point bottom to an actual unknown callback.
             return bottoms[name]
-        signature = tuple((info.native, info.decoder.definite if info.decoder is not None else None)
+        signature = tuple((info.native, info.decoder.definite if info.decoder is not None else None,
+                           (info.reader.kinds, info.reader.scanned, info.reader.definite, info.reader.methods)
+                           if info.reader is not None else None)
                           for info in infos[:parameter_counts[name]])
-        signature += ((_UNKNOWN_NATIVE, None),) * (parameter_counts[name] - len(signature))
-        if all(native == _UNKNOWN_NATIVE and decoder is None for native, decoder in signature):
+        signature += ((_UNKNOWN_NATIVE, None, None),) * (parameter_counts[name] - len(signature))
+        if all(native == _UNKNOWN_NATIVE and decoder is None and reader is None
+               for native, decoder, reader in signature):
             return summaries[name]
         key = (name, signature)
         dependents[key].add(current)
@@ -2081,7 +2356,7 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                 if parameter and parameter != '_':
                     key = scope.declare(parameter, function.start)
                     state[key] = frozenset({_Trace(parameter, index, (parameter,))})
-                    native, decoder = signature[index] if signature is not None else (_UNKNOWN_NATIVE, None)
+                    native, decoder, reader = signature[index] if signature is not None else (_UNKNOWN_NATIVE, None, None)
                     state[_NativeKey(key)] = native
                     typename = function.parameter_types[index] if index < len(function.parameter_types) else ''
                     state[_ScanKindKey(key)] = analysis.scan_type(
@@ -2089,6 +2364,11 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                     if decoder is not None:
                         state[_DecoderKey(key)] = _DecoderInfo(
                             frozenset({_Trace(parameter, index, (parameter,), 'decoder')}), decoder)
+                    if reader is not None:
+                        kinds, scanned, definite, methods = reader
+                        state[_ReaderKey(key)] = _ReaderInfo(
+                            frozenset({_Trace(parameter, index, (parameter,), 'reader-data')}), kinds,
+                            frozenset({_ReaderOrigin((function.start, index), index)}), scanned, definite, methods)
                     if index in function.reference_parameters:
                         state[_PointerKey(key)] = frozenset({_Target(key, index)})
             for result in function.results:
@@ -2100,7 +2380,9 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
             analysis.block(function.body, state, scope)
             mutations.update(analysis.native_mutations)
             variants.append(_Summary(analysis.returns, analysis.effects, function.variadic,
-                                     analysis.writes, analysis.value_returns, analysis.native_writes))
+                                     analysis.writes, analysis.value_returns, analysis.native_writes,
+                                     frozenset(origin.parameter for origin in analysis.reader_scans
+                                               if origin.parameter is not None)))
         newly_uncertain = (mutations & global_cells) - uncertain_globals
         if newly_uncertain:
             # Package callbacks are mutable cells. A write in any selected

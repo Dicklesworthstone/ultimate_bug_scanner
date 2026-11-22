@@ -491,10 +491,14 @@ class _Fact(frozenset):
     can refer to it before a later property write introduces any source.
     """
 
-    def __new__(cls, traces=(), refs=(), *, absent=False):
+    def __new__(cls, traces=(), refs=(), *, absent=False, non_array=None, scalar_alternative=None):
         value = super().__new__(cls, traces)
         object.__setattr__(value, 'refs', frozenset(refs))
         object.__setattr__(value, 'absent', absent)
+        object.__setattr__(value, 'non_array', getattr(traces, 'non_array', False)
+                           if non_array is None else non_array)
+        object.__setattr__(value, 'scalar_alternative', getattr(traces, 'scalar_alternative', False)
+                           if scalar_alternative is None else scalar_alternative)
         return value
 
     def __setattr__(self, name, value):
@@ -506,15 +510,18 @@ class _Fact(frozenset):
     def __eq__(self, other):
         return (isinstance(other, frozenset) and frozenset.__eq__(self, other)
                 and self.refs == getattr(other, 'refs', frozenset())
-                and self.absent == getattr(other, 'absent', False))
+                and self.absent == getattr(other, 'absent', False)
+                and self.non_array == getattr(other, 'non_array', False)
+                and self.scalar_alternative == getattr(other, 'scalar_alternative', False))
 
     def __ne__(self, other):
         return not self == other
 
     def __hash__(self):
         # Retain the frozenset hash for ordinary scalar facts.
-        return (hash((frozenset(self), self.refs, self.absent))
-                if self.refs or self.absent else frozenset.__hash__(self))
+        return (hash((frozenset(self), self.refs, self.absent, self.non_array, self.scalar_alternative))
+                if self.refs or self.absent or self.non_array or self.scalar_alternative
+                else frozenset.__hash__(self))
 
 
 # A missing property is not a present property whose value happens to be clean.
@@ -635,7 +642,8 @@ def _heap_work(heap):
 
 
 def _join(*facts):
-    nonempty = [fact for fact in facts if fact]
+    nonempty = [fact for fact in facts if fact or getattr(fact, 'non_array', False)
+                or getattr(fact, 'scalar_alternative', False)]
     if not nonempty:
         return _Fact()
     first = nonempty[0]
@@ -650,7 +658,9 @@ def _join(*facts):
             if previous is None or (len(trace.path), trace.path) < (len(previous.path), previous.path):
                 traces[trace] = trace
     return _Fact(traces.values(), frozenset().union(*(_refs(fact) for fact in nonempty)),
-                 absent=any(getattr(fact, 'absent', False) for fact in nonempty))
+                 absent=any(getattr(fact, 'absent', False) for fact in nonempty),
+                 non_array=all(getattr(fact, 'non_array', False) for fact in nonempty),
+                 scalar_alternative=any(getattr(fact, 'scalar_alternative', False) for fact in nonempty))
 
 
 def _step(fact, name):
@@ -660,7 +670,9 @@ def _step(fact, name):
         if len(path) > PATH_LIMIT:
             path = (path[0], *path[-(PATH_LIMIT - 1):])
         traces.append(_Trace(trace.origin, path, trace.sql_state))
-    return _Fact(traces, _refs(fact), absent=getattr(fact, 'absent', False))
+    return _Fact(traces, _refs(fact), absent=getattr(fact, 'absent', False),
+                 non_array=getattr(fact, 'non_array', False),
+                 scalar_alternative=getattr(fact, 'scalar_alternative', False))
 
 
 def _alternatives(*facts):
@@ -669,7 +681,14 @@ def _alternatives(*facts):
     if (any(_function_scope(ref) is not None for ref in _refs(result))
             and any(not _refs(fact) for fact in facts)):
         result = _join(result, _Fact(refs=(_OPAQUE_CALLABLE,)))
-    return result
+    # A clean scalar alternative must not disappear beside an array identity:
+    # flattening [] versus "fixed" has different output widths. Keep that
+    # finite uncertainty outside both source provenance and heap references.
+    return _Fact(result, _refs(result), absent=getattr(result, 'absent', False),
+                 non_array=bool(facts) and all(getattr(fact, 'non_array', False) for fact in facts),
+                 scalar_alternative=(getattr(result, 'scalar_alternative', False)
+                     or bool(_refs(result)) and any(not _refs(fact) and not getattr(fact, 'absent', False)
+                                                   for fact in facts)))
 
 
 def _sql_transfer(fact, state):
@@ -678,7 +697,9 @@ def _sql_transfer(fact, state):
         return fact
     return _Fact((_Trace(trace.origin, trace.path,
                          'opaque' if state == 'opaque' or trace.sql_state == 'opaque' else state)
-                  for trace in fact), _refs(fact), absent=getattr(fact, 'absent', False))
+                  for trace in fact), _refs(fact), absent=getattr(fact, 'absent', False),
+                 non_array=getattr(fact, 'non_array', False),
+                 scalar_alternative=getattr(fact, 'scalar_alternative', False))
 
 
 class _State(dict):
@@ -1672,7 +1693,7 @@ class _Flow:
                         # must not be mistaken for prototype/method writes.
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
                                        'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed',
-                                       'toSpliced', 'with', 'entries', 'map', 'flatMap', 'forEach',
+                                       'toSpliced', 'with', 'entries', 'flat', 'map', 'flatMap', 'forEach',
                                        'reduce', 'reduceRight', 'some', 'every', 'filter',
                                        'find', 'findIndex', 'findLast', 'findLastIndex'):
                             slots[method] = _alternatives(slots.get(method, _ABSENT), present)
@@ -2241,7 +2262,7 @@ class _Flow:
         return bool(refs) and not frozenset(fact) and all(
             ref in state.heap and isinstance(ref[0], _Scope)
             and (len(ref) == 2 or isinstance(ref[2], frozenset)
-                 or ref[2] in {'binding-rest', 'arguments-rest', 'commonjs', 'array-splice', 'array-copy'})
+                 or ref[2] in {'binding-rest', 'arguments-rest', 'commonjs', 'array-splice', 'array-copy', 'array-flat'})
             for ref in refs)
 
     def plain_data_descriptor_call(self, method, arguments, prepared, state):
@@ -2651,6 +2672,121 @@ class _Flow:
                                                  for slots in variants)) for key in keys}
         state.array_lengths[result] = (lengths[0] if lengths
             and all(length == lengths[0] for length in lengths) else None)
+        return _Fact(refs=(result,))
+
+    def array_flat(self, receiver, arguments, prepared, state, location):
+        """Flatten proven native arrays without erasing positional uncertainty.
+
+        Only indexed values are read; holes compact at each visited level.
+        The explicit stack charges nested visits and keeps active paths, not
+        a global visited set, so shared arrays are expanded per occurrence.
+        Nonarray leaves retain their identities and the outer result is fresh.
+        """
+        depth, pure = self.array_integer_argument(arguments, prepared, 0, 1)
+        if depth is not None:
+            depth = 0 if depth <= 0 else depth if depth == float('inf') else int(depth)
+        if depth is None or not pure:
+            self.incomplete.add('Array.flat depth coercion requires a known native integer value')
+
+        def uncertain_values(value):
+            pending, seen, retained = list(_refs(value)), set(), [value]
+            while pending:
+                ref = pending.pop()
+                if ref in seen:
+                    continue
+                seen.add(ref)
+                slots = state.heap.get(ref, {})
+                self.engine.budget.spend(1 + len(slots))
+                if ref not in state.array_lengths:
+                    continue
+                for key, item in slots.items():
+                    if key is None or self.array_index(key) is not None:
+                        retained.append(item)
+                        pending.extend(_refs(item) - seen)
+            return [_join(*retained)], False
+
+        variants = []
+        for root in _refs(receiver):
+            pending, outputs, active = [('array', root, depth, True)], [], defaultdict(int)
+            while pending:
+                self.engine.budget.spend()
+                action, value, level, extra = pending.pop()
+                if action in {'finish', 'merge'}:
+                    count = level
+                    children = outputs[-count:] if count else []
+                    if count:
+                        del outputs[-count:]
+                    exact = extra and all(known for _items, known in children)
+                    if action == 'finish':
+                        active[value] -= 1
+                        items = [item for values, _known in children for item in values]
+                    else:
+                        sizes = {len(items) for items, _known in children}
+                        exact = exact and len(sizes) == 1
+                        if exact:
+                            items = [_alternatives(*(values[index] for values, _known in children))
+                                     for index in range(next(iter(sizes), 0))]
+                        else:
+                            self.incomplete.add('Array.flat value shapes have uncertain output positions')
+                            items = [item for values, _known in children for item in values]
+                    self.engine.budget.spend(len(items))
+                    outputs.append((items, exact))
+                    continue
+                if action == 'value':
+                    if level == 0:
+                        outputs.append(([value], True))
+                        continue
+                    refs = _refs(value)
+                    arrays = {ref for ref in refs if ref in state.array_lengths}
+                    unknown = (getattr(value, 'scalar_alternative', False)
+                               or bool(frozenset(value)) and not getattr(value, 'non_array', False))
+                    if not arrays:
+                        known = (getattr(value, 'non_array', False)
+                                 or bool(refs) and all(ref in state.heap for ref in refs)) and not unknown
+                        if not known:
+                            self.incomplete.add('Array.flat element has an unknown scalar or array shape')
+                        outputs.append(([value], known))
+                        continue
+                    count = len(arrays)
+                    other = refs - arrays
+                    if other or unknown:
+                        outputs.append(([_Fact(value, other)], not unknown))
+                        count += 1
+                    pending.append(('merge', None, count, not unknown))
+                    pending.extend(('array', ref, level - 1, False) for ref in arrays)
+                    continue
+                ref = value
+                slots, length = state.heap[ref], state.array_lengths[ref]
+                self.engine.budget.spend(1 + len(slots))
+                if level == float('inf') and active[ref]:
+                    self.incomplete.add('Array.flat array cycle at infinite depth requires unsupported traversal')
+                    outputs.append(uncertain_values(_Fact(refs=(ref,))))
+                    continue
+                ordinary = self.array_mutation_contract(ref, state, species=extra)
+                if level is None or not pure or not ordinary or length is None or None in slots:
+                    self.incomplete.add('Array.flat requires known extents, ordinary indexed properties and native species')
+                    outputs.append(uncertain_values(_Fact(refs=(ref,))))
+                    continue
+                indexed = sorted((int(key), item) for key, item in slots.items()
+                                 if self.array_index(key) is not None and int(key) < length)
+                exact = not any(getattr(item, 'absent', False) for _index, item in indexed)
+                if not exact:
+                    self.incomplete.add('Array.flat optional element shapes have uncertain output positions')
+                active[ref] += 1
+                pending.append(('finish', ref, len(indexed), exact))
+                pending.extend(('value', item, level, None) for _index, item in reversed(indexed))
+            items, exact = outputs[0]
+            variants.append(({str(index): item for index, item in enumerate(items)}, len(items))
+                            if exact else ({None: _join(*items)}, None))
+        result = (self.scope, location, 'array-flat')
+        if result in state.heap:
+            variants.append((state.heap[result], state.array_lengths.get(result)))
+            state.weak_refs.add(result)
+        keys = set().union(*(slots.keys() for slots, _length in variants))
+        state.heap[result] = {key: _alternatives(*(slots.get(key, slots.get(None, _ABSENT))
+                                                  for slots, _length in variants)) for key in keys}
+        lengths = [length for _slots, length in variants]
+        state.array_lengths[result] = lengths[0] if lengths and all(size == lengths[0] for size in lengths) else None
         return _Fact(refs=(result,))
 
     def array_splice(self, receiver, arguments, prepared, state, location):
@@ -3277,10 +3413,11 @@ class _Flow:
         refs = _refs(receiver)
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
         if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin',
-                       'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flatMap', 'map', 'forEach',
+                       'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flat', 'flatMap', 'map', 'forEach',
                        'reduce', 'reduceRight', 'some', 'every', 'filter',
                        'find', 'findIndex', 'findLast', 'findLastIndex'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
+                and not (method == 'flat' and getattr(receiver, 'scalar_alternative', False))
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
         return None
@@ -3297,7 +3434,7 @@ class _Flow:
                 if unknown:
                     fact = _join(fact, selected)
             cursor = selected_end
-            match = re.match(r'\s*\.\s*(flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
+            match = re.match(r'\s*\.\s*(flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
             if match is None:
                 break
             opening = cursor + match.end() - 1
@@ -3385,6 +3522,8 @@ class _Flow:
             return self.array_sort(receiver, arguments, prepared, state, callback)
         if kind == 'array' and method in {'toSorted', 'toReversed', 'toSpliced', 'with'}:
             return self.array_copy(receiver, method, arguments, prepared, state, location, callback)
+        if kind == 'array' and method == 'flat':
+            return self.array_flat(receiver, arguments, prepared, state, location)
         if kind == 'array' and method in {'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
                                           'find', 'findIndex', 'findLast', 'findLastIndex'}:
             return self.array_iteration(receiver, method, arguments, prepared, state, location, callback)
@@ -3724,7 +3863,7 @@ class _Flow:
                 return None, receiver
             return candidate, receiver
         if (report and key in {'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed', 'toSpliced',
-                              'with', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
+                              'with', 'flat', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
                               'find', 'findIndex', 'findLast', 'findLastIndex'}
                 and _refs(receiver)
                 and all(ref in state.array_lengths for ref in _refs(receiver))
@@ -4084,6 +4223,29 @@ class _Flow:
         return result
 
     def value(self, start, end, state):
+        value = self.value_expression(start, end, state)
+        # Literal primitives cannot be flattened as arrays. Preserve only
+        # this proof, not their concrete values, through aliases and summaries.
+        # Unknown clean or request-valued operands retain unknown shape.
+        text = self.engine.text
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        while text[start:start + 1] == '(' and self.pairs.get(start) == end - 1:
+            start, end = start + 1, end - 1
+            while start < end and text[start].isspace():
+                start += 1
+            while end > start and text[end - 1].isspace():
+                end -= 1
+        raw = text[start:end]
+        if (re.fullmatch(r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')''', raw, re.S)
+                or re.fullmatch(r'(?:true|false|null|[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?n?)', raw)
+                or raw == 'undefined' and self.global_undefined(start)):
+            return _Fact(value, _refs(value), absent=getattr(value, 'absent', False), non_array=True)
+        return value
+
+    def value_expression(self, start, end, state):
         self.engine.budget.spend()
         text, code = self.engine.text, self.scope.code
         # A child function is blanked in its enclosing lexical code. Recognize
@@ -4217,7 +4379,7 @@ class _Flow:
                     self.effect(location, label, fact, evaluated)
             if logical:
                 self.replace_state(state, _join_states(state, evaluated))
-                return _join(old, fact)
+                return _alternatives(old, fact)
             return fact
         if access and access[2] == end:
             fact = self.read_access(access, state)
@@ -4283,7 +4445,7 @@ class _Flow:
         cursor = start
         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
         if (primary_end is not None and primary_end < end - 1
-                and re.match(r'\s*\.\s*(?:flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|sort|toSorted|toReversed|toSpliced|with)\s*\(',
+                and re.match(r'\s*\.\s*(?:flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|sort|toSorted|toReversed|toSpliced|with)\s*\(',
                              code[primary_end + 1:end])):
             primary = self.value(start, primary_end + 1, state)
             primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)

@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Follow native JavaScript `Array.flat` through the shared array heap model.
+  Depth conversion, sparse-hole compaction, repeated arrays, fresh outer
+  results and shallow object aliases preserve exact supported output slots.
+  Array/scalar alternatives, including logical assignments, keep uncertain
+  positions explicit; unproved coercions, species, traversal and value
+  shapes report incomplete analysis without dropping reached findings.
+
 - Trace native Python `enumerate` over text and binary stdin using the shared
   iterator cursor and positional-row model. Payloads reach SQL, command,
   evaluation, HTML and URL sinks while generated indices remain clean.

@@ -3841,6 +3841,210 @@ class HeapTaintTests(unittest.TestCase):
                   'const out = items.flatMap(value => [value]); '
                   'res.send(out[0]); res.send(out[1]);', 'xss')
 
+    def test_flat_preserves_selected_values_and_clean_metadata(self):
+        source = ('const items=[[req.query.html],["safe"]]; const out=items.flat(); '
+                  'res.send(out[0]); res.send(out[1]); res.send(out[2]); res.send(out.length);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe', None, 2])
+        self.scan('const out=[[DOMPurify.sanitize(req.query.html)]].flat(); '
+                  'res.send(out[0]); eval(out[0]); db.query(out[0]); shell.exec(out[0]);',
+                  'eval', 'sql', 'command')
+
+    def test_flat_depth_and_holes_follow_native_index_order(self):
+        for argument in ('', 'undefined', '1', '1.9', 'true'):
+            source = ('const items=[,["safe",,req.query.html],,["fixed"]]; '
+                      f'const out=items.flat({argument}); '
+                      'res.send(out[0]); res.send(out[1]); res.send(out[2]); res.send(out.length);')
+            with self.subTest(argument=argument):
+                self.scan(source, 'xss')
+                self.assert_runtime_sends(source, ['safe', 'review-input', 'fixed', 3])
+        for argument in ('0', '-1', 'null', 'false', 'NaN', '-Infinity'):
+            source = ('const items=[,[req.query.html],,"safe"]; '
+                      f'const out=items.flat({argument}); '
+                      'res.send(out[0][0]); res.send(out[1]); res.send(out.length);')
+            with self.subTest(argument=argument):
+                self.scan(source, 'xss')
+                self.assert_runtime_sends(source, ['review-input', 'safe', 2])
+        for argument in ('2', 'Infinity'):
+            source = ('const box={html:req.query.html}; const items=[[[box]]]; '
+                      f'const out=items.flat({argument}); res.send(out[0].html);')
+            with self.subTest(argument=argument):
+                self.scan(source, 'xss')
+                self.assert_runtime_sends(source, ['review-input'])
+
+    def test_flat_preserves_nested_aliases_and_copies_outer_slots(self):
+        source = ('const box={html:"safe"}; const inside=[box]; const items=[inside]; '
+                  'const out=items.flat(); out[0].html=req.query.html; '
+                  'res.send(box.html); res.send(inside[0].html);')
+        self.scan(source, 'xss', 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'review-input'])
+        source = ('const inside=[req.query.html]; const out=[inside].flat(); '
+                  'out[0]="safe"; res.send(inside[0]); res.send(out[0]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        source = ('const inside=["safe"]; const out=[inside].flat(0); '
+                  'out[0][0]=req.query.html; res.send(inside[0]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_flat_only_flattens_arrays_and_ignores_named_properties(self):
+        source = ('const box={0:req.query.html,length:1,html:"safe"}; '
+                  'const items=[box,"fixed",["clean"]]; items.note=req.query.html; '
+                  'const out=items.flat(); res.send(out[0].html); res.send(out[0][0]); '
+                  'res.send(out[1]); res.send(out[2]); res.send(out.note); res.send(out.length);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['safe', 'review-input', 'fixed', 'clean', None, 3])
+
+    def test_flat_repeated_arrays_are_flattened_per_occurrence(self):
+        source = ('const box={html:req.query.html}; const inner=[box]; '
+                  'const out=[inner,inner].flat(); '
+                  'res.send(out[0].html); res.send(out[1].html); res.send(out.length);')
+        self.scan(source, 'xss', 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'review-input', 2])
+        source = ('const box={html:req.query.html}; const items=[box]; items.push(items); '
+                  'const out=items.flat(2); res.send(out[0].html); '
+                  'res.send(out[1].html); res.send(out[2].html);')
+        self.scan(source, 'xss', 'xss', 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'review-input', 'review-input'])
+
+    def test_flat_helpers_and_postfix_chains_preserve_identity(self):
+        source = ('function flatten(items) {return items.flat();} '
+                  'const dirty=flatten([[req.query.html]]); const clean=flatten([["safe"]]); '
+                  'res.send(dirty[0]); res.send(clean[0]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        self.scan('res.send([[req.query.html]].flat()[0]);', 'xss')
+        self.scan('res.send(([[req.query.html]]).flat()[0]);', 'xss')
+        self.scan('function make(){return [[[req.query.html]]];} '
+                  'res.send(make().flat().flat()[0]);', 'xss')
+        self.scan('const items=[[[req.query.html]]]; res.send(items["flat"]().flat()[0]);', 'xss')
+
+    def test_flat_literal_shape_proofs_survive_aliases_and_captured_helpers(self):
+        source = ('function flatten(label,box) { const saved=label; '
+                  'function values(){return [saved,[box]];} return values().flat(Infinity); } '
+                  'const dirty=flatten("fixed",{html:req.query.html}); '
+                  'const clean=flatten("fixed",{html:"safe"}); '
+                  'res.send(dirty[0]); res.send(dirty[1].html); res.send(clean[1].html);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['fixed', 'review-input', 'safe'])
+
+    def test_flat_sparse_arrays_do_not_expand_absent_slots(self):
+        self.scan('const inner=[]; inner.length=4294967294; inner[4000000000]=req.query.html; '
+                  'const items=[]; items.length=4294967294; items[4000000000]=inner; '
+                  'const out=items.flat(); res.send(out[0]); res.send(out[1]); res.send(out.length);', 'xss')
+
+    def test_flat_overrides_and_captured_native_method_remain_distinct(self):
+        self.scan('const items=[[req.query.html]]; items.flat=function(){return ["safe"];}; '
+                  'res.send(items.flat()[0]);')
+        self.scan('const items=[["safe"]]; items.flat=function(){return [req.query.html];}; '
+                  'res.send(items.flat()[0]);', 'xss')
+        source = ('const items=[[req.query.html]]; '
+                  'const out=items.flat(1,items.flat=function(){return ["safe"];}); '
+                  'res.send(out[0]); res.send(items.flat()[0]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+
+    def test_flat_depth_coercion_and_native_protocols_stay_explicit(self):
+        for argument in ('unknown', '{valueOf: external}', '1n', '...unknown'):
+            with self.subTest(argument=argument):
+                self.assert_fill_partial('res.send(req.query.html); const items=[["safe"]]; '
+                                         f'items.flat({argument});', 'xss', reason='Array.flat')
+        for setup in ('items.constructor=custom;',
+                      'Object.defineProperty(items,"0",{get(){return [req.query.html];}});',
+                      'Object.setPrototypeOf(items,foreign);',
+                      'Array.prototype.flat=external;',
+                      'Array.prototype[0]=[req.query.html];'):
+            with self.subTest(setup=setup):
+                self.assert_fill_partial('res.send(req.query.html); const items=[["safe"]]; '
+                                         + setup + 'items.flat();', 'xss', reason='flat|Object[.]')
+
+    def test_flat_mixed_value_shapes_cannot_certify_output_positions(self):
+        source = ('const flag=false; const selected=flag ? [] : "safe"; '
+                  'const out=[selected,[req.query.html]].flat(); res.send(out[0]); res.send(out[1]);')
+        self.assert_fill_partial(source, 'xss', 'xss', reason='Array.flat.*shape')
+        self.assert_runtime_sends(source, ['safe', 'review-input'])
+        source = ('function selected(flag){if(flag)return [];return "safe";} '
+                  'const out=[selected(false),[req.query.html]].flat(); res.send(out[1]);')
+        self.assert_fill_partial(source, 'xss', reason='Array.flat.*shape')
+        self.assert_fill_partial('const out=[req.query.values,"safe"].flat(); res.send(out[1]);',
+                                 'xss', reason='Array.flat.*shape')
+        for initial, operator, replacement in (('[]', '&&=', '"safe"'),
+                                                ('"safe"', '||=', '[]'),
+                                                ('"safe"', '??=', '[]')):
+            source = (f'let selected={initial}; '
+                      f'const out=[selected {operator} {replacement},[req.query.html]].flat(); '
+                      'res.send(out[1]);')
+            with self.subTest(operator=operator):
+                self.assert_runtime_sends(source, ['review-input'])
+                self.assert_fill_partial(source, 'xss', reason='Array.flat.*shape')
+
+    def test_flat_cycles_and_unknown_extents_remain_incomplete(self):
+        self.assert_fill_partial('res.send(req.query.html); const items=[]; items.push(items); '
+                                 'items.flat(Infinity);', 'xss', reason='Array.flat.*cycle')
+        self.assert_fill_partial('res.send(req.query.html); const inner=[...unknown]; '
+                                 '[inner].flat();', 'xss', reason='Array.flat.*extent')
+
+    def test_flat_repeated_expansion_obeys_shared_work_budget(self):
+        source = 'const box={html:req.query.html}; const level0=[box]; ' + ' '.join(
+            f'const level{index}=[level{index-1},level{index-1}];' for index in range(1, 21))
+        self.assert_fill_partial(source + ' level20.flat(Infinity); res.send("safe");', reason='work limit')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_flat_public_json_sarif_selection_and_partial(self):
+        cases = (
+            ('alias', 'const box={html:"safe"};\n'
+             'const items=[[box],[{html:req.query.html}]];\n'
+             'const out=items.flat();\nout[0].html=req.query.html;\n'
+             'res.send(box.html);\nres.send(out[1].html);\n',
+             [('javascript.taint.xss', 5, 1), ('javascript.taint.xss', 6, 1)], False),
+            ('clean', 'const out=[[req.query.html],["safe"]].flat();\n'
+             'res.send(out[1]);\nres.send(out.length);\n', [], False),
+            ('partial', 'res.send(req.query.html);\nconst items=[["safe"]];\n'
+             'items.flat({valueOf:external});\n', [('javascript.taint.xss', 1, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-array-flat-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Array.flat')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_flat_public_cache_edits_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-array-flat-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = 'const out=[[req.query.html],["safe"]].flat();\nres.send(out[0]);\n'
+        clean = unsafe.replace('out[0]', 'out[1]')
+        suppressed = unsafe.replace('res.send(out[0]);', 'res.send(out[0]); // ubs:ignore')
+        partial = 'res.send(req.query.html);\nconst items=[["safe"]]; items.flat(unknown);\n'
+        cases = (
+            (unsafe, [('javascript.taint.xss', 2, 1)], False, 0),
+            (unsafe, [('javascript.taint.xss', 2, 1)], False, 1),
+            (clean, [], False, 0), (suppressed, [], False, 0),
+            (unsafe, [('javascript.taint.xss', 2, 1)], False, 1),
+            (partial, [('javascript.taint.xss', 1, 1)], True, 0),
+            (partial, [('javascript.taint.xss', 1, 1)], True, 0),
+        )
+        for index, (source, expected, incomplete, cache_hits) in enumerate(cases):
+            with self.subTest(index=index):
+                if index not in (1, 6):
+                    target.write_text(source, encoding='utf-8')
+                report = self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                                expected=expected, cache=True, partial=incomplete,
+                                                partial_reason='Array.flat')
+                self.assertEqual(report['profile']['cache_hits'], cache_hits, report)
+
     def test_flatmap_flattens_once_and_preserves_object_identity(self):
         source = ('const box = {html: "safe"}; const items = [1]; '
                   'const out = items.flatMap(value => [[box]]); '

@@ -459,3 +459,69 @@ separate from the bounded feature checks below.
   Its one critical record is the existing LDAP heuristic misclassifying
   `self.http_parameters.add(request.parameter)`, an analyzer set update, as
   a directory sink. No suppression or gate change was added.
+
+## 14. November 22 continuation: native flattening, callable helpers and LDAP
+
+The comprehensive feedback plan and current Beads were reread at `3d3fc4f5`.
+Prioritize missing semantic behavior using the existing shared engines. The
+three implementation tracks remain separate meaningful commits on main.
+
+### Native JavaScript flattening (`1b9j.6.13`)
+
+- [x] Freeze the missing native `Array.flat` behavior: 11 initial methods
+  expose 26 failed assertions and one error on the unchanged analyzer.
+- [x] Extend the array heap model with depth conversion, sparse compaction,
+  fresh outer results, repeated nested arrays and shallow object identity.
+  Unknown array/scalar alternatives retain uncertain positions and payloads;
+  custom protocols, unproved extents and traversal limits remain explicit.
+- [x] Freeze and fix a further logical-assignment gap: `&&=`, `||=` and `??=`
+  must preserve array/scalar return alternatives. All three Node-backed
+  regressions fail before the fix and pass afterward.
+- [x] Pass the final full heap cohort: 427 methods, 407 executed passes and
+  20 opt-in public skips. Log SHA256
+  `61118225f279002c3a05a0acff22e9a62f66a024bbc1beab539b567fa2b492eb`.
+- [x] Pass two public methods comprising 19 module/runner JSON/SARIF and
+  cache/edit/suppression/partial-nonreuse calls. Candidate log SHA256
+  `d6511120b50e9156d6224f99dc1d5e5cf54b07f34036305e7f206ee67f6cedcb`.
+- [x] Repeat all 19 public calls on the publication tree, followed by both
+  canonical integrity verifiers, Bash syntax and diff checks; all pass.
+  Publication log SHA256
+  `e584eee3e539ab3d8e80c8bf8c88bbb10cfbc24fef957a4d2e39ed4bce4e92d3`.
+- [x] Independently review the source and freeze 18 native witnesses. All
+  18 Node outcomes pass; 17 scanner expectations match. The remaining
+  original depth-two helper expectation requires an unproved scalar input
+  type and correctly remains partial. Keep that wider corpus unchanged.
+  Two supported shallow/deep-object helper contexts pass separately; a
+  native witness demonstrates that array-valued input changes output width.
+  Follow-up log SHA256
+  `9bf2823eb4265d3f3c7c7ad9056eb4ba08d15cf33eacfa2392aed8b8264d7ac8`.
+- [ ] Broader protocol, source-type and release qualification remain open.
+- [ ] Changed-source self-scan remains incomplete (exit 2): 42 unsupported
+  Python scopes, zero critical findings, five parameter-count warnings,
+  six JSON test-parse warnings and 1,164 informational records. No suppression or gate
+  change was added. Log SHA256
+  `e6b113664258497bb58955571f895e4d391e3f8bad51c11ad1648a8d95c1ecaa`.
+
+### Selected Rust callable helpers (`1b9j.6.14`)
+
+- [ ] Reuse the bounded summary worklist with finite callable identities,
+  preserving symbolic data parameters, recursion and caller separation.
+- [ ] Preserve native and selected local wrappers, clean metadata, exact
+  sink sites and explicit unknown-callback boundaries.
+- [ ] Complete native/shared/public checks and publish separately.
+
+### Python LDAP provenance (`1b9j.6.15`)
+
+- [ ] Replace the flat visitor with a shared-flow adapter proving native
+  receiver identities, API-specific operands and separate filter/DN escaping.
+- [ ] Preserve helpers, branches, captured methods, conservative opaque
+  operations and valid builtin-set receiver exclusions.
+- [ ] Complete native/shared/public checks and publish separately.
+
+### Continuation qualification
+
+- [x] The exact prescribed full ShellCheck command passes on the unchanged
+  continuation base in the current environment (35.617 seconds); log SHA256
+  `cfc2a13b85405aca2ebd0ad6463149da682569588967064cab7387d2813a5e5d`.
+  This supersedes the earlier environment-killed attempts for that base;
+  whole-repository and release qualification still require their own results.

@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Follow native JavaScript `findLast` and `findLastIndex` callbacks through the
+  shared array flow engine. Reverse traversal preserves captured writes,
+  thrown values, live lower-index mutations, sparse holes and early stops;
+  value searches retain the original selected element while index results
+  remain clean. Unsupported callbacks and excessive sparse walks report
+  incomplete analysis, preserving findings already reached.
+
 - Fix JS/TS and Bash precision defects (#225, #226, #227) and harden read-only
   temporary cleanup (#228):
   - Enable `code_only=True` on `js.debug.debugger` so `"debugger"` inside

@@ -2676,6 +2676,269 @@ class HeapTaintTests(unittest.TestCase):
                 self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
                                         expected=expected, cache=True)
 
+    def test_find_last_orders_captured_writes_and_stops_from_the_right(self):
+        for method in ('findLast', 'findLastIndex'):
+            for predicate in ('true', 'false'):
+                for values, last_tainted in (('["safe",req.query.html]', True),
+                                              ('[req.query.html,"safe"]', False)):
+                    with self.subTest(method=method, predicate=predicate, values=values):
+                        tainted = last_tainted if predicate == 'true' else not last_tainted
+                        source = ('let saved="safe";const box={html:"safe"};'
+                                  f'{values}.{method}(value=>{{saved=value;box.html=value;return {predicate};}});'
+                                  'res.send(saved);res.send(box.html);')
+                        self.assert_runtime_sends(source, ['review-input' if tainted else 'safe'] * 2)
+                        self.scan_sort(source, *(('xss', 'xss') if tainted else ()))
+
+    def test_find_last_selects_original_values_and_returns_clean_indices(self):
+        for predicate, matched in (('true', True), ('false', False), ('null', False),
+                                   ('0', False), ('""', False), ('"yes"', True)):
+            for method in ('findLast', 'findLastIndex'):
+                with self.subTest(method=method, predicate=predicate):
+                    source = f'res.send(["safe",req.query.html].{method}(value=>{predicate}));'
+                    expected = ('review-input' if matched else None) if method == 'findLast' else (1 if matched else -1)
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan_sort(source, *(('xss',) if matched and method == 'findLast' else ()))
+        for method in ('findLast', 'findLastIndex'):
+            source = f'res.send(["safe"].{method}(value=>req.query.html));'
+            self.assert_runtime_sends(source, ['safe' if method == 'findLast' else 0])
+            self.scan_sort(source)
+
+    def test_find_last_visits_trailing_holes_and_skips_empty_array_callbacks(self):
+        for method in ('findLast', 'findLastIndex'):
+            with self.subTest(method=method):
+                source = f'[].{method}(()=>{{res.send(req.query.html);return true;}});res.send("safe");'
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+                source = ('let saved="safe";'
+                          f'[,].{method}(()=>{{saved=req.query.html;return true;}});res.send(saved);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+                source = ('let saved=req.query.html;'
+                          f'[req.query.html,,].{method}(value=>{{saved=value;return true;}});res.send(saved);')
+                self.assert_runtime_sends(source, [None])
+                self.scan_sort(source)
+
+    def test_find_last_reads_live_lower_slots_with_snapshot_length(self):
+        for method in ('findLast', 'findLastIndex'):
+            for values, mutation, expected, rules in (
+                    ('["safe",req.query.html]', 'items.length=0;', None, ()),
+                    ('["safe",req.query.html]', 'delete items[0];', None, ()),
+                    ('[,"safe"]', 'items[0]=req.query.html;', 'review-input', ('xss',)),
+                    ('[req.query.html]', 'items.push("safe");', 'review-input', ('xss',)),
+                    ('["safe",req.query.html]', 'items.unshift(req.query.html);', 'review-input', ('xss',))):
+                with self.subTest(method=method, values=values, mutation=mutation):
+                    source = (f'const items={values};let saved="safe";'
+                              f'items.{method}(value=>{{saved=value;{mutation}return false;}});res.send(saved);')
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan_sort(source, *rules)
+
+    def test_find_last_preserves_pre_callback_value_and_shallow_identity(self):
+        source = ('const items=["safe",req.query.html];'
+                  'const selected=items.findLast(value=>{items[1]="safe";return true;});'
+                  'res.send(selected);res.send(items[1]);')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        self.scan_sort(source, 'xss')
+        source = ('const box={html:"safe"};const items=[{},box];'
+                  'const selected=items.findLast(value=>true);selected.html=req.query.html;'
+                  'res.send(box.html);res.send(items[0].html);')
+        self.assert_runtime_sends(source, ['review-input', None])
+        self.scan_sort(source, 'xss')
+
+    def test_find_last_optional_slots_and_definite_hole_defaults(self):
+        for method in ('findLast', 'findLastIndex'):
+            with self.subTest(method=method):
+                source = ('const items=[req.query.html,,];if(flag){items[1]="safe";}'
+                          'let saved=req.query.html;'
+                          f'items.{method}(value=>{{saved="safe";return true;}});res.send(saved);')
+                for flag in ('false', 'true'):
+                    self.assert_runtime_sends(f'const flag={flag};' + source, ['safe'])
+                self.scan_sort(source)
+                source = ('let saved=req.query.html;'
+                          f'[,].{method}((value=(saved="safe"))=>true);res.send(saved);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+                source = ('const items=[,];if(flag){items[0]={};}let saved="safe";'
+                          f'items.{method}((value=(saved=req.query.html))=>false);res.send(saved);')
+                self.assert_runtime_sends('const flag=false;' + source, ['review-input'])
+                self.assert_runtime_sends('const flag=true;' + source, ['safe'])
+                self.scan_sort(source, 'xss', partial=f'Array.{method} element default')
+
+    def test_find_last_hole_destructuring_preserves_abrupt_completion(self):
+        for method in ('findLast', 'findLastIndex'):
+            for pattern in ('{html}', '[html]'):
+                with self.subTest(method=method, pattern=pattern):
+                    source = ('let saved=req.query.html;try{'
+                              f'[,].{method}(({pattern})=>{{saved="safe";res.send(req.query.html);return true;}});'
+                              '}catch(error){res.send("caught");}res.send(saved);')
+                    self.assert_runtime_sends(source, ['caught', 'review-input'])
+                    self.scan_sort(source, 'xss')
+
+    def test_find_last_binds_this_source_rest_and_clean_index(self):
+        for method in ('findLast', 'findLastIndex'):
+            with self.subTest(method=method):
+                source = ('const box={};const items=[{}, {html:req.query.html}];'
+                          f'items.{method}(function({{html}},index,source){{this.html=html;'
+                          'res.send(index);res.send(source[1].html);return true;},box);res.send(box.html);')
+                self.assert_runtime_sends(source, [1, 'review-input', 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+                source = (f'["safe",req.query.html].{method}((...args)=>{{res.send(args[0]);'
+                          'res.send(args[1]);res.send(args[2][1]);return true;});')
+                self.assert_runtime_sends(source, ['review-input', 1, 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+
+    def test_find_last_keeps_throws_effects_and_unknown_stopped_paths(self):
+        for method in ('findLast', 'findLastIndex'):
+            with self.subTest(method=method):
+                source = ('const box={html:"safe"};try{'
+                          f'["safe",req.query.html].{method}(value=>{{box.html=value;throw value;}});'
+                          'res.send(req.query.html);}catch(error){res.send(error);}res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input', 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+                source = ('const stop=true;let saved="safe";'
+                          f'["safe",req.query.html].{method}(value=>{{saved=value;return stop;}});res.send(saved);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+
+    def test_find_last_keeps_lexical_captures_and_selected_callable_alternatives(self):
+        for method in ('findLast', 'findLastIndex'):
+            with self.subTest(method=method):
+                source = ('const box={html:"safe"};const visit=value=>{box.html=value;return true;};'
+                          'const alias=visit;'
+                          f'function run(items,predicate){{const box={{html:"local"}};return items.{method}(predicate);}}'
+                          'run(["safe",req.query.html],alias);res.send(box.html);'
+                          'run([req.query.html,"safe"],alias);res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input', 'safe'])
+                self.scan_sort(source, 'xss')
+        source = ('function visit(value){res.send(value);}'
+                  'const callback=[visit].findLast(()=>true);[req.query.html].forEach(callback);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, 'xss')
+        source = ('const stop=true;function visit(value){res.send(value);}'
+                  'const callback=[visit].findLast(()=>stop);res.send(req.query.html);'
+                  '[req.query.html].forEach(callback);')
+        self.assert_runtime_sends(source, ['review-input', 'review-input'])
+        self.scan_sort(source, 'xss', partial='Array.forEach.*synchronous callback')
+
+    def test_find_last_respects_own_methods_and_evaluation_order(self):
+        for method in ('findLast', 'findLastIndex'):
+            with self.subTest(method=method):
+                source = ('const box={html:"safe"};const items=[req.query.html];'
+                          f'items.{method}=function(callback){{return "safe";}};'
+                          f'res.send(items.{method}(value=>{{box.html=value;}}));res.send(box.html);')
+                self.assert_runtime_sends(source, ['safe', 'safe'])
+                self.scan_sort(source)
+                source = ('const items=["safe"];'
+                          f'items.{method}=function(){{return req.query.html;}};res.send(items.{method}(()=>true));')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+                source = ('const box={html:req.query.html};const items=["safe"];'
+                          f'function replace(){{items.{method}=function(){{box.html=req.query.html;}};return {{}};}}'
+                          f'items.{method}(value=>{{box.html=value;return true;}},replace());res.send(box.html);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+
+    def test_find_last_composes_computed_methods_chains_and_sanitizer_domains(self):
+        source = ('const values=["safe",req.query.html];'
+                  'res.send(values["findLast"](value=>true));'
+                  'res.send(values["findLastIndex"](value=>true));'
+                  'res.send([["safe"],[req.query.html]].findLast(value=>true).find(value=>true));'
+                  'res.send([req.query.html].map(value=>({html:value})).findLast(value=>true).html);')
+        self.assert_runtime_sends(source, ['review-input', 1, 'review-input', 'review-input'])
+        self.scan_sort(source, 'xss', 'xss', 'xss')
+        source = ('const out=[DOMPurify.sanitize(req.query.html)].findLast(value=>true);'
+                  'res.send(out);eval(out);db.query(out);shell.exec(out);')
+        self.scan_sort(source, 'eval', 'sql', 'command')
+
+    def test_find_last_keeps_unknown_callbacks_and_protocols_explicit(self):
+        for method in ('findLast', 'findLastIndex'):
+            for callback in ('external', 'async value=>value', 'function*(value){yield value;}'):
+                with self.subTest(method=method, callback=callback):
+                    self.scan_sort('res.send(req.query.html);'
+                                   f'["safe"].{method}({callback});', 'xss',
+                                   partial=f'Array.{method}.*synchronous callback')
+            for change in ('items[unknown]=external;', f'items.{method}=external;',
+                           f'Array.prototype.{method}=external;', 'Object.setPrototypeOf(items,foreign);'):
+                with self.subTest(method=method, change=change):
+                    self.scan_sort('res.send(req.query.html);const items=["safe"];'
+                                   + change + f'items.{method}(value=>true);', 'xss',
+                                   partial=f'Array.{method}|Own method')
+            with self.subTest(method=method, extent='unknown'):
+                self.scan_sort('res.send(req.query.html);const items=[...unknown];'
+                               f'items.{method}(value=>true);', 'xss', partial=f'Array.{method}.*finite')
+
+    def test_find_last_bounds_reverse_sparse_work_after_first_stop_or_throw(self):
+        for method in ('findLast', 'findLastIndex'):
+            with self.subTest(method=method):
+                source = ('const items=[];items.length=4294967294;'
+                          f'items.{method}(()=>{{res.send(req.query.html);return true;}});')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+                self.scan_sort('res.send(req.query.html);const items=[];items.length=4294967294;'
+                               f'items.{method}(()=>false);', 'xss', partial='work limit')
+                self.scan_sort('res.send(req.query.html);const stop=true;'
+                               'const items=[];items.length=4294967294;'
+                               f'items.{method}(()=>stop);', 'xss', partial='work limit')
+                source = ('const items=[];items.length=4294967294;try{'
+                          f'items.{method}(()=>{{throw req.query.html;}});'
+                          '}catch(error){res.send(error);}')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_find_last_public_results_effects_and_partial_status(self):
+        cases = (
+            ('effects', 'let saved="safe";\nconst item={html:"safe"};\n'
+             'const selected=[{},item].findLast(value=>true);\nselected.html=req.query.html;\n'
+             '["safe",req.query.html].findLastIndex(value=>{saved=value;return true;});\n'
+             'res.send(item.html);\nres.send(saved);\ntry{\n'
+             '["safe",req.query.html].findLast(value=>{throw value;});\n}catch(error){\n'
+             'res.send(error);\n}\n',
+             [('javascript.taint.xss', line, 1) for line in (6, 7, 11)], False),
+            ('clean', 'res.send([req.query.html].findLast(value=>false));\n'
+             'res.send([req.query.html].findLastIndex(value=>true));\nlet saved=req.query.html;\n'
+             '[req.query.html,"safe"].findLast(value=>{saved=value;return true;});\n'
+             'res.send(saved);\n[].findLastIndex(()=>{res.send(req.query.html);return true;});\n', [], False),
+            ('partial', 'res.send(req.query.html);\nconst items=["safe"];\nitems.findLastIndex(external);\n',
+             [('javascript.taint.xss', 1, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-find-last-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            if not partial:
+                self.assert_runtime_sends(source, ['review-input'] * 3 if name == 'effects' else [None, 0, 'safe'])
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Array.findLastIndex')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_find_last_public_cache_invalidation_and_suppression(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-find-last-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const items=["safe",req.query.html];\nconst selected=items.findLast(value=>true);\n'
+                  'res.send(selected);\n')
+        clean = unsafe.replace('value=>true', 'value=>false')
+        suppressed = unsafe.replace('res.send(selected);', 'res.send(selected); // ubs:ignore')
+        for index, (source, expected) in enumerate((
+                (unsafe, [('javascript.taint.xss', 3, 1)]),
+                (unsafe, [('javascript.taint.xss', 3, 1)]),
+                (clean, []), (suppressed, []), (unsafe, [('javascript.taint.xss', 3, 1)]))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                                expected=expected, cache=True)
+                self.assertEqual(report['profile']['cache_hits'], 1 if index in (1, 4) else 0, report)
+
     def test_predicates_preserve_captured_scalar_and_heap_writes(self):
         for method, result in (('some', 'false'), ('every', 'true')):
             with self.subTest(method=method):

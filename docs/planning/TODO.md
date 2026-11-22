@@ -331,3 +331,45 @@ these gaps. Existing broad detector and release goals remain open.
 - [ ] Verify mixed valid/invalid iterator alternatives and opaque expansions.
 - [ ] Verify actual JSON/SARIF, clean controls and explicit partial results.
 - [ ] Publish the bounded feature with canonical integrity pins.
+
+## 13. November 22, 2026: reverse searches and native callable/input flow
+
+The plan and current Beads were reviewed before choosing these changes. Work
+preserves concurrent Rust executable-flow, forward JavaScript search and Python
+zip/cursor implementations. Whole-repository and release qualification remain
+separate from the bounded feature checks below.
+
+### JavaScript reverse predicate searches
+
+- [x] Freeze `findLast` and `findLastIndex` unsafe, clean and native controls;
+  the incumbent has 55 failed assertions across the selected regression methods.
+- [x] Extend the existing array callback engine, preserving native identity,
+  reverse traversal, pre-callback values, shallow aliases, live lower slots,
+  holes/defaults, callback writes/throws and stopped paths.
+- [x] Charge remaining sparse visits in the selected direction while allowing
+  immediate first-call stops and throws to complete.
+- [x] Pass all 14 new source/native methods and the adjacent callback cohort:
+  110 executed methods pass, with 11 opt-in public methods skipped in that cohort.
+  Source log SHA256 `4bf435fa71a9e6160db364b4fd9bb994509ada9bac56e2d96b32cba5af4e832f`;
+  adjacent log `fe6af20f835a1a983d29bbf30617d4f3b1e4d4ef4e3dbd6d5c08a78674a152d4`.
+- [x] Independently review the exact source diff and pass 17 real module/runner
+  calls covering JSON/SARIF, exact locations/statuses, selected files,
+  cold/warm cache, edits and suppression. Public log SHA256
+  `15682323faa44e0521429d012f9d8246afc72021deccbdc213a7da937a966965`.
+- [ ] Complete broad self-scan, full-suite and release qualification.
+
+### Native Rust callable identity
+
+- [ ] Prove saved constructors and environment readers through aliases,
+  branches and selected helpers without treating inert function values as input.
+- [ ] Preserve namespace/shadow controls and existing redirect behavior.
+- [ ] Verify actual public JSON/SARIF, suppression, selection and cache behavior.
+
+### Native Python enumeration
+
+- [ ] Reuse the current native iterator/cursor and positional-row model.
+- [ ] Preserve source payloads separately from numeric indices through
+  consumption, exhaustion and supported helper/collection paths.
+- [ ] Preserve explicit incomplete boundaries for unresolved protocols and
+  unsupported iterator transport; retain independent findings.
+- [ ] Verify exact public reports and publish with canonical integrity pins.

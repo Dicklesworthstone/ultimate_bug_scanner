@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Trace selected native and local Rust callbacks through helper summaries.
+  Command constructors and input readers keep their callable identity across
+  recursive/transitive forwarding and local wrappers while ordinary values
+  remain separate for each caller. Unknown callback targets report partial
+  analysis with any concrete findings preserved.
+
 - Follow native JavaScript `Array.flat` through the shared array heap model.
   Depth conversion, sparse-hole compaction, repeated arrays, fresh outer
   results and shallow object aliases preserve exact supported output slots.

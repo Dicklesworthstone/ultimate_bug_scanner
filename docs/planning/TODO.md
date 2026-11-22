@@ -501,14 +501,42 @@ three implementation tracks remain separate meaningful commits on main.
   six JSON test-parse warnings and 1,164 informational records. No suppression or gate
   change was added. Log SHA256
   `e6b113664258497bb58955571f895e4d391e3f8bad51c11ad1648a8d95c1ecaa`.
+- [x] Preserve all 33 scoped evidence files, including seven failed originals,
+  in GitHub blob `c1228e3396525ce2fa4131f623718c4bbd1361b6`.
+  All 15 receipt/log hash pairs and both publication source hashes match.
 
 ### Selected Rust callable helpers (`1b9j.6.14`)
 
-- [ ] Reuse the bounded summary worklist with finite callable identities,
+- [x] Reuse the bounded summary worklist with finite callable identities,
   preserving symbolic data parameters, recursion and caller separation.
-- [ ] Preserve native and selected local wrappers, clean metadata, exact
+- [x] Preserve native and selected local wrappers, clean metadata, exact
   sink sites and explicit unknown-callback boundaries.
-- [ ] Complete native/shared/public checks and publish separately.
+- [x] Freeze native helper misses and independent local-wrapper/source-reader
+  misses on the original analyzer. Imported callback targets also remain
+  explicit partial cases when no constructor spelling appears locally.
+- [x] Pass 244 shared methods: 237 executed passes and seven public skips,
+  including four real rustc witnesses. Log SHA256
+  `b6f2225b8b89c157df4f7890a372942e65aa1fcd09af5a220f90ff74e998cb53`.
+- [x] Independently review the final source and replay the unchanged 11-case
+  corpus: ten exact complete results and one expected mixed-callable partial.
+  Log SHA256
+  `ba5590a236a0e461a80469150344cee76dbf2193b9f243111510c0f536e2aace`.
+- [x] Pass 27 public module/runner JSON/SARIF, selection, cache, suppression
+  and partial-nonreuse calls on the publication tree, followed by both
+  integrity verifiers, Bash syntax and diff checks. Log SHA256
+  `f4129c2bcda6eb293f94e8712f3fda56510bd2dfe39253f76ff769bc1abed96b`.
+- [x] Preserve 34 candidate evidence files in GitHub blob
+  `629c2dbe22f47888930bd4a717b6ef51d83ece54`, including failed baselines.
+- [ ] General closure/collection transport, imported bodies, mixed callable
+  dispatch and broad Rust/release qualification remain open.
+- [ ] Changed-source self-scan remains incomplete (18 unsupported Python
+  scopes, exit 2). Eight critical records are paired reports on four native
+  test witnesses intentionally selecting rustc from `UBS_TEST_RUSTC`; the
+  compiler path is test-runner configuration, not a production request.
+  Ten warnings and 617 informational records are also retained. Do not
+  reinterpret this as a passing self-scan or suppress the compiler probes.
+  Log SHA256
+  `faebeb1f91a9f1f990e86e687103017ed06b34d6dd47990077a6703a32d7fe3a`.
 
 ### Python LDAP provenance (`1b9j.6.15`)
 

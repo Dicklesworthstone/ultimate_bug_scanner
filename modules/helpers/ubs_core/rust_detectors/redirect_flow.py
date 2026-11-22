@@ -222,6 +222,8 @@ class Source:
                 self.associated[key] = None if key in self.associated else function
         self.summaries = {f: Summary() for f in self.functions}
         self.callers = defaultdict(set)
+        self.pending = None
+        self.queued = set()
 
     def skip(self, pos, end=None):
         end = len(self.code) if end is None else end
@@ -651,36 +653,66 @@ class Source:
         """Share transfer semantics while allowing sink-specific contracts."""
         return Flow(self, function)
 
-    def solve(self):
-        pending = deque(self.functions)
-        queued = set(pending)
-        while pending:
-            self.budget.spend()
-            function = pending.popleft()
-            queued.discard(function)
-            flow = self.flow(function)
-            state = State()
+    def summary_function(self, target):
+        return target
+
+    def summary_target(self, function, actuals):
+        return function
+
+    def initial_state(self, target):
+        state = State()
+        function = self.summary_function(target)
+        if function is not None:
             for index, names in enumerate(function.params):
                 for name in names:
                     state.assign(name, frozenset({Origin('parameter', index)}))
-            normal, tail = flow.block(function.body + 1, function.end, state)
-            returned = join(tail if normal is not None else CLEAN,
-                            *(exit.value for exit in flow.exits if exit.kind == 'return'))
-            previous = self.summaries[function]
-            summary = Summary(join(previous.returned, returned), dict(previous.sinks),
-                              previous.completes or normal is not None or any(e.kind == 'return' for e in flow.exits))
-            for site, fact in flow.sinks.items():
-                summary.sinks[site] = join(summary.sinks.get(site, CLEAN), fact)
-            if summary != previous:
-                self.summaries[function] = summary
-                for caller in sorted(self.callers[function], key=lambda f: f.start):
-                    if caller not in queued:
-                        queued.add(caller)
-                        pending.append(caller)
-        # Top-level snippets and initializers are a separate lexical scope.
-        flow = self.flow(None)
-        flow.block(0, len(self.code), State())
-        findings = dict(flow.sinks)
+        return state
+
+    def schedule(self, target):
+        if self.pending is None:
+            raise AnalysisLimit('Rust helper summary requested outside the worklist; analysis is incomplete')
+        if target not in self.summaries:
+            self.budget.spend()
+            self.summaries[target] = Summary()
+            self.queued.add(target)
+            self.pending.append(target)
+
+    def solve(self):
+        # Top-level snippets are also a work item: a selected contract may
+        # request a finite specialization from a call in that lexical scope.
+        self.summaries[None] = Summary()
+        self.pending = deque([*self.functions, None])
+        self.queued = set(self.pending)
+        try:
+            while self.pending:
+                self.budget.spend()
+                target = self.pending.popleft()
+                self.queued.discard(target)
+                function = self.summary_function(target)
+                flow = self.flow(function)
+                flow.context = target
+                state = self.initial_state(target)
+                begin, end = ((function.body + 1, function.end) if function is not None
+                              else (0, len(self.code)))
+                normal, tail = flow.block(begin, end, state)
+                returned = join(tail if normal is not None else CLEAN,
+                                *(exit.value for exit in flow.exits if exit.kind == 'return'))
+                previous = self.summaries[target]
+                summary = Summary(join(previous.returned, returned), dict(previous.sinks),
+                                  previous.completes or normal is not None
+                                  or any(e.kind == 'return' for e in flow.exits))
+                for site, fact in flow.sinks.items():
+                    summary.sinks[site] = join(summary.sinks.get(site, CLEAN), fact)
+                if summary != previous:
+                    self.summaries[target] = summary
+                    for caller in sorted(self.callers[target], key=lambda c:
+                                         self.summary_function(c).start if c is not None else -1):
+                        if caller not in self.queued:
+                            self.queued.add(caller)
+                            self.pending.append(caller)
+        finally:
+            self.pending = None
+        findings = {}
         for summary in self.summaries.values():
             for site, fact in summary.sinks.items():
                 findings[site] = join(findings.get(site, CLEAN), fact)
@@ -694,6 +726,7 @@ class Flow:
     def __init__(self, source, function):
         self.source = source
         self.function = function
+        self.context = function
         self.exits = []
         self.sinks = {}
 
@@ -1229,10 +1262,10 @@ class Flow:
                     local = src.resolve_receiver(self.function, name)
                     implicit_receiver = local is not None
                 if local is not None:
-                    if self.function is not None:
-                        src.callers[local].add(self.function)
-                    summary = src.summaries[local]
                     actuals = ([state.values.get('self', CLEAN)] if implicit_receiver else []) + arguments
+                    target = src.summary_target(local, actuals)
+                    src.callers[target].add(self.context)
+                    summary = src.summaries[target]
                     value = self.substitute(summary.returned, actuals)
                     for site, fact in summary.sinks.items():
                         self.emit(site, self.substitute(fact, actuals))

@@ -9,7 +9,9 @@ guards never establish an executable allowlist.
 Saved native function values carry callable identity, not input contents.
 Aliasing, finite joins, explicit function-pointer casts and selected helper
 returns preserve that identity; only invocation reads input or selects an
-executable. Opaque callable alternatives and transports remain explicit.
+executable. Helper summaries specialize finite native/local callable identities;
+ordinary data arguments remain symbolic across callers and recursion.
+Opaque callable alternatives and transports remain explicit.
 
 The legacy entry-parameter vocabulary remains a conservative input boundary
 for externally callable functions. It does not taint fixed locals or private
@@ -20,6 +22,7 @@ selected-file model.
 from __future__ import annotations
 
 from bisect import bisect_right
+from dataclasses import dataclass
 import re
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -27,7 +30,7 @@ from typing import Iterator, Sequence
 from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.suppression import SourceSuppressions
 from ubs_core.taint_flow import AnalysisLimit
-from .redirect_flow import CLEAN, Flow, Origin, Source, State, join
+from .redirect_flow import CLEAN, Flow, Function, Origin, Source, State, join
 
 RULE_ID = "rust.security.command-executable"
 CATEGORY = 8
@@ -43,9 +46,18 @@ untrusted = re.compile(
 _ENV_SOURCES = {('std', 'env', name) for name in ('var', 'var_os', 'args', 'args_os')}
 _COMMAND_NEW = ('std', 'process', 'Command', 'new')
 _NATIVE_CALLABLE = 'native-command-callable'
+_LOCAL_CALLABLE = 'local-command-callable'
 _OPAQUE_VALUE = 'opaque-command-value'
 _CALLABLE_PARAMETER = 'invoked-command-parameter'
+_CALLABLE_TARGET = 'invoked-command-target'
 _DATA_PARAMETER = 'data-command-parameter'
+_CALLABLE_KINDS = frozenset({_NATIVE_CALLABLE, _LOCAL_CALLABLE})
+
+
+@dataclass(frozen=True)
+class CallableContext:
+    function: Function
+    parameters: tuple[Origin | None, ...]
 
 
 class CommandSource(Source):
@@ -84,6 +96,44 @@ class CommandSource(Source):
     def flow(self, function):
         self.current_flow = CommandFlow(self, function)
         return self.current_flow
+
+    def summary_function(self, target):
+        return target.function if isinstance(target, CallableContext) else target
+
+    def summary_target(self, function, actuals):
+        bindings = []
+        for fact in actuals[:len(function.params)]:
+            self.budget.spend()
+            identities = {Origin(origin.kind, 0 if origin.kind == _NATIVE_CALLABLE else origin.site,
+                                 origin.label) for origin in fact if origin.kind in _CALLABLE_KINDS}
+            bindings.append(next(iter(identities)) if len(identities) == 1
+                            and all(origin.kind in _CALLABLE_KINDS for origin in fact) else None)
+        if not any(bindings):
+            return function
+        target = CallableContext(function, tuple(bindings))
+        if target not in self.summaries:
+            self.schedule(target)
+        return target
+
+    def initial_state(self, target):
+        state = super().initial_state(target)
+        if isinstance(target, CallableContext):
+            for index, identity in enumerate(target.parameters):
+                if identity is not None:
+                    # Normalize the handle's construction site out of the
+                    # key; only invocation sites create source provenance.
+                    for name in target.function.params[index]:
+                        state.assign(name, frozenset({identity}))
+        return state
+
+    def resolve(self, name, pos, state):
+        fact = state.values.get(name, CLEAN)
+        local = {origin.site for origin in fact if origin.kind == _LOCAL_CALLABLE}
+        if not local:
+            return super().resolve(name, pos, state)
+        if len(local) != 1 or any(origin.kind != _LOCAL_CALLABLE for origin in fact):
+            raise AnalysisLimit('Rust native callable/local function alternatives require dispatch summaries; analysis is incomplete')
+        return self.definitions[next(iter(local))]
 
     def use_bindings(self, start, end, prefix=()):
         """Expand a selected use tree without treating its leaf as API proof."""
@@ -192,7 +242,10 @@ class CommandSource(Source):
             # The caller emits retained concrete findings before this error.
             return findings
         entries = self.entry_functions()
-        for function, summary in self.summaries.items():
+        for target, summary in self.summaries.items():
+            function = self.summary_function(target)
+            if function is None:
+                continue
             if function not in entries and not function.public:
                 continue
             inputs = {index: name for index, names in enumerate(function.params)
@@ -212,13 +265,18 @@ class CommandSource(Source):
         facts. A root recursive component still has an unknown external entry;
         an internal backedge cannot prove its arguments are fixed.
         """
-        callees = {function: set() for function in self.functions}
-        for target, callers in self.callers.items():
-            for caller in callers:
+        functions = [*self.functions, None]
+        callees = {function: set() for function in functions}
+        callers = {function: set() for function in functions}
+        for context, incoming in self.callers.items():
+            target = self.summary_function(context)
+            for origin in incoming:
                 self.budget.spend()
+                caller = self.summary_function(origin)
                 callees[caller].add(target)
+                callers[target].add(caller)
         visited, order = set(), []
-        for function in self.functions:
+        for function in functions:
             if function in visited:
                 continue
             visited.add(function)
@@ -244,14 +302,15 @@ class CommandSource(Source):
                 if current in components:
                     continue
                 components[current] = function
-                stack.extend(self.callers[current])
+                stack.extend(callers[current])
         roots = set(components.values())
-        for target, callers in self.callers.items():
-            for caller in callers:
+        for target, incoming in callers.items():
+            for caller in incoming:
                 self.budget.spend()
                 if components[target] != components[caller]:
                     roots.discard(components[target])
-        return {function for function, component in components.items() if component in roots}
+        return {function for function, component in components.items()
+                if function is not None and component in roots}
 
 
 class CommandFlow(Flow):
@@ -260,6 +319,10 @@ class CommandFlow(Flow):
     @staticmethod
     def native_values(fact):
         return frozenset(origin for origin in fact if origin.kind == _NATIVE_CALLABLE)
+
+    @staticmethod
+    def callable_values(fact):
+        return frozenset(origin for origin in fact if origin.kind in _CALLABLE_KINDS)
 
     def native_callable(self, name, pos, state):
         native = self.source.native_path(name, pos, state)
@@ -288,7 +351,7 @@ class CommandFlow(Flow):
                 # The type of a cast is syntax, not another value alternative.
                 return (frozenset(Origin(_DATA_PARAMETER, origin.site, origin.label)
                                   if origin.kind == 'parameter' else origin
-                                  for origin in fact if origin.kind != _NATIVE_CALLABLE)
+                                  for origin in fact if origin.kind not in _CALLABLE_KINDS)
                         if integer else fact)
         if re.match(r'(?:move\s+)?\|', src.code[start:end]):
             # A closure is a different callable even when it captures a native
@@ -306,10 +369,14 @@ class CommandFlow(Flow):
                 name = token.group()
                 if name in parameters:
                     continue
-                fact = join(fact, self.native_values(state.values.get(name, CLEAN)))
+                fact = join(fact, self.callable_values(state.values.get(name, CLEAN)))
                 native = src.native_path(name, start + token.start(), state)
                 if native in _ENV_SOURCES or native == _COMMAND_NEW:
                     fact = join(fact, frozenset({Origin(_NATIVE_CALLABLE, start, '::'.join(native))}))
+                elif name not in state.values:
+                    local = src.resolve(name, start + token.start(), state)
+                    if local is not None:
+                        fact = join(fact, frozenset({Origin(_LOCAL_CALLABLE, local.start, local.name)}))
             return fact
         fact = super().expr(start, end, state)
         indirect = re.search(r'[)\]]\s*\(', src.code[start:end])
@@ -317,7 +384,7 @@ class CommandFlow(Flow):
             for origin in fact:
                 if origin.kind == 'parameter':
                     self.emit(start, frozenset({Origin(_CALLABLE_PARAMETER, origin.site, 'indirect invocation')}))
-        if not self.native_values(fact):
+        if not self.callable_values(fact):
             return fact
         if (indirect
                 or any(begin <= start < finish for begin, finish in src.constant_initializers)):
@@ -326,17 +393,25 @@ class CommandFlow(Flow):
 
     def substitute(self, fact, actuals):
         result = super().substitute(frozenset(origin for origin in fact
-                                              if origin.kind not in {_CALLABLE_PARAMETER, _DATA_PARAMETER}), actuals)
+                                              if origin.kind not in {
+                                                  _CALLABLE_PARAMETER, _CALLABLE_TARGET, _DATA_PARAMETER}), actuals)
         for origin in fact:
             if origin.kind == _DATA_PARAMETER and origin.site < len(actuals):
                 result = join(result, frozenset(Origin(_DATA_PARAMETER, value.site, value.label)
                                                 if value.kind == 'parameter' else value
-                                                for value in actuals[origin.site] if value.kind != _NATIVE_CALLABLE))
+                                                for value in actuals[origin.site] if value.kind not in _CALLABLE_KINDS))
+                continue
+            if origin.kind == _CALLABLE_TARGET and origin.site < len(actuals):
+                actual = actuals[origin.site]
+                if any(value.kind != 'parameter' for value in actual):
+                    raise AnalysisLimit('Rust native callable/local callback target is unresolved; analysis is incomplete')
+                result = join(result, frozenset(Origin(_CALLABLE_TARGET, value.site, origin.label)
+                                                for value in actual))
                 continue
             if origin.kind != _CALLABLE_PARAMETER or origin.site >= len(actuals):
                 continue
             actual = actuals[origin.site]
-            if self.native_values(actual):
+            if self.callable_values(actual):
                 raise AnalysisLimit('Rust native callable parameter invocation requires summaries; analysis is incomplete')
             result = join(result, frozenset(Origin(_CALLABLE_PARAMETER, value.site, origin.label)
                                             for value in actual if value.kind == 'parameter'))
@@ -352,8 +427,12 @@ class CommandFlow(Flow):
             return frozenset({Origin('source', pos, ' '.join(self.source.raw[pos:close + 1].split()))})
         if native == _COMMAND_NEW:
             return CLEAN
-        if self.native_values(value):
+        if self.callable_values(value):
             raise AnalysisLimit('Rust native callable escaped to an unsupported call; analysis is incomplete')
+        if not chained and not macro and '.' not in name:
+            for origin in state.values.get(name, CLEAN):
+                if origin.kind == 'parameter':
+                    self.emit(pos, frozenset({Origin(_CALLABLE_TARGET, origin.site, name)}))
         # A native callable may reach an opaque invocation through a helper
         # argument/receiver. Preserve that use as a symbolic effect even when
         # its return value is discarded, then resolve it at the actual caller.
@@ -368,12 +447,15 @@ class CommandFlow(Flow):
             return frozenset({Origin(_NATIVE_CALLABLE, pos, '::'.join(native))})
         if name in state.values or '.' in name:
             return CLEAN
+        local = self.source.resolve(name, pos, state)
+        if local is not None:
+            return frozenset({Origin(_LOCAL_CALLABLE, local.start, local.name)})
         # Keep an alternative local/imported function from disappearing into
         # CLEAN beside a native function pointer at a control-flow join.
         return frozenset({Origin(_OPAQUE_VALUE, pos, name)})
 
     def index_result(self, name, pos, state, value, arguments):
-        if self.native_values(value):
+        if self.callable_values(value):
             raise AnalysisLimit('Rust native callable collection indexing requires identity analysis; analysis is incomplete')
         for origin in value:
             if origin.kind == 'parameter':
@@ -401,7 +483,10 @@ def find(files: Sequence[Path]) -> Iterator[tuple[Path, int, int, str]]:
         except OSError as exc:
             raise OSError(f'Cannot read Rust command input {path}: {exc}') from exc
         masked = strip_comments_and_strings(text, lang="rust")
-        if not re.search(r'\bCommand\b', masked) or not re.search(r'\bnew\b', masked):
+        # A selected callable factory may return Command without spelling
+        # its constructor here. Requiring `new` would bypass the explicit
+        # unresolved-target boundary for imported callbacks.
+        if not re.search(r'\bCommand\b', masked):
             continue
         source = CommandSource(text)
         suppressions.index(path, text)

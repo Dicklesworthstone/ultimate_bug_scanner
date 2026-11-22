@@ -1903,13 +1903,275 @@ class CommandExecutableFlowTests(SourceCase):
             }
         ''')
 
+    def test_native_callable_helper_constructor_parameters_keep_data_symbolic(self):
+        for value, marker in (('std::env::var("UBS_PROGRAM").unwrap()', ' // HIT'),
+                              ('"/usr/bin/printf".to_owned()', '')):
+            with self.subTest(value=value):
+                self.command('use std::process::Command;\n'
+                             'fn launch(make: fn(String) -> Command, value: String) -> Command {\n'
+                             '    let copied = make;\n'
+                             '    copied(value)' + marker + '\n}\n'
+                             'fn main() { launch(Command::new::<String>, ' + value + '); }\n')
+        self.command('''
+            use std::process::Command;
+            fn launch(make: fn(String) -> Command, mut program: String) {
+                program = "/usr/bin/printf".to_owned();
+                make(program);
+            }
+            fn main() { launch(Command::new::<String>, std::env::var("UBS_PROGRAM").unwrap()); }
+        ''')
+
+    def test_native_callable_helper_getters_create_sources_only_when_called(self):
+        for source, parameter, call in (
+                ('std::env::var::<&str>', "fn(&'static str) -> Result<String, std::env::VarError>",
+                 'get("UBS_PROGRAM").unwrap()'),
+                ('std::env::var_os::<&str>', "fn(&'static str) -> Option<std::ffi::OsString>",
+                 'get("UBS_PROGRAM").unwrap().to_string_lossy().into_owned()'),
+                ('std::env::args', 'fn() -> std::env::Args', 'get().nth(1).unwrap()'),
+                ('std::env::args_os', 'fn() -> std::env::ArgsOs',
+                 'get().nth(1).unwrap().to_string_lossy().into_owned()')):
+            with self.subTest(source=source):
+                self.command('fn read(get: ' + parameter + ') -> String {\n'
+                             '    ' + call + '\n}\nfn main() {\n'
+                             '    std::process::Command::new(read(' + source + ')); // HIT\n}\n')
+                self.command('fn discard(get: ' + parameter + ') -> String {\n'
+                             '    ' + call + ';\n    "/usr/bin/printf".to_owned()\n}\n'
+                             'fn main() { std::process::Command::new(discard(' + source + ')); }\n')
+
+    def test_native_callable_helper_transitive_forwarding_and_return_identity(self):
+        self.command('''
+            use std::process::Command;
+            fn choose(make: fn(String) -> Command) -> fn(String) -> Command { make }
+            fn leaf(make: fn(String) -> Command, value: String) -> Command {
+                let selected = choose(make);
+                selected(value) // HIT
+            }
+            fn forward(make: fn(String) -> Command, value: String) -> Command { leaf(make, value) }
+            fn main() {
+                forward(Command::new::<String>, std::env::var("UBS_PROGRAM").unwrap());
+                forward(Command::new::<String>, "/usr/bin/printf".to_owned());
+            }
+        ''')
+        self.command('''
+            fn identity(get: fn() -> std::env::Args) -> fn() -> std::env::Args { get }
+            fn forward(get: fn() -> std::env::Args) -> String {
+                let selected = identity(get);
+                selected().nth(1).unwrap()
+            }
+            fn main() { std::process::Command::new(forward(std::env::args)); } // HIT
+        ''')
+
+    def test_native_callable_helper_contexts_do_not_poison_other_callers(self):
+        for calls in (
+                'launch(Command::new::<String>, std::env::var("UBS_PROGRAM").unwrap());\n'
+                'launch(fixed, std::env::var("UBS_PROGRAM").unwrap());',
+                'launch(fixed, std::env::var("UBS_PROGRAM").unwrap());\n'
+                'launch(Command::new::<String>, std::env::var("UBS_PROGRAM").unwrap());'):
+            with self.subTest(calls=calls):
+                self.command('use std::process::Command;\n'
+                             'fn fixed(_: String) -> Command { Command::new("/usr/bin/printf") }\n'
+                             'fn launch(make: fn(String) -> Command, value: String) {\n'
+                             '    make(value); // HIT\n}\nfn main() {\n' + calls + '\n}\n')
+        self.command('''
+            use std::process::Command;
+            fn fixed(_: String) -> Command { Command::new("/usr/bin/printf") }
+            fn launch(make: fn(String) -> Command, value: String) { make(value); }
+            fn main() {
+                launch(Command::new::<String>, "/usr/bin/printf".to_owned());
+                launch(fixed, std::env::var("UBS_PROGRAM").unwrap());
+            }
+        ''')
+
+    def test_native_callable_helper_recursion_has_finite_identity_contexts(self):
+        for value, marker in (('std::env::var("UBS_PROGRAM").unwrap()', ' // HIT'),
+                              ('"/usr/bin/printf".to_owned()', '')):
+            with self.subTest(value=value):
+                self.command('use std::process::Command;\n'
+                             'fn launch(make: fn(String) -> Command, value: String, done: bool) {\n'
+                             '    if done {\n        make(value);' + marker + '\n'
+                             '    } else { launch(make, value, true); }\n}\n'
+                             'fn main() { launch(Command::new::<String>, ' + value + ', false); }\n')
+
+    def test_native_callable_helper_selected_entries_and_argument_effects(self):
+        self.command('''
+            use std::process::Command;
+            fn launch(make: fn(String) -> Command, program: String) {
+                Command::new(program);
+                make("/usr/bin/printf".to_owned());
+            }
+            fn main() { launch(Command::new::<String>, "/usr/bin/printf".to_owned()); }
+        ''')
+        self.command('''
+            use std::process::Command;
+            fn make() -> fn(String) -> Command {
+                Command::new(std::env::var("UBS_PROGRAM").unwrap()); // HIT
+                Command::new::<String>
+            }
+            fn launch(make: fn(String) -> Command, value: String) { make(value); }
+            fn main() { launch(make(), "/usr/bin/printf".to_owned()); }
+        ''')
+
+    def test_native_callable_helper_environment_effect_inside_selected_context(self):
+        self.command('''
+            use std::process::Command;
+            fn launch(make: fn(String) -> Command) {
+                let value = std::env::var("UBS_PROGRAM").unwrap();
+                make(value); // HIT
+            }
+            fn main() { launch(Command::new::<String>); }
+        ''')
+
+    def test_native_callable_helper_native_program_witness(self):
+        rustc = os.environ.get('UBS_TEST_RUSTC') or shutil.which('rustc')
+        if rustc is None:
+            self.skipTest('native callable-helper witness requires rustc')
+        artifacts = ROOT / 'test-suite/artifacts/rust-command-flow'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='native-helper-', dir=artifacts))
+        source = '''use std::process::Command;
+fn launch(make: fn(String) -> Command, value: String) -> Command {
+    make(value) // HIT
+}
+fn read(get: fn(&'static str) -> Result<String, std::env::VarError>) -> String {
+    get("UBS_PROGRAM").unwrap()
+}
+fn discard(get: fn() -> std::env::Args) -> String {
+    get();
+    "/usr/bin/printf".to_owned()
+}
+fn identity(make: fn(String) -> Command) -> fn(String) -> Command { make }
+fn forward(make: fn(String) -> Command, value: String) -> Command {
+    let selected = identity(make);
+    launch(selected, value)
+}
+fn main() {
+    let make = Command::new::<String>;
+    let supplied = forward(make, read(std::env::var::<&str>));
+    let fixed = forward(make, discard(std::env::args));
+    println!("{}", supplied.get_program().to_str().unwrap());
+    println!("{}", fixed.get_program().to_str().unwrap());
+}
+'''
+        target, executable = scratch / 'witness.rs', scratch / 'witness'
+        target.write_text(source, encoding='utf-8')
+        compiled = subprocess.run([rustc, '--edition=2021', str(target), '-o', str(executable)],
+                                  capture_output=True, text=True, timeout=60, check=False)
+        (scratch / 'compile.stdout.log').write_text(compiled.stdout, encoding='utf-8')
+        (scratch / 'compile.stderr.log').write_text(compiled.stderr, encoding='utf-8')
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        result = subprocess.run([str(executable)], env={**os.environ, 'UBS_PROGRAM': 'review-input'},
+                                capture_output=True, text=True, timeout=15, check=False)
+        (scratch / 'runtime.stdout.log').write_text(result.stdout, encoding='utf-8')
+        (scratch / 'runtime.stderr.log').write_text(result.stderr, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['review-input', '/usr/bin/printf'])
+        self.command(source)
+
+    def test_selected_local_callable_helpers_keep_body_sources_and_sinks(self):
+        self.command('''
+            use std::process::Command;
+            fn wrap(x: String) -> Command {
+                Command::new(x) // HIT
+            }
+            fn launch(make: fn(String) -> Command, x: String) { make(x); }
+            fn main() { launch(wrap, std::env::var("UBS_PROGRAM").unwrap()); }
+        ''')
+        self.command('''
+            fn supplied() -> String { std::env::var("UBS_PROGRAM").unwrap() }
+            fn read(get: fn() -> String) -> String { get() }
+            fn main() {
+                std::process::Command::new(read(supplied)); // HIT
+            }
+        ''')
+        for calls in (
+                'launch(wrap, std::env::var("UBS_PROGRAM").unwrap()); launch(fixed, "literal".to_owned());',
+                'launch(fixed, "literal".to_owned()); launch(wrap, std::env::var("UBS_PROGRAM").unwrap());'):
+            with self.subTest(calls=calls):
+                self.command('use std::process::Command;\n'
+                             'fn wrap(x: String) -> Command {\n    Command::new(x) // HIT\n}\n'
+                             'fn fixed(_: String) -> Command { Command::new("/usr/bin/printf") }\n'
+                             'fn launch(make: fn(String) -> Command, x: String) { make(x); }\n'
+                             'fn main() { ' + calls + ' }\n')
+
+    def test_selected_local_callable_helpers_keep_clean_and_metadata_controls(self):
+        self.command('''
+            use std::process::Command;
+            fn fixed(_: String) -> Command { Command::new("/usr/bin/printf") }
+            fn read_fixed() -> String { "/usr/bin/printf".to_owned() }
+            fn launch(make: fn(String) -> Command, x: String) { make(x); }
+            fn read(get: fn() -> String) -> String { get() }
+            fn address(make: fn(String) -> Command) -> usize { make as usize }
+            fn main() {
+                launch(fixed, std::env::var("UBS_PROGRAM").unwrap());
+                Command::new(read(read_fixed));
+                Command::new(address(fixed).to_string());
+            }
+        ''')
+
+    def test_opaque_callback_targets_remain_distinct_from_ordinary_data(self):
+        for callback in ('external::make', 'make'):
+            with self.subTest(callback=callback), self.assertRaisesRegex(AnalysisLimit, 'callable'):
+                self.command('use external::make;\n'
+                             'fn launch(f: fn(String) -> std::process::Command, x: String) { f(x); }\n'
+                             'fn main() { launch(' + callback + ', std::env::var("UBS_PROGRAM").unwrap()); }\n')
+        self.command('''
+            fn identity(value: String) -> String { value.trim().to_owned() }
+            fn main() {
+                std::process::Command::new(identity("/usr/bin/printf".to_owned()));
+                std::process::Command::new(identity(std::env::var("UBS_PROGRAM").unwrap())); // HIT
+            }
+        ''')
+
+    def test_selected_local_callable_native_program_witness(self):
+        rustc = os.environ.get('UBS_TEST_RUSTC') or shutil.which('rustc')
+        if rustc is None:
+            self.skipTest('selected local callable witness requires rustc')
+        artifacts = ROOT / 'test-suite/artifacts/rust-command-flow'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='native-local-helper-', dir=artifacts))
+        source = '''use std::process::Command;
+fn wrap(x: String) -> Command {
+    Command::new(x) // HIT
+}
+fn fixed(_: String) -> Command { Command::new("/usr/bin/printf") }
+fn supplied() -> String { std::env::var("UBS_PROGRAM").unwrap() }
+fn read(get: fn() -> String) -> String { get() }
+fn ignore(get: fn() -> String) -> String { get(); "/usr/bin/printf".to_owned() }
+fn launch(make: fn(String) -> Command, x: String) -> Command { make(x) }
+fn forward(make: fn(String) -> Command, get: fn() -> String) -> Command { launch(make, read(get)) }
+fn main() {
+    let harmless = forward(fixed, supplied);
+    let dangerous = forward(wrap, supplied);
+    let discarded = launch(wrap, ignore(supplied));
+    let make = wrap;
+    let literal = launch(make, "/usr/bin/printf".to_owned());
+    println!("{}", harmless.get_program().to_str().unwrap());
+    println!("{}", dangerous.get_program().to_str().unwrap());
+    println!("{}", discarded.get_program().to_str().unwrap());
+    println!("{}", literal.get_program().to_str().unwrap());
+}
+'''
+        target, executable = scratch / 'witness.rs', scratch / 'witness'
+        target.write_text(source, encoding='utf-8')
+        compiled = subprocess.run([rustc, '--edition=2021', str(target), '-o', str(executable)],
+                                  capture_output=True, text=True, timeout=60, check=False)
+        (scratch / 'compile.stdout.log').write_text(compiled.stdout, encoding='utf-8')
+        (scratch / 'compile.stderr.log').write_text(compiled.stderr, encoding='utf-8')
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        result = subprocess.run([str(executable)], env={**os.environ, 'UBS_PROGRAM': 'review-input'},
+                                capture_output=True, text=True, timeout=15, check=False)
+        (scratch / 'runtime.stdout.log').write_text(result.stdout, encoding='utf-8')
+        (scratch / 'runtime.stderr.log').write_text(result.stderr, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(),
+                         ['/usr/bin/printf', 'review-input', '/usr/bin/printf', '/usr/bin/printf'])
+        self.command(source)
+
     def test_opaque_native_callable_transports_remain_explicit(self):
         cases = (
             'fn fixed(value: String) -> std::process::Command { std::process::Command::new("printf") } '
             'fn main(flag: bool) { let native = std::process::Command::new::<String>; '
             'let create = if flag {native} else {fixed}; create(std::env::var("UBS_PROGRAM").unwrap()); }',
-            'fn invoke(make: fn(String) -> std::process::Command, value: String) { make(value); } '
-            'fn main() { invoke(std::process::Command::new::<String>, std::env::var("UBS_PROGRAM").unwrap()); }',
             'fn escape(make: fn(String) -> std::process::Command) { opaque(make); } '
             'fn main() { escape(std::process::Command::new::<String>); }',
             'fn main() { let native = std::process::Command::new::<String>; opaque(native); }',
@@ -2070,6 +2332,29 @@ fn main() {
                      'set UBS_RUST_COMMAND_E2E=1 for native callable CLI scans')
 class CommandExecutablePublicTests(SourceCase):
     rule = 'rust.security.command-executable'
+    helper_unsafe = ('use std::process::Command;\n'
+                     'fn launch(make: fn(String) -> Command, value: String) {\n'
+                     '    make(value);\n'
+                     '}\n'
+                     'fn read(get: fn() -> std::env::Args) -> String { get().nth(1).unwrap() }\n'
+                     'fn main() { launch(Command::new::<String>, read(std::env::args)); }\n')
+    helper_local = ('use std::process::Command;\n'
+                    'fn wrap(x: String) -> Command {\n'
+                    '    Command::new(x)\n'
+                    '}\n'
+                    'fn supplied() -> String { std::env::var("UBS_PROGRAM").unwrap() }\n'
+                    'fn read(get: fn() -> String) -> String { get() }\n'
+                    'fn launch(make: fn(String) -> Command, x: String) { make(x); }\n'
+                    'fn main() { launch(wrap, read(supplied)); }\n'
+                    'fn fixed(_: String) -> Command { Command::new("/usr/bin/printf") }\n')
+    helper_partial = ('use std::process::Command;\n'
+                      'fn launch(make: fn(String) -> Command, value: String) { make(value); }\n'
+                      'fn fixed(_: String) -> Command { Command::new("/usr/bin/printf") }\n'
+                      'fn main(flag: bool) {\n'
+                      '    Command::new(std::env::var("UBS_PROGRAM").unwrap());\n'
+                      '    let make = if flag { Command::new::<String> } else { fixed };\n'
+                      '    launch(make, std::env::var("UBS_PROGRAM").unwrap());\n'
+                      '}\n')
     unsafe = ('use std::{env::var as read, process::Command as Proc};\n'
               'fn constructor() -> fn(String) -> Proc { Proc::new::<String> }\n'
               'fn main() {\n'
@@ -2189,6 +2474,46 @@ class CommandExecutablePublicTests(SourceCase):
                  (self.unsafe, [6], False, 1),
                  (self.partial, [4], True, 0), (self.partial, [4], True, 0))
         for index, (source, lines, partial, hits) in enumerate(cases):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                            lines=lines, partial=partial, cache=True)
+                self.assertEqual(report['profile']['cache_hits'], hits, report)
+
+    def test_helper_formats_selection_and_partial_findings(self):
+        artifacts = ROOT / 'test-suite/artifacts/rust-callable-helpers'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        clean = self.helper_unsafe.replace('read(std::env::args)', '"/usr/bin/printf".to_owned()')
+        local_clean = self.helper_local.replace('launch(wrap, read(supplied))', 'launch(fixed, read(supplied))')
+        for name, source, lines, partial in (
+                ('unsafe', self.helper_unsafe, [3], False), ('clean', clean, [], False),
+                ('local', self.helper_local, [3], False), ('local-clean', local_clean, [], False),
+                ('partial', self.helper_partial, [5], True)):
+            project = scratch / name
+            project.mkdir()
+            target = project / 'selected.rs'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.rs').write_text(self.helper_unsafe, encoding='utf-8')
+            for meta in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, fmt=fmt):
+                        self.public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                           lines=lines, partial=partial)
+
+    def test_helper_cache_edits_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/rust-callable-helpers'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'selected.rs'
+        clean = self.helper_unsafe.replace('read(std::env::args)', '"/usr/bin/printf".to_owned()')
+        suppressed = self.helper_unsafe.replace('make(value);',
+                                               'make(value); // ubs:ignore[rust.security.command-executable]')
+        for index, (source, lines, partial, hits) in enumerate((
+                (self.helper_unsafe, [3], False, 0), (self.helper_unsafe, [3], False, 1),
+                (clean, [], False, 0), (suppressed, [], False, 0),
+                (self.helper_unsafe, [3], False, 1),
+                (self.helper_partial, [5], True, 0), (self.helper_partial, [5], True, 0))):
             with self.subTest(index=index):
                 target.write_text(source, encoding='utf-8')
                 report = self.public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',

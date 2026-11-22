@@ -36,7 +36,7 @@ import tokenize
 from urllib.parse import urlsplit
 from bisect import bisect_right
 from collections import defaultdict, deque
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Union
@@ -81,11 +81,12 @@ _STDIN_EAGER_PARSERS = frozenset({'json.load', 'tomllib.load'})
 _STDIN_CSV_PARSERS = frozenset({'csv.reader', 'csv.DictReader'})
 _STDIN_PARSER_CARRIERS = (_STDIN_EAGER_PARSERS | _STDIN_CSV_PARSERS | _STDIN_STREAMS
                           | frozenset(_STDIN_READERS)
-                          | {'json', 'tomllib', 'csv', 'sys', 'iter', 'builtins.iter', 'zip', 'builtins.zip'})
+                          | {'json', 'tomllib', 'csv', 'sys', 'iter', 'builtins.iter', 'zip', 'builtins.zip',
+                             'enumerate', 'builtins.enumerate'})
 _STDIN_OPAQUE_ARGUMENTS = '@stdin:opaque-arguments'
 _SOURCE_MEMBERS = {'os': frozenset({'getenv', 'getenvb', 'environ', 'environb'}),
                    'sys': frozenset({'argv', 'stdin', '__stdin__'}),
-                   'builtins': frozenset({'iter', 'list', 'tuple', 'next', 'zip', 'bytearray'}),
+                   'builtins': frozenset({'iter', 'list', 'tuple', 'next', 'zip', 'enumerate', 'bytearray'}),
                    'json': frozenset({'load', 'loads', 'JSONDecoder', '_default_decoder'}),
                    'tomllib': frozenset({'load', 'loads'}),
                    **{stream: methods | {'__iter__', 'buffer', 'raw', 'readinto', 'readinto1'}
@@ -579,6 +580,8 @@ class _ZipIterator:
     repeating: bool = False
     fallible: bool = False
     fallible_at_end: bool = False
+    native_kind: str = 'zip'
+    exhaustible: bool = True
 
 
 def _literal_choices(binding):
@@ -1077,6 +1080,7 @@ def _analysis_comparison_steps(a, b, evidence):
         return (type(a) is type(b) and a.cursor == b.cursor and a.references == b.references
                 and a.optional == b.optional and a.repeating == b.repeating
                 and a.fallible == b.fallible and a.fallible_at_end == b.fallible_at_end
+                and a.native_kind == b.native_kind and a.exhaustible == b.exhaustible
                 and (yield (a.rows, b.rows, evidence)))
     return a == b
 
@@ -1093,7 +1097,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'zip', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -4359,10 +4363,10 @@ class _Flow:
             elif isinstance(value, _ArgumentVector) and map_objects is not None:
                 value = _ArgumentVector(value.operands, tuple(map_objects(refs) for refs in value.references))
             elif isinstance(value, _ZipIterator):
-                value = _ZipIterator(tuple(self.map_cell_bindings(
+                value = replace(value, rows=tuple(self.map_cell_bindings(
                     row, map_ref, memo, map_objects=map_objects) for row in value.rows),
-                    map_ref(value.cursor), map_objects(value.references) if map_objects else value.references,
-                    value.optional, value.repeating, value.fallible, value.fallible_at_end)
+                    cursor=map_ref(value.cursor),
+                    references=map_objects(value.references) if map_objects else value.references)
             elif isinstance(value, (_FunctionValue, _DeferredCall)):
                 self.engine.budget.spend(1 + len(value.values))
                 values = tuple((name, self.map_cell_bindings(child, map_ref, memo, map_objects=map_objects))
@@ -4878,6 +4882,78 @@ class _Flow:
             elements.append((element, incoming, NO_REFERENCES))
         return tuple(elements), len(elements), references, False
 
+    def enumerate_value(self, node, state, inputs):
+        """Expose native stdin rows while keeping the generated index clean.
+
+        Reuse the shared row/cursor engine, including its exhaustion and
+        escape boundaries. The counter is abstract: unlike an invented zero,
+        a clean unknown value cannot certify an exact branch or lookup.
+        """
+        positions = self.call_positions(node, inputs.arguments, state)
+        if None in inputs.keywords or any(isinstance(expression, (ast.Starred, _ArgumentExpansion))
+                                         for expression, _fact, _binding, _refs in positions):
+            raise AnalysisLimit('native enumerate argument expansion is unresolved; analysis is incomplete')
+        if (len(positions) > 2 or inputs.keywords.keys() - {'iterable', 'start'}
+                or any(key in inputs.keywords for key in ('iterable', 'start')[:len(positions)])):
+            self.possible_exception(state)
+            return CLEAN
+        arguments = dict(zip(('iterable', 'start'), positions))
+        arguments.update((key, (expression, inputs.keywords[key],
+                               self.expression_bindings.get(expression, expression),
+                               self.expression_references.get(expression, NO_REFERENCES)))
+                         for key, expression in inputs.keyword_nodes.items())
+        if 'iterable' not in arguments:
+            self.possible_exception(state)
+            return CLEAN
+        expression, fact, binding, references = arguments['iterable']
+        self.require_value(binding)
+        choices = _binding_choices(binding)
+        if not choices:
+            return CLEAN
+        known = [value for value in choices if self.stdin_identity(value) in _STDIN_STREAMS
+                 or isinstance(value, _StdinCallableIterator)]
+        if not known:
+            # Request identity specialization for selected callers above,
+            # without imposing a native-stream obligation on ordinary
+            # generic enumeration (including uncalled library helpers).
+            return None
+        if any(isinstance(value, _SymbolicValue) for value in choices):
+            self.zip_parameters.update(value.parameter for value in choices if isinstance(value, _SymbolicValue))
+            return CLEAN
+        if any(value not in known and not (isinstance(value, ast.Constant)
+                and type(value.value) in {int, float, complex, bool, type(None)}) for value in choices):
+            raise AnalysisLimit('native enumerate input alternatives are unresolved; analysis is incomplete')
+        if not self.stdin_parser_stable(node, members={'enumerate', '__iter__', '__next__', '__index__'}):
+            raise AnalysisLimit('native enumerate callable identity is unresolved; analysis is incomplete')
+        if 'start' in arguments:
+            start_node, _fact, start, _refs = arguments['start']
+            if (isinstance(start_node, ast.UnaryOp) and isinstance(start_node.op, (ast.UAdd, ast.USub))
+                    and isinstance(start_node.operand, ast.Constant)
+                    and type(start_node.operand.value) in {int, bool}):
+                start = start_node.operand  # Its sign leaves the native index protocol unchanged.
+            self.require_value(start)
+            starts = _binding_choices(start)
+            if not starts:
+                return CLEAN
+            if any(isinstance(value, _SymbolicValue) for value in starts):
+                self.zip_parameters.update(value.parameter for value in starts if isinstance(value, _SymbolicValue))
+                return CLEAN
+            if any(not (isinstance(value, (_LiteralString, ast.Constant))
+                        and (not isinstance(value, ast.Constant) or type(value.value) in {
+                            str, bytes, int, float, complex, bool, type(None)})) for value in starts):
+                raise AnalysisLimit('native enumerate start index protocol is unresolved; analysis is incomplete')
+            if not any(isinstance(value, ast.Constant) and type(value.value) in {int, bool} for value in starts):
+                self.possible_exception(state)
+                return CLEAN
+        columns = [self.zip_input(expression, fact, value, references, state) for value in known]
+        payload = join_facts(*(elements[0][1] for elements, _length, _refs, _fallible in columns))
+        element = _join_bindings(*(elements[0][0] for elements, _length, _refs, _fallible in columns))
+        row = _ArgumentVector(((None, CLEAN), (element, payload)))
+        return self.install_zip_iterator(node, state, _ZipIterator(
+            (row,), None, optional=True, repeating=True, fallible=True, fallible_at_end=True,
+            native_kind='enumerate', exhaustible=all(not isinstance(value, _StdinCallableIterator)
+                                                     or value.eof_terminated for value in known)))
+
     def zip_value(self, node, state, inputs):
         positions = self.call_positions(node, inputs.arguments, state)
         if (any(isinstance(expression, (ast.Starred, _ArgumentExpansion))
@@ -4925,6 +5001,23 @@ class _Flow:
             tuple((elements[index if length is not None else 0][0],
                    elements[index if length is not None else 0][1])
                   for elements, length, _references, _fallible in columns)) for index in range(count))
+        return self.install_zip_iterator(node, state, _ZipIterator(
+            rows, None, frozenset().union(*(references for _elements, _length, references, _fallible in columns)),
+            optional=any(length is None for _elements, length, _references, _fallible in columns),
+            repeating=bool(columns) and not lengths,
+            fallible=any(fallible for _elements, _length, _references, fallible in columns),
+            fallible_at_end=any(fallible for _elements, _length, _references, fallible
+                                in columns[:stopping_column]),
+            # A finite companion bounds traversal even when a callable
+            # reader's sentinel does not match EOF. Column ordering still
+            # controls final-read exceptions through fallible_at_end above.
+            exhaustible=bool(lengths) or all(
+                not isinstance(value, _StdinCallableIterator) or value.eof_terminated
+                for _expression, _fact, binding, _refs in positions
+                for value in _binding_choices(binding))))
+
+    def install_zip_iterator(self, node, state, iterator):
+        """Share native row/cursor ownership across zip and enumerate."""
         cursor = _CellRef(self.scope, '@zip:cursor', (node,))
         cells = state.cell_state()
         child = self.engine.original_calls.get(node, node)
@@ -4946,13 +5039,7 @@ class _Flow:
         if cursor in cells.contents:
             cells.multiple.add(cursor)
         state.put_cell(cursor, _CellContents(binding=_ZipCursor(0)), written=True)
-        self.expression_bindings[node] = _ZipIterator(
-            rows, cursor, frozenset().union(*(references for _elements, _length, references, _fallible in columns)),
-            optional=any(length is None for _elements, length, _references, _fallible in columns),
-            repeating=bool(columns) and not lengths,
-            fallible=any(fallible for _elements, _length, _references, fallible in columns),
-            fallible_at_end=any(fallible for _elements, _length, _references, fallible
-                                in columns[:stopping_column]))
+        self.expression_bindings[node] = replace(iterator, cursor=cursor)
         self.expression_references[node] = frozenset({node})
         self.possible_exception(state)
         return CLEAN
@@ -5023,6 +5110,8 @@ class _Flow:
     def zip_materialize(self, node, state, iterators):
         outputs, branches = [], []
         for iterator in iterators:
+            if not iterator.exhaustible:
+                raise AnalysisLimit('native iterator exhaustion is unproved; analysis is incomplete')
             if iterator.repeating:
                 raise AnalysisLimit('native zip unbounded materialization is unresolved; analysis is incomplete')
             # Validate shared cursor/backing identity before reading its state.
@@ -5052,6 +5141,10 @@ class _Flow:
 
     def zip_call(self, node, state, target, name, inputs):
         native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
+        if native and name in {'enumerate', 'builtins.enumerate'}:
+            if isinstance(target, _BoundCallable) and target.producer_unproved:
+                raise AnalysisLimit('native enumerate callable producer effects are unresolved; analysis is incomplete')
+            return self.enumerate_value(node, state, inputs)
         if native and name in {'zip', 'builtins.zip'}:
             if isinstance(target, _BoundCallable) and target.producer_unproved:
                 raise AnalysisLimit('native zip callable producer effects are unresolved; analysis is incomplete')
@@ -5094,6 +5187,8 @@ class _Flow:
         every back edge would incorrectly retain pre-loop values after a
         definite overwrite, and would replay already-consumed rows.
         """
+        if not iterator.exhaustible:
+            raise AnalysisLimit('native iterator exhaustion is unproved; analysis is incomplete')
         head, finished = state.copy(), None
         remaining = len(iterator.rows) + 1
         while head is not None:
@@ -5514,9 +5609,11 @@ class _Flow:
         def native(binding):
             return all((self.stdin_identity(value) in _STDIN_STREAMS
                         or self.stdin_identity(value) in _STDIN_READERS
-                        or isinstance(value, str) and value in _STDIN_CSV_PARSERS | {'iter', 'builtins.iter', 'zip', 'builtins.zip'}
+                        or isinstance(value, str) and value in _STDIN_CSV_PARSERS | {
+                            'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate'}
                         or isinstance(value, _BoundCallable) and value.namespace_proven
-                        and value.name in _STDIN_CSV_PARSERS | {'iter', 'builtins.iter', 'zip', 'builtins.zip'})
+                        and value.name in _STDIN_CSV_PARSERS | {
+                            'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate'})
                        and not (isinstance(value, _BoundCallable) and value.producer_unproved)
                        or isinstance(value, (_CsvReader, _StdinCallableIterator)) and value.format_safe
                        or self.materialized_generator_binding(value, NO_REFERENCES, state)
@@ -5530,7 +5627,7 @@ class _Flow:
                 if expression.id in values:
                     return values[expression.id]
                 contents = self.global_contents(expression.id, state)
-                if (contents.binding is None and expression.id in {'iter', 'zip', 'builtins'}
+                if (contents.binding is None and expression.id in {'iter', 'zip', 'enumerate', 'builtins'}
                         and expression.id not in self.engine.globals.bindings
                         and expression.id not in state.bindings
                         and '@global:' + expression.id not in state.bindings):
@@ -5553,7 +5650,8 @@ class _Flow:
             return False
         returned = body[0].value
         if isinstance(returned, ast.Call):
-            return (identity(returned.func) in _STDIN_CSV_PARSERS | {'iter', 'builtins.iter', 'zip', 'builtins.zip'}
+            return (identity(returned.func) in _STDIN_CSV_PARSERS | {
+                        'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate'}
                     and all(inert(value) for value in returned.args)
                     and all(keyword.arg is not None and inert(keyword.value) for keyword in returned.keywords))
         return inert(returned)
@@ -6501,10 +6599,10 @@ class _Flow:
                 actual = frozenset().union(*(
                     self._lookup_refs(references, ref) if isinstance(ref, str) else frozenset({node})
                     for ref in target.references))
-                choices.append(_ZipIterator(tuple(self.substitute_binding(
+                choices.append(replace(target, rows=tuple(self.substitute_binding(
                     row, bound, references, node, call_name, values, substitute=substitute, cells=cells)
-                    for row in target.rows), (cells or {}).get(target.cursor, target.cursor), actual,
-                    target.optional, target.repeating, target.fallible, target.fallible_at_end))
+                    for row in target.rows), cursor=(cells or {}).get(target.cursor, target.cursor),
+                    references=actual))
             elif isinstance(target, _ArgumentVector):
                 operands = []
                 element_references = []

@@ -408,11 +408,54 @@ separate from the bounded feature checks below.
   independent Python rules. These are intentional test-tool configuration,
   not production command dispatch; no suppression or gate change was made.
 
-### Native Python enumeration
+### Native Python enumeration (`1b9j.6.12`)
 
-- [ ] Reuse the current native iterator/cursor and positional-row model.
-- [ ] Preserve source payloads separately from numeric indices through
-  consumption, exhaustion and supported helper/collection paths.
-- [ ] Preserve explicit incomplete boundaries for unresolved protocols and
-  unsupported iterator transport; retain independent findings.
-- [ ] Verify exact public reports and publish with canonical integrity pins.
+- [x] Reuse the native iterator/cursor and positional-row model for text,
+  binary and raw stdin. Preserve payloads separately from clean numeric
+  indices through next/default, saved next methods, aliases, loops,
+  comprehensions and supported pure factory helpers.
+- [x] Preserve native callable identity, valid routes within known-invalid
+  alternatives, and explicit boundaries for unresolved input/start protocols,
+  unbounded materialization and captured iterator transport. Reached findings
+  survive partial analysis; ordinary generic enumeration keeps its existing
+  transfer behavior.
+- [x] Fix the independently reproduced finite-zip regression: a finite or
+  empty companion bounds a callable reader even when its sentinel differs
+  from EOF. Native witnesses preserve final-read column ordering.
+- [x] Preserve all concurrent `b1303533` source and regression changes.
+  Native regular-file witnesses show raw-stream enumeration resuming after
+  EOF and seek, with its index advancing from 7 to 8. Unproved resumption
+  remains explicitly incomplete rather than becoming permanently clean.
+- [x] Pass the final dataflow cohort: 158 methods, 151 executed passes and
+  seven opt-in skips. Its 36 zip/enumeration methods, including native
+  runtime witnesses, are a subset of that total. DSR log SHA256
+  `133d55a1ce50b32405c88df68d92db077db4d3f04049690f29143fbddcbb21c9`.
+- [x] Pass the final two public methods comprising 25 actual scanner calls:
+  16 module/runner JSON/SARIF combinations and nine cache/edit/suppression/
+  repeated-partial calls. Exact sites, severity, selection, retained findings,
+  and incomplete-result nonreuse are asserted for opaque-start and EOF cases.
+  Candidate public log SHA256
+  `942bc0ed27a7ee00e26213c194dfd7edffa060b6ae019cfcfe2666135b1fe6f1`.
+- [x] Replay all 25 unchanged public calls on the combined Rust/Python tree
+  with canonical development version 5.5.112; log SHA256
+  `6b6513daba37cdbbfa9ac6d91814e018329969d3fc7d3fc3363b02e4e6794842`.
+  Canonical module/helper/release hashes, runner syntax and whitespace pass;
+  integrity log `ccef15bdbdbb29fe10fad7e1c70f20fc376b450cc88161390fbdc858ede83114`.
+- [x] Retain all frozen failures and exact phase provenance in evidence blob
+  `e9781ed51ecfffe6414ee578bf2d78a61c75a1b8`. Earlier adjacent call-completion,
+  module and expression checks passed on the earlier reviewed candidate;
+  they are not represented as final merged-tree executions.
+- [ ] Complete the broader summary and stdin-provenance goals. Two summary
+  failures reproduce on pristine `5ad0246`: a `None` versus `ast.Constant(None)`
+  expectation and existing delayed-generator boundaries in `argparse`.
+  The added generic-enumeration obligation was fixed, and the later summary
+  run reports exactly the two baseline failure reasons without weakening tests.
+  Arbitrary iterator protocols, unbounded list/tuple materialization and
+  captured iterator transport remain outside this bounded implementation.
+- [ ] Complete changed-source self-scan qualification. The first attempt's
+  analyzer process was killed while other checks ran. The isolated replay
+  completes with partial analysis (exit 2), not a clean pass; log SHA256
+  `2898b3e369c09e9601d35df547469f84a74c0144e631300dd3e87d79291b89d2`.
+  Its one critical record is the existing LDAP heuristic misclassifying
+  `self.http_parameters.add(request.parameter)`, an analyzer set update, as
+  a directory sink. No suppression or gate change was added.

@@ -1354,6 +1354,208 @@ class EagerStdinParserTests(SourceTest):
                          {('eval',2),('eval',6)})
 
 
+class EnumeratedStdinTests(SourceTest):
+    def test_native_payload_reaches_each_sink_domain(self):
+        for stream, convert in (('sys.stdin', ''), ('sys.stdin.buffer', '.decode()'),
+                                ('sys.stdin.buffer.raw', '.decode()')):
+            for sink, rule in (("eval(value)", 'eval'), ("cursor.execute(value)", 'sql'),
+                               ("os.system(value)", 'command'), ("HttpResponse(value)", 'xss'),
+                               ("requests.get(value)", 'ssrf')):
+                with self.subTest(stream=stream, sink=sink):
+                    findings = self.assert_rules('import sys, os, requests\n'
+                        f'value = next(enumerate({stream}))[1]{convert}\n{sink}\n', rule)
+                    self.assertEqual([finding['line'] for finding in findings], [3])
+                    self.assertIn(stream, findings[0]['message'])
+
+    def test_aliases_methods_and_loop_pairs_preserve_payload(self):
+        for setup in (
+                'rows = enumerate(sys.stdin)\nvalue = next(rows)[1]',
+                'rows = enumerate(sys.stdin)\nalias = rows\nvalue = next(iter(alias))[-1]',
+                'rows = enumerate(sys.stdin)\nadvance = rows.__next__\nvalue = advance()[1]',
+                'rows = enumerate(sys.stdin).__iter__()\nindex, value = next(rows)',
+                'for index, line in enumerate(sys.stdin):\n    value = line',
+                'for pair in enumerate(sys.stdin):\n    value = pair[1]',
+                'value = [line for index, line in enumerate(sys.stdin)][0]',
+                'value = [pair[1] for pair in enumerate(sys.stdin)][0]',
+                'from builtins import enumerate as number_lines\nvalue = next(number_lines(sys.stdin))[1]',
+                'import builtins as native\nvalue = native.next(native.enumerate(sys.stdin))[1]',
+                'make = enumerate\nvalue = next(make(sys.stdin))[1]',
+                'arguments = (sys.stdin, 4)\nvalue = next(enumerate(*arguments))[1]',
+                'value = next(enumerate(iter(sys.stdin.readline, "")))[1]',
+                'value = next(enumerate(iterable=sys.stdin, start=4))[1]',
+                'value = next(enumerate(sys.stdin, start=-4))[1]'):
+            with self.subTest(setup=setup):
+                self.assert_rules('import sys\n' + setup + '\neval(value)\n', 'eval')
+
+    def test_numeric_indices_and_fixed_replacements_are_clean(self):
+        for setup in (
+                'value = next(enumerate(sys.stdin))[0]',
+                'value = next(enumerate(sys.stdin))[-2]',
+                'index, line = next(enumerate(sys.stdin))\nvalue = index',
+                'for index, line in enumerate(sys.stdin):\n    value = index',
+                'value = [index for index, line in enumerate(sys.stdin)][0]',
+                'rows = enumerate(sys.stdin)\nvalue = "fixed"',
+                'value = next(enumerate(sys.stdin))[1]\nvalue = "fixed"',
+                'rows = enumerate(sys.stdin)\nrows = iter([(0, "fixed")])\nvalue = next(rows)[1]',
+                'def enumerate(stream):\n    return [(0, "fixed")]\nvalue = enumerate(sys.stdin)[0][1]'):
+            with self.subTest(setup=setup):
+                self.assert_rules('import sys\n' + setup + '\ncursor.execute(str(value))\n')
+
+    def test_pure_factories_preserve_native_rows(self):
+        for setup in (
+                'def make(stream):\n    return enumerate(stream)\nvalue = next(make(sys.stdin))[1]',
+                'def make():\n    return enumerate(sys.stdin)\nvalue = next(make())[1]',
+                'def number(stream, start):\n    return enumerate(stream, start)\nvalue = next(number(sys.stdin, 3))[1]'):
+            with self.subTest(setup=setup):
+                self.assert_rules('import sys\n' + setup + '\neval(value)\n', 'eval')
+
+    def test_generic_enumeration_helpers_keep_ordinary_transfer(self):
+        for source in (
+                'def number(items):\n    return enumerate(items)\n',
+                'def render(items):\n    for index, item in enumerate(items):\n        print(item)\n',
+                'def number(items):\n    return enumerate(items)\nnumber(options)\n'):
+            with self.subTest(source=source):
+                self.assert_rules(source)
+        self.assert_rules('def first(items):\n    return next(enumerate(items))[1]\n'
+                          'cursor.execute(first([input()]))\n', 'sql')
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'native zip'):
+            self.scan('import sys\ndef number(other):\n'
+                      '    return enumerate(sys.stdin if flag else other)\n')
+
+    def test_next_default_keeps_each_pair_position(self):
+        for expression, expected in (
+                ('next(enumerate(sys.stdin), (0, "fixed"))[1]', ('sql',)),
+                ('next(enumerate(sys.stdin), (0, "fixed"))[0]', ()),
+                ('next(enumerate(sys.stdin), (0, input()))[1]', ('sql',))):
+            with self.subTest(expression=expression):
+                self.assert_rules('import sys\ncursor.execute(str(' + expression + '))\n', *expected)
+
+    def test_shared_cursor_requires_proof_after_native_eof(self):
+        for handle in ('rows', 'alias'):
+            with self.subTest(handle=handle), self.assertRaisesRegex(taint_py.AnalysisLimit, 'zip cursor'):
+                self.scan('import sys\nrows = enumerate(sys.stdin)\nalias = rows\n'
+                    'for index, line in rows:\n    print(index)\n'
+                    f'value = next({handle}, (0, "fixed"))[1]\ncursor.execute(value)\n')
+
+    def test_enumeration_resumption_after_native_eof_remains_explicit(self):
+        for consume in ('next(rows, None)\n', 'for index, line in rows:\n    pass\n'):
+            for reset in ('sys.stdin.seek(0)\n', 'stream = sys.stdin\nstream.seek(0)\n',
+                          'seek = sys.stdin.seek\nseek(0)\n'):
+                source = ('import sys\nrows = enumerate(sys.stdin, start=7)\nalias = rows\n'
+                          'sys.stdin.read()\n' + consume + reset +
+                          'cursor.execute(next(alias)[1])\n')
+                with self.subTest(consume=consume, reset=reset), \
+                        self.assertRaisesRegex(taint_py.AnalysisLimit, 'zip cursor'):
+                    self.scan(source)
+
+    def test_native_enumeration_seek_after_eof_witness(self):
+        artifacts = ROOT / 'test-suite/artifacts/python-enumeration-eof'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='native-', dir=artifacts))
+        stdin_path = scratch / 'stdin.txt'
+        stdin_path.write_text('SELECT supplied\n', encoding='utf-8')
+        for stream, convert in (('sys.stdin', ''), ('sys.stdin.buffer', '.decode()')):
+            for consume in ('next(rows, None)\n', 'for index, line in rows:\n    pass\n'):
+                source = ('import json, sys\nrows = enumerate(' + stream + ', start=7)\n'
+                          'next(rows)\n' + stream + '.read()\n' + consume + 'sys.stdin.seek(0)\n'
+                          'index, value = next(rows)\nprint(json.dumps([index, value' + convert + ']))\n')
+                with self.subTest(stream=stream, consume=consume):
+                    with stdin_path.open('rb') as source_file:
+                        result = subprocess.run([sys.executable, '-c', source], stdin=source_file,
+                                                capture_output=True, text=True, timeout=15, check=True)
+                    self.assertEqual(json.loads(result.stdout), [8, 'SELECT supplied\n'])
+
+    def test_known_invalid_input_and_start_alternatives_preserve_valid_rows(self):
+        for invalid in ('None', '42', 'False'):
+            with self.subTest(invalid=invalid):
+                self.assert_rules('import sys\nstream = sys.stdin if flag else ' + invalid + '\n'
+                                  'eval(next(enumerate(stream))[1])\n', 'eval')
+        self.assert_rules('import sys\nstart = 0 if flag else "invalid"\n'
+                          'eval(next(enumerate(sys.stdin, start))[1])\n', 'eval')
+
+    def test_opaque_inputs_start_and_expansions_remain_incomplete(self):
+        for setup in ('rows = enumerate(sys.stdin if flag else opaque)',
+                      'rows = enumerate(sys.stdin, start=opaque)',
+                      'rows = enumerate(*arguments)', 'rows = enumerate(**options)'):
+            with self.subTest(setup=setup), self.assertRaisesRegex(taint_py.AnalysisLimit, 'enumerate'):
+                self.scan('import sys\n' + setup + '\n')
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'source member mutation'):
+            self.scan('import builtins, sys\nbuiltins.enumerate = replacement\n'
+                      'eval(next(builtins.enumerate(sys.stdin))[1])\n')
+
+    def test_shared_native_iterator_boundaries_remain_explicit(self):
+        for setup in ('value = list(enumerate(sys.stdin))',
+                      'value = tuple(enumerate(sys.stdin))',
+                      'def take(rows):\n    return next(rows)\nvalue = take(enumerate(sys.stdin))',
+                      'rows = enumerate(sys.stdin)\nunknown(rows)',
+                      'def make():\n    owned = Owner()\n    return enumerate(sys.stdin)\nrows = make()'):
+            with self.subTest(setup=setup), self.assertRaisesRegex(taint_py.AnalysisLimit, 'native zip'):
+                self.scan('import sys\n' + setup + '\n')
+
+    def test_partial_enumeration_retains_reached_findings(self):
+        engine = taint_py._Analysis(ast.parse(
+            'import sys\neval(input())\nrows = enumerate(sys.stdin, start=opaque)\n'))
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'enumerate') as caught:
+            engine.analyze()
+        self.assertEqual({(kind, line) for kind, line, _column, _label in caught.exception.effects},
+                         {('eval', 2)})
+
+    def test_constructor_argument_errors_do_not_produce_payload(self):
+        for expression in ('enumerate(sys.stdin, 0, 1)', 'enumerate(sys.stdin, unknown=True)',
+                           'enumerate(sys.stdin, start="invalid")'):
+            with self.subTest(expression=expression):
+                self.assert_rules('import sys\ncursor.execute(' + expression + ')\n')
+
+    def test_callable_sentinel_exhaustion_proof_survives_native_wrapping(self):
+        self.assert_rules('import sys\nrows = enumerate(iter(sys.stdin.readline, "STOP"))\n'
+                          'eval(next(rows)[1])\n', 'eval')
+        for expression in ('enumerate(iter(sys.stdin.readline, "STOP"))',
+                           'zip(iter(sys.stdin.readline, "STOP"))'):
+            with self.subTest(expression=expression), self.assertRaisesRegex(taint_py.AnalysisLimit, 'exhaustion'):
+                self.scan('import sys\nfor row in ' + expression + ':\n    cursor.execute(row)\n')
+
+    def test_finite_zip_companions_bound_non_eof_callable_readers(self):
+        for expression, column in (('zip(iter(sys.stdin.readline, "STOP"), [0])', 0),
+                                   ('zip([0], iter(sys.stdin.readline, "STOP"))', 1)):
+            with self.subTest(expression=expression):
+                self.assert_rules('import sys\nfor row in ' + expression + ':\n'
+                                  f'    cursor.execute(row[{column}])\n', 'sql')
+                self.assert_rules('import sys\nrows = list(' + expression + ')\n'
+                                  f'cursor.execute(rows[0][{column}])\n', 'sql')
+        for expression in ('zip(iter(sys.stdin.readline, "STOP"), [])',
+                           'zip([], iter(sys.stdin.readline, "STOP"))'):
+            with self.subTest(empty=expression):
+                self.assert_rules('import sys\nfor row in ' + expression + ':\n'
+                                  '    cursor.execute(row)\n')
+                self.assert_rules('import sys\nrows = tuple(' + expression + ')\n'
+                                  'cursor.execute(rows)\n')
+
+    def test_native_zip_non_eof_witness_preserves_column_read_order(self):
+        for expression, expected in (
+                ('zip(iter(sys.stdin.readline, "STOP"), [0])', [[['first\n', 0]], '']),
+                ('zip([0], iter(sys.stdin.readline, "STOP"))', [[[0, 'first\n']], 'second\n']),
+                ('zip(iter(sys.stdin.readline, "STOP"), [])', [[], 'second\n']),
+                ('zip([], iter(sys.stdin.readline, "STOP"))', [[], 'first\n'])):
+            source = ('import json, sys\nrows = list(' + expression + ')\n'
+                      'print(json.dumps([rows, sys.stdin.readline()]))\n')
+            with self.subTest(expression=expression):
+                result = subprocess.run([sys.executable, '-c', source], input='first\nsecond\n',
+                                        text=True, capture_output=True, timeout=15, check=True)
+                self.assertEqual(json.loads(result.stdout), expected)
+
+    def test_native_python_witnesses_preserve_indices_and_exhaustion(self):
+        for stream, convert in (('sys.stdin', ''), ('sys.stdin.buffer', '.decode()')):
+            source = ('import json, sys\nrows = enumerate(' + stream + ', start=7)\n'
+                      'index, value = next(rows)\n'
+                      'print(json.dumps([index, value' + convert + ']))\n'
+                      'print(json.dumps(next(rows, (0, "fixed"))))\n')
+            with self.subTest(stream=stream):
+                result = subprocess.run([sys.executable, '-c', source], input='payload\n',
+                                        text=True, capture_output=True, timeout=15, check=True)
+                self.assertEqual([json.loads(line) for line in result.stdout.splitlines()],
+                                 [[7, 'payload\n'], [0, 'fixed']])
+
+
 class CallableStdinIteratorTests(SourceTest):
     def test_native_reader_sentinel_iteration_reaches_each_sink_domain(self):
         for stream, sentinel, convert in (("sys.stdin", "''", ''),
@@ -1908,7 +2110,8 @@ class SuppressionTests(SourceTest):
 
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 to run real runner integration')
 class RunnerIntegrationTests(unittest.TestCase):
-    def zip_public_report(self, target, artifact, *, meta, output, expected, partial=False, cache=False):
+    def zip_public_report(self, target, artifact, *, meta, output, expected, partial=False, cache=False,
+                          partial_label='zip'):
         command = ROOT / ('ubs' if meta else 'modules/ubs-python.sh')
         arguments = [str(command), str(target), '--ci', '--no-color', f'--format={output}']
         if meta:
@@ -1946,7 +2149,7 @@ class RunnerIntegrationTests(unittest.TestCase):
                 self.assertEqual(row['severity'], 'critical', row)
                 self.assertFalse(row.get('suppressed', False), row)
             if partial:
-                self.assertIn('zip', result.stdout + result.stderr)
+                self.assertIn(partial_label, result.stdout + result.stderr)
                 if meta:
                     self.assertEqual(report['profile']['cache_hits'], 0, report)
         else:
@@ -1964,7 +2167,7 @@ class RunnerIntegrationTests(unittest.TestCase):
             self.assertEqual(bool(failed), partial, report)
             for invocation in failed:
                 self.assertEqual(invocation['exitCode'], 2, invocation)
-                self.assertIn('zip', json.dumps(invocation))
+                self.assertIn(partial_label, json.dumps(invocation))
         self.assertEqual(sites, expected, report)
         return report
 
@@ -2032,6 +2235,70 @@ class RunnerIntegrationTests(unittest.TestCase):
                                            output='json', expected=[(2, 1)], partial=True, cache=True)
                     self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
                                      'An incomplete native zip scan must not enter the completed cache')
+
+    def test_enumerated_stdin_module_and_runner_reports_keep_sites_and_selection(self):
+        prefix = ('import sys\ndef rows():\n    return enumerate(sys.stdin, start=7)\n'
+                  'pending = rows()\nalias = iter(pending)\n'
+                  'index, query = next(alias, (0, "SELECT 1"))\n')
+        cases = (
+            ('unsafe', prefix + 'cursor.execute(query)\n', [(7, 1)], False, 'enumerate'),
+            ('clean-index', prefix + 'cursor.execute(index)\n', [], False, 'enumerate'),
+            ('partial', 'import sys\ncursor.execute(input())\n'
+             'rows = enumerate(sys.stdin, start=opaque)\n', [(2, 1)], True, 'enumerate'),
+            ('restarted-stream', 'import sys\ncursor.execute(input())\n'
+             'rows = enumerate(sys.stdin)\nsys.stdin.read()\nfor index, row in rows:\n    pass\n'
+             'sys.stdin.seek(0)\ncursor.execute(next(rows)[1])\n', [(2, 1)], True, 'zip cursor'),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/python-enumeration-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial, reason in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'view.py'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.py').write_text('cursor.execute(input())\n', encoding='utf-8')
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, output=output):
+                        self.zip_public_report(target, project / f'{meta}-{output}', meta=meta,
+                                               output=output, expected=expected, partial=partial,
+                                               partial_label=reason)
+
+    def test_enumerated_stdin_cache_invalidation_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/python-enumeration-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'view.py'
+        prefix = 'import sys\nfor index, query in enumerate(sys.stdin, start=7):\n'
+        unsafe = prefix + '    cursor.execute(query)\n'
+        clean = prefix + '    cursor.execute(index)\n'
+        suppressed = prefix + '    cursor.execute(query)  # ubs:ignore\n'
+        for index, (source, expected, hits) in enumerate((
+                (unsafe, [(3, 5)], 0), (unsafe, [(3, 5)], 1),
+                (clean, [], 0), (suppressed, [], 0), (unsafe, [(3, 5)], 1))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.zip_public_report(target, scratch / f'cache-{index}', meta=True, output='json',
+                                               expected=expected, cache=True)
+                self.assertEqual(report['profile']['cache_hits'], hits, report)
+        entries = set((scratch / 'cache').glob('*/files/**/*.json'))
+        self.assertTrue(entries, 'Completed stdin enumeration scans must create reusable cache entries')
+        partial_sources = (
+            ('import sys\ncursor.execute(input())\n'
+             'rows = enumerate(sys.stdin, start=opaque)\n', 'enumerate'),
+            ('import sys\ncursor.execute(input())\nrows = enumerate(sys.stdin)\n'
+             'sys.stdin.read()\nfor index, row in rows:\n    pass\n'
+             'sys.stdin.seek(0)\ncursor.execute(next(rows)[1])\n', 'zip cursor'),
+        )
+        for case, (source, reason) in enumerate(partial_sources):
+            target.write_text(source, encoding='utf-8')
+            for index in range(2):
+                with self.subTest(partial=case, attempt=index):
+                    self.zip_public_report(target, scratch / f'partial-{case}-{index}', meta=True, output='json',
+                                           expected=[(2, 1)], partial=True, cache=True, partial_label=reason)
+                    self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
+                                     'An incomplete enumeration scan must not enter the completed cache')
 
     def test_callable_stdin_iterator_json_and_sarif(self):
         prefix = ('import sys\ndef make(read):\n    return iter(read, "")\n'

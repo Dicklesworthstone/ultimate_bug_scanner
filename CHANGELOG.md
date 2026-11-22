@@ -10,6 +10,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Trace native Python `enumerate` over text and binary stdin using the shared
+  iterator cursor and positional-row model. Payloads reach SQL, command,
+  evaluation, HTML and URL sinks while generated indices remain clean.
+  Aliases, saved next methods, loops, comprehensions and supported pure
+  factories preserve provenance. Ordinary generic enumeration stays on its
+  existing transfer path. Unproved EOF resumption, custom index protocols and
+  unsupported iterator transport remain explicitly incomplete; finite zip
+  companions still bound callable readers whose sentinel differs from EOF.
+
 - Track saved native Rust command constructors and environment/argument readers
   through aliases, finite joins and supported helper returns. Function handles
   and integer address metadata remain separate from data read on invocation.

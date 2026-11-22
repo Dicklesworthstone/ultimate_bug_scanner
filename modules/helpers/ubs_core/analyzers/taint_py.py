@@ -559,7 +559,7 @@ class _ArgumentExpansion:
 
 @dataclass(frozen=True)
 class _ZipCursor:
-    """Finite native zip progress; -1 means the shared handle is exhausted."""
+    """Finite native zip progress; -1 means persistent exhaustion is proved."""
     index: int
 
 
@@ -4968,8 +4968,10 @@ class _Flow:
         yielded, exhausted = [], []
         for phase in phases:
             self.engine.budget.spend()
-            if phase.index >= 0 and iterator.fallible and (phase.index < len(iterator.rows)
-                    or phase.index == len(iterator.rows) and iterator.fallible_at_end):
+            may_read_stream = phase.index >= 0 and iterator.fallible and (
+                phase.index < len(iterator.rows)
+                or phase.index == len(iterator.rows) and iterator.fallible_at_end)
+            if may_read_stream:
                 # A native read/CSV decoder may fail after earlier columns
                 # have advanced. The ordinary row cursor cannot certify how
                 # far each input got. Retain the exceptional effects, but a
@@ -4980,7 +4982,12 @@ class _Flow:
                 self.possible_exception(failed)
             if phase.index < 0 or phase.index >= len(iterator.rows) or iterator.optional:
                 ended = state.copy()
-                ended.put_cell(iterator.cursor, _CellContents(binding=_ZipCursor(-1)), written=True)
+                # zip retries its inputs after StopIteration. A native stream
+                # can resume after seek (or a later read), while earlier
+                # columns may already have advanced on the failed row. Only
+                # fixed-input exhaustion proves this handle stays exhausted.
+                ended.put_cell(iterator.cursor, _CellContents(
+                    binding=None if may_read_stream else _ZipCursor(-1)), written=True)
                 exhausted.append(ended)
             if phase.index < 0 or phase.index >= len(iterator.rows):
                 continue
@@ -5028,7 +5035,14 @@ class _Flow:
                     outputs.append(_ArgumentVector(tuple((row, join_facts(*(
                         fact for _value, fact in row.operands))) for row in rows[:length])))
                 branch = state.copy()
-                branch.put_cell(iterator.cursor, _CellContents(binding=_ZipCursor(-1)), written=True)
+                may_read_stream = phase.index >= 0 and iterator.fallible and (
+                    phase.index < len(iterator.rows)
+                    or phase.index == len(iterator.rows) and iterator.fallible_at_end)
+                # Materialization can stop at an unknown native EOF before
+                # the fixed bound. Keep its output, but do not certify a
+                # subsequent read from the partially advanced input columns.
+                branch.put_cell(iterator.cursor, _CellContents(
+                    binding=None if may_read_stream else _ZipCursor(-1)), written=True)
                 branches.append(branch)
         state.replace(_join_states(*branches))
         self.expression_bindings[node] = _join_bindings(*outputs)

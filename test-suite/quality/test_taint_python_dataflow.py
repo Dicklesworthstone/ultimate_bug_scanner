@@ -1095,6 +1095,56 @@ class ZipIteratorTests(SourceTest):
                     self.assertRaisesRegex(taint_py.AnalysisLimit, 'zip cursor'):
                 self.scan('import sys, csv\nrows = zip(csv.reader(sys.stdin), [])\n' + suffix)
 
+    def test_zip_native_eof_does_not_certify_permanent_exhaustion(self):
+        consumers = ('list(rows)\n', 'tuple(rows)\n',
+                     'for value, record in rows:\n    pass\n', 'next(rows, None)\n')
+        for stream in ('sys.stdin', 'csv.reader(sys.stdin)'):
+            for consume in consumers:
+                source = ('import sys, csv\nrows = zip(["safe", input()], ' + stream + ')\n'
+                          'sys.stdin.read()\n' + consume + 'sys.stdin.seek(0)\n'
+                          'cursor.execute(next(rows)[0])\n')
+                with self.subTest(stream=stream, consume=consume), \
+                        self.assertRaisesRegex(taint_py.AnalysisLimit, 'zip cursor'):
+                    self.scan(source)
+        # The cursor boundary covers aliases of the input and its seek method;
+        # recognizing a particular spelling of seek cannot prove EOF stable.
+        for reset in ('stream = sys.stdin\nstream.seek(0)\n',
+                      'seek = sys.stdin.seek\nseek(0)\n'):
+            with self.subTest(reset=reset), \
+                    self.assertRaisesRegex(taint_py.AnalysisLimit, 'zip cursor'):
+                self.scan('import sys\nrows = zip(["safe", input()], sys.stdin)\n'
+                          'sys.stdin.read()\nlist(rows)\n' + reset +
+                          'cursor.execute(next(rows)[0])\n')
+        for construction in ('zip([], sys.stdin)', 'zip([input()], [0])'):
+            with self.subTest(permanent=construction):
+                self.assert_rules('import sys\nrows = ' + construction + '\nlist(rows)\n'
+                                  'sys.stdin.seek(0)\ncursor.execute(next(rows, "SELECT 1"))\n')
+
+    def test_native_zip_seek_after_eof_witnesses(self):
+        artifacts = ROOT / 'test-suite/artifacts/python-zip-eof'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='native-', dir=artifacts))
+        stdin_path = scratch / 'stdin.txt'
+        stdin_path.write_text('SELECT supplied\n', encoding='utf-8')
+        consumers = (('list', 'list(rows)\n'), ('tuple', 'tuple(rows)\n'),
+                     ('for', 'for value, record in rows:\n    pass\n'),
+                     ('next-default', 'next(rows, None)\n'))
+        for stream_name, stream in (('stdin', 'sys.stdin'), ('csv', 'csv.reader(sys.stdin)')):
+            for label, consume in consumers:
+                with self.subTest(stream=stream_name, consumer=label):
+                    source = ('import sys, csv\nrows = zip(["safe", input()], ' + stream + ')\n'
+                              'sys.stdin.read()\n' + consume + 'sys.stdin.seek(0)\n'
+                              'print(next(rows)[0])\n')
+                    path = scratch / f'{stream_name}-{label}.py'
+                    path.write_text(source, encoding='utf-8')
+                    with stdin_path.open(encoding='utf-8') as source_file:
+                        result = subprocess.run([sys.executable, str(path)], stdin=source_file,
+                                                capture_output=True, text=True, timeout=15)
+                    path.with_suffix('.stdout').write_text(result.stdout, encoding='utf-8')
+                    path.with_suffix('.stderr').write_text(result.stderr, encoding='utf-8')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, 'SELECT supplied\n')
+
     def test_native_zip_partial_row_error_witnesses(self):
         artifacts = ROOT / 'test-suite/artifacts/python-zip-exceptions'
         artifacts.mkdir(parents=True, exist_ok=True)
@@ -1930,6 +1980,9 @@ class RunnerIntegrationTests(unittest.TestCase):
             ('interrupted-row', 'import sys, csv\ncursor.execute(input())\n'
              'rows = zip(["safe", input()], csv.reader(sys.stdin))\ntry:\n    next(rows)\n'
              'except csv.Error:\n    cursor.execute(next(rows)[0])\n', [(2, 1)], True),
+            ('restarted-stream', 'import sys\ncursor.execute(input())\n'
+             'rows = zip(["safe", input()], sys.stdin)\nsys.stdin.read()\nlist(rows)\n'
+             'sys.stdin.seek(0)\ncursor.execute(next(rows)[0])\n', [(2, 1)], True),
         )
         artifacts = ROOT / 'test-suite/artifacts/python-zip-public'
         artifacts.mkdir(parents=True, exist_ok=True)
@@ -1965,14 +2018,20 @@ class RunnerIntegrationTests(unittest.TestCase):
                 self.assertEqual(report['profile']['cache_hits'], hits, report)
         entries = set((scratch / 'cache').glob('*/files/**/*.json'))
         self.assertTrue(entries, 'Completed native zip scans must create reusable cache entries')
-        target.write_text('import sys\ncursor.execute(input())\n'
-                          'rows = zip(["SELECT 1"], sys.stdin, strict=True)\n', encoding='utf-8')
-        for index in range(2):
-            with self.subTest(partial=index):
-                self.zip_public_report(target, scratch / f'partial-{index}', meta=True, output='json',
-                                       expected=[(2, 1)], partial=True, cache=True)
-                self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
-                                 'An incomplete native zip scan must not enter the completed cache')
+        partial_sources = (
+            'import sys\ncursor.execute(input())\n'
+            'rows = zip(["SELECT 1"], sys.stdin, strict=True)\n',
+            'import sys\ncursor.execute(input())\nrows = zip(["safe", input()], sys.stdin)\n'
+            'sys.stdin.read()\nlist(rows)\nsys.stdin.seek(0)\ncursor.execute(next(rows)[0])\n',
+        )
+        for case, source in enumerate(partial_sources):
+            target.write_text(source, encoding='utf-8')
+            for index in range(2):
+                with self.subTest(partial=case, attempt=index):
+                    self.zip_public_report(target, scratch / f'partial-{case}-{index}', meta=True,
+                                           output='json', expected=[(2, 1)], partial=True, cache=True)
+                    self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
+                                     'An incomplete native zip scan must not enter the completed cache')
 
     def test_callable_stdin_iterator_json_and_sarif(self):
         prefix = ('import sys\ndef make(read):\n    return iter(read, "")\n'

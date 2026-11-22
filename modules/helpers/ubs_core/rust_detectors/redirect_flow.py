@@ -1215,16 +1215,17 @@ class Flow:
                 call = src.skip(call + 1, end)
             if call in src.pairs and src.code[call] in '([' and src.pairs[call] < end:
                 close = src.pairs[call]
+                indexed = src.code[call] == '[' and not macro
                 spans = src.parts(call + 1, close)
                 arguments = [self.expr(a, b, state) for a, b in spans]
                 if not state.reachable:
                     return CLEAN
-                catalogued = self.sink_target(name, spans, chained, pos, state)
+                catalogued = None if indexed else self.sink_target(name, spans, chained, pos, state)
                 local = (src.resolve(name, pos, state)
-                         if not chained and not macro and not opaque_path
+                         if not indexed and not chained and not macro and not opaque_path
                          and not ('::' in name and catalogued is not None) else None)
                 implicit_receiver = False
-                if local is None and not chained and not macro and not opaque_path:
+                if local is None and not indexed and not chained and not macro and not opaque_path:
                     local = src.resolve_receiver(self.function, name)
                     implicit_receiver = local is not None
                 if local is not None:
@@ -1232,12 +1233,9 @@ class Flow:
                         src.callers[local].add(self.function)
                     summary = src.summaries[local]
                     actuals = ([state.values.get('self', CLEAN)] if implicit_receiver else []) + arguments
-                    def substitute(fact):
-                        return join(*(actuals[o.site] if o.kind == 'parameter' and o.site < len(actuals)
-                                      else CLEAN if o.kind == 'parameter' else frozenset({o}) for o in fact))
-                    value = substitute(summary.returned)
+                    value = self.substitute(summary.returned, actuals)
                     for site, fact in summary.sinks.items():
-                        self.emit(site, substitute(fact))
+                        self.emit(site, self.substitute(fact, actuals))
                     if not summary.completes:
                         state.reachable = False
                 elif name.endswith(('.starts_with', '.contains', '.is_empty')):
@@ -1246,9 +1244,10 @@ class Flow:
                     # Unknown helpers retain their arguments' taint. A name
                     # such as safe_redirect_url is not a sanitizer contract.
                     value = join(value, *arguments)
-                value = join(value, self.call_source(name, pos, close, end, state,
-                                                    local, chained, macro, opaque_path))
-                target = (catalogued if local is None and name not in state.values
+                value = (self.index_result(name, pos, state, value, arguments) if indexed else
+                         self.call_result(name, pos, close, end, state, local,
+                                          chained, macro, opaque_path, value, arguments))
+                target = (catalogued if catalogued is not None and local is None
                           and self.supported_sink_path(name, pos, state, opaque_path) else None)
                 if target is not None:
                     self.emit(pos, arguments[target] if target >= 0 else arguments[0])
@@ -1270,6 +1269,18 @@ class Flow:
                 pos = path_end
         return result
 
+    def substitute(self, fact, actuals):
+        return join(*(actuals[o.site] if o.kind == 'parameter' and o.site < len(actuals)
+                      else CLEAN if o.kind == 'parameter' else frozenset({o}) for o in fact))
+
+    def call_result(self, name, pos, close, end, state, local, chained, macro, opaque_path, value, arguments):
+        return join(value, self.call_source(name, pos, close, end, state,
+                                            local, chained, macro, opaque_path))
+
+    def index_result(self, name, pos, state, value, arguments):
+        """Indexing transports data; it never invokes the indexed value."""
+        return value
+
     def call_source(self, name, pos, close, end, state, local, chained, macro, opaque_path):
         src = self.source
         direct = rules.source_re.match(src.raw[pos:close + 1])
@@ -1282,7 +1293,7 @@ class Flow:
         return frozenset({Origin('source', pos, ' '.join(direct.group().split()))}) if direct else CLEAN
 
     def supported_sink_path(self, name, pos, state, opaque_path):
-        return not opaque_path
+        return name not in state.values and not opaque_path
 
     def sink_target(self, name, spans, chained, pos=None, state=None):
         leaf = name.split('.')[-1]

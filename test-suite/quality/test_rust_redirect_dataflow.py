@@ -1774,9 +1774,8 @@ class CommandExecutableFlowTests(SourceCase):
             }
         ''')
 
-    def test_saved_constructor_and_malformed_command_source_remain_explicit(self):
-        with self.assertRaisesRegex(AnalysisLimit, 'saved command constructors'):
-            self.command('fn main() { let launch=std::process::Command::new; launch("printf"); }')
+    def test_fixed_saved_constructor_and_malformed_command_source(self):
+        self.command('fn main() { let launch=std::process::Command::new; launch("printf"); }')
         with self.assertRaisesRegex(ValueError, 'Unbalanced Rust'):
             self.command('fn main() { std::process::Command::new(std::env::args()); (] }')
 
@@ -1789,6 +1788,245 @@ class CommandExecutableFlowTests(SourceCase):
         # An independent detector, not this command policy, owns syntax in a
         # source that contains no native command API or import.
         self.command('fn unrelated() { let value = Foreign::new(); unfamiliar! { (] } }')
+
+    def test_saved_native_constructor_invocations(self):
+        for constructor in ('std::process::Command::new::<String>',
+                            '::std::process::Command::new::<String>'):
+            with self.subTest(constructor=constructor):
+                self.command('''
+                    fn main() {
+                        let create = CONSTRUCTOR;
+                        let copy = create;
+                        let selected = std::env::var("UBS_PROGRAM").unwrap();
+                        let _ = copy(selected); // HIT
+                        let _ = create("/usr/bin/printf".to_owned());
+                    }
+                '''.replace('CONSTRUCTOR', constructor))
+        self.command('''
+            fn main(flag: bool) {
+                let first = std::process::Command::new::<String>;
+                let second = std::process::Command::new::<String>;
+                let create = if flag { first } else { second };
+                create(std::env::var("UBS_PROGRAM").unwrap()); // HIT
+                let unused = std::process::Command::new::<String>;
+            }
+        ''')
+
+    def test_saved_native_source_functions_execute_only_on_call(self):
+        self.command('''
+            fn main() {
+                let read = std::env::var::<&str>;
+                let again = read;
+                let selected = again("UBS_PROGRAM").unwrap();
+                std::process::Command::new(selected); // HIT
+                let address = read as usize;
+                std::process::Command::new(address.to_string());
+            }
+        ''')
+        self.command('''
+            fn main() {
+                let read = std::env::args;
+                let selected = read().nth(1).unwrap();
+                std::process::Command::new(selected); // HIT
+                let address = read as usize;
+                std::process::Command::new(format!("tool-{address}"));
+            }
+        ''')
+
+    def test_native_callable_helpers_preserve_returns_and_sink_context(self):
+        self.command('''
+            fn constructor() -> fn(String) -> std::process::Command {
+                std::process::Command::new::<String>
+            }
+            fn identity(value: fn(String) -> std::process::Command) -> fn(String) -> std::process::Command {
+                value
+            }
+            fn launch(command: String) {
+                let create = constructor();
+                create(command); // HIT
+            }
+            fn launch_fixed(command: String) {
+                let create = constructor();
+                create(command);
+            }
+            fn main() {
+                let create = identity(constructor());
+                create(std::env::var("UBS_PROGRAM").unwrap()); // HIT
+                launch(std::env::var("UBS_PROGRAM").unwrap());
+                launch_fixed("/usr/bin/printf".to_owned());
+            }
+        ''')
+
+    def test_native_callable_aliases_preserve_import_and_binding_identity(self):
+        self.command('''
+            use std::{env::var as native_read, process::Command as Runner};
+            fn main() {
+                let create = Runner::new::<String>;
+                let read = native_read::<&str>;
+                { let read = |_: &str| -> Result<String, ()> { Ok("printf".to_owned()) };
+                  create(read("UBS_PROGRAM").unwrap()); }
+                create(read("UBS_PROGRAM").unwrap()); // HIT
+            }
+        ''')
+        self.command('''
+            struct Command;
+            impl Command { fn new(value: String) {} }
+            fn main() {
+                let create = Command::new;
+                create(std::env::var("UBS_PROGRAM").unwrap());
+            }
+        ''')
+
+    def test_saved_native_callable_casts_and_strong_overwrites(self):
+        self.command('''
+            fn fixed(_: &str) -> Result<String, std::env::VarError> { Ok("printf".to_owned()) }
+            fn getter() -> fn() -> std::env::Args { std::env::args }
+            fn main() {
+                let create = std::process::Command::new::<String> as fn(String) -> std::process::Command;
+                let mut read = std::env::var::<&str>;
+                read = fixed;
+                create(read("UBS_PROGRAM").unwrap());
+                let read_args = getter();
+                create(read_args().nth(1).unwrap()); // HIT
+                create((read_args as usize).to_string());
+            }
+        ''')
+        self.command('''
+            fn address(value: fn() -> std::env::Args) -> usize { value as usize }
+            fn main() {
+                std::process::Command::new(address(std::env::args).to_string());
+            }
+        ''')
+        self.command('''
+            fn run(user_input: u64) {
+                std::process::Command::new((user_input as usize).to_string()); // HIT
+            }
+        ''')
+
+    def test_opaque_native_callable_transports_remain_explicit(self):
+        cases = (
+            'fn fixed(value: String) -> std::process::Command { std::process::Command::new("printf") } '
+            'fn main(flag: bool) { let native = std::process::Command::new::<String>; '
+            'let create = if flag {native} else {fixed}; create(std::env::var("UBS_PROGRAM").unwrap()); }',
+            'fn invoke(make: fn(String) -> std::process::Command, value: String) { make(value); } '
+            'fn main() { invoke(std::process::Command::new::<String>, std::env::var("UBS_PROGRAM").unwrap()); }',
+            'fn escape(make: fn(String) -> std::process::Command) { opaque(make); } '
+            'fn main() { escape(std::process::Command::new::<String>); }',
+            'fn main() { let native = std::process::Command::new::<String>; opaque(native); }',
+            'fn main() { let native = std::process::Command::new::<String>; '
+            '(native)(std::env::var("UBS_PROGRAM").unwrap()); }',
+            'const MAKE: fn(String) -> std::process::Command = std::process::Command::new::<String>; '
+            'fn main() { MAKE(std::env::var("UBS_PROGRAM").unwrap()); }',
+            'fn main() { let native = std::process::Command::new::<String>; '
+            'let wrapped = |value| native(value); wrapped(std::env::var("UBS_PROGRAM").unwrap()); }',
+        )
+        for source in cases:
+            with self.subTest(source=source), self.assertRaisesRegex(AnalysisLimit, 'native callable'):
+                self.command(source)
+
+    def test_nested_native_callable_storage_remains_explicit(self):
+        for source in (
+            'mod config { pub static GET: fn() -> std::env::Args = std::env::args; } '
+            'fn main() { std::process::Command::new(config::GET().nth(1).unwrap()); }',
+            'struct Config; impl Config { const GET: fn() -> std::env::Args = std::env::args; } '
+            'fn main() { std::process::Command::new(Config::GET().nth(1).unwrap()); }',
+        ):
+            with self.subTest(source=source), self.assertRaisesRegex(AnalysisLimit, 'native callable'):
+                self.command(source)
+
+    def test_indirect_native_callable_parameters_remain_explicit(self):
+        for invocation in ('(value)()', '[value][0]()'):
+            for tail in (invocation + '.nth(1).unwrap()', invocation + '; "printf".to_owned()'):
+                source = ('fn get(value: fn() -> std::env::Args) -> String {' + tail + '} '
+                          'fn main() { std::process::Command::new(get(std::env::args)); }')
+                with self.subTest(tail=tail), self.assertRaisesRegex(AnalysisLimit, 'native callable'):
+                    self.command(source)
+
+    def test_native_callable_indexing_does_not_mint_environment_data(self):
+        for expression in ('ops[0] as usize', 'ops[0]().nth(1).unwrap()'):
+            source = ('fn main() { let ops = [std::env::args as fn() -> std::env::Args]; '
+                      'let selected = ' + expression + '; std::process::Command::new(selected.to_string()); }')
+            with self.subTest(expression=expression), self.assertRaisesRegex(AnalysisLimit, 'native callable'):
+                self.command(source)
+
+    def test_partial_command_analysis_retains_concrete_findings_and_other_files(self):
+        from ubs_core.rust_detectors import command_executable
+        artifacts = ROOT / 'test-suite/artifacts/rust-command-flow'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='partial-', dir=artifacts))
+        first, partial, last = (scratch / name for name in ('first.rs', 'partial.rs', 'last.rs'))
+        for path in (first, last):
+            path.write_text('fn main() {\nstd::process::Command::new(std::env::var("UBS_PROGRAM").unwrap());\n}\n', encoding='utf-8')
+        partial.write_text('''fn before() {
+    std::process::Command::new(std::env::var("UBS_PROGRAM").unwrap());
+}
+fn incomplete() {
+    std::process::Command::new(std::env::var("UBS_PROGRAM").unwrap());
+    let create = std::process::Command::new::<String>;
+    opaque(create);
+    std::process::Command::new(std::env::var("UBS_PROGRAM").unwrap());
+}
+''', encoding='utf-8')
+        for paths in ((first, partial, last), (last, partial, first)):
+            findings = []
+            with self.subTest(paths=paths), self.assertRaisesRegex(AnalysisLimit, 'native callable'):
+                for finding in command_executable.find(paths):
+                    findings.append(finding)
+            self.assertEqual([(path, line) for path, line, _col, _code in findings],
+                             [(paths[0], 2), (partial, 2), (partial, 5), (paths[2], 2)])
+        partial.write_text('''fn incomplete(command: String) -> String {
+    let create = std::process::Command::new::<String>;
+    opaque(create);
+    command
+}
+fn main() { std::process::Command::new(incomplete(std::env::var("UBS_PROGRAM").unwrap())); }
+''', encoding='utf-8')
+        findings = []
+        with self.assertRaisesRegex(AnalysisLimit, 'native callable'):
+            for finding in command_executable.find([partial]):
+                findings.append(finding)
+        self.assertEqual(findings, [], 'An unfinished helper must not publish a return or symbolic sink summary')
+
+    def test_native_saved_callable_program_witness_without_spawning_commands(self):
+        rustc = os.environ.get('UBS_TEST_RUSTC') or shutil.which('rustc')
+        if rustc is None:
+            self.skipTest('native saved-callable witness requires rustc')
+        artifacts = ROOT / 'test-suite/artifacts/rust-command-flow'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='native-callable-', dir=artifacts))
+        target, executable = scratch / 'witness.rs', scratch / 'witness'
+        source = '''use std::{env::var as native_read, process::Command as Runner};
+fn constructor() -> fn(String) -> Runner { Runner::new::<String> }
+fn main() {
+    let read = native_read::<&str>;
+    let again = read;
+    let create = constructor();
+    let supplied = create(again("UBS_PROGRAM").unwrap()); // HIT
+    let fixed = create("/usr/bin/printf".to_owned());
+    let read_args = std::env::args;
+    let explicit = Runner::new::<String> as fn(String) -> Runner;
+    let supplied_arg = explicit(read_args().nth(1).unwrap()); // HIT
+    let address = read_args as usize;
+    let metadata = create(address.to_string());
+    println!("{}", supplied.get_program().to_str().unwrap());
+    println!("{}", fixed.get_program().to_str().unwrap());
+    println!("{}", supplied_arg.get_program().to_str().unwrap());
+    println!("{}", metadata.get_program().to_str().unwrap().parse::<usize>().unwrap() > 0);
+}
+'''
+        self.command(source)
+        target.write_text(source, encoding='utf-8')
+        compiled = subprocess.run([rustc, '--edition=2021', str(target), '-o', str(executable)],
+                                  capture_output=True, text=True, timeout=60, check=False)
+        (scratch / 'compile.stdout.log').write_text(compiled.stdout, encoding='utf-8')
+        (scratch / 'compile.stderr.log').write_text(compiled.stderr, encoding='utf-8')
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        result = subprocess.run([str(executable), 'review-argument'], env={**os.environ, 'UBS_PROGRAM': 'review-input'},
+                                capture_output=True, text=True, timeout=15, check=False)
+        (scratch / 'runtime.stdout.log').write_text(result.stdout, encoding='utf-8')
+        (scratch / 'runtime.stderr.log').write_text(result.stderr, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['review-input', '/usr/bin/printf', 'review-argument', 'true'])
 
     def test_native_command_program_witness_without_spawning_commands(self):
         rustc = os.environ.get('UBS_TEST_RUSTC') or shutil.which('rustc')
@@ -1826,6 +2064,136 @@ fn main() {
         (scratch / 'runtime.stderr.log').write_text(result.stderr, encoding='utf-8')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ['review-input', '/usr/bin/printf', 'review-argument'])
+
+
+@unittest.skipUnless(os.environ.get('UBS_RUST_COMMAND_E2E') == '1',
+                     'set UBS_RUST_COMMAND_E2E=1 for native callable CLI scans')
+class CommandExecutablePublicTests(SourceCase):
+    rule = 'rust.security.command-executable'
+    unsafe = ('use std::{env::var as read, process::Command as Proc};\n'
+              'fn constructor() -> fn(String) -> Proc { Proc::new::<String> }\n'
+              'fn main() {\n'
+              '    let create = constructor();\n'
+              '    let get = read::<&str>;\n'
+              '    create(get("UBS_PROGRAM").unwrap());\n'
+              '}\n')
+    clean = ('use std::process::Command;\n'
+             'fn constructor() -> fn(String) -> Command { Command::new::<String> }\n'
+             'fn address(value: fn() -> std::env::Args) -> usize { value as usize }\n'
+             'fn launch_fixed(command: String) { let make=constructor(); make(command); }\n'
+             'fn main() {\n'
+             '    let read=std::env::args;\n'
+             '    let create=constructor();\n'
+             '    create(address(read).to_string());\n'
+             '    launch_fixed("/usr/bin/printf".to_owned());\n'
+             '    let unused=Command::new::<String>;\n'
+             '}\n')
+    partial = ('use opaque_helper::consume;\n'
+               'fn main() {\n'
+               '    let create=std::process::Command::new::<String>;\n'
+               '    create(std::env::var("UBS_PROGRAM").unwrap());\n'
+               '    consume(create);\n'
+               '    create(std::env::var("UBS_PROGRAM").unwrap());\n'
+               '}\n')
+
+    def public_report(self, target, artifact, *, meta, fmt, lines, partial=False, cache=False):
+        command = ROOT / ('ubs' if meta else 'modules/ubs-rust.sh')
+        arguments = [str(command), str(target), '--no-color', '--ci', '--no-cargo', f'--format={fmt}']
+        if meta:
+            arguments.append('--only=rust')
+        elif fmt == 'json':
+            # Rust's module JSON stdout is its summary contract. The public
+            # report sidecar carries the per-site ledger used by the runner.
+            arguments.append('--report-json=' + str(artifact.with_suffix('.findings.jsonl')))
+        result = subprocess.run(arguments, cwd=target.parent,
+                                env={**os.environ, 'UBS_KEEP_TEMP': '1', 'UBS_NO_AUTO_UPDATE': '1',
+                                     'UBS_SKIP_RUST_BUILD': '1', 'UBS_PROFILE': '1',
+                                     'UBS_NO_CACHE': '0' if cache else '1',
+                                     'UBS_CACHE_DIR': str(target.parent / 'cache')},
+                                capture_output=True, text=True, timeout=90)
+        artifact.with_suffix('.stdout.log').write_text(result.stdout, encoding='utf-8')
+        artifact.with_suffix('.stderr.log').write_text(result.stderr, encoding='utf-8')
+        self.assertEqual(result.returncode, 2 if partial else (1 if lines else 0),
+                         (arguments, result.stdout, result.stderr))
+        report = json.loads(result.stdout)
+        if fmt == 'json':
+            self.assertEqual(report['status'], 'partial' if partial else 'ok', report)
+            rule_key, path_key = ('rule_id', 'file') if meta else ('rule', 'path')
+            ledger = (report['findings'] if meta else
+                      [json.loads(line) for line in artifact.with_suffix('.findings.jsonl').read_text(
+                          encoding='utf-8').splitlines() if line.strip()])
+            records = [row for row in ledger if row.get(rule_key) == self.rule]
+            self.assertEqual([(row['line'], row['col']) for row in records],
+                             [(line, 1) for line in lines], report)
+            totals = report['totals'] if meta else report
+            self.assertEqual(totals['files'], 1, report)
+            self.assertEqual(totals['critical'], len(lines), report)
+            for row in records:
+                self.assertEqual(Path(row[path_key]).name, target.name, row)
+                self.assertEqual(row['severity'], 'critical', row)
+                self.assertFalse(row.get('suppressed', False), row)
+            if partial:
+                self.assertIn('native callable', result.stdout + result.stderr)
+                if meta:
+                    self.assertEqual(report['profile']['cache_hits'], 0, report)
+        else:
+            self.assertEqual(report['version'], '2.1.0', report)
+            records = [row for run in report['runs'] for row in run.get('results', [])
+                       if row['ruleId'] == self.rule]
+            observed = []
+            for row in records:
+                location = row['locations'][0]['physicalLocation']
+                observed.append((location['region']['startLine'], location['region']['startColumn']))
+                self.assertEqual(Path(location['artifactLocation']['uri']).name, target.name, row)
+                self.assertEqual(row['level'], 'error', row)
+            self.assertEqual(observed, [(line, 1) for line in lines], report)
+            failed = [inv for run in report['runs'] for inv in run.get('invocations', [])
+                      if inv.get('executionSuccessful') is False]
+            self.assertEqual(bool(failed), partial, report)
+            for invocation in failed:
+                self.assertEqual(invocation['exitCode'], 2, invocation)
+                self.assertIn('native callable', json.dumps(invocation))
+        print('RUST_COMMAND_PUBLIC_SCAN', meta, fmt, target.name, lines, partial, 'PASS', flush=True)
+        return report
+
+    def test_formats_selection_and_retained_partial_findings(self):
+        artifacts = ROOT / 'test-suite/artifacts/rust-native-callables'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, lines, partial in (
+                ('unsafe', self.unsafe, [6], False), ('clean', self.clean, [], False),
+                ('partial', self.partial, [4], True)):
+            project = scratch / name
+            project.mkdir()
+            target = project / 'selected.rs'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.rs').write_text(self.unsafe, encoding='utf-8')
+            for meta in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, fmt=fmt):
+                        self.public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                           lines=lines, partial=partial)
+
+    def test_cache_edits_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/rust-native-callables'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'selected.rs'
+        clean = self.unsafe.replace('create(get("UBS_PROGRAM").unwrap());',
+                                    'create("/usr/bin/printf".to_owned());')
+        suppressed = self.unsafe.replace('create(get("UBS_PROGRAM").unwrap());',
+                                         'create(get("UBS_PROGRAM").unwrap()); '
+                                         '// ubs:ignore[rust.security.command-executable]')
+        cases = ((self.unsafe, [6], False, 0), (self.unsafe, [6], False, 1),
+                 (clean, [], False, 0), (suppressed, [], False, 0),
+                 (self.unsafe, [6], False, 1),
+                 (self.partial, [4], True, 0), (self.partial, [4], True, 0))
+        for index, (source, lines, partial, hits) in enumerate(cases):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                            lines=lines, partial=partial, cache=True)
+                self.assertEqual(report['profile']['cache_hits'], hits, report)
 
 
 if __name__ == '__main__':

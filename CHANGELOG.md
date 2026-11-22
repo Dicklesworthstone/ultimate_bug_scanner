@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track saved native Rust command constructors and environment/argument readers
+  through aliases, finite joins and supported helper returns. Function handles
+  and integer address metadata remain separate from data read on invocation.
+  Unsupported callable storage, indirect calls and escapes report incomplete
+  analysis while retaining concrete findings reached before the boundary and
+  continuing independent selected files.
+
 - Follow native JavaScript `findLast` and `findLastIndex` callbacks through the
   shared array flow engine. Reverse traversal preserves captured writes,
   thrown values, live lower-index mutations, sparse holes and early stops;

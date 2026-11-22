@@ -358,12 +358,55 @@ separate from the bounded feature checks below.
   `15682323faa44e0521429d012f9d8246afc72021deccbdc213a7da937a966965`.
 - [ ] Complete broad self-scan, full-suite and release qualification.
 
-### Native Rust callable identity
+### Native Rust callable identity (`1b9j.6.11`)
 
-- [ ] Prove saved constructors and environment readers through aliases,
-  branches and selected helpers without treating inert function values as input.
-- [ ] Preserve namespace/shadow controls and existing redirect behavior.
-- [ ] Verify actual public JSON/SARIF, suppression, selection and cache behavior.
+- [x] Prove saved constructors and environment readers through aliases,
+  branches and supported helpers without treating inert function values as input.
+  The frozen baseline fails one assertion and raises five errors across four
+  new methods; both real rustc witnesses inspect `Command::get_program`
+  without spawning a selected command.
+- [x] Preserve namespace/shadow controls and existing redirect behavior.
+  Independent review froze nine failed assertions covering nested constant
+  storage, indirect parameter calls, callable collection indexing and address
+  metadata. The corrected implementation preserves explicit boundaries and
+  retains concrete findings before an incomplete operation.
+- [x] Pass the final shared Rust suite: 228 methods, three opt-in public skips;
+  the existing cross-language Rust input-boundary method also passes. The
+  33 focused command methods are included in that cohort, not extra passes.
+  DSR log SHA256
+  `e1cb23f5351523d3b581ec530c60abe2093c6cbf28695782ff3ea31e5ee9efb1`.
+- [x] Pass two added public methods comprising 19 actual scanner invocations:
+  12 module/runner JSON/SARIF combinations plus seven cache, edit, scoped
+  suppression and repeated-partial checks. Selected files, exact sites,
+  critical counts, retained partial findings and exit 2 are asserted. Rust's
+  module JSON summary is paired with its documented findings JSONL sidecar;
+  the initial test's incorrect inline-ledger assumption is retained as a
+  failed receipt. Public log SHA256
+  `01f194b5256e0d8b0e5c906d0934606913628c8d04338789bfdb9677b3c620d3`.
+- [x] Refresh canonical helper/module/release pins and development version
+  5.5.111, preserving the concurrent Python zip EOF fix in `b1303533`.
+  The broad executable-flow and release umbrellas stay open.
+- [ ] General callable storage, opaque callable escapes and indirect
+  callable-parameter execution remain explicit incomplete-analysis boundaries.
+
+### Repository qualification limits
+
+- [ ] Complete the prescribed whole-repository suite. The 240-second DSR
+  attempt timed out during cache checks; log SHA256
+  `82024db77a1a8b4dbbb6e3a56f886e14e3f190b1265b9ea0140d065e9e74b937`.
+  Its cache-prune assertion was caused by inherited `UBS_KEEP_TEMP=1`; the
+  exact test passes with that retention override unset. This isolated replay
+  is not a full-suite pass.
+- [ ] Complete full ShellCheck and broad self-scan/release qualification.
+  The prescribed ShellCheck invocation was killed with exit 137. The earlier
+  JavaScript changed-source scan returned partial analysis with zero critical
+  findings; neither result is a passing broad gate.
+  The Rust changed-source scan also returns partial (log SHA256
+  `587f7e25cbde442d3ef8f721380d7a3abd52b5bb97ecc928179cfcd8da6c2903`):
+  four critical records identify the two native-test compiler invocations
+  using the explicit `UBS_TEST_RUSTC` environment override, twice each via
+  independent Python rules. These are intentional test-tool configuration,
+  not production command dispatch; no suppression or gate change was made.
 
 ### Native Python enumeration
 

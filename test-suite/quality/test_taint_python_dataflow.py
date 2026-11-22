@@ -921,6 +921,233 @@ class StdinSourceTests(SourceTest):
         self.assert_rules('import sys, html\neval(html.escape(sys.stdin.read()))\n', 'eval')
 
 
+class ZipIteratorTests(SourceTest):
+    def test_native_zip_stream_rows_reach_each_sink(self):
+        sinks = (("eval(code)", 'eval'), ("os.system(code)", 'command'),
+                 ("cursor.execute(code)", 'sql'), ("HttpResponse(code)", 'xss'),
+                 ("requests.get(code)", 'ssrf'))
+        for sink, rule in sinks:
+            for prefix in ("for label, code in zip(['fixed'], sys.stdin):\n    ",
+                           "label, code = next(zip(['fixed'], sys.stdin))\n",
+                           "code = next(zip(['fixed'], sys.stdin))[1]\n"):
+                with self.subTest(sink=sink, prefix=prefix):
+                    self.assert_rules('import sys, os, requests\n' + prefix + sink + '\n', rule)
+
+    def test_zip_preserves_clean_columns_and_exact_shortest_input(self):
+        cases = (
+            "for label, code in zip(['fixed'], sys.stdin):\n    eval(label)",
+            "eval(next(zip(['fixed'], sys.stdin))[0])",
+            "for code, label in zip(sys.stdin, []):\n    eval(code)",
+            "for label, code in zip([], sys.stdin):\n    eval(code)",
+            "for code in zip():\n    eval(input())",
+            "rows = zip([input(), 'safe'], [])\nvalue = next(rows, 'safe')\neval(value)",
+            "rows = zip(['safe'], ['safe', input()])\nnext(rows)\neval(next(rows, 'safe'))",
+            "rows = zip(['safe'], [input()])\neval('fixed')",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_rules('import sys\n' + source + '\n')
+
+    def test_zip_aliases_native_builtins_and_captured_streams(self):
+        setups = (
+            "rows = zip(['fixed'], sys.stdin)\nalias = rows\nvalue = next(alias)[1]",
+            "from builtins import zip as pair\nvalue = next(pair(['fixed'], sys.stdin))[1]",
+            "import builtins\npair = builtins.zip\nvalue = next(pair(['fixed'], sys.stdin))[1]",
+            "pair = zip\nzip = lambda a, b: [('fixed', 'fixed')]\nvalue = next(pair(['fixed'], sys.stdin))[1]",
+            "stream = iter(sys.stdin)\nrows = zip(stream, stream)\nvalue = next(rows)[1]",
+            "rows = zip(['fixed'], sys.stdin).__iter__()\nread = rows.__next__\nvalue = read()[1]",
+        )
+        for source in setups:
+            with self.subTest(source=source):
+                self.assert_rules('import sys\n' + source + '\neval(value)\n', 'eval')
+
+    def test_zip_materialization_and_comprehensions_keep_slot_identity(self):
+        for consumer in ('list', 'tuple'):
+            with self.subTest(consumer=consumer):
+                self.assert_rules(f'import sys\nrows = {consumer}(zip(["fixed"], sys.stdin))\n'
+                                  'eval(rows[0][1])\n', 'eval')
+                self.assert_rules(f'import sys\nrows = {consumer}(zip(["fixed"], sys.stdin))\n'
+                                  'eval(rows[0][0])\n')
+        self.assert_rules('import sys\nvalues = [code for label, code in zip(["fixed"], sys.stdin)]\n'
+                          'eval(values[0])\n', 'eval')
+        self.assert_rules('import sys\nvalues = [label for label, code in zip(["fixed"], sys.stdin)]\n'
+                          'eval(values[0])\n')
+
+    def test_zip_cursor_aliases_do_not_replay_finite_rows(self):
+        self.assert_rules('rows = zip([input(), "safe"], [0, 1])\nalias = rows\n'
+                          'first = next(rows)\nsecond = next(alias)\neval(second[0])\n')
+        self.assert_rules('rows = zip(["safe", input()], [0, 1])\nalias = rows\n'
+                          'next(rows)\nsecond = next(alias)\neval(second[0])\n', 'eval')
+        self.assert_rules('rows = zip([input()], [0])\nlist(rows)\n'
+                          'eval(next(rows, "safe"))\n')
+
+    def test_zip_loop_completion_preserves_callback_free_row_order(self):
+        self.assert_rules('value = input()\nfor replacement, unused in zip(["safe"], [0]):\n'
+                          '    value = replacement\neval(value)\n')
+        self.assert_rules('value = "safe"\nfor replacement, unused in zip([input()], []):\n'
+                          '    value = replacement\neval(value)\n')
+        self.assert_rules('rows = zip(["safe", input()], [0, 1])\nfor code, unused in rows:\n'
+                          '    break\neval(next(rows)[0])\n', 'eval')
+
+    def test_zip_selected_helpers_construct_native_iterators(self):
+        self.assert_rules('import sys\ndef pairs(stream):\n    return zip(["fixed"], stream)\n'
+                          'eval(next(pairs(sys.stdin))[1])\n', 'eval')
+        self.assert_rules('import sys\ndef consume(stream):\n'
+                          '    for label, code in zip(["fixed"], stream):\n        eval(code)\n'
+                          'consume(sys.stdin)\n', 'eval')
+        self.assert_rules('import sys\ndef native_constructor():\n    return zip\n'
+                          'eval(next(native_constructor()(["fixed"], sys.stdin))[1])\n', 'eval')
+
+    def test_zip_does_not_change_unknown_tuple_assignment(self):
+        self.assert_rules('left, right = unknown(input())\neval(right)\n', 'eval')
+        self.assert_rules('def pair(value):\n    return unknown(value)\n'
+                          'left, right = pair(input())\neval(right)\n', 'eval')
+        self.assert_rules('values = [*unknown(input())]\neval(values[50])\n', 'eval')
+        self.assert_rules('values = [*unknown(input())]\neval(values[-50])\n', 'eval')
+
+    def test_zip_retains_unknown_producer_and_repeated_call_boundaries(self):
+        cases = (
+            'def factory():\n    owned = opaque()\n    return zip\n'
+            'rows = factory()(["fixed"], sys.stdin)\neval(next(rows)[0])',
+            'def factory():\n    owned = opaque()\n    return sys.stdin\n'
+            'rows = zip(["fixed"], factory())\neval(next(rows)[0])',
+            'def consume(stream):\n    for label, code in zip(["fixed"], stream):\n        eval(code)\n'
+            'consume(sys.stdin)\nconsume(sys.stdin)',
+            'def consume(stream):\n    for label, code in zip(["fixed"], stream):\n        eval(code)\n'
+            'for unused in [0, 1]:\n    consume(sys.stdin)',
+            'for unused in [0, 1]:\n    for label, code in zip(["fixed"], sys.stdin):\n        eval(opaque)',
+            'def consume(stream):\n    for unused in [0, 1]:\n'
+            '        for label, code in zip(["fixed"], stream):\n            eval(opaque)\n'
+            'consume(sys.stdin)',
+            'eval(opaque)\nrows = zip(["fixed"], sys.stdin)\neval(next(rows)[0])',
+            'rows = zip(["fixed"], sys.stdin)\nrows()\neval(input())',
+            'rows = zip(["fixed"], sys.stdin)\nvalue = rows[0]\neval(input())',
+            'def unused(stream):\n    return zip(["fixed"], stream)',
+        )
+        for source in cases:
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'zip'):
+                self.scan('import sys\n' + source + '\n')
+
+    def test_zip_shadowed_callable_retains_local_function_semantics(self):
+        self.assert_rules('def zip(a, b):\n    return [("fixed", "fixed")]\n'
+                          'for label, code in zip([input()], [0]):\n    eval(code)\n')
+        self.assert_rules('def zip(a, b):\n    return [("fixed", input())]\n'
+                          'for label, code in zip(["safe"], [0]):\n    eval(code)\n', 'eval')
+        self.assert_rules('zip = opaque\neval(zip(input(), [0]))\n', 'eval')
+
+    def test_unproved_zip_identity_cannot_discard_protected_source_inputs(self):
+        cases = ('zip(["fixed"], sys.stdin)', 'zip(["fixed"], csv.reader(sys.stdin))',
+                 'zip(["fixed"], iter(sys.stdin.readline, ""))',
+                 'zip([input()], [0])', 'zip(unknown(input()), unknown())', 'zip()')
+        for expression in cases:
+            with self.subTest(expression=expression), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan('import sys, csv\ngetattr(opaque, "field")\nrows = ' + expression + '\n')
+
+    def test_zip_mutable_backing_and_unknown_protocols_are_explicit(self):
+        cases = (
+            'values = ["safe"]\nrows = zip(values, [0])\nvalues[0] = input()\neval(next(rows)[0])',
+            'rows = zip(opaque, [0])\nfor code, unused in rows:\n    eval(code)',
+            'rows = zip(["safe"], sys.stdin, strict=True)\nlist(rows)\neval(input())',
+            'rows = zip(*opaque)\neval(next(rows)[0])',
+            'rows = zip(["safe"], sys.stdin)\nexternal(rows)\neval(next(rows)[1])',
+            'rows = zip(["safe"], sys.stdin)\ndef take(values):\n    return next(values)\n'
+            'eval(take(rows)[1])',
+        )
+        for source in cases:
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'zip'):
+                self.scan('import sys\n' + source + '\n')
+        # Rebinding a stdlib source member already has a module-wide boundary;
+        # capturing a zip first must not turn that mutation into a clean result.
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdlib source member mutation'):
+            self.scan('import sys\nrows = zip(["fixed"], sys.stdin)\nsys.stdin = None\n'
+                      'eval(next(rows)[1])\n')
+
+    def test_zip_partial_row_read_errors_never_certify_resumed_handles(self):
+        consumers = ('    next(rows)\n', '    list(rows)\n',
+                     '    for value, record in rows:\n        pass\n')
+        for stream, exception in (('csv.reader(sys.stdin)', 'csv.Error'),
+                                  ('sys.stdin', '(OSError, UnicodeError)'),
+                                  ('iter(sys.stdin.readline, "")', '(OSError, UnicodeError)')):
+            for consume in consumers:
+                source = ('import sys, csv\nrows = zip(["safe", input()], ' + stream + ')\n'
+                          'try:\n' + consume + 'except ' + exception + ':\n'
+                          '    cursor.execute(next(rows)[0])\n')
+                with self.subTest(stream=stream, consume=consume), \
+                        self.assertRaisesRegex(taint_py.AnalysisLimit, 'zip cursor'):
+                    self.scan(source)
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'zip cursor'):
+            self.scan('import sys, csv\nrows = zip(["safe", input()], csv.reader(sys.stdin))\n'
+                      'try:\n    next(rows)\nfinally:\n    cursor.execute(next(rows)[0])\n')
+        # Ordinary selected helper loops remain supported; collecting their
+        # exceptional summary is not itself a reason to refuse native zip.
+        self.assert_rules('import sys\ndef consume(stream):\n'
+                          '    for label, code in zip(["safe"], stream):\n        pass\n'
+                          'try:\n    consume(sys.stdin)\nexcept OSError:\n    cursor.execute(input())\n', 'sql')
+
+    def test_zip_empty_input_order_retains_native_read_failure_boundary(self):
+        for consume in ('    next(rows)\n', '    list(rows)\n',
+                        '    for value, record in rows:\n        pass\n'):
+            suffix = ('try:\n' + consume + 'except csv.Error:\n'
+                      '    cursor.execute(next(rows)[0])\n')
+            with self.subTest(consume=consume, order='empty-first'):
+                self.assert_rules('import sys, csv\nrows = zip([], csv.reader(sys.stdin))\n' + suffix)
+            with self.subTest(consume=consume, order='reader-first'), \
+                    self.assertRaisesRegex(taint_py.AnalysisLimit, 'zip cursor'):
+                self.scan('import sys, csv\nrows = zip(csv.reader(sys.stdin), [])\n' + suffix)
+
+    def test_native_zip_partial_row_error_witnesses(self):
+        artifacts = ROOT / 'test-suite/artifacts/python-zip-exceptions'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='native-', dir=artifacts))
+        for label, consume in (('next', '    next(rows)\n'), ('list', '    list(rows)\n'),
+                               ('for', '    for value, record in rows:\n        pass\n')):
+            with self.subTest(consumer=label):
+                source = ('import sys, csv\nrows = zip(["safe", input()], csv.reader(sys.stdin))\n'
+                          'try:\n' + consume + 'except csv.Error:\n    print(next(rows)[0])\n')
+                path = scratch / f'{label}.py'
+                path.write_text(source, encoding='utf-8')
+                result = subprocess.run([sys.executable, str(path)],
+                                        input='SELECT supplied\n' + 'x' * 140000 + '\nvalid\n',
+                                        capture_output=True, text=True, timeout=15)
+                (scratch / f'{label}.stdout').write_text(result.stdout, encoding='utf-8')
+                (scratch / f'{label}.stderr').write_text(result.stderr, encoding='utf-8')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, 'SELECT supplied\n')
+
+    def test_native_zip_runtime_witnesses(self):
+        # Real builtin observations establish the source and cursor controls
+        # without executing any security sink or scanner-produced program.
+        source = '''
+import io
+stream = io.StringIO('40 + 2\\n41 + 1\\n')
+rows = zip(['fixed', 'also'], stream)
+assert next(rows) == ('fixed', '40 + 2\\n')
+alias = rows
+assert next(alias) == ('also', '41 + 1\\n')
+assert next(rows, 'done') == 'done'
+assert list(zip([], io.StringIO('payload'))) == []
+assert list(zip(io.StringIO('payload'), [])) == []
+assert list(zip()) == []
+stream = io.StringIO('first\\nsecond\\nthird\\n')
+assert list(zip(stream, stream)) == [('first\\n', 'second\\n')]
+values = ['safe']
+rows = zip(values, [0])
+values[0] = 'payload'
+assert next(rows) == ('payload', 0)
+try:
+    list(zip([1], [2, 3], strict=True))
+except ValueError:
+    pass
+else:
+    raise AssertionError('strict zip accepted unequal lengths')
+print('native zip witnesses passed')
+'''
+        result = subprocess.run([sys.executable, '-c', textwrap.dedent(source)],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'native zip witnesses passed')
+
+
 class EagerStdinParserTests(SourceTest):
     def test_json_stream_contents_reach_each_sink_domain(self):
         sinks = (("os.system(value)", 'command'), ("eval(value)", 'eval'),
@@ -1631,6 +1858,122 @@ class SuppressionTests(SourceTest):
 
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 to run real runner integration')
 class RunnerIntegrationTests(unittest.TestCase):
+    def zip_public_report(self, target, artifact, *, meta, output, expected, partial=False, cache=False):
+        command = ROOT / ('ubs' if meta else 'modules/ubs-python.sh')
+        arguments = [str(command), str(target), '--ci', '--no-color', f'--format={output}']
+        if meta:
+            arguments.append('--only=python')
+        result = subprocess.run(
+            arguments, cwd=target.parent,
+            env=dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1', UBS_PROFILE='1',
+                     UBS_NO_CACHE='0' if cache else '1', UBS_CACHE_DIR=str(target.parent / 'cache')),
+            capture_output=True, text=True, timeout=180)
+        artifact.with_suffix('.stdout').write_text(result.stdout, encoding='utf-8')
+        artifact.with_suffix('.stderr').write_text(result.stderr, encoding='utf-8')
+        self.assertEqual(result.returncode, 2 if partial else (1 if expected else 0),
+                         (arguments, result.stdout, result.stderr))
+        report = json.loads(result.stdout)
+        if output == 'json':
+            self.assertEqual(report['status'], 'partial' if partial else 'ok', report)
+            rule_key = 'rule_id' if meta else 'rule'
+            findings = [row for row in report.get('findings', [])
+                        if row[rule_key] == 'python.taint.sql']
+            if meta:
+                sites = [(row['line'], row['col']) for row in findings]
+                locations = findings
+            else:
+                # The Python module's JSON contract groups findings by rule
+                # and exposes sample lines; SARIF and meta JSON retain columns.
+                locations = [sample for row in findings for sample in row['samples']]
+                sites = [sample['line'] for sample in locations]
+                expected = [line for line, _column in expected]
+                self.assertEqual(sum(row['count'] for row in findings), len(expected), report)
+            totals = report['totals'] if meta else report
+            self.assertEqual(totals['files'], 1, report)
+            for location in locations:
+                self.assertEqual(Path(location['file']).name, target.name, location)
+            for row in findings:
+                self.assertEqual(row['severity'], 'critical', row)
+                self.assertFalse(row.get('suppressed', False), row)
+            if partial:
+                self.assertIn('zip', result.stdout + result.stderr)
+                if meta:
+                    self.assertEqual(report['profile']['cache_hits'], 0, report)
+        else:
+            self.assertEqual(report['version'], '2.1.0', report)
+            findings = [row for run in report['runs'] for row in run.get('results', [])
+                        if row['ruleId'] == 'python.taint.sql']
+            sites = []
+            for row in findings:
+                location = row['locations'][0]['physicalLocation']
+                sites.append((location['region']['startLine'], location['region']['startColumn']))
+                self.assertEqual(Path(location['artifactLocation']['uri']).name, target.name, row)
+                self.assertEqual(row['level'], 'error', row)
+            failed = [invocation for run in report['runs'] for invocation in run.get('invocations', [])
+                      if invocation.get('executionSuccessful') is False]
+            self.assertEqual(bool(failed), partial, report)
+            for invocation in failed:
+                self.assertEqual(invocation['exitCode'], 2, invocation)
+                self.assertIn('zip', json.dumps(invocation))
+        self.assertEqual(sites, expected, report)
+        return report
+
+    def test_zip_module_and_runner_json_sarif_keep_sites_status_and_selection(self):
+        prefix = 'import sys\nfor label, query in zip(["SELECT 1"], sys.stdin):\n'
+        cases = (
+            ('unsafe', prefix + '    cursor.execute(query)\n', [(3, 5)], False),
+            ('clean-column', prefix + '    cursor.execute(label)\n', [], False),
+            ('empty', 'import sys\nfor query, label in zip(sys.stdin, []):\n'
+             '    cursor.execute(query)\n', [], False),
+            ('partial', 'import sys\ncursor.execute(input())\n'
+             'rows = zip(["SELECT 1"], sys.stdin, strict=True)\n', [(2, 1)], True),
+            ('interrupted-row', 'import sys, csv\ncursor.execute(input())\n'
+             'rows = zip(["safe", input()], csv.reader(sys.stdin))\ntry:\n    next(rows)\n'
+             'except csv.Error:\n    cursor.execute(next(rows)[0])\n', [(2, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/python-zip-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'view.py'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.py').write_text('cursor.execute(input())\n', encoding='utf-8')
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, output=output):
+                        self.zip_public_report(target, project / f'{meta}-{output}', meta=meta,
+                                               output=output, expected=expected, partial=partial)
+
+    def test_zip_runner_cache_invalidation_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/python-zip-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'view.py'
+        prefix = 'import sys\nfor label, query in zip(["SELECT 1"], sys.stdin):\n'
+        unsafe = prefix + '    cursor.execute(query)\n'
+        clean = prefix + '    cursor.execute(label)\n'
+        suppressed = prefix + '    cursor.execute(query)  # ubs:ignore\n'
+        for index, (source, expected, hits) in enumerate((
+                (unsafe, [(3, 5)], 0), (unsafe, [(3, 5)], 1),
+                (clean, [], 0), (suppressed, [], 0), (unsafe, [(3, 5)], 1))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.zip_public_report(target, scratch / f'cache-{index}', meta=True, output='json',
+                                               expected=expected, cache=True)
+                self.assertEqual(report['profile']['cache_hits'], hits, report)
+        entries = set((scratch / 'cache').glob('*/files/**/*.json'))
+        self.assertTrue(entries, 'Completed native zip scans must create reusable cache entries')
+        target.write_text('import sys\ncursor.execute(input())\n'
+                          'rows = zip(["SELECT 1"], sys.stdin, strict=True)\n', encoding='utf-8')
+        for index in range(2):
+            with self.subTest(partial=index):
+                self.zip_public_report(target, scratch / f'partial-{index}', meta=True, output='json',
+                                       expected=[(2, 1)], partial=True, cache=True)
+                self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
+                                 'An incomplete native zip scan must not enter the completed cache')
+
     def test_callable_stdin_iterator_json_and_sarif(self):
         prefix = ('import sys\ndef make(read):\n    return iter(read, "")\n'
                   'rows = make(sys.stdin.readline)\n')

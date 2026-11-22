@@ -160,10 +160,15 @@ class ReleaseCandidateInstallTests(unittest.TestCase):
                     "UBS_INSTALLER_SELF_UPDATED"):
             self.env.pop(key, None)
         self.flags.remove("--skip-version-check")
-        self.artifact_base = RELEASE_URL + "/latest/download"
+        self.artifact_base = f"{RELEASE_URL}/download/v{version}"
         self.raw_base = RAW_URL
         mapping = {f"{self.artifact_base}/{path.name}": str(path)
                    for path in self.bundle.iterdir() if path.is_file()}
+        # Also serve the mutable aliases so a regression cannot pass merely
+        # because the old endpoint is unavailable. Assertions require the
+        # installer to use only the tag selected by the redirect above.
+        mapping.update({f"{RELEASE_URL}/latest/download/{path.name}": str(path)
+                        for path in self.bundle.iterdir() if path.is_file()})
         mapping[RELEASE_URL + "/latest"] = {
             "effective_url": f"{RELEASE_URL}/tag/v{version}",
         }
@@ -338,6 +343,57 @@ class ReleaseCandidateInstallTests(unittest.TestCase):
             RELEASE_URL + "/latest", self.artifact_base + "/SHA256SUMS",
             self.artifact_base + "/SHA256SUMS.minisig", self.artifact_base + "/ubs",
         ])
+
+    def test_default_latest_rejects_signed_runner_for_another_version(self):
+        # The old installer accepted an authenticated, generation-capable
+        # release that did not match its selected latest tag. Supply every
+        # runtime asset for that other version so the refusal cannot come
+        # from an incidental unavailable download or corrupt manifest.
+        self.seed_historical()
+        before = self.snapshot_install()
+        runner = self.bundle / "ubs"
+        # Keep the other version newer than the installed historical runner:
+        # an independent downgrade refusal must not mask the selection bug.
+        runner.write_bytes(runner.read_bytes().replace(
+            f'UBS_VERSION="{self.version}"'.encode(), b'UBS_VERSION="9999.0.0"', 1))
+        self.resign_flat_payload()
+        self.use_default_delivery()
+        mapping = json.loads(self.url_map.read_text())
+        mapping.update({f"{RAW_URL}/v9999.0.0/modules/{name}":
+                        str(self.bundle / "modules" / name) for name in self.manifest.assets})
+        self.url_map.write_text(json.dumps(mapping))
+        result = self.run_install(standalone=True, expected=1)
+        self.assertIn("Checksum signature verified", result.stdout)
+        self.assertIn("Checksum verified for ubs", result.stdout)
+        self.assertIn("version does not match selected release", result.stdout + result.stderr)
+        self.assertEqual(self.snapshot_install(), before)
+        self.assertEqual(self.fetches(), [
+            RELEASE_URL + "/latest", self.artifact_base + "/SHA256SUMS",
+            self.artifact_base + "/SHA256SUMS.minisig", self.artifact_base + "/ubs",
+        ])
+
+    def test_default_latest_rejects_ambiguous_signed_runner_version(self):
+        runner = self.bundle / "ubs"
+        runner.write_bytes(runner.read_bytes() + f'\nUBS_VERSION="{self.version}"\n'.encode())
+        self.resign_flat_payload()
+        self.use_default_delivery()
+        result = self.run_install(standalone=True, expected=1)
+        self.assertIn("Missing or ambiguous version in authenticated runner",
+                      result.stdout + result.stderr)
+        self.assertFalse((self.destination / "ubs").exists())
+        self.assertFalse(self.cache.exists())
+        self.assertFalse(any("/modules/" in url or url.endswith("/ubs-daemon")
+                             for url in self.fetches()))
+
+    def test_default_latest_requires_successful_exact_tag_resolution(self):
+        self.use_default_delivery()
+        self.env["CANDIDATE_MISSING_URL"] = RELEASE_URL + "/latest"
+        result = self.run_install(standalone=True, expected=1)
+        self.assertIn("Could not resolve latest release to an exact version",
+                      result.stdout + result.stderr)
+        self.assertFalse((self.destination / "ubs").exists())
+        self.assertFalse(self.cache.exists())
+        self.assertEqual(self.fetches(), [RELEASE_URL + "/latest"])
 
     def test_complete_signed_bundle_installs_into_an_empty_cache_offline(self):
         self.assertFalse(self.cache.exists())

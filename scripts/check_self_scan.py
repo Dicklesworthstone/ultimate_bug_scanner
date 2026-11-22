@@ -12,6 +12,14 @@ from pathlib import Path
 
 SELF_SCAN_TIMEOUT_SECONDS = 1800
 
+# Tool locations, scratch retention, and execution deadlines do not select a
+# smaller analysis. All other UBS_* settings belong to an ordinary developer
+# scan and must not silently narrow release qualification.
+OPERATIONAL_UBS_ENV = frozenset({
+    "UBS_KEEP_TEMP", "UBS_PYTHON", "UBS_AST_GREP_BIN", "UBS_TOOLS_DIR",
+    "UBS_MODULE_TIMEOUT", "UBS_MODULE_TIMEOUT_GRACE",
+})
+
 
 class SelfScanError(ValueError):
     """The self-scan did not provide sufficient evidence for a release."""
@@ -76,13 +84,21 @@ def validate_report(report: object) -> int:
 
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
-    env = os.environ.copy()
+    env = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("UBS_") or key in OPERATIONAL_UBS_ENV
+    }
+    # ripgrep also reads an ambient policy file. Its --glob options affect
+    # the runner's source inventory before any scanner sees the files.
+    env.pop("RIPGREP_CONFIG_PATH", None)
     env.update({
         "UBS_ALLOW_PARTIAL": "0",
         "UBS_ALLOW_NO_SCAN": "0",
         "UBS_NO_AUTO_UPDATE": "1",
         "UBS_ENABLE_AUTO_UPDATE": "0",
         "UBS_NO_CACHE": "1",
+        "UBS_MAX_FILE_MB": "0",
+        "FORCE_SELF_UPDATE": "0",
     })
     # Spool potentially large findings rather than buffering subprocess output
     # in memory. On failure retain the actual report in the release log, not
@@ -90,7 +106,8 @@ def main() -> int:
     try:
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as output:
             process = subprocess.run(
-                [str(root / "ubs"), ".", "--ci", "--fail-on-warning", "--format=json"],
+                [str(root / "ubs"), ".", "--ci", "--fail-on-warning", "--format=json",
+                 "--no-config", "--profile=strict"],
                 cwd=root, env=env, stdout=output, check=False,
                 timeout=SELF_SCAN_TIMEOUT_SECONDS,
             )

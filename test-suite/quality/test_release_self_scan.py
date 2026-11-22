@@ -141,6 +141,8 @@ record = {"argv": sys.argv[1:], "cwd": os.getcwd(), "env": {
     key: os.environ.get(key) for key in (
         "UBS_ALLOW_PARTIAL", "UBS_ALLOW_NO_SCAN", "UBS_NO_AUTO_UPDATE",
         "UBS_ENABLE_AUTO_UPDATE", "UBS_NO_CACHE",
+        "UBS_SKIP_CATEGORIES", "UBS_SKIP_TYPE_NARROWING", "UBS_CONTRACT_V2_PY",
+        "UBS_HELPERS_DIR", "UBS_MAX_FILE_MB", "UBS_KEEP_TEMP", "FORCE_SELF_UPDATE",
     )
 }}
 Path(os.environ["CALL_RECORD"]).write_text(json.dumps(record), encoding="utf-8")
@@ -185,6 +187,9 @@ class ReleaseFixture:
             "GIT_TERMINAL_PROMPT": "0", "PYTHONDONTWRITEBYTECODE": "1",
             "UBS_ALLOW_PARTIAL": "1", "UBS_ALLOW_NO_SCAN": "1",
             "UBS_NO_AUTO_UPDATE": "0", "UBS_ENABLE_AUTO_UPDATE": "1", "UBS_NO_CACHE": "0",
+            "UBS_SKIP_CATEGORIES": "1,2,3,4,5,6", "UBS_SKIP_TYPE_NARROWING": "1",
+            "UBS_CONTRACT_V2_PY": "0", "UBS_HELPERS_DIR": "/untrusted/helpers",
+            "UBS_MAX_FILE_MB": "1", "UBS_KEEP_TEMP": "1", "FORCE_SELF_UPDATE": "1",
             "SCAN_REPORT": str(self.report_path), "CALL_RECORD": str(self.record_path),
             "TMPDIR": str(self.base), "SCAN_EXIT": "0", "MODEL_PARTIAL_EXIT": "0",
         })
@@ -254,11 +259,15 @@ class ReleaseTests(ReleaseFixture, unittest.TestCase):
             record = json.loads(self.record_path.read_text())
         except json.JSONDecodeError as error:
             self.fail(f"Invalid scanner invocation record: {error}")
-        self.assertEqual(record["argv"], [".", "--ci", "--fail-on-warning", "--format=json"])
+        self.assertEqual(record["argv"], [".", "--ci", "--fail-on-warning", "--format=json",
+                                          "--no-config", "--profile=strict"])
         self.assertEqual(Path(record["cwd"]).resolve(), self.repo.resolve())
         self.assertEqual(record["env"], {
             "UBS_ALLOW_PARTIAL": "0", "UBS_ALLOW_NO_SCAN": "0",
             "UBS_NO_AUTO_UPDATE": "1", "UBS_ENABLE_AUTO_UPDATE": "0", "UBS_NO_CACHE": "1",
+            "UBS_SKIP_CATEGORIES": None, "UBS_SKIP_TYPE_NARROWING": None,
+            "UBS_CONTRACT_V2_PY": None, "UBS_HELPERS_DIR": None,
+            "UBS_MAX_FILE_MB": "0", "UBS_KEEP_TEMP": "1", "FORCE_SELF_UPDATE": "0",
         })
 
     def test_partial_overrides_cannot_pass_even_with_yes_allow_dirty(self):
@@ -544,6 +553,101 @@ class CandidateReleaseTests(ReleaseFixture, unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git("tag", "--list"), "")
         self.assertIn(b"tree", result.stderr.lower())
+
+
+class NativeSelfScanPolicyTests(unittest.TestCase):
+    """Real findings must survive developer settings during qualification."""
+
+    def setUp(self):
+        missing = [name for name in ("bash", "git", "jq", "rg") if not shutil.which(name)]
+        if missing:
+            if os.environ.get("UBS_RELEASE_QUALIFICATION") == "1":
+                self.fail("release self-scan prerequisites missing: " + ", ".join(missing))
+            self.skipTest("requires " + ", ".join(missing))
+        artifacts = ROOT / "test-suite/artifacts/release-self-scan-policy"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.work = Path(tempfile.mkdtemp(prefix=self._testMethodName + "-", dir=artifacts))
+        self.repo = self.work / "project"
+        (self.repo / "scripts").mkdir(parents=True)
+        shutil.copy2(ROOT / "ubs", self.repo / "ubs")
+        shutil.copy2(ROOT / "scripts/check_self_scan.py", self.repo / "scripts/check_self_scan.py")
+        shutil.copytree(ROOT / "modules", self.repo / "modules")
+        # The scanner is a real authenticated runtime, but the selected
+        # project consists only of the independent clean/unsafe witnesses.
+        (self.repo / ".ubsignore").write_text("ubs\nmodules/\nscripts/\n", encoding="utf-8")
+        self.env = {key: value for key, value in os.environ.items()
+                    if not key.startswith(("UBS_", "GIT_"))}
+        home = self.work / "home"
+        home.mkdir()
+        self.env.update({
+            "HOME": str(home), "XDG_CONFIG_HOME": str(self.work / "config"),
+            "XDG_CACHE_HOME": str(self.work / "cache"),
+            "XDG_DATA_HOME": str(self.work / "data"), "UBS_KEEP_TEMP": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "PYTHONDONTWRITEBYTECODE": "1", "NO_COLOR": "1",
+        })
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.repo,
+                       env=self.env, check=True, capture_output=True, timeout=30)
+        (self.repo / "clean.sh").write_text("#!/usr/bin/env bash\nprintf 'clean\\n'\n", encoding="utf-8")
+
+    def run_gate(self):
+        result = subprocess.run(
+            [sys.executable, str(self.repo / "scripts/check_self_scan.py")],
+            cwd=self.work, env=self.env, capture_output=True, text=True, timeout=60,
+        )
+        (self.work / "stdout.log").write_text(result.stdout, encoding="utf-8")
+        (self.work / "stderr.log").write_text(result.stderr, encoding="utf-8")
+        return result
+
+    def unsafe_script(self, *, large=False):
+        padding = ("# " + "x" * 1020 + "\n") * 1100 if large else ""
+        (self.repo / "unsafe.sh").write_text(
+            "#!/usr/bin/env bash\nrequest=\"${1:-}\"\neval \"$request\"\n" + padding,
+            encoding="utf-8",
+        )
+
+    def assert_real_finding_rejected(self):
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("self-scan rejected: scanner exited 1", result.stderr)
+        reports = [json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+        self.assertEqual(len(reports), 1, result.stderr)
+        report = reports[0]
+        self.assertEqual(report["status"], "ok", result.stderr)
+        self.assertEqual(report["failed_modules"], [], result.stderr)
+        self.assertEqual(report["totals"]["files"], 2, result.stderr)
+        findings = [finding for scanner in report["scanners"] for finding in scanner["findings"]]
+        self.assertIn(("bash.security.eval_variable", 3),
+                      [(finding["rule"], finding["line"]) for finding in findings], result.stderr)
+
+    def test_clean_native_scan_remains_eligible(self):
+        result = self.run_gate()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Self-scan complete: 1 files", result.stdout)
+
+    def test_ambient_category_skips_cannot_hide_real_findings(self):
+        self.unsafe_script()
+        self.env["UBS_SKIP_CATEGORIES"] = "1,2,3,4,5,6"
+        self.assert_real_finding_rejected()
+
+    def test_project_configuration_cannot_exclude_unsafe_source(self):
+        self.unsafe_script()
+        (self.repo / ".ubs.json").write_text(
+            json.dumps({"version": 1, "exclude": ["unsafe.sh"]}), encoding="utf-8",
+        )
+        self.assert_real_finding_rejected()
+
+    def test_ambient_file_size_limit_cannot_hide_unsafe_source(self):
+        self.unsafe_script(large=True)
+        self.env["UBS_MAX_FILE_MB"] = "1"
+        self.assert_real_finding_rejected()
+
+    def test_ripgrep_configuration_cannot_hide_unsafe_source(self):
+        self.unsafe_script()
+        config = self.work / "ripgrep.conf"
+        config.write_text("--glob\n!unsafe.sh\n", encoding="utf-8")
+        self.env["RIPGREP_CONFIG_PATH"] = str(config)
+        self.assert_real_finding_rejected()
 
 
 if __name__ == "__main__":

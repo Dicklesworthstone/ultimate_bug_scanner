@@ -79,7 +79,12 @@ source a hard failure in candidate installation tests; developer-mode skips are
 not release evidence. Use a full-history checkout. The tests exercise the
 standalone installer's default latest-release resolution with fresh homes and
 real signed payloads, followed by a complete offline scan with transport
-disabled. The historical v5.5.26 runner must still be rejected as a latest
+disabled. Default installation resolves latest once and fetches signed assets
+from that exact tag. The authenticated runner must declare exactly that numeric
+version before it can execute or publish a runner, companion, or cache; a valid
+signature for another release is insufficient. Unresolved latest selection and
+ambiguous version declarations fail before publication.
+The historical v5.5.26 runner must still be rejected as a latest
 target, and remain usable if an upgrade fails.
 
 Build a complete unsigned candidate in a new directory:
@@ -142,8 +147,13 @@ commit. Do not rerun the cutter with the same version after preparing it.
 
 The self-scan validator requires complete, nonempty machine-readable results
 with no critical findings or warnings, not merely exit zero. A failed gate
-leaves the version files untouched. Reproduce with
-`./ubs . --ci --fail-on-warning`, fix the cause, and rerun; there is no release
+leaves the version files untouched. It disables automatic `.ubs.json` policy,
+forces the strict profile, and clears ambient scanner settings that could skip
+categories, helpers, or files. It also disables the runner's file-size exclusion;
+the checked-in `.ubsignore` still excludes intentional fixtures and generated output. Tool paths,
+scratch retention, and execution deadlines remain available as operational
+settings. Reproduce with `python3 scripts/check_self_scan.py`, fix the cause,
+and rerun; there is no release
 opt-out. Maintainers can enable `.githooks` with
 `git config core.hooksPath .githooks` for the existing push-time backstop.
 

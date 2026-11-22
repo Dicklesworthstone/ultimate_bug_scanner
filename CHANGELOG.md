@@ -10,6 +10,18 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Pin default verified installations to the exact tag resolved from GitHub's
+  latest release, and bind the authenticated runner's literal version to that
+  selection before execution or publication. Reject unresolved latest aliases,
+  signed payloads for another release, and ambiguous version declarations while
+  preserving an existing installation.
+
+- Keep release self-scans independent of developer scan settings. Disable
+  automatic project policy, force the strict profile, and prevent ambient
+  category skips, helper overrides, and file-size omissions from hiding source
+  findings. Real native-scanner regressions preserve clean eligibility and
+  reject each previously accepted omission.
+
 - Preserve native Go JSON/XML decoder methods saved in variables or passed
   through selected helpers. Keep captured receiver identity, output-pointer
   writes, token payloads, buffered contents and error/metadata result slots

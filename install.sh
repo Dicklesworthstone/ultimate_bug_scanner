@@ -1183,11 +1183,11 @@ version_compare() {
   return 1
 }
 
-# When piped from curl, VERSION stays "main" even though the installer fetches
-# a tagged release asset via releases/latest — so the banner and self-report
-# said "vmain" (issue #95, cosmetic). Resolve the actual tag GitHub's
-# latest-release alias points at and report that instead. Best-effort: on any
-# failure (offline, no curl, custom artifact base) VERSION stays "main".
+# Resolve the mutable latest alias once, then fetch every authenticated asset
+# from that exact tag. Updating only the displayed VERSION would let a release
+# promotion change the selected payload between downloads. On failure leave
+# the selection unresolved; a verified remote installation refuses that case.
+# An explicitly selected artifact mirror retains its caller-supplied endpoint.
 resolve_release_tag() {
   [ "$VERSION" = "main" ] || return 0
   [ -n "${UBS_ARTIFACT_BASE:-}" ] && return 0
@@ -1196,8 +1196,10 @@ resolve_release_tag() {
   effective="$(curl -fsSL --max-time 5 -o /dev/null -w '%{url_effective}' \
     "https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/latest" 2>/dev/null)" || return 0
   tag="${effective##*/}"
-  if [[ "$tag" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+  if [[ "$effective" == "https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/tag/$tag" \
+        && "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     VERSION="${tag#v}"
+    ARTIFACT_BASE="https://github.com/Dicklesworthstone/ultimate_bug_scanner/releases/download/$tag"
     # This installer is now pinned to the newest published release, which is
     # a different version line from main's unreleased VERSION. Record that so
     # check_for_updates does not compare the two (issue #124).
@@ -3498,6 +3500,10 @@ install_scanner() {
       # verify it against the minisign-authenticated release SHA256SUMS.
       # Any fetch or verification
       # failure aborts — no silent fallback to unverified sources.
+      if [[ "$VERSION" == "main" && -z "${UBS_ARTIFACT_BASE:-}" ]]; then
+        error "Could not resolve latest release to an exact version; refusing mutable release downloads"
+        return 1
+      fi
       log "Downloading release artifact from ${ARTIFACT_BASE}..."
 
       fetch_checksum_bundle
@@ -3568,6 +3574,23 @@ install_scanner() {
   if [[ "$generation_declaration" != "UBS_RELEASE_GENERATIONS=1" ]]; then
     error "Target runner does not support verified cache publication; select a supported release generation protocol"
     return 1
+  fi
+  if [[ -z "$local_source" && "$RUN_VERIFICATION" -eq 1 && "$INSECURE" -eq 0 \
+        && "$VERSION" != "main" ]]; then
+    # Minisign authenticates bytes, not the URL they were served from. Bind
+    # those signed bytes to the selected release before executing the runner
+    # or publishing any companion or cache. Never source metadata as code.
+    local runner_version_declaration
+    runner_version_declaration="$(awk '/^UBS_VERSION=/ { count++; value=$0 }
+      END { if (count != 1) exit 1; print value }' "$temp_path")" || {
+      error "Missing or ambiguous version in authenticated runner"
+      return 1
+    }
+    if [[ ! "$runner_version_declaration" =~ ^UBS_VERSION=\"[0-9]+\.[0-9]+\.[0-9]+\"$ \
+          || "$runner_version_declaration" != "UBS_VERSION=\"$VERSION\"" ]]; then
+      error "Authenticated runner version does not match selected release $VERSION"
+      return 1
+    fi
   fi
   # Every target must prepare its complete pinned runtime. A fresh executable
   # path can still share an older cache; neither --local, --insecure nor
@@ -4973,8 +4996,7 @@ fi
 
 read_config_file
 
-# Resolve "main" to the actual release tag the artifact alias serves, so the
-# banner and session summary report the real version (issue #95, cosmetic).
+# Resolve "main" once and pin all release downloads before checking updates.
 resolve_release_tag
 
 print_header

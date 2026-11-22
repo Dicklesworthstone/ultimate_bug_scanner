@@ -80,7 +80,7 @@ _STDIN_API_NAMES = (frozenset(_STDIN_READERS) | frozenset(_STDIN_ITERATORS)
 _STDIN_EAGER_PARSERS = frozenset({'json.load', 'tomllib.load'})
 _STDIN_CSV_PARSERS = frozenset({'csv.reader', 'csv.DictReader'})
 _STDIN_PARSER_CARRIERS = (_STDIN_EAGER_PARSERS | _STDIN_CSV_PARSERS | _STDIN_STREAMS
-                          | {'json', 'tomllib', 'csv', 'sys'})
+                          | frozenset(_STDIN_READERS) | {'json', 'tomllib', 'csv', 'sys', 'iter', 'builtins.iter'})
 _STDIN_OPAQUE_ARGUMENTS = '@stdin:opaque-arguments'
 _SOURCE_MEMBERS = {'os': frozenset({'getenv', 'getenvb', 'environ', 'environb'}),
                    'sys': frozenset({'argv', 'stdin', '__stdin__'}),
@@ -509,6 +509,14 @@ class _CsvReader:
     stream: str
     dictionary: bool = False
     input_header: bool = False
+    format_safe: bool = True
+
+
+@dataclass(frozen=True)
+class _StdinCallableIterator:
+    """Lazy iter(native_reader, sentinel), without borrowing stream methods."""
+    reader: str
+    eof_terminated: bool
     format_safe: bool = True
 
 
@@ -1121,6 +1129,8 @@ def _without_object_contract(binding):
             raise AnalysisLimit('HTTP client mutation or escape is unresolved; analysis is incomplete')
         if isinstance(value, _CsvReader):
             raise AnalysisLimit('CSV reader mutation or escape is unresolved; analysis is incomplete')
+        if isinstance(value, _StdinCallableIterator):
+            raise AnalysisLimit('stdin callable iterator mutation or escape is unresolved; analysis is incomplete')
         if isinstance(value, _ByteBuffer):
             # Content writes retain the native type, but a resize invalidates
             # the allocation's original empty-capacity proof.
@@ -1966,6 +1976,9 @@ class FunctionSummary:
     # A symbolic readinto buffer needs a concrete writable-storage context.
     # Defer this obligation instead of quarantining every helper context.
     buffer_parameters: frozenset[str] = frozenset()
+    # Callable-sentinel iteration requires a primitive sentinel at every
+    # selected invocation; a symbolic helper parameter is not that proof.
+    stdin_iterator_parameters: frozenset[str] = frozenset()
     # A generic prepared-request helper must be revisited with native input
     # identities. Keep that obligation instead of inventing a clean Request.
     http_parameters: frozenset[str] = frozenset()
@@ -2095,6 +2108,7 @@ class _Flow:
         self.capture_globals = set()
         self.value_parameters = set()
         self.buffer_parameters = set()
+        self.stdin_iterator_parameters = set()
         self.http_parameters = set()
         self.observed_global_writes = None
         self.deferred_generator_depth = 0
@@ -2494,6 +2508,9 @@ class _Flow:
             if (isinstance(value, _CsvReader) or isinstance(value, _BoundCallable)
                     and isinstance(value.receiver_binding, _CsvReader)):
                 raise AnalysisLimit('CSV reader storage or escape is unresolved; analysis is incomplete')
+            if (isinstance(value, _StdinCallableIterator) or isinstance(value, _BoundCallable)
+                    and isinstance(value.receiver_binding, _StdinCallableIterator)):
+                raise AnalysisLimit('stdin callable iterator storage or escape is unresolved; analysis is incomplete')
             if isinstance(value, (_LiteralMapping, _LiteralJoinInstance, _LiteralMethodInstance)):
                 self.mutate(references, CLEAN, state)
             elif isinstance(value, _BoundCallable) and (
@@ -3407,7 +3424,7 @@ class _Flow:
     def unproved_producer(binding):
         return any(isinstance(value, _UnprovedProducer)
                    or isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance,
-                                         _CsvReader, _ByteBuffer)) and not value.format_safe
+                                         _CsvReader, _StdinCallableIterator, _ByteBuffer)) and not value.format_safe
                    for value in _binding_choices(binding))
 
     @staticmethod
@@ -3478,6 +3495,8 @@ class _Flow:
                 value = _LiteralMethodInstance(value.owner, value.function, False)
             elif isinstance(value, _CsvReader):
                 value = _CsvReader(value.stream, value.dictionary, value.input_header, False)
+            elif isinstance(value, _StdinCallableIterator):
+                value = _StdinCallableIterator(value.reader, value.eof_terminated, False)
             elif isinstance(value, _ByteBuffer):
                 value = _ByteBuffer(value.empty, False)
             elif isinstance(value, str) and value in _STDIN_PARSER_CARRIERS:
@@ -4687,7 +4706,7 @@ class _Flow:
                 if isinstance(value, _BoundCallable) and value.namespace_proven else None)
         return name if name in _STDIN_STREAMS or name in _STDIN_API_NAMES else None
 
-    def stdin_source(self, binding):
+    def stdin_source(self, binding, *, exhausting=False):
         """Provenance of bytes/lines consumed from an identified stdin stream.
 
         The stream itself is an inert handle: its encoding, file descriptor,
@@ -4696,7 +4715,13 @@ class _Flow:
         """
         sources = []
         for value in _binding_choices(binding):
-            if isinstance(value, _CsvReader):
+            if isinstance(value, _StdinCallableIterator):
+                if not value.format_safe:
+                    raise AnalysisLimit('stdin callable iterator producer effects are unresolved; analysis is incomplete')
+                if exhausting and not value.eof_terminated:
+                    raise AnalysisLimit('stdin callable iterator exhaustion is unproved; analysis is incomplete')
+                name = _STDIN_READERS[value.reader]
+            elif isinstance(value, _CsvReader):
                 if not value.format_safe:
                     raise AnalysisLimit('CSV reader producer effects are unresolved; analysis is incomplete')
                 # _csv.reader requires str records. A binary stream raises
@@ -4851,6 +4876,14 @@ class _Flow:
             self.possible_exception(state)
             return CLEAN
         self.require_value(binding)
+        if any(isinstance(value, _StdinCallableIterator) for value in _binding_choices(binding)):
+            # iter(callable, sentinel) yields data but has no read() method.
+            # A native eager loader cannot consume that iterator as a file.
+            binding = _join_bindings(*(value for value in _binding_choices(binding)
+                                      if not isinstance(value, _StdinCallableIterator)))
+            if not _binding_choices(binding):
+                self.possible_exception(state)
+                return CLEAN
         if name == 'tomllib.load':
             # TOML's binary API rejects text handles before parsing. JSON
             # accepts both native text and binary file-like inputs.
@@ -4990,7 +5023,7 @@ class _Flow:
         return CLEAN
 
     def csv_parser_factory(self, node, target, state):
-        """Prove a small reader/alias factory cannot release opaque locals.
+        """Prove a small stdin iterator/alias factory has no opaque locals.
 
         The ordinary summary already proves the actual CSV construction.
         This separate proof covers its whole producer frame, including every
@@ -5022,11 +5055,12 @@ class _Flow:
 
         def native(binding):
             return all((self.stdin_identity(value) in _STDIN_STREAMS
-                        or isinstance(value, str) and value in _STDIN_CSV_PARSERS
+                        or self.stdin_identity(value) in _STDIN_READERS
+                        or isinstance(value, str) and value in _STDIN_CSV_PARSERS | {'iter', 'builtins.iter'}
                         or isinstance(value, _BoundCallable) and value.namespace_proven
-                        and value.name in _STDIN_CSV_PARSERS)
+                        and value.name in _STDIN_CSV_PARSERS | {'iter', 'builtins.iter'})
                        and not (isinstance(value, _BoundCallable) and value.producer_unproved)
-                       or isinstance(value, _CsvReader) and value.format_safe
+                       or isinstance(value, (_CsvReader, _StdinCallableIterator)) and value.format_safe
                        or self.materialized_generator_binding(value, NO_REFERENCES, state)
                        for value in _binding_choices(binding))
 
@@ -5035,8 +5069,15 @@ class _Flow:
 
         def identity(expression):
             if isinstance(expression, ast.Name):
-                return (values[expression.id] if expression.id in values
-                        else self.global_contents(expression.id, state).binding)
+                if expression.id in values:
+                    return values[expression.id]
+                contents = self.global_contents(expression.id, state)
+                if (contents.binding is None and expression.id in {'iter', 'builtins'}
+                        and expression.id not in self.engine.globals.bindings
+                        and expression.id not in state.bindings
+                        and '@global:' + expression.id not in state.bindings):
+                    return _implicit_identity(expression.id)
+                return contents.binding
             if isinstance(expression, ast.Attribute):
                 parent = identity(expression.value)
                 return parent + '.' + expression.attr if isinstance(parent, str) else None
@@ -5054,10 +5095,68 @@ class _Flow:
             return False
         returned = body[0].value
         if isinstance(returned, ast.Call):
-            return (identity(returned.func) in _STDIN_CSV_PARSERS
+            return (identity(returned.func) in _STDIN_CSV_PARSERS | {'iter', 'builtins.iter'}
                     and all(inert(value) for value in returned.args)
                     and all(keyword.arg is not None and inert(keyword.value) for keyword in returned.keywords))
         return inert(returned)
+
+    def stdin_callable_iterator(self, node, state, target, inputs):
+        """Capture the native reader before arguments can rebind its name.
+
+        A callable_iterator is an inert handle, not a stream. Its equality
+        test must be callback-free, and only a matching native EOF sentinel
+        permits consumers that need exhaustion to return normally.
+        """
+        positions = self.call_positions(node, inputs.arguments, state)
+        if not positions:
+            return None
+        _operand, _fact, binding, _refs = positions[0]
+        choices = _binding_choices(binding)
+        readers = [self.stdin_identity(value) for value in choices]
+        if not any(reader in _STDIN_READERS for reader in readers):
+            return None
+        self.require_value(binding)
+        if any(isinstance(operand, (ast.Starred, _ArgumentExpansion))
+               for operand, _fact, _binding, _refs in positions) or None in inputs.keywords:
+            raise AnalysisLimit('stdin callable iterator argument expansion is unresolved; analysis is incomplete')
+        self.possible_exception(state)
+        if len(positions) != 2 or inputs.keywords:
+            return CLEAN  # iter's callable form takes two positional arguments.
+        if (not all(reader in _STDIN_READERS for reader in readers)
+                or isinstance(target, _BoundCallable) and target.producer_unproved
+                or any(isinstance(value, _BoundCallable) and value.producer_unproved for value in choices)
+                or any(engine.generator_builtin_reflection or engine.generator_namespace_exposed
+                       or engine.generator_frame_exposed for engine in self.engine.generator_peers)):
+            raise AnalysisLimit('stdin callable iterator reader identity is unresolved; analysis is incomplete')
+        sentinel = positions[1][2]
+        self.require_value(sentinel)
+        sentinels = _binding_choices(sentinel)
+        self.engine.budget.spend(len(choices) + len(sentinels) + len(readers) * len(sentinels))
+        if not sentinels:
+            return CLEAN  # A not-yet-solved dependency has no value contract.
+        if any(isinstance(value, _SymbolicValue) for value in sentinels):
+            self.stdin_iterator_parameters.update(value.parameter for value in sentinels
+                                                  if isinstance(value, _SymbolicValue))
+            return CLEAN  # Revisit the helper with its selected sentinel.
+        if not all(
+                isinstance(value, (_LiteralString, _GeneratorString)) and value.format_safe
+                or isinstance(value, ast.Constant) and type(value.value) in {
+                    str, bytes, int, float, complex, bool, type(None)} for value in sentinels):
+            raise AnalysisLimit('stdin callable iterator sentinel equality is unresolved; analysis is incomplete')
+        iterators = []
+        for reader in readers:
+            stream = _STDIN_READERS[reader]
+            method = reader.rsplit('.', 1)[-1]
+            binary = stream.endswith(('.buffer', '.raw'))
+            terminates = method == '__next__' or method not in {'readlines', 'peek'} and all(
+                (isinstance(value, ast.Constant) and type(value.value) is bytes and value.value == b'')
+                if binary else isinstance(value, _LiteralString) and value.value == ''
+                or isinstance(value, ast.Constant) and type(value.value) is str and value.value == ''
+                for value in sentinels)
+            iterators.append(_StdinCallableIterator(reader, terminates))
+        self.expression_bindings[node] = _join_bindings(*iterators)
+        self.expression_references[node] = frozenset({node})
+        return CLEAN
 
     def stdin_call(self, node, state, target, name, receiver, inputs):
         """Finite read/iteration contracts; None leaves ordinary calls alone."""
@@ -5090,6 +5189,23 @@ class _Flow:
             return self.stdin_parser(node, state, target, name, receiver, inputs)
         if native and name in _STDIN_CSV_PARSERS:
             return self.csv_parser(node, state, target, name, inputs)
+        if native and name in {'iter', 'builtins.iter'}:
+            iterator = self.stdin_callable_iterator(node, state, target, inputs)
+            if iterator is not None:
+                return iterator
+        if isinstance(target, _BoundCallable) and isinstance(target.receiver_binding, _StdinCallableIterator):
+            iterator = target.receiver_binding
+            if target.references & state.mutated or target.producer_unproved or not iterator.format_safe:
+                raise AnalysisLimit('stdin callable iterator mutation or producer effects are unresolved; analysis is incomplete')
+            self.possible_exception(state)
+            if arguments or keywords:
+                return CLEAN  # Native iterator methods take no arguments.
+            if name == '@stdin-iterator.__iter__':
+                self.expression_bindings[node] = iterator
+                self.expression_references[node] = target.references
+                return CLEAN
+            if name == '@stdin-iterator.__next__':
+                return self.stdin_source(iterator)
         if isinstance(target, _BoundCallable) and isinstance(target.receiver_binding, _CsvReader):
             reader = target.receiver_binding
             if target.references & state.mutated or target.producer_unproved:
@@ -5200,17 +5316,30 @@ class _Flow:
         if string_join or bytes_join:
             # Native join enforces its element type: text cannot consume a
             # binary stream, and bytes cannot consume a text stream.
-            binding = _join_bindings(*(stream for value in _binding_choices(binding)
-                if (stream := self.stdin_identity(value)) in _STDIN_STREAMS
+            original_bindings = _binding_choices(binding)
+            if (any(isinstance(value, _StdinCallableIterator) for value in original_bindings)
+                    and (keywords or len(positions) != 1)):
+                self.possible_exception(state)
+                return CLEAN
+            binding = _join_bindings(*(value for value in _binding_choices(binding)
+                if (stream := (_STDIN_READERS[value.reader] if isinstance(value, _StdinCallableIterator)
+                               and not value.reader.endswith('.readlines') else self.stdin_identity(value)))
+                   in _STDIN_STREAMS
                 and (stream.endswith(('.buffer', '.raw')) if bytes_join
                      else stream in {'sys.stdin', 'sys.__stdin__'})))
-        csv_readers = any(isinstance(value, _CsvReader) for value in _binding_choices(binding))
-        if csv_readers and builtins_consumer and (
+            if (not _binding_choices(binding)
+                    and all(isinstance(value, _StdinCallableIterator) for value in original_bindings)):
+                self.possible_exception(state)
+                return CLEAN
+        native_readers = any(isinstance(value, (_CsvReader, _StdinCallableIterator))
+                             for value in _binding_choices(binding))
+        if native_readers and builtins_consumer and (
                 keywords or len(positions) > (2 if consumer.rsplit('.', 1)[-1] == 'next' else 1)):
             self.possible_exception(state)
             return CLEAN
-        consumed = self.stdin_source(binding)
-        if not consumed and not csv_readers:
+        consumed = self.stdin_source(binding, exhausting=string_join or bytes_join
+                                     or consumer in {'list', 'tuple', 'builtins.list', 'builtins.tuple'})
+        if not consumed and not native_readers:
             return None
         if builtins_consumer and any(
                 engine.generator_builtin_reflection or engine.generator_namespace_exposed
@@ -5219,10 +5348,10 @@ class _Flow:
         self.possible_exception(state)
         if consumer in {'iter', 'builtins.iter'} and len(positions) == 1 and not keywords:
             self.expression_bindings[node] = _join_bindings(*(
-                value if isinstance(value, _CsvReader)
+                value if isinstance(value, (_CsvReader, _StdinCallableIterator))
                 else stream if (stream := self.stdin_identity(value)) in _STDIN_STREAMS else None
                 for value in _binding_choices(binding)))
-            self.expression_references[node] = _references if csv_readers else NO_REFERENCES
+            self.expression_references[node] = _references if native_readers else NO_REFERENCES
             return first
         if consumer in {'iter', 'builtins.iter'}:
             return None
@@ -7256,6 +7385,7 @@ class _Flow:
                     continue
                 if any(isinstance(value, (str, _LiteralString, _GeneratorString, _UnprovedProducer,
                                           _LiteralMapping, _ArgumentVector, _ProcessInput, _ByteBuffer,
+                                          _StdinCallableIterator,
                                           _LiteralMethodInstance,
                                           _FunctionValue, _ClosureValue,
                                           ast.FunctionDef, ast.AsyncFunctionDef,
@@ -7299,6 +7429,13 @@ class _Flow:
                     self.buffer_parameters.update(value.parameter for value in choices)
                 else:
                     raise AnalysisLimit('stdin buffer mutation helper requires a proven writable buffer; '
+                                        'analysis is incomplete')
+            for name in summary.stdin_iterator_parameters:
+                choices = _binding_choices(values.get(name))
+                if choices and all(isinstance(value, _SymbolicValue) for value in choices):
+                    self.stdin_iterator_parameters.update(value.parameter for value in choices)
+                else:
+                    raise AnalysisLimit('stdin callable iterator helper requires a proven primitive sentinel; '
                                         'analysis is incomplete')
             for name in summary.http_parameters:
                 choices = _binding_choices(values.get(name))
@@ -7375,7 +7512,7 @@ class _Flow:
             # the caller's distinct generator/closure cells.
             format_frame_inert = (bool(self.materialized_generator_depth) or not any(
                 isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _LiteralMethodInstance,
-                                   _ArgumentVector, _LiteralMapping, _CsvReader, _ByteBuffer,
+                                   _ArgumentVector, _LiteralMapping, _CsvReader, _StdinCallableIterator, _ByteBuffer,
                                    _SymbolicValue, ast.Constant))
                 or isinstance(value, str) and value in _STDIN_PARSER_CARRIERS
                 or isinstance(value, _BoundCallable) and (
@@ -7389,7 +7526,10 @@ class _Flow:
                         isinstance(value.receiver_binding, _CsvReader)
                         or value.namespace_proven and value.name in _STDIN_CSV_PARSERS | {'csv'})
                     for value in _binding_choices(summary.returned_binding))
-                if not format_frame_inert and csv_return:
+                stdin_iterator_return = any(isinstance(value, _StdinCallableIterator)
+                    or isinstance(value, _BoundCallable) and isinstance(value.receiver_binding, _StdinCallableIterator)
+                    for value in _binding_choices(summary.returned_binding))
+                if not format_frame_inert and (csv_return or stdin_iterator_return):
                     format_frame_inert = self.csv_parser_factory(node, target, state)
                 if not format_frame_inert and all(
                         value in _STDIN_PARSER_CARRIERS if isinstance(value, str)
@@ -7397,10 +7537,11 @@ class _Flow:
                         and value.name in _STDIN_PARSER_CARRIERS and not value.producer_unproved
                         for value in _binding_choices(summary.returned_binding)):
                     format_frame_inert = self.stdin_parser_factory(node, target)
-                if not format_frame_inert and csv_return:
+                if not format_frame_inert and (csv_return or stdin_iterator_return):
                     # Releasing a factory's locals/defaults happens now,
                     # even if its returned lazy reader is never consumed.
-                    raise AnalysisLimit('CSV reader producer effects are unresolved; analysis is incomplete')
+                    description = 'stdin callable iterator' if stdin_iterator_return else 'CSV reader'
+                    raise AnalysisLimit(description + ' producer effects are unresolved; analysis is incomplete')
             for parameter, written in summary.mutations:
                 fact = substitute(written)
                 self.mutate(self._lookup_refs(references, parameter), fact, state)
@@ -7673,7 +7814,8 @@ class _Flow:
                     # Native handle metadata is inert, but this exemption
                     # must not relax pre-existing CSV/mapping escape checks.
                     escaping = _join_bindings(*(
-                        choice for choice in _binding_choices(value) if not _http_contract(choice)))
+                        choice for choice in _binding_choices(value)
+                        if not _http_contract(choice) and not isinstance(choice, _StdinCallableIterator)))
                 self.escape_literal_mapping(escaping, self.expression_references.get(expression, NO_REFERENCES), state)
                 if {'functools', _PARTIAL_CHANGED_MODULE} & _binding_choices(value) and name not in {
                         'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr'}:
@@ -7773,7 +7915,7 @@ class _Flow:
                             ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
                             _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _GeneratorString,
                             _UnprovedProducer, _LiteralMapping, _LiteralJoinInstance, _LiteralMethodInstance,
-                            _ProcessInput, _ByteBuffer, ast.Constant)
+                            _ProcessInput, _StdinCallableIterator, _ByteBuffer, ast.Constant)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
                     self.capture_globals.add((self.engine.tree, node.id))
@@ -7911,6 +8053,15 @@ class _Flow:
                     raise AnalysisLimit('pending HTTP request attribute protocol is unmodeled; analysis is incomplete')
                 if _http_contract(base, _HTTPPrepared):
                     raise AnalysisLimit('prepared HTTP request attribute protocol is unmodeled; analysis is incomplete')
+                if isinstance(base, _StdinCallableIterator):
+                    if not base.format_safe or receiver_refs & state.mutated:
+                        raise AnalysisLimit('stdin callable iterator mutation or producer effects are unresolved; analysis is incomplete')
+                    if node.attr in {'__next__', '__iter__'}:
+                        candidates.append(_BoundCallable('@stdin-iterator.' + node.attr, receiver_refs,
+                                                          namespace_proven=True, receiver_binding=base))
+                    else:
+                        raise AnalysisLimit('stdin callable iterator attribute protocol is unmodeled; analysis is incomplete')
+                    continue
                 if isinstance(base, _CsvReader):
                     if not base.format_safe or receiver_refs & state.mutated:
                         raise AnalysisLimit('CSV reader mutation or producer effects are unresolved; analysis is incomplete')
@@ -8537,7 +8688,7 @@ class _Flow:
             if synchronous_generator and not self.materialized_generator_iterable(generator.iter, entering):
                 raise AnalysisLimit('generator materialization iterator or captured lifetime is unresolved; '
                                     'analysis is incomplete')
-            value = join_facts(value, self.stdin_source(binding))
+            value = join_facts(value, self.stdin_source(binding, exhausting=True))
             if synchronous_generator:
                 iterator_references.update(refs)
             literal = generator.iter
@@ -8990,7 +9141,7 @@ class _Flow:
             if not state.reachable:
                 return None
             binding = self.expression_bindings.get(node.iter)
-            value = join_facts(value, self.stdin_source(binding))
+            value = join_facts(value, self.stdin_source(binding, exhausting=True))
             references = self.expression_references.get(node.iter, NO_REFERENCES)
             generators = _binding_choices(binding)
             if any(isinstance(value, (_DeferredGenerator, _GeneratorNext)) for value in generators):
@@ -9091,6 +9242,7 @@ class _Flow:
             capture_globals=frozenset(self.capture_globals),
             value_parameters=frozenset(self.value_parameters),
             buffer_parameters=frozenset(self.buffer_parameters),
+            stdin_iterator_parameters=frozenset(self.stdin_iterator_parameters),
             http_parameters=frozenset(self.http_parameters),
             cells=cells,
             multiple_cells=frozenset(cell_state.cells.multiple)
@@ -10255,7 +10407,7 @@ class _Analysis:
                 # Partial captures may retain exact scalar options such as
                 # shell=False. Their source AST identities are finite.
                 pass
-            elif not isinstance(value, (str, _LiteralMapping, _ProcessInput, _CsvReader, _ByteBuffer, ast.FunctionDef, ast.AsyncFunctionDef,
+            elif not isinstance(value, (str, _LiteralMapping, _ProcessInput, _CsvReader, _StdinCallableIterator, _ByteBuffer, ast.FunctionDef, ast.AsyncFunctionDef,
                                         ast.Lambda, ast.ClassDef)):
                 value = _SymbolicValue(name) if captured else None
             choices.append(value)
@@ -10354,7 +10506,7 @@ class _Analysis:
                 if (binding is nominal
                         and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
                                                      _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
-                                                     _LiteralMapping, _ProcessInput, _CsvReader, _ByteBuffer))
+                                                     _LiteralMapping, _ProcessInput, _CsvReader, _StdinCallableIterator, _ByteBuffer))
                         and not explicit_override
                         and gname in owner_bindings
                         and gname not in owner_fn.locals[function]
@@ -10367,7 +10519,7 @@ class _Analysis:
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
                                            ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
                                            _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
-                                           _LiteralMapping, _ProcessInput, _CsvReader, _ByteBuffer, ast.Constant))
+                                           _LiteralMapping, _ProcessInput, _CsvReader, _StdinCallableIterator, _ByteBuffer, ast.Constant))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue
             elif binding is None or isinstance(binding, _SymbolicValue):
@@ -10600,6 +10752,20 @@ class _Analysis:
                      if isinstance(key, tuple) and not value.buffer_parameters
                      and not value.incomplete}
         reason = 'stdin buffer mutation helper has unresolved writable-buffer inputs; analysis is incomplete'
+        return tuple(self.scope_diagnostic(function, reason) for function in functions
+                     if function not in qualified or not self.generator_helper_identity(function))
+
+    def stdin_iterator_diagnostics(self):
+        """Keep unqualified sentinel equality outside complete analysis."""
+        functions = [function for function in self.functions
+                     if self.summaries.get(function, FunctionSummary()).stdin_iterator_parameters]
+        if not functions:
+            return ()
+        self.budget.spend(len(self.summaries))
+        qualified = {key[0] for key, value in self.summaries.items()
+                     if isinstance(key, tuple) and not value.stdin_iterator_parameters
+                     and not value.incomplete}
+        reason = 'stdin callable iterator helper has unresolved sentinel inputs; analysis is incomplete'
         return tuple(self.scope_diagnostic(function, reason) for function in functions
                      if function not in qualified or not self.generator_helper_identity(function))
 
@@ -11040,6 +11206,9 @@ class _Analysis:
                     buffer_diagnostics = self.buffer_diagnostics()
                     problems.extend(item['reason'] for item in buffer_diagnostics)
                     diagnostics.extend(buffer_diagnostics)
+                    iterator_diagnostics = self.stdin_iterator_diagnostics()
+                    problems.extend(item['reason'] for item in iterator_diagnostics)
+                    diagnostics.extend(iterator_diagnostics)
                     http_diagnostics = self.http_diagnostics()
                     problems.extend(item['reason'] for item in http_diagnostics)
                     diagnostics.extend(http_diagnostics)
@@ -11521,6 +11690,15 @@ class _Project:
             except AnalysisLimit as exc:
                 unresolved_buffers.append(engine.scope_diagnostic(engine.tree, str(exc)))
         diagnostics.extend(unresolved_buffers)
+        unresolved_iterators = []
+        for _path, _text, engine, _offset in self.sources:
+            if engine not in self.ready or engine.project is None:
+                continue
+            try:
+                unresolved_iterators.extend(engine.stdin_iterator_diagnostics())
+            except AnalysisLimit as exc:
+                unresolved_iterators.append(engine.scope_diagnostic(engine.tree, str(exc)))
+        diagnostics.extend(unresolved_iterators)
         unresolved_http = []
         for _path, _text, engine, _offset in self.sources:
             if engine not in self.ready or engine.project is None:
@@ -11543,6 +11721,9 @@ class _Project:
         if unresolved_buffers:
             problems.append(f'{len(unresolved_buffers)} buffer scope(s): '
                             + '; '.join(item['reason'] for item in unresolved_buffers[:3]))
+        if unresolved_iterators:
+            problems.append(f'{len(unresolved_iterators)} stdin iterator scope(s): '
+                            + '; '.join(item['reason'] for item in unresolved_iterators[:3]))
         if unresolved_http:
             problems.append(f'{len(unresolved_http)} HTTP scope(s): '
                             + '; '.join(item['reason'] for item in unresolved_http[:3]))

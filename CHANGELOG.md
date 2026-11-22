@@ -10,6 +10,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track Python callable/sentinel stdin iterators such as
+  `iter(sys.stdin.readline, "")` through native reader aliases, selected helpers
+  and lazy or eager consumers. Keep iterator handles and metadata distinct from
+  yielded input, and require matching text/bytes EOF semantics before proving
+  exhaustion. Unsupported producers, equality callbacks and unproved exhaustion
+  remain explicitly incomplete while earlier concrete findings are retained.
+  Source/native and actual JSON/SARIF regressions cover unsafe, clean and partial
+  outcomes.
+
 - Follow native JavaScript `Array.filter` callbacks through selected helper
   summaries. Preserve captured writes, throws, element snapshots and shallow
   aliases; compact sparse selections into fresh arrays and retain finite

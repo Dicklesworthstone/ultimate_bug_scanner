@@ -1077,6 +1077,190 @@ class EagerStdinParserTests(SourceTest):
                          {('eval',2),('eval',6)})
 
 
+class CallableStdinIteratorTests(SourceTest):
+    def test_native_reader_sentinel_iteration_reaches_each_sink_domain(self):
+        for stream, sentinel, convert in (("sys.stdin", "''", ''),
+                                          ("sys.stdin.buffer", "b''", '.decode()'),
+                                          ("sys.stdin.buffer.raw", "b''", '.decode()')):
+            for sink, rule in (("eval(value)", 'eval'), ("cursor.execute(value)", 'sql'),
+                               ("os.system(value)", 'command'), ("HttpResponse(value)", 'xss'),
+                               ("requests.get(value)", 'ssrf')):
+                with self.subTest(stream=stream, sink=sink):
+                    findings = self.assert_rules(
+                        'import sys, os, requests\n'
+                        f'rows = iter({stream}.readline, {sentinel})\n'
+                        f'value = next(rows){convert}\n' + sink + '\n', rule)
+                    self.assertEqual([finding['line'] for finding in findings], [4])
+                    self.assertIn(stream, findings[0]['message'])
+
+    def test_captured_readers_and_native_consumers_preserve_lazy_source(self):
+        for setup in (
+                "value = next(iter(sys.stdin.readline, ''))",
+                "value = list(iter(sys.stdin.readline, ''))[0]",
+                "value = tuple(iter(sys.stdin.readline, ''))[0]",
+                "for line in iter(sys.stdin.readline, ''):\n    value = line",
+                "value = [line for line in iter(sys.stdin.readline, '')][0]",
+                "value = ''.join(iter(sys.stdin.readline, ''))",
+                "rows = iter(sys.stdin.readline, '')\nalias = rows\nvalue = next(iter(alias))",
+                "rows = iter(sys.stdin.readline, '')\nadvance = rows.__next__\nvalue = advance()",
+                "rows = iter(sys.stdin.readline, '').__iter__()\nvalue = next(rows)",
+                "read = sys.stdin.readline\nsys = None\nvalue = next(iter(read, ''))",
+                "from sys import __stdin__ as stream\nvalue = next(iter(stream.readline, ''))",
+                "import builtins as native\nmake = native.iter\nvalue = next(make(sys.stdin.readline, ''))",
+                "arguments = (sys.stdin.readline, '')\nvalue = next(iter(*arguments))",
+                "value = next(iter(sys.stdin.buffer.read1, b'')).decode()",
+                "value = next(iter(sys.stdin.buffer.raw.readall, b'')).decode()"):
+            with self.subTest(setup=setup):
+                source = 'import sys\n' + setup + '\neval(value)\n'
+                findings = self.assert_rules(source, 'eval')
+                self.assertEqual([finding['line'] for finding in findings], [len(source.splitlines())])
+
+    def test_selected_helpers_transport_reader_and_iterator_identity(self):
+        for setup in (
+                "def take(rows):\n    return next(rows)\nvalue = take(iter(sys.stdin.readline, ''))",
+                "def make(read):\n    return iter(read, '')\nvalue = next(make(sys.stdin.readline))",
+                "def make():\n    return iter(sys.stdin.readline, '')\nvalue = next(make())",
+                "def make(read, sentinel):\n    return iter(read, sentinel)\n"
+                "value = next(make(sys.stdin.readline, ''))",
+                "def take(read=sys.stdin.readline):\n    return next(iter(read, ''))\nvalue = take()",
+                "rows = iter(sys.stdin.readline, '')\ndef take():\n    return next(rows)\nvalue = take()"):
+            with self.subTest(setup=setup):
+                self.assert_rules('import sys\n' + setup + '\neval(value)\n', 'eval')
+
+    def test_handles_and_safe_data_uses_remain_clean(self):
+        for setup in (
+                "rows = iter(sys.stdin.readline, '')\nvalue = '1'",
+                "rows = iter(sys.stdin.readline, '')\nvalue = str(rows)",
+                "rows = iter(sys.stdin.readline, '')\nvalue = repr(rows)",
+                "rows = iter(sys.stdin.readline, '')\nvalue = str(bool(rows))",
+                "rows = iter(sys.stdin.readline, '')\nrows = iter(['1'])\nvalue = next(rows)",
+                "read = sys.stdin.readline\nread = lambda: '1'\nvalue = next(iter(read, ''))",
+                "def iter(read, sentinel):\n    return ['1']\nvalue = next(iter(sys.stdin.readline, ''))"):
+            with self.subTest(setup=setup):
+                self.assert_rules('import sys\n' + setup + '\neval(value)\n')
+        self.assert_rules('''
+            import sys, html, shlex, os
+            value = next(iter(sys.stdin.readline, ''))
+            cursor.execute('SELECT ?', (value,))
+            HttpResponse(html.escape(value))
+            os.system('echo ' + shlex.quote(value))
+        ''')
+        self.assert_rules("import sys, html\neval(html.escape(next(iter(sys.stdin.readline, ''))))\n", 'eval')
+
+    def test_opaque_sentinel_and_iterator_protocols_are_explicit(self):
+        for setup in (
+                "rows = iter(sys.stdin.readline, sentinel)",
+                "rows = iter(sys.stdin.readline, Sentinel())",
+                "rows = iter(sys.stdin.readline, '')\nunknown(rows)\nvalue = next(rows)",
+                "rows = [iter(sys.stdin.readline, '')]\nvalue = next(rows[0])",
+                "rows = iter(sys.stdin.readline, '')\nvalue = rows.read()"):
+            with self.subTest(setup=setup), self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin callable iterator'):
+                self.scan('import sys\n' + setup + '\n')
+
+    def test_native_callable_iterator_witnesses(self):
+        for stream, sentinel, expected in (("sys.stdin", "'STOP\\n'", ['payload\n']),
+                                           ("sys.stdin.buffer", "b'STOP\\n'", ['payload\n']),
+                                           ("sys.stdin.buffer.raw", "b'STOP\\n'", ['payload\n'])):
+            with self.subTest(stream=stream):
+                source = ('import json, sys\n'
+                          f'rows = iter({stream}.readline, {sentinel})\n'
+                          "values = [line.decode() if isinstance(line, bytes) else line for line in rows]\n"
+                          "print(json.dumps({'values': values, 'has_read': hasattr(rows, 'read')}))\n")
+                result = subprocess.run([sys.executable, '-c', source], input='payload\nSTOP\nignored\n',
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {'values': expected, 'has_read': False})
+
+    def test_non_eof_sentinels_allow_next_but_do_not_prove_exhaustion(self):
+        for reader, sentinel in (('sys.stdin.readline', "b''"),
+                                 ('sys.stdin.buffer.readline', "''"),
+                                 ('sys.stdin.readline', "'STOP\\n'"),
+                                 ('sys.stdin.buffer.peek', "b''")):
+            with self.subTest(reader=reader, sentinel=sentinel):
+                self.assert_rules(f'import sys\neval(next(iter({reader}, {sentinel})))\n', 'eval')
+                for consumer in ('list(rows)', 'tuple(rows)', '[line for line in rows]'):
+                    with self.subTest(consumer=consumer):
+                        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin callable iterator exhaustion'):
+                            self.scan(f'import sys\nrows = iter({reader}, {sentinel})\n' + consumer + '\n')
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin callable iterator exhaustion'):
+                    self.scan(f'import sys\nrows = iter({reader}, {sentinel})\nfor line in rows:\n    pass\n')
+        self.assert_rules("import sys\neval(''.join(iter(sys.stdin.buffer.readline, b'')))\n")
+        self.assert_rules("import sys\neval(b''.join(iter(sys.stdin.readline, '')))\n")
+
+    def test_unqualified_sentinel_helpers_keep_an_explicit_obligation(self):
+        for invocation in ('', 'make(unknown)', 'expose(make)'):
+            with self.subTest(invocation=invocation):
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin callable iterator'):
+                    self.scan('import sys\ndef make(sentinel):\n'
+                              '    return iter(sys.stdin.readline, sentinel)\n' + invocation + '\n')
+
+    def test_callable_iterators_do_not_acquire_stream_read_protocols(self):
+        for parser in ('json', 'tomllib'):
+            with self.subTest(parser=parser):
+                self.assert_rules(f'import sys, {parser}\n'
+                                  "rows = iter(sys.stdin.buffer.readline, b'')\n"
+                                  f'eval({parser}.load(rows)["code"])\n')
+
+    def test_partial_sentinel_scope_retains_independent_findings(self):
+        engine = taint_py._Analysis(ast.parse(textwrap.dedent('''\
+            import sys
+            eval(input())
+            def unsupported():
+                return list(iter(sys.stdin.readline, Sentinel()))
+            def independent():
+                eval(input())
+            unsupported()
+            independent()
+        ''')))
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin callable iterator') as caught:
+            engine.analyze()
+        self.assertEqual({(kind, line) for kind, line, _column, _label in caught.exception.effects},
+                         {('eval', 2), ('eval', 6)})
+
+    def test_selected_modules_keep_primitive_sentinel_specialization(self):
+        for supplied in ("''", "b''"):
+            with self.subTest(sentinel=supplied), temporary_directory(prefix='ubs-calliter-modules-') as directory:
+                root = Path(directory)
+                helper, caller = root / 'reader.py', root / 'app.py'
+                helper.write_text('import sys\ndef take(sentinel):\n'
+                                  '    return next(iter(sys.stdin.readline, sentinel))\n', encoding='utf-8')
+                caller.write_text(f'from reader import take\neval(take({supplied}))\n', encoding='utf-8')
+                findings = list(taint_py.run(RunContext(lang='python', files=[caller, helper])))
+                self.assertEqual([(finding['rule'], finding['path'], finding['line']) for finding in findings],
+                                 [('python.taint.eval', str(caller), 2)], findings)
+
+    def test_unknown_equality_can_change_data_without_yielding_a_row(self):
+        program = textwrap.dedent('''\
+            import json, sys
+            observed = 'fixed'
+            class Sentinel:
+                def __eq__(self, line):
+                    global observed
+                    observed = line
+                    return True
+            rows = iter(sys.stdin.readline, Sentinel())
+            result = next(rows, 'no row')
+            print(json.dumps([observed, result]))
+        ''')
+        result = subprocess.run([sys.executable, '-c', program], input='external-payload\n',
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ['external-payload\n', 'no row'])
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'stdin callable iterator sentinel'):
+            self.scan(program.replace('print(json.dumps([observed, result]))', 'eval(observed)'))
+
+    def test_suppression_and_profiles_apply_to_real_selected_sink_sites(self):
+        prefix = "import sys\nrows = iter(sys.stdin.readline, '')\n"
+        self.assert_rules(prefix + "eval(next(rows))  # ubs:ignore[python.taint.eval]\n")
+        findings = self.assert_rules(prefix + "eval(next(rows))  # ubs:ignore[python.taint.xss]\n", 'eval')
+        self.assertEqual([finding['line'] for finding in findings], [3])
+        with temporary_directory(prefix='ubs-calliter-profile-') as directory:
+            path = Path(directory) / 'view.py'
+            path.write_text(prefix + 'eval(next(rows))\n', encoding='utf-8')
+            context = RunContext(lang='python', files=[path], profile={'disabled_rules': ['python.taint.eval']})
+            self.assertEqual(list(taint_py.run(context)), [])
+
+
 class CsvStdinParserTests(SourceTest):
     def test_consumed_rows_reach_each_sink_domain(self):
         for sink, rule in (("eval(value)", 'eval'), ("cursor.execute(value)", 'sql'),
@@ -1447,6 +1631,48 @@ class SuppressionTests(SourceTest):
 
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 to run real runner integration')
 class RunnerIntegrationTests(unittest.TestCase):
+    def test_callable_stdin_iterator_json_and_sarif(self):
+        prefix = ('import sys\ndef make(read):\n    return iter(read, "")\n'
+                  'rows = make(sys.stdin.readline)\n')
+        cases = (
+            (prefix + 'cursor.execute(next(rows))\n', [5], 'ok', 1),
+            (prefix + "cursor.execute('SELECT ?', (next(rows),))\n", [], 'ok', 0),
+            ('import sys\ncursor.execute(input())\n'
+             'rows = iter(sys.stdin.readline, Sentinel())\n', [2], 'partial', 2),
+        )
+        for source, expected_lines, status, exit_code in cases:
+            with temporary_directory(prefix='ubs-calliter-cli-') as directory:
+                path = Path(directory) / 'view.py'
+                path.write_text(source, encoding='utf-8')
+                for output in ('json', 'sarif'):
+                    with self.subTest(source=source, format=output):
+                        result = subprocess.run(
+                            [str(ROOT / 'ubs'), str(path), '--only=python', '--ci', f'--format={output}'],
+                            cwd=directory, env=dict(os.environ, UBS_NO_AUTO_UPDATE='1', UBS_NO_CACHE='1'),
+                            capture_output=True, text=True, timeout=180)
+                        self.assertEqual(result.returncode, exit_code, result.stdout + result.stderr)
+                        report = json.loads(result.stdout)
+                        if output == 'json':
+                            self.assertEqual(report.get('status'), status, report)
+                            findings = [finding for finding in report.get('findings', [])
+                                        if finding['rule_id'] in {'py.taint.sql', 'python.taint.sql'}]
+                            lines = [finding['line'] for finding in findings]
+                        else:
+                            findings = [finding for run in report['runs'] for finding in run.get('results', [])
+                                        if finding['ruleId'] in {'py.taint.sql', 'python.taint.sql'}]
+                            lines = [finding['locations'][0]['physicalLocation']['region']['startLine']
+                                     for finding in findings]
+                            successful = [invocation.get('executionSuccessful') for run in report['runs']
+                                          for invocation in run.get('invocations', [])]
+                            # Complete SARIF may omit invocations; partial runs
+                            # must explicitly report unsuccessful execution.
+                            if status == 'ok':
+                                self.assertTrue(all(value is True for value in successful), report)
+                            else:
+                                self.assertTrue(successful, report)
+                                self.assertTrue(all(value is False for value in successful), report)
+                        self.assertEqual(lines, expected_lines, report)
+
     def test_readinto_json_and_sarif(self):
         prefix = ('import sys\ndef fill(buffer):\n    sys.stdin.buffer.readinto(buffer)\n'
                   'buffer = bytearray(64)\nfill(buffer)\n')

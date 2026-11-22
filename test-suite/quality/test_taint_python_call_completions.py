@@ -1529,6 +1529,34 @@ class GeneratorProjectTests(unittest.TestCase):
             files.append(path)
         return taint_py._Project(files, root)
 
+    def test_native_predicate_helper_crosses_selected_module_boundary(self):
+        helper = 'def selected(key, values):\n    return any(value == key for value in values)\n'
+        for invocation in ("import predicate\npredicate.selected('fixed', ['fixed'])\n",
+                           "from predicate import selected as accept\naccept('fixed', ('fixed',))\n"):
+            with self.subTest(invocation=invocation):
+                project = self.project({'predicate.py': helper, 'app.py': invocation
+                    + 'import os\nos.system(input())\n'})
+                self.assertEqual([(path.name, rule) for path, rule, _line, _col, _message in project.findings()],
+                                 [('app.py', 'py.taint.command')])
+
+    def test_native_predicate_call_does_not_cover_imported_callable_escape(self):
+        helper = 'def selected(key, values):\n    return any(value == key for value in values)\n'
+        for extra in ('opaque(predicate.selected)',
+                      'def factory():\n    return predicate.selected\nopaque(factory())',
+                      'opaque(predicate)',
+                      'alias = predicate\nopaque(alias.selected)',
+                      'from predicate import selected as accept\nopaque(accept)',
+                      "predicate.selected('fixed', unknown)"):
+            with self.subTest(extra=extra):
+                project = self.project({'predicate.py': helper, 'app.py':
+                    "import predicate\npredicate.selected('fixed', ['fixed'])\n" + extra + '\n',
+                    'independent.py': 'import os\ndef report():\n    os.system(input())\n'})
+                observed = []
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    observed.extend(project.findings())
+                self.assertIn(('independent.py', 'py.taint.command'),
+                              [(path.name, rule) for path, rule, _line, _col, _message in observed])
+
     def test_mutated_defining_module_cannot_keep_stale_callable_identity(self):
         library = "selected=print\ndef values():\n    yield selected\n"
         for replacement in ('lib.selected=eval', 'alias=lib\nalias.selected=eval'):
@@ -1937,6 +1965,192 @@ class NextGeneratorCompletionTests(SourceTest):
 
 
 class PredicateGeneratorCompletionTests(SourceTest):
+    def test_selected_native_predicate_helpers_keep_boolean_results(self):
+        for consumer in ('any', 'all'):
+            for values in ("['fixed', 'other']", "('fixed',)", "'fixed'"):
+                for key in ("'fixed'", 'input()'):
+                    source = (f'def selected(key, values):\n'
+                              f'    return {consumer}(value == key for value in values)\n'
+                              f'print(selected({key}, {values}))\n')
+                    with self.subTest(consumer=consumer, values=values, key=key):
+                        native = subprocess.run([sys.executable, '-I', '-B', '-c', source],
+                                                input='fixed\n', text=True, capture_output=True, timeout=10)
+                        self.assertEqual(native.returncode, 0, native.stderr)
+                        expected = (consumer == 'any' and values != "'fixed'"
+                                    or consumer == 'all' and values == "('fixed',)")
+                        self.assertEqual(native.stdout.strip(), str(expected))
+                        self.assert_rules(source)
+
+    def test_selected_predicate_helper_exact_branches_match_native_execution(self):
+        cases = (('any', '[]', False), ('all', '[]', True),
+                 ('any', "['fixed', 'other']", True), ('all', "['fixed', 'other']", False),
+                 ('any', "['other']", False), ('all', "['fixed']", True))
+        for consumer, values, accepted in cases:
+            for negate in (False, True):
+                source = ('import os\n'
+                          f'def selected(key, values):\n'
+                          f'    return {consumer}(value == key for value in values)\n'
+                          f'if {"not " if negate else ""}selected("fixed", {values}):\n'
+                          '    os.system(input())\n')
+                witness = ('import os,json\nobserved=[]\nos.system=observed.append\n'
+                           + f'exec({source!r})\nprint(json.dumps(observed))\n')
+                with self.subTest(consumer=consumer, values=values, negate=negate):
+                    native = subprocess.run([sys.executable, '-I', '-B', '-c', witness],
+                                            input='UNTRUSTED\n', text=True, capture_output=True, timeout=10)
+                    self.assertEqual(native.returncode, 0, native.stderr)
+                    reached = accepted != negate
+                    self.assertEqual(json.loads(native.stdout), ['UNTRUSTED'] if reached else [])
+                    self.assert_rules(source, *(('command',) if reached else ()))
+
+    def test_if_statement_keeps_ordered_guard_effects_and_unknown_successors(self):
+        for guard, reached in (('False and (code := input())', False),
+                               ('True or (code := input())', False),
+                               ('True and (code := input())', True),
+                               ('False or (code := input())', True),
+                               ('not (False or (code := input()))', True)):
+            source = ('import os\ncode="fixed"\n'
+                      f'if {guard}:\n    pass\nos.system(code)\n')
+            witness = ('import os,json\nobserved=[]\nos.system=observed.append\n'
+                       + f'exec({source!r})\nprint(json.dumps(observed))\n')
+            with self.subTest(guard=guard):
+                native = subprocess.run([sys.executable, '-I', '-B', '-c', witness],
+                                        input='UNTRUSTED\n', text=True, capture_output=True, timeout=10)
+                self.assertEqual(native.returncode, 0, native.stderr)
+                self.assertEqual(json.loads(native.stdout), ['UNTRUSTED' if reached else 'fixed'])
+                self.assert_rules(source, *(('command',) if reached else ()))
+        self.assert_rules('if False and eval(input()):\n    pass\n')
+        self.assert_rules('if True and eval(input()):\n    pass\n', 'eval')
+        self.assert_rules('import os\nif input():\n    os.system(input())\n'
+                          'else:\n    eval(input())\n', 'command', 'eval')
+        for method, returned in (('__bool__', 'False'), ('__len__', '0')):
+            with self.subTest(protocol=method):
+                self.assert_rules('import os\nclass Flag:\n'
+                                  f'    def {method}(self):\n        os.system(input())\n'
+                                  f'        return {returned}\nif Flag():\n    pass\n', 'command')
+
+    def test_if_does_not_prune_using_an_unproved_string_producer(self):
+        for returned, first, second in (("'yes'", 'pass', 'code = input()'),
+                                        ("''", 'code = input()', 'pass')):
+            source = ('import os\ncode="fixed"\nclass Owned:\n'
+                      '    def __del__(self):\n        global code\n        code = input()\n'
+                      f'def flag():\n    owned = Owned()\n    return {returned}\n'
+                      f'if flag():\n    {first}\nelse:\n    {second}\nos.system(code)\n')
+            witness = ('import os,json\nobserved=[]\nos.system=observed.append\n'
+                       + f'exec({source!r})\nprint(json.dumps(observed))\n')
+            with self.subTest(returned=returned):
+                native = subprocess.run([sys.executable, '-I', '-B', '-c', witness],
+                                        input='UNTRUSTED\n', text=True, capture_output=True, timeout=10)
+                self.assertEqual(native.returncode, 0, native.stderr)
+                self.assertEqual(json.loads(native.stdout), ['UNTRUSTED'])
+                self.assert_rules(source, 'command')
+
+    def test_selected_predicate_filters_and_forwarding_obligations(self):
+        for consumer in ('any', 'all'):
+            source = (f'def selected(key, values):\n'
+                      f'    return {consumer}(value == key for value in values if value)\n'
+                      'def forward(key, values):\n    return selected(key, values)\n'
+                      "print(forward('fixed', ['', 'fixed']))\n"
+                      'import os\nos.system(input())\n')
+            with self.subTest(consumer=consumer):
+                self.assert_rules(source, 'command')
+
+    def test_good_predicate_context_does_not_discharge_unknown_or_escaped_calls(self):
+        helper = 'def selected(key, values):\n    return any(value == key for value in values)\n'
+        for suffix in ('', "selected('fixed', unknown)\n", 'opaque(selected)\n',
+                       "selected('fixed', ['fixed'])\nselected('fixed', unknown)\n",
+                       "selected('fixed', ['fixed'])\nopaque(selected)\n",
+                       "selected('fixed', ['fixed'])\nalias = selected\n",
+                       "selected('fixed', ['fixed'])\ndef factory():\n    return selected\nopaque(factory())\n"):
+            with self.subTest(suffix=suffix), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                self.scan(helper + suffix)
+
+    def test_unknown_predicate_call_keeps_independent_and_following_findings(self):
+        for invocation in ("selected('fixed', unknown)\n",
+                           "def invoke():\n    selected('fixed', unknown)\n"
+                           "    return selected('fixed', ['fixed'])\ninvoke()\n"):
+            source = ('def report():\n    from os import system as execute\n    execute(input())\n'
+                      'def selected(key, values):\n    return any(value == key for value in values)\n'
+                      "selected('fixed', ['fixed'])\n" + invocation
+                      + 'from os import system as execute\nexecute(input())\n')
+            with self.subTest(invocation=invocation):
+                engine = taint_py._Analysis(ast.parse(source))
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'proven native inputs.*incomplete') as caught:
+                    engine.analyze()
+                self.assertEqual({key[1] for key in caught.exception.effects if key[0] == 'command'},
+                                 {3, len(source.splitlines())})
+                if invocation.startswith('def'):
+                    invoked = next(function for function in engine.functions if function.name == 'invoke')
+                    self.assertTrue(engine.summaries[invoked].incomplete)
+
+    def test_predicate_native_input_proof_keeps_callback_protocols_incomplete(self):
+        cases = (
+            ('key, values', 'any(value == key for value in values)',
+             "'fixed', [Trigger()]", '__eq__(self, other)', 'return True'),
+            ('values', 'any(value for value in values)',
+             '[Trigger()]', '__bool__(self)', 'return True'),
+            ('values, ignored', 'any(value for value in values)',
+             "['fixed'], Trigger()", '__del__(self)', 'return None'),
+        )
+        for signature, expression, arguments, method, returned in cases:
+            source = ('import os\ncode="fixed"\nclass Trigger:\n'
+                      f'    def {method}:\n        global code\n        code = input()\n        {returned}\n'
+                      f'def selected({signature}):\n    return {expression}\n'
+                      f'selected({arguments})\nos.system(code)\n')
+            witness = ('import os,json\nobserved=[]\nos.system=observed.append\n'
+                       + f'exec({source!r})\nprint(json.dumps(observed))\n')
+            with self.subTest(method=method):
+                native = subprocess.run([sys.executable, '-I', '-B', '-c', witness],
+                                        input='UNTRUSTED\n', text=True, capture_output=True, timeout=10)
+                self.assertEqual(native.returncode, 0, native.stderr)
+                self.assertEqual(json.loads(native.stdout), ['UNTRUSTED'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_revoked_predicate_consumer_keeps_protocol_effects_incomplete(self):
+        for method, returned, arguments in (
+                ('__eq__(self, other)', 'True', "'fixed', [Trigger()]"),
+                ('__del__(self)', 'None', "Trigger(), ['fixed']")):
+            source = ('import os\ncode="fixed"\nclass Trigger:\n'
+                      f'    def {method}:\n        global code\n        code = input()\n'
+                      f'        return {returned}\n'
+                      'def selected(key, values):\n'
+                      '    return any(value == key for value in values)\n'
+                      'eval(input())\n'
+                      f'selected({arguments})\nos.system(code)\n')
+            witness = ('import os,json\nobserved=[]\nos.system=observed.append\n'
+                       + f'exec({source!r}, {{"eval": observed.append}})\nprint(json.dumps(observed))\n')
+            with self.subTest(method=method):
+                native = subprocess.run([sys.executable, '-I', '-B', '-c', witness],
+                                        input='UNTRUSTED\n' * 2, text=True, capture_output=True, timeout=10)
+                self.assertEqual(native.returncode, 0, native.stderr)
+                self.assertEqual(json.loads(native.stdout), ['UNTRUSTED', 'UNTRUSTED'])
+                engine = taint_py._Analysis(ast.parse(source))
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'consumer identity.*incomplete') as caught:
+                    engine.analyze()
+                self.assertIn('eval', {key[0] for key in caught.exception.effects})
+
+    def test_unused_argument_cannot_bypass_revoked_predicate_consumer(self):
+        source = ("payload = 'fixed'\n"
+                  'class Release:\n'
+                  '    def __del__(self):\n'
+                  '        global payload\n'
+                  '        payload = input()\n'
+                  'def selected(key, values, ignored):\n'
+                  '    return any(value == key for value in values)\n'
+                  "selected('fixed', ['fixed'], Release())\n"
+                  'eval(payload)\n'
+                  'eval(input())\n')
+        witness = ('import json\nobserved=[]\n'
+                   + f'exec({source!r}, {{"eval": observed.append}})\nprint(json.dumps(observed))\n')
+        native = subprocess.run([sys.executable, '-I', '-B', '-c', witness],
+                                input='UNTRUSTED\n' * 2, text=True, capture_output=True, timeout=10)
+        self.assertEqual(native.returncode, 0, native.stderr)
+        self.assertEqual(json.loads(native.stdout), ['UNTRUSTED', 'UNTRUSTED'])
+        engine = taint_py._Analysis(ast.parse(source))
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'consumer identity.*incomplete') as caught:
+            engine.analyze()
+        self.assertTrue(any(key[0] == 'eval' and key[1] == 10 for key in caught.exception.effects))
+
     def test_short_circuit_keeps_the_last_executed_write(self):
         cases = (
             ('any', "['fixed', input()]", 'fixed', False),

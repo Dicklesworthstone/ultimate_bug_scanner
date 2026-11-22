@@ -776,6 +776,49 @@ class GlobalWriteCliTests(unittest.TestCase):
         ]
         self.assert_cli_cases(cases)
 
+    def test_native_predicate_helpers_module_and_runner_json_sarif(self):
+        cases = [
+            Case('predicate_helper_true_branch_resets_taint', """
+                from os import system as execute
+                def selected(key, values):
+                    return any(value == key for value in values)
+                code = input()
+                if selected('fixed', ['fixed']):
+                    code = 'fixed'
+                execute(code)
+                """),
+            Case('predicate_helper_false_branch_keeps_taint', """
+                from os import system as execute
+                def selected(key, values):
+                    return any(value == key for value in values)
+                code = input()
+                if selected('fixed', ['other']):
+                    code = 'fixed'
+                execute(code) # expect:command
+                """),
+            Case('predicate_helper_opaque_stays_incomplete', """
+                def report():
+                    from os import system as execute
+                    execute(input()) # expect:command
+                def selected(key, values):
+                    return any(value == key for value in values)
+                selected('fixed', ['fixed'])
+                selected('fixed', unknown)
+                """),
+            Case('predicate_helper_escaped_stays_incomplete', """
+                def report():
+                    from os import system as execute
+                    execute(input()) # expect:command
+                def selected(key, values):
+                    return any(value == key for value in values)
+                selected('fixed', ['fixed'])
+                def factory():
+                    return selected
+                opaque(factory())
+                """),
+        ]
+        self.assert_cli_cases(cases)
+
     def test_first_yield_generators_module_and_runner_json_sarif(self):
         cases = [
             Case('next_preserves_first_unsafe_write', """
@@ -1275,7 +1318,9 @@ class GlobalWriteCliTests(unittest.TestCase):
                                        'join_inline_protocol_stays_incomplete',
                                        'join_custom_consumer_stays_incomplete',
                                        'join_binding_alias_stays_incomplete',
-                                       'join_binding_helper_stays_incomplete'}
+                                       'join_binding_helper_stays_incomplete',
+                                       'predicate_helper_opaque_stays_incomplete',
+                                       'predicate_helper_escaped_stays_incomplete'}
             # The full scanner also warns about eval syntax independently of
             # whether its operand is tainted. Keep those existing rules in
             # the oracle; the strong reset must remove only the taint finding.
@@ -1293,6 +1338,15 @@ class GlobalWriteCliTests(unittest.TestCase):
                                                'deleted_builtin_shadow_survives_helper_sibling_join'} else [
                 ('py.eval-exec', syntax_line),
                 ('py.security.eval-exec-usage', syntax_line)])
+            if case.name.startswith('predicate_helper_'):
+                # These controls use an imported command callable. Preserve
+                # its independent security detector in every report. That
+                # legacy rule still joins both helper-conditioned branches;
+                # only python.taint.command proves the native strong reset.
+                syntax_sites = [('py.security.command-injection', node.lineno)
+                                for node in ast.walk(ast.parse(case.source))
+                                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                                and node.func.id == 'execute']
             expected_sites = sorted([*case.expected, *syntax_sites])
             for meta in (False, True):
                 for output in ('json', 'sarif'):
@@ -1363,6 +1417,8 @@ class GlobalWriteCliTests(unittest.TestCase):
                                     actual.extend(sites)
                         if incomplete:
                             diagnostic = ('foreign module global write' if case.name == 'foreign_module_write'
+                                          else 'generator predicate helper'
+                                          if case.name.startswith('predicate_helper_')
                                           else 'generator join consumer identity is unresolved'
                                           if case.name == 'join_custom_consumer_stays_incomplete'
                                           else 'generator join receiver producer effects are unresolved'
@@ -1409,6 +1465,9 @@ class GlobalWriteCliTests(unittest.TestCase):
                                 # Refusing later dynamic execution must retain
                                 # the already observed command-injection sink.
                                 self.assertEqual(sorted(actual), case.expected, payload)
+                            if case.name.startswith('predicate_helper_'):
+                                self.assertEqual(sorted(actual), case.expected, payload)
+                                self.assertEqual(sorted(all_sites), expected_sites, payload)
                         else:
                             self.assertEqual(sorted(actual), case.expected, payload)
                             self.assertEqual(sorted(all_sites), expected_sites, payload)

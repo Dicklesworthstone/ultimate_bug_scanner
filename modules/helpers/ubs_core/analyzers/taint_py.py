@@ -1982,6 +1982,14 @@ class FunctionSummary:
     # A generic prepared-request helper must be revisited with native input
     # identities. Keep that obligation instead of inventing a clean Request.
     http_parameters: frozenset[str] = frozenset()
+    # Pure any/all helpers still need concrete iterator and value protocols.
+    # Selected native calls may discharge this obligation; an unused generic
+    # function or an escaped callable must remain explicitly incomplete.
+    generator_predicate_parameters: frozenset[str] = frozenset()
+    # An actual call with unresolved protocols must use the ordinary opaque
+    # continuation. Retain its coverage failure until the fixed point settles
+    # so independent scopes still run, without recording provisional errors.
+    generator_predicate_incomplete: bool = False
     # Final contents of written incoming cells and newly escaping cells.
     # Unlike object mutations, these may replace a value or delete its name.
     cells: tuple = ()
@@ -2110,6 +2118,8 @@ class _Flow:
         self.buffer_parameters = set()
         self.stdin_iterator_parameters = set()
         self.http_parameters = set()
+        self.generator_predicate_parameters = set()
+        self.generator_predicate_incomplete = False
         self.observed_global_writes = None
         self.deferred_generator_depth = 0
         self.materialized_generator_depth = 0
@@ -3914,6 +3924,48 @@ class _Flow:
                     return False
         return True
 
+    def generator_predicate_inputs(self, node, state, consumer):
+        """Defer only a closed, pure predicate's symbolic input protocols.
+
+        A symbolic iterable is not a native iterator, and equality/truth can
+        invoke arbitrary Python code. Keep a summary obligation until the
+        existing value-sensitive solver revisits every selected call with
+        concrete identities; never reinterpret the generic body as clean.
+        """
+        if consumer not in {'any', 'all'}:
+            return False
+        shape = self.engine.generator_predicate_shape(self.scope)
+        if shape is None or shape[0] is not node:
+            return False
+        symbolic = set()
+        for name in shape[1]:
+            binding = state.bindings.get(name)
+            self.require_value(binding)
+            choices = _binding_choices(binding)
+            if choices and all(isinstance(value, _SymbolicValue) for value in choices):
+                symbolic.update(value.parameter for value in choices)
+            elif not self.materialized_generator_binding(
+                    binding, state.references.get(name, NO_REFERENCES), state):
+                return False
+        if not symbolic:
+            return False  # Concrete inputs use ordered native consumption.
+        self.generator_predicate_parameters.update(symbolic)
+        self.expression_bindings[node] = _join_bindings(*_PREDICATE_RESULTS)
+        self.expression_references[node] = NO_REFERENCES
+        return True
+
+    def generator_predicate_frame(self, function, summary, values, references, state):
+        """Keep an exact boolean only when the entire helper frame is inert."""
+        owner = self.engine.owner(function)
+        shape = owner.generator_predicate_shape(function)
+        returned = _binding_choices(summary.returned_binding)
+        return (shape is not None and bool(returned)
+                and returned <= frozenset(_PREDICATE_RESULTS)
+                and not summary.generator_predicate_parameters
+                and owner.generator_predicate_identity(function)
+                and all(self.materialized_generator_binding(
+                    values.get(name), references.get(name, NO_REFERENCES), state) for name in shape[1]))
+
     def generator_expression_immediate(self, node, state):
         """Bound only private name lifetimes for an exact synchronous predicate."""
         consumer = self.engine.parents.get(node)
@@ -4652,7 +4704,7 @@ class _Flow:
         if isinstance(literal, ast.Constant):
             return (state, None) if bool(literal.value) else (None, state)
         binding = self.expression_bindings.get(node)
-        if isinstance(binding, _LiteralString):
+        if isinstance(binding, _LiteralString) and binding.format_safe:
             return (state, None) if binding.value else (None, state)
         if (isinstance(binding, ast.Constant)
                 and type(binding.value) in {str, bytes, int, float, complex, bool, type(None)}):
@@ -7444,6 +7496,14 @@ class _Flow:
                 else:
                     raise AnalysisLimit('HTTPX prepared-request helper requires proven native inputs; '
                                         'analysis is incomplete')
+            predicate_incomplete = summary.generator_predicate_incomplete
+            for name in summary.generator_predicate_parameters:
+                choices = _binding_choices(values.get(name))
+                if choices and all(isinstance(value, _SymbolicValue) for value in choices):
+                    self.generator_predicate_parameters.update(value.parameter for value in choices)
+                else:
+                    predicate_incomplete = True
+            self.generator_predicate_incomplete |= predicate_incomplete
             substitute = _CallSubstitution(self.substitute_trace, bound, call_name, self.engine.budget)
             for kind, line, column, label, fact in summary.effects:
                 propagated = substitute(fact)
@@ -7479,7 +7539,7 @@ class _Flow:
                                                                             ast.Lambda, _LiteralString)))
                        for name in owner.rebound_globals.intersection(delayed_globals)):
                     raise AnalysisLimit('generator live global reads require resume-state analysis; analysis is incomplete')
-            if summary.incomplete:
+            if summary.incomplete or predicate_incomplete:
                 # Resumed coroutines use an Await node, not a Call, and their
                 # values were captured at construction. Use the already bound
                 # environment without evaluating either syntax a second time.
@@ -7519,7 +7579,9 @@ class _Flow:
                     value.receiver_binding is not None or value.name in _STDIN_PARSER_CARRIERS)
                 for value in _binding_choices(summary.returned_binding) if not _http_contract(value)))
             if not format_frame_inert and isinstance(node, ast.Call):
-                format_frame_inert = self.materialized_generator_call(node, target, state)
+                format_frame_inert = (self.generator_predicate_frame(
+                    function, summary, values, references, state)
+                    or self.materialized_generator_call(node, target, state))
                 csv_return = any(isinstance(value, _CsvReader)
                     or isinstance(value, str) and value in _STDIN_CSV_PARSERS | {'csv'}
                     or isinstance(value, _BoundCallable) and (
@@ -8361,14 +8423,37 @@ class _Flow:
             )
         if isinstance(node, ast.Compare):
             self.expr(node.left, state)
+            left_binding = self.expression_bindings.get(node.left)
             self.expr(node.comparators[0], state)
+            right_binding = self.expression_bindings.get(node.comparators[0])
             for comparator in node.comparators[1:]:
                 executed = state.copy()
                 self.expr(comparator, executed)
                 state.replace(_join_states(state, executed))
+            if (self.materialized_generator_depth and len(node.ops) == 1
+                    and isinstance(node.ops[0], (ast.Eq, ast.NotEq))):
+                # Compare captured exact primitives, never an object's Python
+                # equality protocol or a name's possibly changed initializer.
+                values = []
+                for binding in (left_binding, right_binding):
+                    if isinstance(binding, _LiteralString) and binding.format_safe:
+                        self.engine.budget.spend(len(binding.value))
+                        values.append(binding.value)
+                    elif isinstance(binding, ast.Constant) and type(binding.value) in {
+                            str, bytes, int, float, complex, bool, type(None)}:
+                        values.append(binding.value)
+                if len(values) == 2:
+                    result = (values[0] == values[1]) != isinstance(node.ops[0], ast.NotEq)
+                    self.expression_bindings[node] = _PREDICATE_RESULTS[result]
             return CLEAN  # A comparison produces a bool, not executable text.
         if isinstance(node, ast.UnaryOp):
             operand = self.expr(node.operand, state)
+            if isinstance(node.op, ast.Not):
+                binding = self.expression_bindings.get(node.operand)
+                if binding is _PREDICATE_RESULTS[0]:
+                    self.expression_bindings[node] = _PREDICATE_RESULTS[1]
+                elif binding is _PREDICATE_RESULTS[1]:
+                    self.expression_bindings[node] = _PREDICATE_RESULTS[0]
             return CLEAN if isinstance(node.op, ast.Not) else operand
         if isinstance(node, ast.Name):
             return state.value(node.id)
@@ -8492,7 +8577,22 @@ class _Flow:
             # constructing a lazy generator. Inner iterations may be skipped.
             first = node.generators[0]
             consumer = self.generator_exhaustion_consumer(node, state)
+            if not consumer:
+                shape = self.engine.generator_predicate_shape(self.scope, require_all_parameters=False)
+                if shape is not None and shape[0] is node:
+                    call = self.engine.parents[node]
+                    choices = _binding_choices(self.expression_bindings.get(call.func))
+                    if (choices and choices <= {'any', 'all', 'builtins.any', 'builtins.all'}
+                            and not self.generator_expression_immediate(node, state)):
+                        # Revoked native authority is not permission to fall
+                        # back to a lazy generic summary. That path would
+                        # discard equality/truth/finalizer callbacks while
+                        # certifying an unobserved input protocol as complete.
+                        raise AnalysisLimit('generator predicate helper consumer identity is unresolved; '
+                                            'analysis is incomplete')
             if consumer:
+                if self.generator_predicate_inputs(node, state, consumer):
+                    return CLEAN
                 materialized = node
                 while (len(materialized.generators) == 1
                        and not materialized.generators[0].is_async
@@ -9073,10 +9173,18 @@ class _Flow:
             return None
         elif isinstance(node, ast.If):
             self.expr(node.test, state)
-            yes, no = state.copy(), state.copy()
-            self.refine_url_guard(node.test, yes, True)
-            self.refine_url_guard(node.test, no, False)
-            return _join_states(self.block(node.body, yes), self.block(node.orelse, no))
+            # Keep ordinary guards on their existing joined-state traversal.
+            # Only native predicate results with an inert producer frame can
+            # remove a successor; an opaque helper's nominal return cannot.
+            binding = self.expression_bindings.get(node.test)
+            yes = None if binding is _PREDICATE_RESULTS[0] else state.copy()
+            no = None if binding is _PREDICATE_RESULTS[1] else state.copy()
+            if yes is not None:
+                self.refine_url_guard(node.test, yes, True)
+            if no is not None:
+                self.refine_url_guard(node.test, no, False)
+            return _join_states(self.block(node.body, yes) if yes is not None else None,
+                                self.block(node.orelse, no) if no is not None else None)
         elif isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
             return self.loop(node, state)
         elif isinstance(node, ast.Break):
@@ -9239,11 +9347,14 @@ class _Flow:
             yielded_binding=yielded_binding,
             can_return=normal is not None,
             exceptions=tuple(exceptions),
+            incomplete=self.generator_predicate_incomplete,
             capture_globals=frozenset(self.capture_globals),
             value_parameters=frozenset(self.value_parameters),
             buffer_parameters=frozenset(self.buffer_parameters),
             stdin_iterator_parameters=frozenset(self.stdin_iterator_parameters),
             http_parameters=frozenset(self.http_parameters),
+            generator_predicate_parameters=frozenset(self.generator_predicate_parameters),
+            generator_predicate_incomplete=self.generator_predicate_incomplete,
             cells=cells,
             multiple_cells=frozenset(cell_state.cells.multiple)
             if cell_state is not None and cell_state.cells is not None else frozenset(),
@@ -9405,6 +9516,8 @@ class _Analysis:
         self.generators = set()
         self.generator_peers = (self,)
         self.generator_helper_proofs = {}
+        self.generator_predicate_shapes = {}
+        self.generator_predicate_proofs = {}
         self.generator_discard_proofs = {}
         self.generator_discard_nodes = {}
         self.generator_discard_identities = {}
@@ -9962,6 +10075,124 @@ class _Analysis:
         return (self.generator_helper_proofs[function]
                 and not any(engine.generator_attribute_writes & {'__code__', '__defaults__', '__kwdefaults__'}
                             for engine in self.generator_peers))
+
+    def generator_predicate_shape(self, function, *, require_all_parameters=True):
+        """Recognize the whole frame, including every participating argument."""
+        cache_key = (function, require_all_parameters)
+        if cache_key in self.generator_predicate_shapes:
+            return self.generator_predicate_shapes[cache_key]
+        self.generator_predicate_shapes[cache_key] = None
+        self.budget.spend()
+        if (not isinstance(function, ast.FunctionDef) or self.enclosing(function) is not self.tree
+                or function.decorator_list or function.returns is not None
+                or len(function.body) != 1 or not isinstance(function.body[0], ast.Return)):
+            return None
+        args = function.args
+        parameters = {argument.arg for argument in (*args.posonlyargs, *args.args, *args.kwonlyargs)}
+        if (args.vararg or args.kwarg or args.defaults or any(value is not None for value in args.kw_defaults)
+                or any(argument.annotation is not None
+                       for argument in (*args.posonlyargs, *args.args, *args.kwonlyargs))):
+            return None
+        call = function.body[0].value
+        if (not isinstance(call, ast.Call) or len(call.args) != 1 or call.keywords
+                or not isinstance(call.args[0], ast.GeneratorExp)):
+            return None
+        generator = call.args[0]
+        if len(generator.generators) != 1:
+            return None
+        clause = generator.generators[0]
+        if (clause.is_async or not isinstance(clause.target, ast.Name)
+                or not isinstance(clause.iter, ast.Name) or clause.iter.id not in parameters):
+            return None
+        names = {clause.iter.id}
+        pending = [generator.elt, *clause.ifs]
+        while pending:
+            value = pending.pop()
+            self.budget.spend()
+            if isinstance(value, ast.Name):
+                if value.id != clause.target.id:
+                    names.add(value.id)
+            elif isinstance(value, ast.Constant) and type(value.value) in {
+                    str, bytes, int, float, complex, bool, type(None)}:
+                continue
+            elif isinstance(value, ast.Compare) and all(isinstance(operation, (ast.Eq, ast.NotEq))
+                                                       for operation in value.ops):
+                pending.extend((value.left, *value.comparators))
+            elif isinstance(value, ast.BoolOp):
+                pending.extend(value.values)
+            elif isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.Not):
+                pending.append(value.operand)
+            else:
+                return None
+        # An ignored opaque argument could release a finalizer on return.
+        # Every frame input must therefore participate in the native proof.
+        # Refusing a revoked consumer also covers unused parameters: they
+        # cannot turn an unsafe generic frame into a safe lazy fallback.
+        # Native admission and returned-bool authority keep the strict check.
+        if not names <= parameters or require_all_parameters and names != parameters:
+            return None
+        result = (generator, frozenset(parameters))
+        self.generator_predicate_shapes[cache_key] = result
+        return result
+
+    def generator_predicate_identity(self, function):
+        """An observed native call cannot certify an escaping generic helper.
+
+        Inspect nested references and import aliases as well as the defining
+        module. A function handed to opaque code, returned from a factory or
+        exposed through an imported module still has unobserved input types.
+        """
+        if function in self.generator_predicate_proofs:
+            return self.generator_predicate_proofs[function]
+        self.generator_predicate_proofs[function] = False
+        if (not isinstance(function, ast.FunctionDef) or self.enclosing(function) is not self.tree
+                or self.generator_binders[self.tree].get(function.name) != [function]
+                or not self.generator_helper_identity(function)
+                or any(engine.generator_namespace_exposed or engine.generator_frame_exposed
+                       or engine.generator_builtin_reflection or engine.generator_literal_authority_exposed
+                       for engine in self.generator_peers)):
+            return False
+        names = {function.name}
+        imports = [node for engine in self.generator_peers for node in engine.imports]
+        changed = True
+        while changed:
+            changed = False
+            for node in imports:
+                self.budget.spend()
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                for alias in node.names:
+                    if alias.name in names and (alias.asname or alias.name) not in names:
+                        names.add(alias.asname or alias.name)
+                        changed = True
+        for engine in self.generator_peers:
+            modules = set()
+            if self.project is not None:
+                for node in engine.imports:
+                    for alias in node.names:
+                        imported = ('.'.join(filter(None, (node.module, alias.name)))
+                                    if isinstance(node, ast.ImportFrom) else alias.name)
+                        key = self.project.import_key(engine, node, imported)
+                        if key in self.project.namespaces:
+                            modules.add(alias.asname or alias.name.split('.')[0])
+            for reference in ast.walk(engine.tree):
+                self.budget.spend()
+                parent = engine.parents.get(reference)
+                if (isinstance(reference, ast.Name) and reference.id in names
+                        or isinstance(reference, ast.Attribute) and reference.attr in names):
+                    if not (isinstance(reference.ctx, ast.Load) and isinstance(parent, ast.Call)
+                            and parent.func is reference):
+                        return False
+                if isinstance(reference, ast.Name) and reference.id in modules:
+                    if not isinstance(reference.ctx, ast.Load):
+                        return False
+                    member = reference
+                    while isinstance(parent, ast.Attribute) and parent.value is member:
+                        member, parent = parent, engine.parents.get(parent)
+                    if member is reference or not isinstance(parent, ast.Call) or parent.func is not member:
+                        return False  # A namespace alias can expose this helper indirectly.
+        self.generator_predicate_proofs[function] = True
+        return True
 
     def generator_readonly_frame(self, capability):
         """Recognize unescaped stack inspection, never a writable frame map."""
@@ -10783,6 +11014,20 @@ class _Analysis:
                      if function not in qualified or not (
                          self.generator_helper_identity(function) or self.http_factory_callback(function)))
 
+    def generator_predicate_diagnostics(self):
+        """Discharge generic protocols only after native contexts complete."""
+        functions = [function for function in self.functions
+                     if self.summaries.get(function, FunctionSummary()).generator_predicate_parameters]
+        if not functions:
+            return ()
+        self.budget.spend(len(self.summaries))
+        qualified = {key[0] for key, value in self.summaries.items()
+                     if isinstance(key, tuple) and value.can_return and not value.incomplete
+                     and not value.generator_predicate_parameters}
+        reason = 'generator predicate helper has unresolved native inputs; analysis is incomplete'
+        return tuple(self.scope_diagnostic(function, reason) for function in functions
+                     if function not in qualified or not self.generator_predicate_identity(function))
+
     def http_factory_callback(self, function):
         """A closed factory callback is invoked immediately at every use.
 
@@ -11199,6 +11444,14 @@ class _Analysis:
                 diagnostics = list(self.scope_diagnostics)
                 for items in self.failed_scope_diagnostics.values():
                     diagnostics.extend(items)
+                predicate_failures = [function for function in self.functions
+                                      if self.summaries.get(function, FunctionSummary()).generator_predicate_incomplete]
+                if module.generator_predicate_incomplete:
+                    predicate_failures.append(self.tree)
+                if predicate_failures:
+                    reason = 'generator predicate helper requires proven native inputs; analysis is incomplete'
+                    problems.append(reason)
+                    diagnostics.extend(self.scope_diagnostic(scope, reason) for scope in predicate_failures)
                 if self.project is None:
                     # Selected imports may acquire concrete contexts only
                     # when their later callers run. The project settles these
@@ -11212,6 +11465,9 @@ class _Analysis:
                     http_diagnostics = self.http_diagnostics()
                     problems.extend(item['reason'] for item in http_diagnostics)
                     diagnostics.extend(http_diagnostics)
+                    predicate_diagnostics = self.generator_predicate_diagnostics()
+                    problems.extend(item['reason'] for item in predicate_diagnostics)
+                    diagnostics.extend(predicate_diagnostics)
                 if self._escaping_namespace_factory():
                     reason = 'globals mapping factory stored in an object; analysis is incomplete'
                     problems.append(reason)
@@ -11708,6 +11964,15 @@ class _Project:
             except AnalysisLimit as exc:
                 unresolved_http.append(engine.scope_diagnostic(engine.tree, str(exc)))
         diagnostics.extend(unresolved_http)
+        unresolved_predicates = []
+        for _path, _text, engine, _offset in self.sources:
+            if engine not in self.ready or engine.project is None:
+                continue
+            try:
+                unresolved_predicates.extend(engine.generator_predicate_diagnostics())
+            except AnalysisLimit as exc:
+                unresolved_predicates.append(engine.scope_diagnostic(engine.tree, str(exc)))
+        diagnostics.extend(unresolved_predicates)
         starts = [offset for _, _, _, offset in self.sources]
         indexes = {path: build_index(text, lang='python') for path, text, _, _ in self.sources}
         for (kind, line, column, label), trace in _sink_traces(effects):
@@ -11727,6 +11992,9 @@ class _Project:
         if unresolved_http:
             problems.append(f'{len(unresolved_http)} HTTP scope(s): '
                             + '; '.join(item['reason'] for item in unresolved_http[:3]))
+        if unresolved_predicates:
+            problems.append(f'{len(unresolved_predicates)} generator predicate scope(s): '
+                            + '; '.join(item['reason'] for item in unresolved_predicates[:3]))
         if self.failed_inputs:
             omitted = (f'; and {self.failed_inputs - len(self.input_failures)} more failed inputs'
                        if self.failed_inputs > len(self.input_failures) else '')

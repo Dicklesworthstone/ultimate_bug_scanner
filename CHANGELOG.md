@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Resolve selected Python helpers that return native `any`/`all` predicates
+  when their iterator and comparison inputs have proved builtin identities.
+  Preserve exact primitive equality during native consumption and predicate
+  boolean results through helper calls and ordinary `if` branches. Unproved
+  producer lifetimes retain conservative branches; unobserved inputs, callable
+  escapes and revoked native consumers
+  remain explicitly incomplete, retaining independently established findings.
+
 - Audit exact PyPI package versions from supported `uv.lock` files without
   resolving dependencies or building project packages. Check every locked
   version, including development dependencies and alternative resolution

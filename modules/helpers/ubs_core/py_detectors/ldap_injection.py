@@ -1,18 +1,10 @@
-"""ubs_core.py_detectors.ldap_injection — LDAP filter/DN injection (bead 0xjg.5).
+"""LDAP filter and DN flow with native receiver and escaping identities.
 
-Port of run_ldap_injection_checks (modules/ubs-python.sh 2833-3106): a
-taint-style ast.NodeVisitor flagging request-controlled values that reach
-directory sinks — LDAP search methods (filter as 2nd arg for search/
-paged_search, 3rd for the *_s/_ext variants, `search_filter`/`filterstr`/
-`ldap_filter` keywords, LDAPSearch constructor filter arg) and DN methods
-(add/delete/modify/rename/bind families, `dn`/`user`/`*_dn` keywords). A
-value is tainted when it roots at `request` (or `*_request`), comes from
-input()/sys.stdin, or indexes sys.argv/os.environ, unless it passes through
-a SAFE_LDAP_FUNCS sanitizer or a `.format()` over safe parts. Function
-scopes reset the taint/safe tracking, exactly like the legacy analyzer.
-
-Comment directives use shared statement ownership and rule scopes; hits
-dedupe per line within a file (legacy `seen_lines`).
+The shared Python solver owns control flow, aliases and local helper calls.
+This adapter supplies the different python-ldap/ldap3 operand contracts and
+keeps filter escaping separate from DN escaping. Opaque directory-shaped
+calls retain the legacy conservative check; only a proved non-directory
+receiver can exclude one. Sanitizer names alone never establish safety.
 """
 from __future__ import annotations
 
@@ -20,6 +12,7 @@ import ast
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.analyzers import taint_py as flow
 from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.ldap-injection"
@@ -29,32 +22,50 @@ SEVERITY = "critical"
 DESCRIPTION = ("Escape LDAP filter values with escape_filter_chars(), escape DN fragments "
                "with escape_dn_chars(), or use fixed allow-lists before LDAP operations")
 
-REQUEST_NAMES = {'request'}
-# Pattern-binding AST nodes do not exist on the supported Python 3.9 runtime.
-_NAMED_BINDINGS = (ast.ExceptHandler,) + tuple(
-    getattr(ast, name) for name in ('MatchAs', 'MatchStar') if hasattr(ast, name))
-_MAPPING_BINDINGS = tuple(
-    getattr(ast, name) for name in ('MatchMapping',) if hasattr(ast, name))
 LDAP_SEARCH_METHODS = {
     'search', 'search_s', 'search_st', 'search_ext', 'search_ext_s',
     'paged_search', 'paged_search_s', 'paged_search_ext_s',
 }
-LDAP_SECOND_ARG_FILTER_METHODS = {'search', 'paged_search'}
 LDAP_DN_METHODS = {
     'add', 'add_s', 'delete', 'delete_s', 'modify', 'modify_s',
-    'modify_dn', 'modify_dn_s', 'rename', 'rename_s', 'compare_s',
-    'simple_bind_s', 'bind_s', 'rebind', 'rebind_s',
+    'modify_dn', 'modify_dn_s', 'rename', 'rename_s', 'compare', 'compare_s',
+    'simple_bind', 'simple_bind_s', 'bind', 'bind_s', 'rebind', 'rebind_s',
 }
-LDAP_CONSTRUCTORS = {'LDAPSearch', 'django_auth_ldap.config.LDAPSearch'}
-FILTER_KEYWORDS = {'search_filter', 'filterstr', 'ldap_filter'}
-DN_KEYWORDS = {'dn', 'user', 'user_dn', 'bind_dn', 'base_dn'}
-SAFE_LDAP_FUNCS = {
-    'escape_filter_chars', 'ldap.filter.escape_filter_chars',
-    'escape_dn_chars', 'ldap.dn.escape_dn_chars',
-    'validate_ldap_filter_value', 'validate_ldap_dn_value',
-    'sanitize_ldap_filter_value', 'sanitize_ldap_dn_value',
-    'allowlisted_ldap_value', 'allowlisted_ldap_dn',
+_SINK_METHODS = LDAP_SEARCH_METHODS | LDAP_DN_METHODS
+_FILTER, _DN, _RESET = 'ldap:filter', 'ldap:dn', 'ldap:reset'
+_PROOFS = frozenset({_FILTER, _DN})
+_IMPORT, _MODULE_REF = '@ldap-import:', '@ldap-module:'
+_CONNECTION, _METHOD, _SET = '@ldap-connection:', '@ldap-method:', '@ldap-builtin:set'
+_SET_FACTORY = '@ldap-builtin:set-constructor'
+_UNKNOWN_INSTANCE = '@ldap-instance:unproved'
+_CHANGED_RECEIVER = '@ldap-receiver:changed'
+_EXTEND, _STANDARD = '@ldap3-extension:extend', '@ldap3-extension:standard'
+_MODULES = {
+    'ldap', 'ldap.filter', 'ldap.dn', 'ldap.ldapobject',
+    'ldap3', 'ldap3.core', 'ldap3.core.connection', 'ldap3.utils',
+    'ldap3.utils.conv', 'ldap3.utils.dn', 'django_auth_ldap', 'django_auth_ldap.config',
 }
+_FACTORIES = {
+    'ldap.initialize': 'python-ldap', 'ldap.open': 'python-ldap',
+    'ldap.ldapobject.LDAPObject': 'python-ldap',
+    'ldap.ldapobject.ReconnectLDAPObject': 'python-ldap',
+    'ldap3.Connection': 'ldap3', 'ldap3.core.connection.Connection': 'ldap3',
+}
+_CONNECTION_CLASSES = frozenset({
+    'ldap.ldapobject.LDAPObject', 'ldap.ldapobject.ReconnectLDAPObject',
+    'ldap3.Connection', 'ldap3.core.connection.Connection',
+})
+_ENCODERS = {
+    'ldap.filter.escape_filter_chars': _FILTER,
+    'ldap.dn.escape_dn_chars': _DN,
+    'ldap3.utils.conv.escape_filter_chars': _FILTER,
+    'ldap3.utils.dn.escape_rdn': _DN,
+}
+_FILTER_FORMAT = 'ldap.filter.filter_format'
+_SEARCH_CONSTRUCTOR = 'django_auth_ldap.config.LDAPSearch'
+_KNOWN_IMPORTS = _MODULES | set(_FACTORIES) | set(_ENCODERS) | {_FILTER_FORMAT, _SEARCH_CONSTRUCTOR}
+_LOCAL_CALLABLES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                    flow._BoundClassMethod, flow._FunctionValue, flow._ClosureValue)
 
 
 def _call_name(node):
@@ -70,273 +81,581 @@ def _call_name(node):
     return ''
 
 
-def _source_line(lines, line_no):
-    idx = line_no - 1
-    if 0 <= idx < len(lines):
-        return lines[idx].strip()
-    return ''
+def _source_line(lines, line):
+    return lines[line - 1].strip() if 0 < line <= len(lines) else ''
 
 
-def _target_names(target):
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names = []
-        for elt in target.elts:
-            names.extend(_target_names(elt))
-        return names
-    return []
-
-
-def _rooted_at_request(node):
-    if isinstance(node, ast.Name):
-        return node.id in REQUEST_NAMES or node.id.endswith('_request')
-    if isinstance(node, ast.Attribute):
-        return _rooted_at_request(node.value)
-    if isinstance(node, ast.Call):
-        return _rooted_at_request(node.func)
-    if isinstance(node, ast.Subscript):
-        return _rooted_at_request(node.value)
-    return False
-
-
-def _direct_untrusted_source(node):
+def _request_source(node):
     name = _call_name(node)
-    if _rooted_at_request(node):
-        return True
-    if isinstance(node, ast.Call) and name in {'input', 'sys.stdin.read', 'sys.stdin.readline'}:
-        return True
-    if isinstance(node, ast.Subscript) and _call_name(node.value) in {'sys.argv', 'os.environ'}:
-        return True
-    return False
+    root = name.split('.', 1)[0]
+    return name if root == 'request' or root.endswith('_request') else None
 
 
-def _keyword_values(node, names):
-    return [keyword.value for keyword in getattr(node, 'keywords', []) if keyword.arg in names]
+def _has_sink(tree):
+    # A saved method still contains its original attribute read. Keep the
+    # prefilter syntactic and broad, before the semantic receiver proof.
+    return any(isinstance(node, ast.Attribute) and node.attr in _SINK_METHODS
+               or isinstance(node, ast.Name) and node.id in _SINK_METHODS | {'LDAPSearch'}
+               or isinstance(node, ast.ImportFrom) and any(alias.name == 'LDAPSearch' for alias in node.names)
+               for node in ast.walk(tree))
 
 
-class _LDAPInjectionAnalyzer(ast.NodeVisitor):
-    def __init__(self, lines, tree, suppressions):
-        self.lines = lines
-        self.suppressions = suppressions
-        self.tainted_values = set()
-        self.safe_values = set()
-        self.issue_lines = []
-        self.seen_lines = set()
-        self.set_receivers = set()
+def _prove(fact, domain):
+    # Escaping for another grammar cannot preserve a prior grammar's proof:
+    # DN escaping adds backslashes that a filter parser interprets differently.
+    return frozenset(flow.TaintTrace(t.source, t.parameter,
+                                    (t.sanitizers - _PROOFS) | {domain, _RESET}, t.path) for t in fact)
+
+
+def _revoke(fact):
+    return frozenset(flow.TaintTrace(t.source, t.parameter,
+                                    (t.sanitizers - _PROOFS) | {_RESET}, t.path) for t in fact)
+
+
+def _import_name(binding):
+    if isinstance(binding, flow._BoundCallable):
+        binding = binding.name
+    return binding[len(_IMPORT):] if isinstance(binding, str) and binding.startswith(_IMPORT) else None
+
+
+def _native_class_method(binding):
+    imported = _import_name(binding)
+    owner, _, method = (imported or '').rpartition('.')
+    if owner in _CONNECTION_CLASSES and method in _SINK_METHODS:
+        return _FACTORIES[owner], method
+    return None
+
+
+def _module_refs(binding):
+    return frozenset(_MODULE_REF + name for choice in flow._binding_choices(binding)
+                     if (name := _import_name(choice)) in _MODULES)
+
+
+def _native_receiver(binding):
+    return isinstance(binding, str) and (binding.startswith(_CONNECTION) or binding in {_EXTEND, _STANDARD})
+
+
+class _ReceiverProof:
+    """Small structural proof for builtin sets, including owned fields.
+
+    Flow-sensitive local aliases and rebindings are handled by the solver.
+    Reflective namespace writes invalidate the builtin proof. Instance field
+    exclusion is narrower: one unconditional constructor assignment, no
+    alternate field stores, and no custom attribute protocol or inheritance.
+    No receiver spelling such as ``items`` or ``parameters`` is trusted.
+    """
+    def __init__(self, engine):
+        self.engine = engine
+        tree = engine.tree
         nodes = tuple(ast.walk(tree))
-        self.external_names = {name for node in nodes if isinstance(node, (ast.Global, ast.Nonlocal))
-                               for name in node.names}
-        self.dynamic_names = any(
-            isinstance(node, ast.Name) and node.id in {
-                'globals', 'locals', 'vars', 'exec', 'eval', '__builtins__', 'currentframe', '_getframe'}
-            or isinstance(node, ast.Attribute) and node.attr in {
-                'f_locals', 'f_globals', '__dict__', '__globals__', '__closure__',
-                'cell_contents', 'currentframe', '_getframe'}
-            or isinstance(node, ast.ImportFrom) and any(
-                alias.name in {'currentframe', '_getframe'} for alias in node.names)
-            for node in nodes)
-        self.builtin_set = not self.dynamic_names and 'set' not in self.external_names
+        parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
+        self.class_locals = {node: flow._local_names(node) for node in nodes if isinstance(node, ast.ClassDef)}
+        attribute_writes = {node.attr for node in nodes if isinstance(node, ast.Attribute)
+                            and isinstance(node.ctx, (ast.Store, ast.Del))}
+        readonly_vars = set()
         for node in nodes:
-            if (isinstance(node, ast.Name) and node.id == 'set' and isinstance(node.ctx, (ast.Store, ast.Del))
-                    or isinstance(node, ast.arg) and node.arg == 'set'
-                    or isinstance(node, _NAMED_BINDINGS) and node.name == 'set'
-                    or isinstance(node, _MAPPING_BINDINGS) and node.rest == 'set'
-                    or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == 'set'
-                    or isinstance(node, ast.Attribute) and node.attr == 'set' and isinstance(node.ctx, (ast.Store, ast.Del))
-                    or isinstance(node, ast.Call) and _call_name(node.func).rsplit('.', 1)[-1] in {
-                        'setattr', 'delattr', '__setattr__', '__delattr__'}):
-                self.builtin_set = False
-            if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-                    (alias.asname or alias.name.split('.')[0]) == 'set' or alias.name == '*'
-                    for alias in node.names):
-                self.builtin_set = False
-
-    def local_set_receivers(self, function):
-        """Prove builtin set identity, never infer LDAP safety from a name.
-
-        A single function-local binding cannot change type through an alias.
-        Rebindings, parameters, deferred nonlocal writes and frame reflection
-        invalidate that proof. Constructor shadowing affects set(), while a
-        set display intrinsically constructs the builtin type.
-        """
-        if self.dynamic_names:
-            return set()
-        arguments = [*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs]
-        arguments += [arg for arg in (function.args.vararg, function.args.kwarg) if arg is not None]
-        counts = {argument.arg: 1 for argument in arguments}
-        candidates, pending = set(), list(function.body)
-        while pending:
-            node = pending.pop()
-            names = []
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                counts[node.name] = counts.get(node.name, 0) + 1
-                if isinstance(node, ast.ClassDef):
-                    pending.extend([*node.decorator_list, *node.bases, *node.keywords])
-                else:
-                    pending.extend([*node.decorator_list, *node.args.defaults,
-                                    *(value for value in node.args.kw_defaults if value is not None)])
-                    pending.extend(argument.annotation for argument in
-                                   [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
-                                    *(arg for arg in (node.args.vararg, node.args.kwarg) if arg is not None)]
-                                   if argument.annotation is not None)
-                    if node.returns is not None:
-                        pending.append(node.returns)
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'vars'
+                    and len(node.args) == 1 and not node.keywords and isinstance(node.args[0], ast.Name)):
                 continue
-            if isinstance(node, ast.Lambda):
-                pending.extend([*node.args.defaults, *(value for value in node.args.kw_defaults if value is not None)])
+            scope = node
+            while scope not in engine.locals and scope not in self.class_locals:
+                scope = parents.get(scope)
+            member, call = parents.get(node), parents.get(parents.get(node))
+            if ('vars' not in attribute_writes and self.builtin_visible('vars', scope)
+                    and self.builtins_module(node.args[0].id, scope)
+                    and isinstance(member, ast.Attribute) and member.attr == 'items'
+                    and isinstance(call, ast.Call) and call.func is member and not call.args and not call.keywords):
+                readonly_vars.add(node)
+        self.reflection = any(
+            isinstance(node, ast.Name) and node.id in {
+                'globals', 'locals', 'exec', 'eval', '__builtins__', 'currentframe', '_getframe'}
+            or isinstance(node, ast.Name) and node.id == 'vars' and parents.get(node) not in readonly_vars
+            or isinstance(node, ast.Attribute) and node.attr in {
+                'f_locals', 'f_globals', '__dict__', '__globals__', '__closure__', 'currentframe', '_getframe'}
+            or isinstance(node, ast.Attribute) and node.attr == 'cell_contents'
+            and not (isinstance(node.ctx, ast.Load) and isinstance(parents.get(node), ast.Call)
+                     and parents[node].func is node)
+            for node in nodes)
+        reflected_fields = set()
+        for node in nodes:
+            if not isinstance(node, ast.Call):
                 continue
-            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-                names.append(node.id)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                names.extend(alias.asname or alias.name.split('.')[0] for alias in node.names)
-            elif isinstance(node, _NAMED_BINDINGS) and node.name:
-                names.append(node.name)
-            elif isinstance(node, _MAPPING_BINDINGS) and node.rest:
-                names.append(node.rest)
-            for name in names:
-                counts[name] = counts.get(name, 0) + 1
-            target = node.targets[0] if isinstance(node, ast.Assign) and len(node.targets) == 1 else (
-                node.target if isinstance(node, ast.AnnAssign) else None)
-            if isinstance(target, ast.Name):
-                value = node.value
-                if (isinstance(value, (ast.Set, ast.SetComp))
-                        or self.builtin_set and isinstance(value, ast.Call)
-                        and isinstance(value.func, ast.Name) and value.func.id == 'set'):
-                    candidates.add(target.id)
-            pending.extend(ast.iter_child_nodes(node))
-        return {name for name in candidates if counts.get(name) == 1 and name not in self.external_names}
-
-    def remember_issue(self, line_no):
-        if self.suppressions.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
-            return
-        self.seen_lines.add(line_no)
-        self.issue_lines.append(line_no)
-
-    def expr_is_safe_ldap(self, node):
-        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes, int, float, bool, type(None))):
-            return True
-        if isinstance(node, ast.Name):
-            return node.id in self.safe_values
-        if isinstance(node, ast.Call):
             name = _call_name(node.func)
-            short = name.rsplit('.', 1)[-1]
-            if name in SAFE_LDAP_FUNCS or short in SAFE_LDAP_FUNCS:
-                return True
-            if isinstance(node.func, ast.Attribute) and node.func.attr == 'format':
-                return self.expr_is_safe_ldap(node.func.value) and all(
-                    self.expr_is_safe_ldap(arg) for arg in node.args
-                ) and all(self.expr_is_safe_ldap(keyword.value) for keyword in node.keywords)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-            return self.expr_is_safe_ldap(node.left) and self.expr_is_safe_ldap(node.right)
-        if isinstance(node, ast.JoinedStr):
-            for value in node.values:
-                if isinstance(value, ast.Constant):
-                    continue
-                if isinstance(value, ast.FormattedValue) and self.expr_is_safe_ldap(value.value):
-                    continue
+            leaf = name.rsplit('.', 1)[-1]
+            if leaf not in {'setattr', 'delattr', '__setattr__', '__delattr__'}:
+                continue
+            position = 1 if leaf in {'setattr', 'delattr'} or name.startswith('object.') else 0
+            attribute = node.args[position] if position < len(node.args) else None
+            reflected_fields.update(self.attribute_names(attribute, node, parents))
+        self.reflection |= 'vars' in reflected_fields
+        factory_shadowed = bool({None, 'set'} & reflected_fields) or any(
+            isinstance(node, ast.Attribute) and node.attr == 'set' and isinstance(node.ctx, (ast.Store, ast.Del))
+            or isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+                alias.name == '*' for alias in node.names)
+            for node in nodes)
+        self.builtin_set = not self.reflection and not factory_shadowed
+        self.fields = {}
+        # A method named cell_contents or a read-only vars(builtins) inventory
+        # is not a write to an instance field. Still reject real namespace
+        # mutation/escape before using the narrower constructor-field proof.
+        field_reflection = None in reflected_fields or self.reflection
+        if field_reflection:
+            return
+        writes = {}
+        for node in nodes:
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                writes.setdefault(node.attr, []).append(node)
+        for owner in (node for node in nodes if isinstance(node, ast.ClassDef)):
+            methods = [node for node in owner.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+            if (owner.bases or owner.keywords or owner.decorator_list
+                    or any(method.name in {'__getattr__', '__getattribute__', '__setattr__', '__delattr__'}
+                           for method in methods)
+                    or any(not isinstance(decorator, ast.Name)
+                           or decorator.id not in {'staticmethod', 'classmethod'}
+                           or not self.builtin_visible(decorator.id, owner)
+                           or decorator.id in reflected_fields | attribute_writes
+                           for method in methods for decorator in method.decorator_list)):
+                continue
+            init = next((method for method in methods if method.name == '__init__'), None)
+            if init is None or init.decorator_list or not init.args.args:
+                continue
+            receiver = init.args.args[0].arg
+            # Passing or returning the complete instance can expose its
+            # fields to an opaque mutator. Direct attribute reads/calls alone
+            # cannot replace a builtin set's identity.
+            instance_methods = [method for method in methods if method.args.args and not method.decorator_list]
+            escapes = {method: [node for node in ast.walk(method)
+                               if isinstance(node, ast.Name) and node.id == method.args.args[0].arg
+                               and (not isinstance(node.ctx, ast.Load)
+                                    or not isinstance(parents.get(node), ast.Attribute)
+                                    or parents[node].value is not node)]
+                       for method in instance_methods}
+            # An earlier escape retains aliases after a later assignment.
+            # An ordinary method may also expose self transitively. Until the
+            # shared heap proves those lifetimes, retain the conservative
+            # directory-shaped finding for every field of that class.
+            if any(escapes.values()):
+                continue
+            fields = set()
+            for statement in init.body:
+                target = (statement.targets[0] if isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                          else statement.target if isinstance(statement, ast.AnnAssign) else None)
+                if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                        and target.value.id == receiver
+                        and writes.get(target.attr) == [target]
+                        and target.attr not in reflected_fields
+                        and (isinstance(statement.value, (ast.Set, ast.SetComp))
+                             or self.builtin_set and self.builtin_visible('set', init)
+                             and isinstance(statement.value, ast.Call) and isinstance(statement.value.func, ast.Name)
+                             and statement.value.func.id == 'set')):
+                    fields.add(target.attr)
+            for method in instance_methods:
+                self.fields[method] = (method.args.args[0].arg, fields)
+
+    @staticmethod
+    def attribute_names(attribute, call, parents):
+        if isinstance(attribute, ast.Constant) and isinstance(attribute.value, str):
+            return {attribute.value}
+        if not isinstance(attribute, ast.Name):
+            return {None}
+        # A finite literal loop writes exactly its enumerated names. Rebinding
+        # the iterator variable inside that loop destroys the proof; arbitrary
+        # expressions and unknown iterables remain namespace-wide mutations.
+        owner = parents.get(call)
+        while owner is not None and not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if (isinstance(owner, ast.For) and isinstance(owner.target, ast.Name)
+                    and owner.target.id == attribute.id):
+                if not (isinstance(owner.iter, (ast.Tuple, ast.List))
+                        and all(isinstance(value, ast.Constant) and isinstance(value.value, str)
+                                for value in owner.iter.elts)):
+                    return {None}
+                for node in ast.walk(owner):
+                    if node is owner.target:
+                        continue
+                    if (isinstance(node, ast.Name) and node.id == attribute.id and isinstance(node.ctx, (ast.Store, ast.Del))
+                            or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler))
+                            and node.name == attribute.id
+                            or isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+                                (alias.asname or alias.name.split('.')[0]) == attribute.id for alias in node.names)
+                            or flow._pattern_capture(node) == attribute.id):
+                        return {None}
+                return {value.value for value in owner.iter.elts}
+            owner = parents.get(owner)
+        return {None}
+
+    def lexical_scopes(self, scope):
+        first = True
+        while scope is not None:
+            if first or not isinstance(scope, ast.ClassDef):
+                yield scope
+            first = False
+            scope = self.engine.enclosing(scope)
+
+    def builtin_visible(self, name, scope):
+        for owner in self.lexical_scopes(scope):
+            if name in self.engine.locals.get(owner, self.class_locals.get(owner, ())):
                 return False
-            return True
+            if name in self.engine.declared_globals.get(owner, ()):
+                return name not in self.engine.global_names
+        return True
+
+    def builtins_module(self, name, scope):
+        for owner in self.lexical_scopes(scope):
+            if name not in self.engine.locals.get(owner, self.class_locals.get(owner, ())):
+                continue
+            binders = self.engine.generator_binders.get(owner, {}).get(name, ())
+            return (len(binders) == 1 and isinstance(binders[0], ast.Import)
+                    and any(alias.name == 'builtins' and (alias.asname or alias.name) == name
+                            for alias in binders[0].names))
         return False
 
-    def expr_contains_taint(self, node):
-        if self.expr_is_safe_ldap(node):
-            return False
+    def owned_set(self, scope, node):
+        receiver, fields = self.fields.get(scope, (None, ()))
+        return (isinstance(node, ast.Attribute) and node.attr in fields
+                and isinstance(node.value, ast.Name) and node.value.id == receiver)
+
+
+class _LDAPFlow(flow._Flow):
+    @staticmethod
+    def substitute_trace(trace, actual, call_name):
+        if trace.parameter is None:
+            return frozenset({trace})
+        if _RESET in trace.sanitizers:
+            actual = _revoke(actual)
+        for sanitizer in trace.sanitizers - {_RESET}:
+            actual = flow._sanitize(actual, sanitizer)
+        steps = trace.path[1:] if trace.parameter.startswith('@') else trace.path
+        return flow._advance(actual, call_name, *steps)
+
+    @staticmethod
+    def incomplete_result(fact):
+        return _revoke(flow._Flow.incomplete_result(fact))
+
+    def effect(self, kind, node, label, fact):
+        if kind in {'ldap-filter', 'ldap-dn'} and fact:
+            key = (kind, node.lineno, node.col_offset + 1, label)
+            self.effects[key] = flow.join_facts(self.effects.get(key, flow.CLEAN), fact)
+
+    def _lookup_refs(self, references, key):
+        if isinstance(key, str) and key.startswith(_MODULE_REF):
+            return frozenset({key})
+        return super()._lookup_refs(references, key)
+
+    def mutate(self, references, fact, state):
+        super().mutate(references, fact, state)
+        module_refs = frozenset(ref for ref in references
+                                if isinstance(ref, str) and ref.startswith(_MODULE_REF))
+        if not module_refs:
+            return
+        local = self.engine.locals.get(self.scope, set())
+        changed_globals = set(self.context_globals)
+        for name in set(state.bindings) | set(self.engine.globals.bindings):
+            binding = state.bindings.get(name, self.engine.globals.bindings.get(name))
+            refs = _module_refs(binding) | state.references.get(name, flow.NO_REFERENCES)
+            if not refs & module_refs:
+                continue
+            choices = [None if _import_name(choice) in _MODULES else choice
+                       for choice in flow._binding_choices(binding)]
+            if name not in local and name in self.engine.global_symbols:
+                value, global_refs, _binding = self.engine.global_symbols[name]
+                state.setdefault(name, value)
+                state.references[name] = refs | global_refs
+                changed_globals.add(name)
+            self.write_name(state, name, state.get(name, flow.CLEAN), flow._join_bindings(*choices),
+                            state.references.get(name, flow.NO_REFERENCES))
+        self.context_globals = tuple(sorted(changed_globals))
+
+    def statement(self, node, state):
+        if isinstance(node, ast.ImportFrom) and any(alias.name == '*' for alias in node.names):
+            for name, binding in tuple(state.bindings.items()):
+                replacement = flow._join_bindings(*(
+                    None if _import_name(choice) else choice for choice in flow._binding_choices(binding)))
+                self.write_name(state, name, state.get(name, flow.CLEAN), replacement,
+                                state.references.get(name, flow.NO_REFERENCES))
+            return state
+        result = super().statement(node, state)
+        if result is not None and isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                local = alias.asname or alias.name.split('.')[0]
+                name = (f'{node.module}.{alias.name}' if isinstance(node, ast.ImportFrom)
+                        else alias.name if alias.asname else local)
+                if name in _KNOWN_IMPORTS and not getattr(node, 'level', 0):
+                    refs = frozenset({_MODULE_REF + name}) if name in _MODULES else flow.NO_REFERENCES
+                    owner = name.rsplit('.', 1)[0]
+                    invalid = _MODULE_REF + name in state.mutated or _MODULE_REF + owner in state.mutated
+                    self.write_name(result, local, result.get(local, flow.CLEAN),
+                                    None if invalid else _IMPORT + name, refs)
+        return result
+
+    def source(self, node, state, candidate=None):
+        fact = super().source(node, state, candidate)
+        name = candidate or _call_name(node)
+        request = _request_source(node)
+        if request and isinstance(node, (ast.Attribute, ast.Subscript, ast.Call)):
+            fact = flow.join_facts(fact, frozenset({flow.TaintTrace(request, path=(request,))}))
+        if isinstance(node, ast.Call) and name.rstrip('(') in {'sys.stdin.read', 'sys.stdin.readline'}:
+            return flow.join_facts(fact, frozenset({flow.TaintTrace(name, path=(name,))}))
+        return fact
+
+    def expr(self, node, state):
+        if node is None or not state.reachable:
+            return flow.CLEAN
+        fact = super().expr(node, state)
+        binding = self.expression_bindings.get(node)
         if isinstance(node, ast.Name):
-            return node.id in self.tainted_values
-        if _direct_untrusted_source(node):
-            return True
-        return any(self.expr_contains_taint(child) for child in ast.iter_child_nodes(node))
+            if (node.id == 'set' and self.engine.receiver_proof.builtin_set
+                    and self.engine.receiver_proof.builtin_visible('set', self.scope)):
+                binding = _SET_FACTORY
+            refs = self.expression_references.get(node, flow.NO_REFERENCES) | _module_refs(binding)
+            self.expression_references[node] = refs
+            if refs & state.mutated:
+                binding = flow._join_bindings(*(
+                    None if _import_name(choice) in _MODULES else
+                    _CHANGED_RECEIVER if _native_receiver(choice) else choice
+                    for choice in flow._binding_choices(binding)))
+            if _request_source(node) and any(choice is None or isinstance(choice, flow._SymbolicValue)
+                                            for choice in flow._binding_choices(binding)):
+                fact = flow.join_facts(fact, frozenset({flow.TaintTrace(node.id, path=(node.id,))}))
+        elif isinstance(node, ast.Attribute):
+            parent_binding = self.expression_bindings.get(node.value)
+            if node.attr in _SINK_METHODS:
+                self.require_value(parent_binding)
+            choices = []
+            refs = self.expression_references.get(node.value, flow.NO_REFERENCES)
+            for parent in flow._binding_choices(parent_binding):
+                imported = _import_name(parent)
+                if imported is not None:
+                    choices.append(None if refs & state.mutated else _IMPORT + f'{imported}.{node.attr}')
+                elif parent == _CHANGED_RECEIVER:
+                    choices.append(flow._BoundCallable(_CHANGED_RECEIVER + '.' + node.attr, refs,
+                        self.expression_facts.get(node.value, flow.CLEAN), True))
+                elif parent == _CONNECTION + 'ldap3' and node.attr == 'extend':
+                    choices.append(_EXTEND)
+                elif parent == _EXTEND and node.attr == 'standard':
+                    choices.append(_STANDARD)
+                elif parent == _STANDARD and node.attr == 'paged_search':
+                    choices.append(flow._BoundCallable(_METHOD + 'ldap3:paged_search', refs,
+                        self.expression_facts.get(node.value, flow.CLEAN), True, receiver_binding=parent))
+                elif isinstance(parent, str) and parent.startswith(_CONNECTION):
+                    choices.append(flow._BoundCallable(_METHOD + parent[len(_CONNECTION):] + ':' + node.attr,
+                        refs, self.expression_facts.get(node.value, flow.CLEAN), True, receiver_binding=parent))
+                elif parent == _SET:
+                    choices.append(flow._BoundCallable(_SET + '.' + node.attr, refs,
+                        self.expression_facts.get(node.value, flow.CLEAN), True, receiver_binding=_SET))
+                else:
+                    choices.extend(None if _import_name(choice) else choice
+                                   for choice in flow._binding_choices(binding))
+            binding = flow._join_bindings(*choices)
+            module_refs = _module_refs(binding)
+            if module_refs:
+                self.expression_references[node] = refs | module_refs
+            elif all(_import_name(choice) in set(_ENCODERS) | {_FILTER_FORMAT}
+                     for choice in flow._binding_choices(binding)):
+                self.expression_references[node] = flow.NO_REFERENCES
+        owned_set = self.engine.receiver_proof.owned_set(self.scope, node)
+        if owned_set:
+            receiver_binding = self.expression_bindings.get(node.value)
+            self.require_value(receiver_binding)
+            receiver_name = self.engine.receiver_proof.fields[self.scope][0]
+            owned_set = all(isinstance(choice, flow._SymbolicValue) and choice.parameter == receiver_name
+                            for choice in flow._binding_choices(receiver_binding))
+        if (isinstance(node, (ast.Set, ast.SetComp)) and not self.engine.receiver_proof.reflection) or owned_set:
+            binding = _SET
+        self.expression_bindings[node] = binding
+        self.expression_facts[node] = fact
+        return fact
 
-    def mark_assignment(self, names, value):
-        is_safe = self.expr_is_safe_ldap(value)
-        is_tainted = (not is_safe) and self.expr_contains_taint(value)
-        for name in names:
-            if is_safe:
-                self.safe_values.add(name)
-            else:
-                self.safe_values.discard(name)
-            if is_tainted:
-                self.tainted_values.add(name)
-            else:
-                self.tainted_values.discard(name)
+    def expression(self, node, state):
+        fact = super().expression(node, state)
+        # Field-insensitive provenance cannot prove another selected member.
+        # Per-source proofs keep fresh components visible in compositions.
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
+            return _revoke(fact)
+        if isinstance(node, ast.BinOp) and not isinstance(node.op, (ast.Add, ast.Mod)):
+            return _revoke(fact)
+        return fact
 
-    def visit_FunctionDef(self, node):
-        old_safe = set(self.safe_values)
-        old_tainted = set(self.tainted_values)
-        old_sets, self.set_receivers = self.set_receivers, self.local_set_receivers(node)
-        self.safe_values.clear()
-        self.tainted_values.clear()
-        for stmt in node.body:
-            self.visit(stmt)
-        self.safe_values = old_safe
-        self.tainted_values = old_tainted
-        self.set_receivers = old_sets
+    def assign(self, target, fact, state, value=None, *, target_references=None, deleting=False):
+        if isinstance(target, ast.Attribute):
+            if target_references is None:
+                self.expr(target.value, state)
+                target_references = self.expression_references.get(target.value, flow.NO_REFERENCES)
+            binding = self.expression_bindings.get(target.value)
+            self.require_value(binding)
+            if any(_native_receiver(choice) or _import_name(choice) in _FACTORIES
+                   for choice in flow._binding_choices(binding)):
+                raise flow.AnalysisLimit('native LDAP receiver or class mutation is unresolved; analysis is incomplete')
+        super().assign(target, fact, state, value, target_references=target_references, deleting=deleting)
 
-    def visit_AsyncFunctionDef(self, node):
-        self.visit_FunctionDef(node)
+    def _operands(self, node, inputs, state, positions, names):
+        actual = self.call_positions(node, inputs.arguments, state)
+        selected = [actual[index][1] for index in positions if index < len(actual)]
+        selected.extend(inputs.keywords.get(name, flow.CLEAN) for name in names)
+        if any(isinstance(expression, (ast.Starred, flow._ArgumentExpansion))
+               for expression, _fact, _binding, _refs in actual):
+            # Unknown expansion may shift an argument into a sensitive slot.
+            selected.extend(fact for _expression, fact, _binding, _refs in actual)
+        selected.append(inputs.keywords.get(None, flow.CLEAN))
+        return flow.join_facts(*selected)
 
-    def visit_Assign(self, node):
-        names = [name for target in node.targets for name in _target_names(target)]
-        if names:
-            self.mark_assignment(names, node.value)
-        self.generic_visit(node)
+    def _sinks(self, node, state, target, name, inputs):
+        if name.startswith(_CHANGED_RECEIVER):
+            raise flow.AnalysisLimit('native LDAP receiver escaped before use; analysis is incomplete')
+        if isinstance(target, _LOCAL_CALLABLES) or name.startswith(_SET + '.'):
+            return
+        flavor, receiver_offset = None, 0
+        unbound = _native_class_method(target)
+        if name.startswith(_METHOD):
+            flavor, short = name[len(_METHOD):].split(':', 1)
+        elif unbound is not None:
+            # A class-qualified or saved unbound function still has its
+            # native API signature. Its explicit self precedes positional
+            # operands; keyword names keep their ordinary meaning.
+            flavor, short = unbound
+            receiver_offset = 1
+        else:
+            short = node.func.attr if isinstance(node.func, ast.Attribute) else name.rsplit('.', 1)[-1]
+        if short in LDAP_SEARCH_METHODS:
+            # python-ldap: (base, scope, filterstr). ldap3: (base, filter,
+            # scope). Both have a DN operand independent of the filter.
+            filter_position = 2 if flavor == 'python-ldap' or short not in {'search', 'paged_search'} else 1
+            filter_names = {'filterstr'} if flavor == 'python-ldap' else {'search_filter'} if flavor == 'ldap3' else {
+                'search_filter', 'filterstr', 'ldap_filter'}
+            base_names = {'base'} if flavor == 'python-ldap' else {'search_base'} if flavor == 'ldap3' else {
+                'base', 'base_dn', 'search_base'}
+            self.effect('ldap-filter', node, 'LDAP filter', self._operands(
+                node, inputs, state, (filter_position + receiver_offset,), filter_names))
+            self.effect('ldap-dn', node, 'LDAP search base', self._operands(
+                node, inputs, state, (receiver_offset,), base_names))
+        if short in LDAP_DN_METHODS:
+            positions = (0,)
+            names = {'dn', 'user', 'user_dn', 'bind_dn', 'base_dn'}
+            if short in {'modify_dn', 'modify_dn_s'}:
+                positions = (0, 1, 3)
+                names |= {'relative_dn', 'new_superior'}
+            elif short in {'rename', 'rename_s'}:
+                positions = (0, 1, 2)
+                names |= {'newrdn', 'newsuperior'}
+            self.effect('ldap-dn', node, 'LDAP distinguished name', self._operands(
+                node, inputs, state, tuple(index + receiver_offset for index in positions), names))
+        if _import_name(target) == _SEARCH_CONSTRUCTOR or short == 'LDAPSearch':
+            self.effect('ldap-filter', node, 'LDAPSearch filter', self._operands(
+                node, inputs, state, (2,), {'filterstr'}))
+            self.effect('ldap-dn', node, 'LDAPSearch base', self._operands(
+                node, inputs, state, (0,), {'base_dn'}))
 
-    def visit_AnnAssign(self, node):
-        if node.value is not None:
-            names = _target_names(node.target)
-            if names:
-                self.mark_assignment(names, node.value)
-        self.generic_visit(node)
+    def invoke(self, node, state, callee, inputs, *, resumed=None):
+        if resumed is not None:
+            return super().invoke(node, state, callee, inputs, resumed=resumed)
+        target = callee.binding
+        name = (target.name if isinstance(target, flow._BoundCallable)
+                else target if isinstance(target, str) else callee.fallback_name) or ''
+        self._sinks(node, state, target, name, inputs)
+        local = isinstance(target, _LOCAL_CALLABLES)
+        function = target
+        while isinstance(function, (flow._FunctionValue, flow._ClosureValue)):
+            function = function.function
+        if (function in self.engine.receiver_proof.fields and not isinstance(target, flow._BoundClassMethod)
+                and self.engine.receiver_proof.fields[function][1]):
+            # Python permits Holder.method(arbitrary_object, ...), including
+            # a saved method or callback. A constructor-field fact describes
+            # ordinary instance entry, not an arbitrary supplied first arg.
+            # The core intentionally collapses unknown callable arguments;
+            # retain this domain's finite unknown-receiver identity so its
+            # context cannot reuse the generic constructor-field exclusion.
+            parameter = self.engine.receiver_proof.fields[function][0]
+            receiver = node.args[0] if node.args else inputs.keyword_nodes.get(parameter)
+            if receiver is None or isinstance(receiver, ast.Starred):
+                raise flow.AnalysisLimit('unbound LDAP field receiver expansion is unresolved; analysis is incomplete')
+            binding = self.expression_bindings.get(receiver)
+            self.expression_bindings[receiver] = flow._join_bindings(*(
+                _UNKNOWN_INSTANCE if choice is None or isinstance(choice, flow._SymbolicValue) else choice
+                for choice in flow._binding_choices(binding)))
+        if not local and _native_class_method(target) is None:
+            for expression in (*node.args, *inputs.keyword_nodes.values()):
+                if any(_native_receiver(choice)
+                       for choice in flow._binding_choices(self.expression_bindings.get(expression))):
+                    # An opaque consumer can replace an object's methods. It
+                    # need not perform a directory operation itself (for
+                    # example SimpleNamespace stores a supplied connection).
+                    # Invalidate later receiver reads through all aliases;
+                    # methods captured before escape keep their own callable.
+                    self.mutate(self.expression_references.get(expression, flow.NO_REFERENCES), flow.CLEAN, state)
+                if _module_refs(self.expression_bindings.get(expression)):
+                    self.mutate(self.expression_references.get(expression, flow.NO_REFERENCES), flow.CLEAN, state)
+        result = super().invoke(node, state, callee, inputs, resumed=resumed)
+        if local:
+            return result
+        imported = _import_name(target)
+        if imported in _FACTORIES:
+            self.expression_bindings[node] = _CONNECTION + _FACTORIES[imported]
+            return flow.CLEAN
+        if name == _SET_FACTORY:
+            self.expression_bindings[node] = _SET
+        if imported in _ENCODERS:
+            return _prove(result, _ENCODERS[imported])
+        if imported == _FILTER_FORMAT:
+            template = self._operands(node, inputs, state, (0,), {'filter_template'})
+            values = self._operands(node, inputs, state, (1,), {'assertion_values'})
+            return flow.join_facts(_revoke(template), _prove(values, _FILTER))
+        if name in {'str', 'builtins.str'}:
+            return result
+        if isinstance(node.func, ast.Attribute) and node.func.attr == 'format':
+            if isinstance(self.expression_bindings.get(node.func.value), flow._LiteralString):
+                return result
+        return _revoke(result)
 
-    def search_filter_args(self, node, short):
-        args = []
-        if short in LDAP_SECOND_ARG_FILTER_METHODS:
-            if len(node.args) >= 2:
-                args.append(node.args[1])
-        elif short in LDAP_SEARCH_METHODS:
-            if len(node.args) >= 3:
-                args.append(node.args[2])
-        if short in LDAP_CONSTRUCTORS:
-            if len(node.args) >= 3:
-                args.append(node.args[2])
-        args.extend(_keyword_values(node, FILTER_KEYWORDS))
-        return args
 
-    def dn_args(self, node, short):
-        args = []
-        if short in LDAP_DN_METHODS and node.args:
-            args.append(node.args[0])
-        args.extend(_keyword_values(node, DN_KEYWORDS))
-        return args
+class _LDAPAnalysis(flow._Analysis):
+    flow_class = _LDAPFlow
 
-    def visit_Call(self, node):
-        name = _call_name(node.func)
-        short = name.rsplit('.', 1)[-1]
-        values = []
-        if short in LDAP_SEARCH_METHODS or short in LDAP_CONSTRUCTORS or name in LDAP_CONSTRUCTORS:
-            values.extend(self.search_filter_args(node, short))
-        builtin_add = (short == 'add' and isinstance(node.func, ast.Attribute)
-                       and isinstance(node.func.value, ast.Name) and node.func.value.id in self.set_receivers)
-        if short in LDAP_DN_METHODS and not builtin_add:
-            values.extend(self.dn_args(node, short))
-        if values and any(self.expr_contains_taint(value) for value in values):
-            self.remember_issue(node.lineno)
-        self.generic_visit(node)
+    def __init__(self, tree):
+        super().__init__(tree)
+        self.receiver_proof = _ReceiverProof(self)
+
+
+class LDAPAnalysisLimit(flow.AnalysisLimit, RuntimeError):
+    """Only bounded semantic failures were observed across LDAP sources."""
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
     suppressions = SourceSuppressions('python')
+    errors, components = [], []
+    semantic_only = True
     for path in files:
         if path.suffix.lower() not in {'.py', '.pyi'}:
             continue
         try:
-            text = path.read_text(encoding='utf-8', errors='ignore')
-            tree = ast.parse(text, filename=str(path))
-        except Exception:
-            continue
+            text, tree = flow._parse_source(path)
+            if not _has_sink(tree):
+                continue
+            analyzer = _LDAPAnalysis(tree)
+            analyzer.source_path = path
+            effects = analyzer.analyze()
+        except (OSError, UnicodeError, SyntaxError, RecursionError, RuntimeError, flow.AnalysisLimit) as exc:
+            errors.append(f'{path}: {type(exc).__name__}: {exc}')
+            cause = exc
+            while isinstance(cause, flow.AnalysisLimit):
+                cause = cause.__cause__
+            semantic_only = semantic_only and cause is None
+            components.extend(getattr(exc, 'components', ()))
+            effects = exc.effects if isinstance(exc, flow.AnalysisLimit) else {}
+            if not effects:
+                continue
         lines = text.splitlines()
-        analyzer = _LDAPInjectionAnalyzer(lines, tree, suppressions.index(path, text))
-        analyzer.visit(tree)
-        for line_no in analyzer.issue_lines:
-            yield path, line_no, 1, _source_line(lines, line_no)[:240]
+        directives = suppressions.index(path, text)
+        seen = set()
+        for (kind, line, column, label), fact in sorted(effects.items(), key=lambda item: item[0][1:]):
+            domain = _FILTER if kind == 'ldap-filter' else _DN
+            unsafe = [trace for trace in fact if domain not in trace.sanitizers]
+            if line in seen or directives.is_suppressed(line, RULE_ID) or not unsafe:
+                continue
+            seen.add(line)
+            trace = min(unsafe, key=lambda item: (len(item.path), item.path, item.source))
+            witness = ' -> '.join([*(trace.path or (trace.source,)), label])
+            yield path, line, column, f'{witness}: {_source_line(lines, line)}'[:240]
+    if errors:
+        message = 'incomplete LDAP analysis: ' + '; '.join(errors[:8])
+        if semantic_only:
+            raise LDAPAnalysisLimit(message, components=components)
+        raise RuntimeError(message)

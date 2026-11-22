@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Analyze Python LDAP injection with the shared flow engine. Proven
+  python-ldap and ldap3 receivers select each API's actual filter and DN
+  operands, including saved methods and paged-search extensions. Filter
+  escaping and DN escaping remain separate proofs across helpers and joins;
+  proven builtin set operations stay clean, while unknown receivers, changed native
+  methods and analysis limits retain conservative or explicit partial results.
+
 - Trace selected native and local Rust callbacks through helper summaries.
   Command constructors and input readers keep their callable identity across
   recursive/transitive forwarding and local wrappers while ordinary values

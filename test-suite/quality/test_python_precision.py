@@ -2052,6 +2052,718 @@ class LDAPReceiverIdentityTests(unittest.TestCase):
                 print(f'[{name}] PASS ({time.perf_counter() - started:.3f}s)')
 
 
+class LDAPFlowTests(unittest.TestCase):
+    """Native LDAP operands and escape domains share ordinary Python flow."""
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.work = Path(tempfile.mkdtemp(prefix='python-ldap-flow-', dir=artifacts))
+
+    def check_cases(self, cases):
+        for name, source in cases.items():
+            with self.subTest(case=name):
+                started = time.monotonic()
+                print(f'[ldap-{name}] RUN', flush=True)
+                source = textwrap.dedent(source).lstrip('\n')
+                target = self.work / f'{name}.py'
+                target.write_text(source, encoding='utf-8')
+                expected = [line for line, text in enumerate(source.splitlines(), 1) if '# ldap-finding' in text]
+                actual = list(ldap_injection.find([target]))
+                (self.work / f'{name}.json').write_text(json.dumps({
+                    'expected': expected, 'actual': [(str(p), line, col, message) for p, line, col, message in actual],
+                    'elapsed_seconds': time.monotonic() - started,
+                }, indent=2) + '\n', encoding='utf-8')
+                self.assertEqual([line for _, line, _, _ in actual], expected, (source, actual))
+                self.assertTrue(all(p == target and col > 0 for p, _, col, _ in actual), actual)
+                print(f'[ldap-{name}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    def test_native_search_operand_positions_and_metadata(self):
+        self.check_cases({
+            'python-ldap-search': '''
+                import ldap
+                directory = ldap.initialize('ldap://directory.invalid')
+                directory.search('dc=example', ldap.SCOPE_SUBTREE, request.args['filter'])  # ldap-finding
+            ''',
+            'python-ldap-scope-is-not-filter': '''
+                import ldap
+                directory = ldap.initialize('ldap://directory.invalid')
+                directory.search('dc=example', request.args['scope'], '(uid=fixed)')
+            ''',
+            'python-ldap-search-base': '''
+                import ldap
+                directory = ldap.initialize('ldap://directory.invalid')
+                directory.search_s(request.args['base'], ldap.SCOPE_SUBTREE, '(uid=fixed)')  # ldap-finding
+            ''',
+            'ldap3-search': '''
+                from ldap3 import Connection
+                directory = Connection('directory.invalid')
+                directory.search('dc=example', request.args['filter'])  # ldap-finding
+            ''',
+            'ldap3-metadata': '''
+                from ldap3 import Connection
+                directory = Connection('directory.invalid')
+                directory.search('dc=example', '(uid=fixed)', attributes=request.args['attributes'])
+            ''',
+            'native-keyword-slots': '''
+                import ldap
+                from ldap3 import Connection
+                first = ldap.initialize('ldap://directory.invalid')
+                second = Connection('directory.invalid')
+                first.search(base='dc=example', scope=ldap.SCOPE_SUBTREE, filterstr=request.args['filter'])  # ldap-finding
+                second.search(search_base=request.args['base'], search_filter='(uid=fixed)')  # ldap-finding
+            ''',
+            'ldap3-paged-search-extension': '''
+                from ldap3 import Connection
+                directory = Connection('directory.invalid')
+                directory.extend.standard.paged_search('dc=example', request.args['filter'])  # ldap-finding
+            ''',
+            'ldap3-saved-paged-search-extension': '''
+                from ldap3 import Connection
+                directory = Connection('directory.invalid')
+                standard = directory.extend.standard
+                paged = standard.paged_search
+                paged(request.args['base'], '(uid=fixed)')  # ldap-finding
+            ''',
+        })
+
+    def test_native_unbound_class_operands(self):
+        self.check_cases({
+            'unbound-ldap3-search': '''
+                from ldap3 import Connection
+                directory = Connection('directory.invalid')
+                Connection.search(directory, 'dc=example', request.args['filter'])  # ldap-finding
+                directory.search('dc=example', request.args['next'])  # ldap-finding
+            ''',
+            'saved-unbound-search-before-class-rebind': '''
+                from ldap3 import Connection
+                directory = Connection('directory.invalid')
+                search = Connection.search
+                Connection = external_factory
+                search(directory, 'dc=example', request.args['filter'])  # ldap-finding
+            ''',
+            'unbound-python-ldap-search': '''
+                from ldap.ldapobject import LDAPObject
+                directory = LDAPObject('ldap://directory.invalid')
+                LDAPObject.search(directory, 'dc=example', 2, request.args['filter'])  # ldap-finding
+                LDAPObject.search(directory, 'dc=example', request.args['scope'], '(uid=fixed)')
+            ''',
+            'unbound-dn-positions': '''
+                from ldap3 import Connection
+                directory = Connection('directory.invalid')
+                Connection.add(directory, request.args['dn'])  # ldap-finding
+                Connection.modify_dn(directory, 'cn=old,dc=example', request.args['rdn'])  # ldap-finding
+                Connection.modify_dn(directory, 'cn=old,dc=example', 'cn=new', True, request.args['parent'])  # ldap-finding
+                Connection.modify_dn(directory, 'cn=old,dc=example', 'cn=new', request.args['delete_flag'])
+            ''',
+            'unbound-keyword-self': '''
+                from ldap3 import Connection
+                from ldap.ldapobject import LDAPObject
+                directory = Connection('directory.invalid')
+                Connection.search(self=directory, search_base='dc=example', search_filter=request.args['filter'])  # ldap-finding
+                Connection.add(self=directory, dn=request.args['dn'])  # ldap-finding
+                legacy = LDAPObject('ldap://directory.invalid')
+                LDAPObject.search(self=legacy, base='dc=example', scope=2, filterstr=request.args['filter'])  # ldap-finding
+            ''',
+            'unbound-expanded-positions': '''
+                from ldap3 import Connection
+                directory = Connection('directory.invalid')
+                Connection.search(*(directory, 'dc=example', request.args['filter']))  # ldap-finding
+                Connection.search(*(directory, 'dc=example', '(uid=fixed)'), attributes=request.args['attributes'])
+            ''',
+            'unbound-domain-and-metadata-controls': '''
+                from ldap3 import Connection
+                from ldap3.utils.conv import escape_filter_chars
+                directory = Connection('directory.invalid')
+                Connection.search(directory, 'dc=example', escape_filter_chars(request.args['filter']))
+                Connection.search(directory, 'dc=example', '(uid=fixed)', attributes=request.args['attributes'])
+                Connection.add(directory, 'cn=fixed,dc=example', attributes={'sn': request.args['surname']})
+                Connection.search(directory, request.args['base'], escape_filter_chars(request.args['filter']))  # ldap-finding
+            ''',
+            'unbound-local-class-lookalike': '''
+                class Connection:
+                    def search(self, base, value): return value
+                Connection.search(object(), 'fixed', request.args['filter'])
+            ''',
+        })
+
+    @unittest.skipUnless(os.environ.get('UBS_LDAP_NATIVE') == '1', 'set UBS_LDAP_NATIVE=1 with ldap3 installed')
+    def test_native_unbound_class_runtime(self):
+        from ldap3 import Connection, Server, MOCK_SYNC, NONE
+        connection = Connection(Server('offline.invalid', get_info=NONE), client_strategy=MOCK_SYNC)
+        connection.strategy.add_entry('cn=known,dc=example',
+                                      {'objectClass': ['person'], 'cn': ['known'], 'sn': ['known']})
+        self.assertTrue(connection.bind())
+        self.assertTrue(Connection.search(connection, 'dc=example', '(cn=known)'))
+        self.assertEqual(len(connection.entries), 1)
+        saved = Connection.search
+        self.assertTrue(saved(self=connection, search_base='dc=example', search_filter='(cn=known)'))
+        self.assertEqual(len(connection.entries), 1)
+        self.assertTrue(Connection.add(connection, 'cn=other,dc=example', object_class='person',
+                                       attributes={'sn': 'other'}))
+        self.assertTrue(connection.search('cn=other,dc=example', '(objectClass=person)'))
+        self.assertEqual(len(connection.entries), 1)
+        self.assertTrue(connection.unbind())
+
+    def test_native_dn_operands_include_rename_targets(self):
+        self.check_cases({
+            'ldap3-relative-dn': '''
+                from ldap3 import Connection
+                directory = Connection('directory.invalid')
+                directory.modify_dn('cn=fixed,dc=example', request.args['relative'])  # ldap-finding
+                directory.modify_dn('cn=fixed,dc=example', 'cn=other', new_superior=request.args['parent'])  # ldap-finding
+            ''',
+            'python-ldap-new-rdn-and-superior': '''
+                import ldap
+                directory = ldap.initialize('ldap://directory.invalid')
+                directory.rename_s('cn=fixed,dc=example', request.args['rdn'])  # ldap-finding
+                directory.rename_s('cn=fixed,dc=example', 'cn=other', request.args['parent'])  # ldap-finding
+            ''',
+            'dn-metadata-clean': '''
+                from ldap3 import Connection
+                directory = Connection('directory.invalid')
+                directory.add('cn=fixed,dc=example', attributes={'description': request.args['description']})
+                directory.modify_dn('cn=fixed,dc=example', 'cn=other', delete_old_dn=request.args['flag'])
+            ''',
+        })
+
+    def test_helpers_and_call_contexts_preserve_provenance(self):
+        self.check_cases({
+            'helper-argument': '''
+                def lookup(value):
+                    conn.search('dc=example', value)  # ldap-finding
+                lookup(request.args['filter'])
+            ''',
+            'helper-return': '''
+                def build(value): return '(uid=' + value + ')'
+                conn.search('dc=example', build(request.args['name']))  # ldap-finding
+            ''',
+            'unsafe-then-safe': '''
+                def identity(value): return value
+                conn.search('dc=example', identity(request.args['filter']))  # ldap-finding
+                conn.search('dc=example', identity('(uid=fixed)'))
+            ''',
+            'safe-then-unsafe': '''
+                def identity(value): return value
+                conn.search('dc=example', identity('(uid=fixed)'))
+                conn.search('dc=example', identity(request.args['filter']))  # ldap-finding
+            ''',
+            'fixed-helper-result': '''
+                def fixed(value): return '(uid=fixed)'
+                conn.search('dc=example', fixed(request.args['filter']))
+            ''',
+        })
+
+    def test_branches_overwrites_and_abrupt_paths(self):
+        self.check_cases({
+            'conditional-cleanup': '''
+                value = request.args['filter']
+                if enabled: value = '(uid=fixed)'
+                conn.search('dc=example', value)  # ldap-finding
+            ''',
+            'strong-cleanup': '''
+                value = request.args['filter']
+                value = '(uid=fixed)'
+                conn.search('dc=example', value)
+            ''',
+            'later-source': '''
+                value = '(uid=fixed)'
+                conn.search('dc=example', value)
+                value = request.args['filter']
+            ''',
+            'dead-sink': '''
+                def handle(request):
+                    return 'done'
+                    conn.search('dc=example', request.args['filter'])
+            ''',
+        })
+
+    def test_aliases_saved_methods_and_native_factories(self):
+        self.check_cases({
+            'module-constructor-alias': '''
+                import ldap as directory_api
+                make = directory_api.initialize
+                client = make('ldap://directory.invalid')
+                search = client.search
+                search('dc=example', 2, request.args['filter'])  # ldap-finding
+            ''',
+            'captured-before-rebind': '''
+                from ldap3 import Connection as Connect
+                client = Connect('directory.invalid')
+                search = client.search
+                client = set()
+                search('dc=example', request.args['filter'])  # ldap-finding
+            ''',
+            'selected-native-factory': '''
+                from ldap3 import Connection
+                def connect(): return Connection('directory.invalid')
+                client = connect()
+                client.search('dc=example', request.args['filter'])  # ldap-finding
+            ''',
+            'saved-method-helper': '''
+                from ldap3 import Connection
+                client = Connection('directory.invalid')
+                def invoke(search, value): search('dc=example', value)  # ldap-finding
+                invoke(client.search, request.args['filter'])
+            ''',
+        })
+
+    def test_filter_and_dn_sanitizers_are_separate(self):
+        self.check_cases({
+            'native-filter-alias': '''
+                from ldap.filter import escape_filter_chars as escape
+                conn.search('dc=example', '(uid=' + escape(request.args['name']) + ')')
+            ''',
+            'native-dn-alias': '''
+                from ldap.dn import escape_dn_chars as escape
+                conn.add('cn=' + escape(request.args['name']) + ',dc=example')
+            ''',
+            'dn-escape-in-filter': '''
+                from ldap.dn import escape_dn_chars
+                conn.search('dc=example', '(uid=' + escape_dn_chars(request.args['name']) + ')')  # ldap-finding
+            ''',
+            'filter-escape-in-dn': '''
+                from ldap.filter import escape_filter_chars
+                conn.add('cn=' + escape_filter_chars(request.args['name']) + ',dc=example')  # ldap-finding
+            ''',
+            'ldap3-filter-and-dn': '''
+                from ldap3.utils.conv import escape_filter_chars as filter_value
+                from ldap3.utils.dn import escape_rdn as dn_value
+                conn.search('dc=example', '(uid=' + filter_value(request.args['name']) + ')')
+                conn.add('cn=' + dn_value(request.args['name']) + ',dc=example')
+                conn.search('dc=example', '(uid=' + dn_value(request.args['name']) + ')')  # ldap-finding
+            ''',
+        })
+
+    def test_sanitizer_identity_and_helper_bodies(self):
+        self.check_cases({
+            'reassuring-name': '''
+                def sanitize_ldap_filter_value(value): return value
+                conn.search('dc=example', sanitize_ldap_filter_value(request.args['filter']))  # ldap-finding
+            ''',
+            'local-shadow': '''
+                from ldap.filter import escape_filter_chars
+                escape_filter_chars = lambda value: value
+                conn.search('dc=example', escape_filter_chars(request.args['filter']))  # ldap-finding
+            ''',
+            'foreign-lookalike': '''
+                from unrelated import escape_filter_chars
+                conn.search('dc=example', escape_filter_chars(request.args['filter']))  # ldap-finding
+            ''',
+            'relative-lookalike': '''
+                from .ldap.filter import escape_filter_chars
+                conn.search('dc=example', escape_filter_chars(request.args['filter']))  # ldap-finding
+            ''',
+            'body-proven-helper': '''
+                from ldap.filter import escape_filter_chars as escaped
+                def prepare(value): return escaped(value)
+                conn.search('dc=example', '(uid=' + prepare(request.args['name']) + ')')
+            ''',
+            'unknown-transform-revokes-proof': '''
+                from ldap.filter import escape_filter_chars
+                def restore(value): return external_decode(value)
+                conn.search('dc=example', restore(escape_filter_chars(request.args['filter'])))  # ldap-finding
+            ''',
+        })
+
+    def test_namespace_writes_and_captured_sanitizers(self):
+        self.check_cases({
+            'changed-module': '''
+                import ldap.filter as escaping
+                escaping.escape_filter_chars = lambda value: value
+                conn.search('dc=example', escaping.escape_filter_chars(request.args['filter']))  # ldap-finding
+            ''',
+            'captured-before-module-write': '''
+                import ldap.filter as escaping
+                encode = escaping.escape_filter_chars
+                escaping.escape_filter_chars = lambda value: value
+                conn.search('dc=example', encode(request.args['filter']))
+            ''',
+            'helper-module-write': '''
+                import ldap.filter as escaping
+                def replace(module): module.escape_filter_chars = lambda value: value
+                replace(escaping)
+                conn.search('dc=example', escaping.escape_filter_chars(request.args['filter']))  # ldap-finding
+            ''',
+        })
+
+    def test_builtin_receiver_identity_and_rebinding(self):
+        self.check_cases({
+            'global-set-alias': '''
+                items = set()
+                alias = items
+                alias.add(request.args['dn'])
+            ''',
+            'helper-owned-set': '''
+                def add(items, value): items.add(value)
+                items = set()
+                add(items, request.args['dn'])
+            ''',
+            'owned-instance-field': '''
+                class Index:
+                    def __init__(self): self.parameters = set()
+                    def collect(self, request): self.parameters.add(request.parameter)
+            ''',
+            'field-rebound-to-directory': '''
+                class Index:
+                    def __init__(self): self.parameters = set()
+                    def collect(self, request, connection):
+                        self.parameters = connection
+                        self.parameters.add(request.parameter)  # ldap-finding
+            ''',
+            'conditional-native-or-set': '''
+                from ldap3 import Connection
+                client = set() if enabled else Connection('directory.invalid')
+                client.add(request.args['dn'])  # ldap-finding
+            ''',
+            'owned-field-receiver-reassigned': '''
+                class Index:
+                    def __init__(self): self.parameters = set()
+                    def collect(self, request, replacement):
+                        self = replacement
+                        self.parameters.add(request.parameter)  # ldap-finding
+            ''',
+            'owned-field-escaped': '''
+                class Index:
+                    def __init__(self): self.parameters = set()
+                    def collect(self, request):
+                        mutate(self)
+                        self.parameters.add(request.parameter)  # ldap-finding
+            ''',
+            'owned-field-reflected-write': '''
+                class Index:
+                    def __init__(self): self.parameters = set()
+                    def collect(self, request, directory):
+                        object.__setattr__(self, 'parameters', directory)
+                        self.parameters.add(request.parameter)  # ldap-finding
+            ''',
+            'unrelated-fixed-field-write': '''
+                class Index:
+                    def __init__(self): self.parameters = set()
+                    def collect(self, request):
+                        self.parameters.add(request.parameter)
+                class Counter:
+                    def count(self): object.__setattr__(self, 'counted', True)
+            ''',
+            'unbound-instance-field-receiver': '''
+                import ldap3
+                from types import SimpleNamespace
+                class Holder:
+                    def __init__(self): self.tokens = set()
+                    def use(self, request): self.tokens.add(request.args['dn'])  # ldap-finding
+                def handle(request):
+                    other = SimpleNamespace(tokens=ldap3.Connection('directory.invalid'))
+                    Holder.use(other, request)
+            ''',
+            'saved-unbound-instance-field-receiver': '''
+                import ldap3
+                from types import SimpleNamespace
+                class Holder:
+                    def __init__(self): self.tokens = set()
+                    def use(self, request): self.tokens.add(request.args['dn'])  # ldap-finding
+                saved = Holder.use
+                def handle(request):
+                    other = SimpleNamespace(tokens=ldap3.Connection('directory.invalid'))
+                    saved(other, request)
+            ''',
+        })
+
+    def test_set_identity_uses_lexical_bindings_and_real_reflection(self):
+        self.check_cases({
+            'readonly-builtin-inventory': '''
+                import builtins
+                inventory = {name: value for name, value in vars(builtins).items()}
+                def collect(request):
+                    values = set()
+                    values.add(request.args['dn'])
+            ''',
+            'unrelated-set-parameter': '''
+                def custom(set): return set()
+                def collect(request):
+                    values = set()
+                    values.add(request.args['dn'])
+            ''',
+            'finite-reflective-metadata-fields': '''
+                def configure(target):
+                    for field in ('metadata', 'options'):
+                        setattr(target, field, {})
+                def collect(request):
+                    values = set()
+                    values.add(request.args['dn'])
+            ''',
+            'finite-reflection-includes-set': '''
+                import builtins
+                for field in ('set', 'metadata'):
+                    setattr(builtins, field, opaque_factory)
+                values = set()
+                values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'reflective-field-name-reassigned': '''
+                import builtins
+                for field in ('metadata', 'options'):
+                    field = request.args['field']
+                    setattr(builtins, field, opaque_factory)
+                values = set()
+                values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'native-static-and-class-methods': '''
+                class Collector:
+                    def __init__(self): self.values = set()
+                    @staticmethod
+                    def identity(value): return value
+                    @classmethod
+                    def make(cls): return cls()
+                    def collect(self, request): self.values.add(request.args['dn'])
+            ''',
+            'ordinary-cell-contents-method': '''
+                class Collector:
+                    def __init__(self): self.values = set()
+                    def cell_contents(self, value): return value
+                    def collect(self, request):
+                        self.cell_contents('fixed')
+                        self.values.add(request.args['dn'])
+            ''',
+            'contained-instance-escapes-before-use': '''
+                class Collector:
+                    def __init__(self, request):
+                        self.values = set()
+                        self.peers = (self,)
+                        mutate(self.peers)
+                        self.values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'fresh-field-overwritten-by-helper': '''
+                def rebind(owner, directory): owner.values = directory
+                class Collector:
+                    def __init__(self, request, directory):
+                        self.values = set()
+                        rebind(self, directory)
+                        self.values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'older-escaped-alias-mutated-after-assignment': '''
+                class Collector:
+                    def __init__(self, request):
+                        remember(self)
+                        self.values = set()
+                        mutate_remembered()
+                        self.values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'transitive-instance-method-escape': '''
+                class Collector:
+                    def __init__(self, request):
+                        self.values = set()
+                        self.change()
+                        self.values.add(request.args['dn'])  # ldap-finding
+                    def change(self): mutate(self)
+            ''',
+            'fresh-field-escape-on-assignment-line': '''
+                class Collector:
+                    def __init__(self, request):
+                        self.values = set(); mutate(self)
+                        self.values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'shadowed-vars-inventory': '''
+                import builtins
+                def collect(request, vars):
+                    inventory = dict(vars(builtins).items())
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'shadowed-builtins-inventory': '''
+                import builtins
+                def collect(request, builtins):
+                    inventory = dict(vars(builtins).items())
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'shadowed-staticmethod-decorator': '''
+                def staticmethod(callback): return external_decorator(callback)
+                class Collector:
+                    def __init__(self): self.values = set()
+                    @staticmethod
+                    def identity(value): return value
+                    def collect(self, request): self.values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'mutated-native-staticmethod': '''
+                import builtins
+                builtins.staticmethod = external_decorator
+                class Collector:
+                    def __init__(self): self.values = set()
+                    @staticmethod
+                    def identity(value): return value
+                    def collect(self, request): self.values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'mutated-native-vars': '''
+                import builtins
+                builtins.vars = opaque_inventory
+                inventory = dict(vars(builtins).items())
+                values = set()
+                values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'escaped-cell-contents': '''
+                def collect(request):
+                    values = set()
+                    def capture(): return values
+                    external(capture.__closure__[0])
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+        })
+
+    @unittest.skipUnless(os.environ.get('UBS_PY_LDAP_CONSTRUCTOR_PRECISION') == '1',
+                         'open constructor precision cohort; preserve clean expectations until alias proof is complete')
+    def test_constructor_precision_open_cohort(self):
+        """Known clean controls remain open, not redefined as unsafe success.
+
+        Earlier escaped aliases and transitive method effects currently rule
+        out the general constructor-field proof. These original controls must
+        remain clean targets for a future sound lifetime model.
+        """
+        self.check_cases({
+            'fresh-constructor-field-after-self-reference': '''
+                class Collector:
+                    def __init__(self, request):
+                        self.peers = (self,)
+                        self.values = set()
+                        self.values.add(request.args['dn'])
+            ''',
+            'fresh-field-before-later-external-writer': '''
+                class Collector:
+                    def __init__(self, request):
+                        self.values = set()
+                        self.peers = (self,)
+                        self.values.add(request.args['dn'])
+                    def collect(self, request): self.values.add(request.args['dn'])  # ldap-finding
+                def rebind(owner, directory): owner.values = directory
+            ''',
+            'fresh-field-before-same-line-escape': '''
+                class Collector:
+                    def __init__(self, request):
+                        mutate(self); self.values = set()
+                        self.values.add(request.args['dn'])
+            ''',
+        })
+
+    def test_native_sources_and_query_formatting(self):
+        self.check_cases({
+            'environment-alias': '''
+                from os import getenv as setting
+                conn.search('dc=example', setting('LDAP_FILTER'))  # ldap-finding
+            ''',
+            'stdin-through-helper': '''
+                import sys
+                def read(): return sys.stdin.readline()
+                conn.search('dc=example', read())  # ldap-finding
+            ''',
+            'filter-format': '''
+                from ldap.filter import filter_format
+                conn.search('dc=example', filter_format('(uid=%s)', [request.args['name']]))
+            ''',
+            'tainted-filter-template': '''
+                from ldap.filter import filter_format
+                conn.search('dc=example', filter_format(request.args['template'], ['fixed']))  # ldap-finding
+            ''',
+            'later-source-in-composition': '''
+                from ldap.filter import escape_filter_chars
+                safe = escape_filter_chars(request.args['name'])
+                conn.search('dc=example', '(uid=' + safe + request.args['suffix'] + ')')  # ldap-finding
+            ''',
+        })
+
+    def test_suppression_owns_sink_not_source(self):
+        self.check_cases({
+            'source-marker': '''
+                value = request.args['filter']  # ubs:ignore[py.security.ldap-injection]
+                conn.search('dc=example', value)  # ldap-finding
+            ''',
+            'sink-marker': '''
+                conn.search('dc=example', request.args['filter'])  # ubs:ignore[py.security.ldap-injection]
+            ''',
+            'other-rule': '''
+                conn.search('dc=example', request.args['filter'])  # ubs:ignore[py.security.header-injection] # ldap-finding
+            ''',
+        })
+
+    @unittest.skipUnless(os.environ.get('UBS_LDAP_NATIVE') == '1', 'set UBS_LDAP_NATIVE=1 with ldap3 installed')
+    def test_native_ldap3_escape_domains_and_directory_queries(self):
+        from ldap3 import Connection, Server, MOCK_SYNC, NONE
+        from ldap3.utils.conv import escape_filter_chars
+        from ldap3.utils.dn import escape_rdn, parse_dn
+        connection = Connection(Server('offline.invalid', get_info=NONE), client_strategy=MOCK_SYNC)
+        connection.strategy.add_entry('dc=example', {'objectClass': ['domain'], 'dc': ['example']})
+        for name in ('alice', 'bob'):
+            connection.strategy.add_entry(f'cn={name},dc=example',
+                                          {'objectClass': ['person'], 'cn': [name], 'sn': [name], 'uid': [name]})
+        self.assertTrue(connection.bind())
+        saved_search = connection.search
+        wildcard = '*'
+        self.assertTrue(saved_search('dc=example', '(uid=' + escape_rdn(wildcard) + ')', attributes=['uid']))
+        self.assertEqual(len(connection.entries), 2)
+        saved_search('dc=example', '(uid=' + escape_filter_chars(wildcard) + ')', attributes=['uid'])
+        self.assertEqual(len(connection.entries), 0)
+        injected_dn = 'first,ou=admins'
+        self.assertEqual(len(parse_dn('cn=' + escape_filter_chars(injected_dn) + ',dc=example')), 3)
+        self.assertEqual(len(parse_dn('cn=' + escape_rdn(injected_dn) + ',dc=example')), 2)
+        from types import SimpleNamespace
+        from unittest import mock
+        class Holder:
+            def __init__(self): self.tokens = set()
+            def use(self, request):
+                return self.tokens.add(request.args['dn'], object_class='person', attributes={'sn': 'unbound'})
+        saved_unbound = Holder.use
+        native_receiver = SimpleNamespace(tokens=connection)
+        user_request = SimpleNamespace(args={'dn': 'cn=unbound,dc=example'})
+        with mock.patch.object(connection, 'add', wraps=connection.add) as actual_add:
+            self.assertTrue(saved_unbound(native_receiver, user_request))
+            actual_add.assert_called_once_with('cn=unbound,dc=example', object_class='person',
+                                               attributes={'sn': 'unbound'})
+        self.assertTrue(connection.search('cn=unbound,dc=example', '(objectClass=person)'))
+        self.assertEqual(len(connection.entries), 1)
+        self.assertTrue(connection.unbind())
+
+    def test_partial_files_retain_independent_findings(self):
+        from unittest import mock
+        malformed, safe, unsafe = [self.work / name for name in ('malformed.py', 'safe.py', 'unsafe.py')]
+        malformed.write_text('conn.search( = request.args["filter"]\n', encoding='utf-8')
+        safe.write_text('conn.search("dc=example", "(uid=fixed)")\n', encoding='utf-8')
+        unsafe.write_text('def lookup(value): conn.search("dc=example", value)\n'
+                          'lookup(request.args["filter"])\n', encoding='utf-8')
+        for paths in ([malformed, safe, unsafe], [unsafe, safe, malformed]):
+            findings = []
+            with self.assertRaisesRegex(RuntimeError, 'incomplete LDAP analysis.*SyntaxError'):
+                findings.extend(ldap_injection.find(paths))
+            self.assertEqual([(path, line, col) for path, line, col, _ in findings], [(unsafe, 1, 20)])
+        limited = self.work / 'scope-limited.py'
+        limited.write_text('conn.search("dc=example", request.args["first"])\n'
+                           'def expensive(value):\n' + '    value = str(value)\n' * 100 +
+                           '    return value\n'
+                           'conn.search("dc=example", request.args["last"])\n', encoding='utf-8')
+        findings = []
+        with mock.patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'}), \
+                self.assertRaisesRegex(ldap_injection.LDAPAnalysisLimit, 'work limit') as raised:
+            findings.extend(ldap_injection.find([limited]))
+        self.assertEqual([line for _, line, _, _ in findings], [1, 104])
+        self.assertTrue(raised.exception.components)
+
+    def test_native_receiver_mutation_and_escape_are_explicitly_partial(self):
+        cases = {
+            'receiver-method-write': 'directory.search = external_search\n',
+            'factory-method-write': 'Connection.search = external_search\n',
+            'receiver-escape': 'configure(directory)\ndirectory.search("dc=example", request.args["later"])\n',
+            'helper-receiver-write': 'def replace(value): value.search = external_search\nreplace(directory)\n',
+        }
+        for label, operation in cases.items():
+            with self.subTest(case=label):
+                target = self.work / f'{label}.py'
+                target.write_text('from ldap3 import Connection\n'
+                                  'directory = Connection("directory.invalid")\n'
+                                  'directory.search("dc=example", request.args["filter"])\n' + operation,
+                                  encoding='utf-8')
+                findings = []
+                with self.assertRaisesRegex(ldap_injection.LDAPAnalysisLimit, 'native LDAP receiver'):
+                    findings.extend(ldap_injection.find([target]))
+                self.assertEqual([line for _, line, _, _ in findings], [3])
+
+
 class HeaderInjectionFlowTests(unittest.TestCase):
     """Header decisions must follow actual values, callees and control flow."""
 
@@ -2658,6 +3370,137 @@ class HeaderInjectionFlowTests(unittest.TestCase):
                             for _, _, _, detail in findings), findings)
         self.assertIn('at-limit.py', str(raised.exception))
         self.assertIn('work limit exceeded', str(raised.exception))
+
+
+@unittest.skipUnless(os.environ.get('UBS_PY_LDAP_E2E') == '1',
+                     'set UBS_PY_LDAP_E2E=1 for actual LDAP CLI scans')
+class LDAPInjectionPublicTests(unittest.TestCase):
+    def test_module_and_runner_json_sarif_preserve_findings_and_partial_status(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix='python-ldap-public-', dir=artifacts))
+        unsafe = ('from ldap3 import Connection\n'
+                  'directory = Connection("directory.invalid")\n'
+                  'def lookup(value): directory.search("dc=example", value)\n'
+                  'lookup(request.args["filter"])\n')
+        clean = ('from ldap3.utils.conv import escape_filter_chars as encode\n'
+                 'def prepare(value): return encode(value)\n' + unsafe.replace(
+                     'lookup(request.args["filter"])', 'lookup(prepare(request.args["filter"]))'))
+        limited = ('def expensive(value):\n' + '    value = str(value)\n' * 100 +
+                   '    return value\n' + unsafe)
+        env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
+               'UBS_NO_CACHE': '1', 'CI': '1', 'NO_COLOR': '1',
+               'XDG_DATA_HOME': str(work / 'data'), 'XDG_CONFIG_HOME': str(work / 'config'),
+               'XDG_CACHE_HOME': str(work / 'cache'), 'PYTHONDONTWRITEBYTECODE': '1'}
+        skip = '--skip=' + ','.join(str(i) for i in range(1, 24) if i != 7)
+        for label, source, expected, partial in (
+                ('unsafe', unsafe, [3], False), ('clean', clean, [], False),
+                ('suppressed', unsafe.replace('value)\n', 'value)  # ubs:ignore[py.security.ldap-injection]\n'), [], False),
+                ('partial', unsafe, [3], True), ('limited', limited, [105], True)):
+            selected = work / label
+            selected.mkdir()
+            path = selected / 'view.py'
+            path.write_text(source, encoding='utf-8')
+            if label == 'partial':
+                (selected / 'malformed.py').write_text('directory.search( = input()\n', encoding='utf-8')
+            run_env = {**env, 'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'} if label == 'limited' else env
+            surfaces = (True,) if os.environ.get('UBS_PY_LDAP_MODULE_ONLY') == '1' else (True, False)
+            for module in surfaces:
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=label, module=module, format=fmt):
+                        prefix = (('bash', str(REPO_ROOT / 'modules/ubs-python.sh'), '--no-uv')
+                                  if module else ('bash', str(REPO_ROOT / 'ubs'), '--only=python'))
+                        command = (*prefix, '--ci', '--format=' + fmt, skip, str(selected))
+                        result = subprocess.run(command, cwd=work, env=run_env, capture_output=True,
+                                                text=True, timeout=180)
+                        output = work / f'{label}-{module}-{fmt}'
+                        output.with_suffix('.stdout').write_text(result.stdout, encoding='utf-8')
+                        output.with_suffix('.stderr').write_text(result.stderr, encoding='utf-8')
+                        self.assertEqual(result.returncode, 2 if partial else int(bool(expected)),
+                                         (command, result.stdout, result.stderr))
+                        payload = json.loads(result.stdout)
+                        if fmt == 'json':
+                            self.assertEqual(payload['status'], 'partial' if partial else 'ok', payload)
+                            rows = [row for row in payload.get('findings', [])
+                                    if row['rule' if module else 'rule_id'] == ldap_injection.RULE_ID]
+                            samples = ([sample for row in rows for sample in row['samples']]
+                                       if module else rows)
+                            self.assertEqual([row['line'] for row in samples], expected, payload)
+                            self.assertEqual(payload['critical'] if module else payload['totals']['critical'],
+                                             len(expected), payload)
+                            for sample in samples:
+                                self.assertEqual(Path(sample['file']).name, path.name)
+                            for row in rows:
+                                message = row['title' if module else 'message']
+                                self.assertIn('request.args', message)
+                                self.assertIn('LDAP filter', message)
+                        else:
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])
+                                    if row['ruleId'] == ldap_injection.RULE_ID]
+                            self.assertEqual([row['locations'][0]['physicalLocation']['region']['startLine']
+                                              for row in rows], expected, payload)
+                            invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                            if partial:
+                                self.assertTrue(invocations, payload)
+                                self.assertTrue(all(item['executionSuccessful'] is False for item in invocations), payload)
+                            else:
+                                self.assertTrue(all(item.get('executionSuccessful') is not False
+                                                    for item in invocations), payload)
+                        print('PYTHON_LDAP_PUBLIC', label, module, fmt, 'PASS', flush=True)
+
+    def test_runner_cache_edits_suppression_and_partial_nonreuse(self):
+        artifacts = REPO_ROOT / 'test-suite/artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix='python-ldap-cache-', dir=artifacts))
+        target = work / 'view.py'
+        unsafe = ('from ldap3 import Connection\n'
+                  'directory = Connection("directory.invalid")\n'
+                  'Connection.search(directory, "dc=example", request.args["filter"])\n')
+        clean = unsafe.replace('request.args["filter"]', '"(uid=fixed)"')
+        suppressed = unsafe.rstrip('\n') + '  # ubs:ignore[py.security.ldap-injection]\n'
+        partial = unsafe + 'directory.search = external_search\n'
+        env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
+               'UBS_NO_CACHE': '0', 'UBS_CACHE_DIR': str(work / 'scan-cache'), 'UBS_PROFILE': '1',
+               'CI': '1', 'NO_COLOR': '1', 'PYTHONDONTWRITEBYTECODE': '1',
+               'XDG_DATA_HOME': str(work / 'data'), 'XDG_CONFIG_HOME': str(work / 'config'),
+               'XDG_CACHE_HOME': str(work / 'cache')}
+        skip = '--skip=' + ','.join(str(i) for i in range(1, 24) if i != 7)
+        command = ('bash', str(REPO_ROOT / 'ubs'), '--only=python', '--ci', '--format=json', skip, str(target))
+        cases = (
+            ('cold', unsafe, [3], False, 0), ('warm', unsafe, [3], False, 1),
+            ('clean-edit', clean, [], False, 0), ('restored', unsafe, [3], False, 1),
+            ('suppressed', suppressed, [], False, 0),
+            ('partial-first', partial, [3], True, 0), ('partial-repeat', partial, [3], True, 0),
+        )
+        for index, (label, source, lines, incomplete, hits) in enumerate(cases):
+            with self.subTest(case=label):
+                if index not in (1, 6):
+                    target.write_text(source, encoding='utf-8')
+                result = subprocess.run(command, cwd=work, env=env, capture_output=True,
+                                        text=True, timeout=180)
+                output = work / f'{index}-{label}'
+                output.with_suffix('.stdout').write_text(result.stdout, encoding='utf-8')
+                output.with_suffix('.stderr').write_text(result.stderr, encoding='utf-8')
+                self.assertEqual(result.returncode, 2 if incomplete else int(bool(lines)),
+                                 (command, result.stdout, result.stderr))
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload['status'], 'partial' if incomplete else 'ok', payload)
+                rows = payload.get('findings', [])
+                self.assertEqual([(row['rule_id'], row['line'], row['col']) for row in rows],
+                                 [(ldap_injection.RULE_ID, line, 1) for line in lines], payload)
+                self.assertEqual([payload['totals'][key] for key in ('files', 'critical', 'warning', 'info')],
+                                 [1, len(lines), 0, 0], payload)
+                for row in rows:
+                    self.assertEqual(Path(row['file']).name, target.name, row)
+                    self.assertEqual(row['severity'], 'critical', row)
+                    self.assertFalse(row.get('suppressed', False), row)
+                    self.assertIn('request.args', row['message'])
+                    self.assertIn('LDAP filter', row['message'])
+                self.assertEqual(payload['profile']['cache_hits'], hits, payload)
+                self.assertEqual(payload['profile']['cache_misses'], 1 - hits, payload)
+                if incomplete:
+                    self.assertIn('native LDAP receiver or class mutation', result.stdout + result.stderr)
+                print('PYTHON_LDAP_CACHE', label, 'hits', hits, 'misses', 1 - hits, 'PASS', flush=True)
 
 
 @unittest.skipUnless(os.environ.get('UBS_PY_HEADER_E2E') == '1',

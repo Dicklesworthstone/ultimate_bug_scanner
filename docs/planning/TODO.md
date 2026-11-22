@@ -527,6 +527,8 @@ three implementation tracks remain separate meaningful commits on main.
   `f4129c2bcda6eb293f94e8712f3fda56510bd2dfe39253f76ff769bc1abed96b`.
 - [x] Preserve 34 candidate evidence files in GitHub blob
   `629c2dbe22f47888930bd4a717b6ef51d83ece54`, including failed baselines.
+- [x] Preserve publication and broad-gate evidence, attributed to `2527a61`,
+  in GitHub blob `ee49bf0c7569d37400ca375ea2c02cc63a56ceaf`.
 - [ ] General closure/collection transport, imported bodies, mixed callable
   dispatch and broad Rust/release qualification remain open.
 - [ ] Changed-source self-scan remains incomplete (18 unsupported Python
@@ -540,11 +542,48 @@ three implementation tracks remain separate meaningful commits on main.
 
 ### Python LDAP provenance (`1b9j.6.15`)
 
-- [ ] Replace the flat visitor with a shared-flow adapter proving native
+- [x] Replace the flat visitor with a shared-flow adapter proving native
   receiver identities, API-specific operands and separate filter/DN escaping.
-- [ ] Preserve helpers, branches, captured methods, conservative opaque
+- [x] Preserve helpers, branches, captured methods, conservative opaque
   operations and valid builtin-set receiver exclusions.
-- [ ] Complete native/shared/public checks and publish separately.
+- [x] Freeze 31 failed subcase assertions on the original flat visitor.
+  Real offline ldap3 witnesses distinguish escaping domains and execute
+  instance, saved and unbound class-method operations.
+- [x] Fix four independently reproduced false cleans from native unbound
+  methods: the actual API identity selects operands after explicit `self`.
+  Keep keyword operands, projection metadata and native escaping distinct.
+- [x] Remove an optimistic constructor-field shortcut after three independent
+  escaped-alias probes expose false cleans. The final unchanged 22-case
+  independent corpus passes, including those lifetime cases; log SHA256
+  `d28e3fe68ddf3ed626ad0056b446541d292854d6c22a6c1bb83a00b79e10c8d5`.
+- [x] Pass 27 real public calls (20 module/runner JSON/SARIF and seven cache,
+  edit, suppression and partial-nonreuse calls), all 22 independent cases,
+  both integrity verifiers, Bash syntax and diff checks on the publication
+  tree. Publication log SHA256
+  `1671ee6a9a34e5f0db83fb1482c1538542dc3622f63c16d1212e7c032a3a98d7`.
+- [ ] Full precision qualification remains open: 154 methods produce 148
+  passes, four opt-in skips, one failure and one error. The two failures
+  reproduce on unchanged main: the C# annotation-regex test references a
+  removed symbol, and the index-arithmetic self-scan exceeds its warning
+  threshold. Final log SHA256
+  `3ac1950c113221989ee2cebf4b1f1250718eb2fab1e226ab9c25a95eb398871c`.
+- [ ] Keep the broader constructor-precision cohort open with all three
+  original clean expectations intact. Its explicit opt-in execution still
+  has three failed subcases (also reproduced on original main). Final log
+  `bd09a9892df95aee6438c9d9d4dcc92d68de2b402ce1d55a0377e88d2fdfaee4`;
+  baseline log `f34a96efa7595ceb629bc83484b60806e0e23260fcfb9d32a218e5d04362e396`.
+  The scoped native functionality is implemented; the Bead stays in progress
+  for those precision gaps, without redefining false positives as successes.
+- [ ] The own-analyzer LDAP probe remains partial (103 unsupported scopes,
+  four conservative set-field findings). The original request-parameter
+  set update and ten local-set false positives are gone. Do not call the
+  broader probe clean; log SHA256
+  `f50180a9a1bb7d3c23027b6ec0bdcc61816a9dbe9df271b9a8e8ea0fe90f5382`.
+- [ ] Changed-source self-scan remains partial (exit 2, 67 unsupported
+  components). Its one critical record is in the public subprocess test
+  harness; three JSON test-parse warnings and 467 informational records are
+  retained. Log SHA256
+  `81fe577d0109b48ea39c5d07109b5703f4cdbc1391d5e9a33d403f888d3e283c`.
 
 ### Continuation qualification
 
@@ -553,3 +592,18 @@ three implementation tracks remain separate meaningful commits on main.
   `cfc2a13b85405aca2ebd0ad6463149da682569588967064cab7387d2813a5e5d`.
   This supersedes the earlier environment-killed attempts for that base;
   whole-repository and release qualification still require their own results.
+- [x] Repeat the prescribed full ShellCheck command on the published JS/Rust
+  tree `2527a61`: pass (40.097 seconds), log SHA256
+  `8314b2cb6d44a86122fc06527601869651e03b19c183d08d952d9d6f0f45c68a`.
+- [x] Repeat full ShellCheck on the combined LDAP publication tree: pass
+  (35.761 seconds), log SHA256
+  `c7a14b8405535afb34925aa82de8ac032eba492537afa488a58c1c1a9f16b4ea`.
+- [ ] Whole-suite qualification remains open. The DSR `run_all.sh` attempt
+  on `2527a61` passes all 12 rule inventories, then records missing Swift
+  buggy/clean fixture pairs in the rule-quality harness. The exact harness
+  failure reproduces on unchanged `3d3fc4f`; baseline log SHA256
+  `b542f8060b2d1a52fdbf44d0f7cfcc41844fce5398a92bf24bcba994c48a3c9d`.
+  Quality tests continue until the 420-second overall budget expires, so
+  there is no completed whole-suite result. Attempt log SHA256
+  `4b6de775aaf47cd99735c812e325797839b35fd35067d80d612725010800e9d2`.
+  No fixture expectations, tests or gates were weakened.

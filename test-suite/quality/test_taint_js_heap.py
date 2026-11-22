@@ -2403,6 +2403,279 @@ class HeapTaintTests(unittest.TestCase):
                 self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
                                         expected=expected, cache=True)
 
+    def test_find_preserves_captured_scalar_and_heap_writes(self):
+        for method in ('find', 'findIndex'):
+            with self.subTest(method=method):
+                source = ('let saved="safe"; const box={html:"safe"}; '
+                          f'[req.query.html].{method}(value=>{{saved=value;box.html=value;return false;}}); '
+                          'res.send(saved);res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input', 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+
+    def test_find_returns_original_match_and_clean_index(self):
+        for predicate, matches in (('true', True), ('false', False), ('null', False),
+                                   ('0', False), ('""', False), ('"yes"', True)):
+            for method in ('find', 'findIndex'):
+                with self.subTest(method=method, predicate=predicate):
+                    source = f'res.send([req.query.html].{method}(value=>{predicate}));'
+                    expected = ('review-input' if matches else None) if method == 'find' else (0 if matches else -1)
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan_sort(source, *(('xss',) if matches and method == 'find' else ()))
+        for method in ('find', 'findIndex'):
+            source = f'res.send(["safe"].{method}(value=>req.query.html));'
+            self.assert_runtime_sends(source, ['safe' if method == 'find' else 0])
+            self.scan_sort(source)
+
+    def test_find_short_circuits_and_orders_captured_writes(self):
+        for method in ('find', 'findIndex'):
+            for predicate in ('true', 'false'):
+                for values, first_tainted in (('[req.query.html,"safe"]', True),
+                                               ('["safe",req.query.html]', False)):
+                    with self.subTest(method=method, predicate=predicate, values=values):
+                        tainted = first_tainted if predicate == 'true' else not first_tainted
+                        source = ('let saved="safe"; '
+                                  f'{values}.{method}(value=>{{saved=value;return {predicate};}});res.send(saved);')
+                        self.assert_runtime_sends(source, ['review-input' if tainted else 'safe'])
+                        self.scan_sort(source, *(('xss',) if tainted else ()))
+
+    def test_find_visits_holes_but_skips_empty_array_callbacks(self):
+        for method in ('find', 'findIndex'):
+            with self.subTest(method=method):
+                source = f'[].{method}(()=>{{res.send(req.query.html);return true;}});res.send("safe");'
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+                source = ('let saved="safe"; '
+                          f'[,].{method}(()=>{{saved=req.query.html;return false;}});res.send(saved);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+                source = ('let saved=req.query.html; '
+                          f'[,req.query.html].{method}(value=>{{saved=value;return true;}});res.send(saved);')
+                self.assert_runtime_sends(source, [None])
+                self.scan_sort(source)
+                source = ('let saved=req.query.html; '
+                          f'["safe",,].{method}(value=>{{saved=value;return false;}});res.send(saved);')
+                self.assert_runtime_sends(source, [None])
+                self.scan_sort(source)
+
+    def test_find_reads_live_slots_including_deleted_indices_with_snapshot_length(self):
+        for method in ('find', 'findIndex'):
+            for values, mutation, expected, rules in (
+                    ('[req.query.html,"safe"]', 'items.length=0;', None, ()),
+                    ('[req.query.html,"safe"]', 'delete items[1];', None, ()),
+                    ('["safe",,]', 'items[1]=req.query.html;', 'review-input', ('xss',)),
+                    ('[req.query.html]', 'items.push("safe");', 'review-input', ('xss',))):
+                with self.subTest(method=method, values=values, mutation=mutation):
+                    source = (f'const items={values};let saved="safe"; '
+                              f'items.{method}(value=>{{saved=value;{mutation}return false;}});res.send(saved);')
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan_sort(source, *rules)
+
+    def test_find_keeps_pre_callback_match_and_shallow_identity(self):
+        source = ('const items=[req.query.html]; '
+                  'const selected=items.find(value=>{items[0]="safe";return true;}); '
+                  'res.send(selected);res.send(items[0]);')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        self.scan_sort(source, 'xss')
+        source = ('const box={html:"safe"};const items=[box]; '
+                  'const selected=items.find(value=>true);selected.html=req.query.html;res.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, 'xss')
+
+    def test_find_optional_holes_still_execute_callback(self):
+        for method in ('find', 'findIndex'):
+            with self.subTest(method=method):
+                source = ('const items=[,req.query.html];if(flag){items[0]="safe";} '
+                          'let saved=req.query.html; '
+                          f'items.{method}(value=>{{saved="safe";return true;}});res.send(saved);')
+                for flag in ('true', 'false'):
+                    self.assert_runtime_sends(f'const flag={flag};' + source, ['safe'])
+                self.scan_sort(source)
+
+    def test_find_binds_callback_arguments_this_and_rest(self):
+        for method in ('find', 'findIndex'):
+            with self.subTest(method=method):
+                source = ('const box={};const items=[{html:req.query.html}]; '
+                          f'items.{method}(function({{html}},index,source){{this.html=html;'
+                          'res.send(index);res.send(source[0].html);return true;},box);res.send(box.html);')
+                self.assert_runtime_sends(source, [0, 'review-input', 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+                source = (f'[req.query.html].{method}((...args)=>{{res.send(args[0]);'
+                          'res.send(args[1]);res.send(args[2][0]);return true;});')
+                self.assert_runtime_sends(source, ['review-input', 0, 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+
+    def test_find_preserves_throws_effects_and_unknown_stop_states(self):
+        for method in ('find', 'findIndex'):
+            with self.subTest(method=method):
+                source = ('const box={html:"safe"};try{'
+                          f'[req.query.html].{method}(value=>{{box.html=value;throw value;}});'
+                          'res.send(req.query.html);}catch(error){res.send(error);}res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input', 'review-input'])
+                self.scan_sort(source, 'xss', 'xss')
+                source = ('const stop=true;let saved="safe";'
+                          f'[req.query.html,"safe"].{method}(value=>{{saved=value;return stop;}});res.send(saved);')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+
+    def test_find_transports_callback_aliases_parameters_and_lexical_captures(self):
+        for method in ('find', 'findIndex'):
+            with self.subTest(method=method):
+                source = ('const box={html:"safe"};const visit=value=>{box.html=value;return true;}; '
+                          'const alias=visit; '
+                          f'function run(items,predicate){{const box={{html:"local"}};return items.{method}(predicate);}} '
+                          'run([req.query.html],alias);res.send(box.html);run(["safe"],alias);res.send(box.html);')
+                self.assert_runtime_sends(source, ['review-input', 'safe'])
+                self.scan_sort(source, 'xss')
+                self.scan_sort(f'let saved;[].{method}(saved=()=>{{res.send(req.query.html);}});saved();', 'xss')
+
+    def test_find_respects_own_methods_and_argument_evaluation_order(self):
+        for method in ('find', 'findIndex'):
+            with self.subTest(method=method):
+                source = ('const box={html:"safe"};const items=[req.query.html];'
+                          f'items.{method}=function(callback){{return "safe";}};'
+                          f'res.send(items.{method}(value=>{{box.html=value;}}));res.send(box.html);')
+                self.assert_runtime_sends(source, ['safe', 'safe'])
+                self.scan_sort(source)
+                source = ('const items=["safe"];'
+                          f'items.{method}=function(){{return req.query.html;}};res.send(items.{method}(()=>true));')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+                source = ('const box={html:req.query.html};const items=["safe"];'
+                          f'function replace(){{items.{method}=function(){{box.html=req.query.html;}};return {{}};}}'
+                          f'items.{method}(value=>{{box.html=value;return true;}},replace());res.send(box.html);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+
+    def test_find_rejects_unknown_callbacks_protocols_and_unbounded_hole_walks(self):
+        for method in ('find', 'findIndex'):
+            for callback in ('external', 'async value=>value', 'function*(value){yield value;}'):
+                with self.subTest(method=method, callback=callback):
+                    self.scan_sort('res.send(req.query.html);'
+                                   f'["safe"].{method}({callback});', 'xss',
+                                   partial=f'Array.{method}.*synchronous callback')
+            for change in ('items[unknown]=external;', f'items.{method}=external;',
+                           f'Array.prototype.{method}=external;', 'Object.setPrototypeOf(items,foreign);'):
+                with self.subTest(method=method, change=change):
+                    self.scan_sort('res.send(req.query.html);const items=["safe"];'
+                                   + change + f'items.{method}(value=>true);', 'xss',
+                                   partial=f'Array.{method}|Own method')
+            with self.subTest(method=method, extent='unknown'):
+                self.scan_sort('res.send(req.query.html);const items=[...unknown];'
+                               f'items.{method}(value=>true);', 'xss', partial=f'Array.{method}.*finite')
+            with self.subTest(method=method, extent='large'):
+                source = ('const items=[];items.length=4294967294;'
+                          f'items.{method}(()=>{{res.send(req.query.html);return true;}});')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+                self.scan_sort('res.send(req.query.html);const items=[];items.length=4294967294;'
+                               f'items.{method}(()=>false);', 'xss', partial='work limit')
+                self.scan_sort('res.send(req.query.html);const stop=true;'
+                               'const items=[];items.length=4294967294;'
+                               f'items.{method}(()=>stop);', 'xss', partial='work limit')
+                source = ('const items=[];items.length=4294967294;try{'
+                          f'items.{method}(()=>{{throw req.query.html;}});'
+                          '}catch(error){res.send(error);}')
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+
+    def test_find_keeps_optional_callback_defaults_explicit(self):
+        for method in ('find', 'findIndex'):
+            with self.subTest(method=method):
+                source = ('const items=[,];if(flag){items[0]={};}let saved="safe";'
+                          f'items.{method}((value=(saved=req.query.html))=>false);res.send(saved);')
+                self.assert_runtime_sends('const flag=false;' + source, ['review-input'])
+                self.assert_runtime_sends('const flag=true;' + source, ['safe'])
+                self.scan_sort(source, 'xss', partial=f'Array.{method} element default')
+
+    def test_find_definite_holes_throw_on_destructuring_and_run_defaults(self):
+        for method in ('find', 'findIndex'):
+            for pattern in ('{html}', '[html]'):
+                with self.subTest(method=method, pattern=pattern):
+                    source = ('let saved=req.query.html;try{'
+                              f'[,].{method}(({pattern})=>{{saved="safe";res.send(req.query.html);return true;}});'
+                              '}catch(error){res.send("caught");}res.send(saved);')
+                    self.assert_runtime_sends(source, ['caught', 'review-input'])
+                    self.scan_sort(source, 'xss')
+            with self.subTest(method=method, defaults=True):
+                source = ('let saved=req.query.html;'
+                          f'[,].{method}((value=(saved="safe"))=>true);res.send(saved);')
+                self.assert_runtime_sends(source, ['safe'])
+                self.scan_sort(source)
+
+    def test_find_transports_selected_callables_without_erasing_no_match(self):
+        source = ('function visit(value){res.send(value);}'
+                  'const callback=[visit].find(()=>true);[req.query.html].forEach(callback);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, 'xss')
+        source = ('const stop=true;function visit(value){res.send(value);}'
+                  'const callback=[visit].find(()=>stop);res.send(req.query.html);'
+                  '[req.query.html].forEach(callback);')
+        self.assert_runtime_sends(source, ['review-input', 'review-input'])
+        self.scan_sort(source, 'xss', partial='Array.forEach.*synchronous callback')
+
+    def test_find_preserves_nested_chains_and_sink_specific_sanitizers(self):
+        source = ('const selected=[req.query.html].map(value=>({html:value})).find(value=>true);'
+                  'res.send(selected.html);res.send([[req.query.html]].find(value=>true).find(value=>true));')
+        self.assert_runtime_sends(source, ['review-input', 'review-input'])
+        self.scan_sort(source, 'xss', 'xss')
+        source = ('const out=[DOMPurify.sanitize(req.query.html)].find(value=>true);'
+                  'res.send(out);eval(out);db.query(out);shell.exec(out);')
+        self.scan_sort(source, 'eval', 'sql', 'command')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_find_public_matches_callback_effects_and_incomplete_status(self):
+        cases = (
+            ('effects', 'let saved="safe";\nconst item={html:"safe"};\n'
+             'const selected=[item].find(value=>true);\nselected.html=req.query.html;\n'
+             '[req.query.html].findIndex(value=>{saved=value;return false;});\n'
+             'res.send(item.html);\nres.send(saved);\ntry{\n'
+             '[req.query.html].find(value=>{throw value;});\n}catch(error){\n'
+             'res.send(error);\n}\n',
+             [('javascript.taint.xss', line, 1) for line in (6, 7, 11)], False),
+            ('clean', 'res.send([req.query.html].find(value=>false));\n'
+             'res.send([req.query.html].findIndex(value=>true));\nlet saved=req.query.html;\n'
+             '["safe",req.query.html].find(value=>{saved=value;return true;});\n'
+             'res.send(saved);\n[].findIndex(()=>{res.send(req.query.html);return true;});\n', [], False),
+            ('partial', 'res.send(req.query.html);\nconst items=["safe"];\nitems.findIndex(external);\n',
+             [('javascript.taint.xss', 1, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-find-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            if not partial:
+                self.assert_runtime_sends(source, ['review-input'] * 3 if name == 'effects' else [None, 0, 'safe'])
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Array.findIndex')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_find_public_cache_invalidation_and_suppression(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-find-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const items=[req.query.html];\nconst selected=items.find(value=>true);\n'
+                  'res.send(selected);\n')
+        clean = unsafe.replace('value=>true', 'value=>false')
+        suppressed = unsafe.replace('res.send(selected);', 'res.send(selected); // ubs:ignore')
+        for index, (source, expected) in enumerate((
+                (unsafe, [('javascript.taint.xss', 3, 1)]),
+                (unsafe, [('javascript.taint.xss', 3, 1)]),
+                (clean, []), (suppressed, []), (unsafe, [('javascript.taint.xss', 3, 1)]))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                        expected=expected, cache=True)
+
     def test_predicates_preserve_captured_scalar_and_heap_writes(self):
         for method, result in (('some', 'false'), ('every', 'true')):
             with self.subTest(method=method):

@@ -1673,7 +1673,7 @@ class _Flow:
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
                                        'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed',
                                        'toSpliced', 'with', 'entries', 'map', 'flatMap', 'forEach',
-                                       'reduce', 'reduceRight', 'some', 'every', 'filter'):
+                                       'reduce', 'reduceRight', 'some', 'every', 'filter', 'find', 'findIndex'):
                             slots[method] = _alternatives(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
@@ -2769,7 +2769,7 @@ class _Flow:
         return receiver
 
     def array_callback(self, callee, element, receiver, this_arg, state, location, method,
-                       accumulator=None):
+                       accumulator=None, *, element_undefined=False):
         """Use ordinary call summaries for a synchronous native callback."""
         self.engine.import_captures(callee, state, self.rule)
         self.engine.dependents[(callee, self.rule)][self.scope] = None
@@ -2780,9 +2780,15 @@ class _Flow:
             ('accumulator', accumulator), ('element', element)]
         actual, missing = [], set()
         for index, (label, value) in enumerate(values):
-            scalar = not _refs(value) or bool(frozenset(value))
+            undefined = label == 'element' and element_undefined
+            if undefined:
+                value = frozenset()
+            # Unlike the other visitors, find calls the predicate for absent
+            # slots too: an optional object can therefore supply undefined.
+            scalar = (undefined or not _refs(value) or bool(frozenset(value))
+                      or (method in {'find', 'findIndex'} and getattr(value, 'absent', False)))
             actual.append((value, scalar))
-            if scalar:
+            if scalar and not undefined:
                 missing.add(index)
                 if index < len(callee.params) and callee.params[index][2] is not None:
                     self.incomplete.add(f'Array.{method} {label} default requires a known undefined or present value')
@@ -3026,7 +3032,8 @@ class _Flow:
         """Execute native callbacks over live finite array slots.
 
         The source length is captured once, while elements are read immediately
-        before each callback. Sparse lengths never turn into dense loops.
+        before each callback. Methods that skip holes visit only present slots;
+        find/findIndex visit every index, charged against the shared work budget.
         Callback writes, throws and borrowed object identities use the same
         bounded heap summaries as ordinary local calls. Map preserves source
         indices and holes; flatMap flattens once; forEach discards return values.
@@ -3035,11 +3042,14 @@ class _Flow:
         from subsequent iterations so later writes cannot clean stopped paths.
         Filter compacts selected input values, preserving their pre-callback
         snapshots and shallow identities independently of predicate results.
+        Find returns that same snapshot from the first match; findIndex returns
+        a clean index. Missing and deleted slots still execute their predicates.
         """
         actual, uncertain, _missing, _kinds = prepared
         callee = (_function_target(actual[0][0]) or callback) if actual else None
         reducing = method in {'reduce', 'reduceRight'}
-        testing = method in {'some', 'every'}
+        searching = method in {'find', 'findIndex'}
+        testing = method in {'some', 'every'} or searching
         filtering = method == 'filter'
         reverse = method == 'reduceRight'
         produces_array = method in {'map', 'flatMap', 'filter'}
@@ -3098,7 +3108,7 @@ class _Flow:
                 # Assignments/containers around a literal can publish it as
                 # another entrypoint, even when this native call is empty.
                 self.engine.escaped_callbacks.add(callee)
-        branches, accumulators = [], []
+        branches, accumulators, matches = [], [], []
         for ref in refs:
             branch = state.copy()
             selected = _Fact(refs=(ref,))
@@ -3122,14 +3132,20 @@ class _Flow:
                     self.incomplete.add(f'Array.{method} callback changed the source to an unknown length')
                     size = None
                     break
-                positions = [int(key) for key in source if self.array_index(key) is not None
-                             and int(key) < min(length, limit)
-                             and (int(key) <= cursor if reverse else int(key) >= cursor)]
-                if not positions:
-                    break
-                index = max(positions) if reverse else min(positions)
+                if searching:
+                    # FindViaPredicate uses Get without HasProperty. Even a
+                    # hole, or an index removed by an earlier callback, is a
+                    # definite visit within the original length snapshot.
+                    index = cursor
+                else:
+                    positions = [int(key) for key in source if self.array_index(key) is not None
+                                 and int(key) < min(length, limit)
+                                 and (int(key) <= cursor if reverse else int(key) >= cursor)]
+                    if not positions:
+                        break
+                    index = max(positions) if reverse else min(positions)
                 value = self.property(selected, str(index), branch)
-                definite = ref not in branch.weak_refs and not getattr(value, 'absent', False)
+                definite = searching or (ref not in branch.weak_refs and not getattr(value, 'absent', False))
                 next_cursor = index - 1 if reverse else index + 1
                 if reducing and not initialized:
                     # Without an initial value, the first present element is
@@ -3148,7 +3164,9 @@ class _Flow:
                 try:
                     mapped = self.array_callback(callee, value, selected, this_arg, branch,
                                                  (location, method + '-index', index), method,
-                                                 accumulator if reducing else None)
+                                                 accumulator if reducing else None,
+                                                 element_undefined=searching and (
+                                                     index >= length or str(index) not in source))
                 except _NoNormalCompletion:
                     if bypass is None:
                         branch = None
@@ -3158,9 +3176,11 @@ class _Flow:
                         accumulator = _join(retained, seed)
                 else:
                     if testing:
-                        stop_when = method == 'some'
+                        stop_when = method != 'every'
                         if predicate_truth is None or predicate_truth == stop_when:
                             stopped = _join_states(stopped, branch)
+                            if method == 'find':
+                                matches.append(value)
                         if predicate_truth is not None and predicate_truth == stop_when:
                             # An optional hole still continues without calling
                             # the predicate, even when every actual call stops.
@@ -3169,6 +3189,14 @@ class _Flow:
                                 break
                         elif bypass is not None:
                             branch = _join_states(branch, bypass)
+                        if searching and limit - next_cursor > self.engine.budget.remaining:
+                            # Every remaining index is a real predicate visit,
+                            # including holes. Disclose an impossible traversal
+                            # before it consumes the component's whole budget,
+                            # retaining established sinks and callback effects.
+                            # The first call still gets to stop or throw above.
+                            self.incomplete.add(f'Array.{method} remaining index visits exceed the taint work limit')
+                            break
                         cursor = next_cursor
                         continue
                     values, exact = (self.flatmap_values(mapped, branch, result_kind)
@@ -3208,6 +3236,11 @@ class _Flow:
                 uninitialized = uninitialized and not definite
                 cursor = next_cursor
             if testing:
+                if method == 'find' and branch is not None:
+                    # A completed nonmatching path returns undefined. Keep it
+                    # as an alternative so a possible function match never
+                    # becomes an unconditionally selected callable.
+                    matches.append(frozenset())
                 branch = _join_states(stopped, branch)
             if uninitialized:
                 # No callback runs on the path where every indexed property
@@ -3232,14 +3265,15 @@ class _Flow:
         if merged is None:
             raise _NoNormalCompletion
         self.replace_state(state, merged)
-        return _join(*accumulators) if reducing else returned
+        return (_join(*accumulators) if reducing else
+                _alternatives(*matches) if method == 'find' else returned)
 
     def native_array_target(self, receiver, method, state):
         refs = _refs(receiver)
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
         if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin',
                        'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flatMap', 'map', 'forEach',
-                       'reduce', 'reduceRight', 'some', 'every', 'filter'}
+                       'reduce', 'reduceRight', 'some', 'every', 'filter', 'find', 'findIndex'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
@@ -3257,7 +3291,7 @@ class _Flow:
                 if unknown:
                     fact = _join(fact, selected)
             cursor = selected_end
-            match = re.match(r'\s*\.\s*(flatMap|map|forEach|reduce|reduceRight|some|every|filter|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
+            match = re.match(r'\s*\.\s*(flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
             if match is None:
                 break
             opening = cursor + match.end() - 1
@@ -3345,7 +3379,7 @@ class _Flow:
             return self.array_sort(receiver, arguments, prepared, state, callback)
         if kind == 'array' and method in {'toSorted', 'toReversed', 'toSpliced', 'with'}:
             return self.array_copy(receiver, method, arguments, prepared, state, location, callback)
-        if kind == 'array' and method in {'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter'}:
+        if kind == 'array' and method in {'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter', 'find', 'findIndex'}:
             return self.array_iteration(receiver, method, arguments, prepared, state, location, callback)
         if values and (kind == 'reflect' or (kind == 'object' and method in {
                 'defineProperty', 'defineProperties', 'freeze', 'seal', 'preventExtensions', 'setPrototypeOf'})):
@@ -3683,7 +3717,7 @@ class _Flow:
                 return None, receiver
             return candidate, receiver
         if (report and key in {'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed', 'toSpliced',
-                              'with', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter'}
+                              'with', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter', 'find', 'findIndex'}
                 and _refs(receiver)
                 and all(ref in state.array_lengths for ref in _refs(receiver))
                 and self.native_target(name, state) is None):
@@ -4241,7 +4275,7 @@ class _Flow:
         cursor = start
         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
         if (primary_end is not None and primary_end < end - 1
-                and re.match(r'\s*\.\s*(?:flatMap|map|forEach|reduce|reduceRight|some|every|filter|sort|toSorted|toReversed|toSpliced|with)\s*\(',
+                and re.match(r'\s*\.\s*(?:flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|sort|toSorted|toReversed|toSpliced|with)\s*\(',
                              code[primary_end + 1:end])):
             primary = self.value(start, primary_end + 1, state)
             primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)
@@ -4315,7 +4349,7 @@ class _Flow:
             sink = self.engine.call_sinks.get(match_start)
             callback = (self.callable(*arguments[0], state)
                         if native is not None and native[0] == 'array' and native[2] in {
-                            'sort', 'toSorted', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter'}
+                            'sort', 'toSorted', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter', 'find', 'findIndex'}
                         and arguments else None)
             if arguments and callback is None:
                 unmodeled = self.callable(*arguments[0], state)
@@ -5019,7 +5053,7 @@ class _Engine:
         self.flatmap_result_kinds = {}
         self.predicate_result_truths = {}
         self.has_array_callbacks = any(name in self.text for name in (
-            'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter', 'sort', 'toSorted'))
+            'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter', 'find', 'findIndex', 'sort', 'toSorted'))
         self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
         self.current_task = None
         self.heap_solve_depth = 0

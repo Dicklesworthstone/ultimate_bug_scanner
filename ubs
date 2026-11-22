@@ -92,7 +92,7 @@ if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
   unset _ubs_arg
 fi
 
-UBS_VERSION="5.5.104"
+UBS_VERSION="5.5.105"
 # Installed releases prepare a complete, version-bound cache before publication.
 # This literal marker is parsed as data by the updater, never evaluated remotely.
 UBS_RELEASE_GENERATIONS=1
@@ -669,13 +669,18 @@ finish_primary_output(){
 # Invoked by the EXIT trap below and the later cleanup callback.
 # shellcheck disable=SC2317,SC2329
 early_cleanup(){
-  local p
-  for p in "${EARLY_TMP_PATHS[@]}"; do
-    [[ -n "$p" && -e "$p" && "$p" != "/" ]] && ubs_remove_temp -rf "$p" 2>/dev/null
+  local p run_dir_seen=0
+  for p in "${EARLY_TMP_PATHS[@]}" "${TMPDIR_RUN:-}"; do
+    [[ -n "$p" && "$p" != "/" && ( -e "$p" || -L "$p" ) ]] || continue
+    if [[ "$p" == "${TMPDIR_RUN:-}" ]]; then
+      [[ "$run_dir_seen" -eq 0 ]] || continue
+      run_dir_seen=1
+    fi
+    # Cleanup must not replace the scan, report-publication or signal status.
+    if ! ubs_remove_temp -rf -- "$p" 2>/dev/null; then
+      printf 'WARNING: Could not remove scanner temporary path %q; retained for inspection.\n' "$p" >&2 || true
+    fi
   done
-  if [[ -n "${TMPDIR_RUN:-}" && -d "$TMPDIR_RUN" && "$TMPDIR_RUN" != "/" ]]; then
-    ubs_remove_temp -rf "$TMPDIR_RUN" 2>/dev/null || true
-  fi
   return 0
 }
 # Invoked by the early EXIT trap, before the full cleanup handler is installed.
@@ -4435,7 +4440,9 @@ copy_file_list(){
   ensure_dir "$dest"
   local err="$TMPDIR_RUN/copy_stderr.txt" rc=0 tar_rc=0
   if need_cmd rsync; then
-    rsync -a --from0 --files-from="$list" "$src"/ "$dest"/ >/dev/null 2>"$err" || rc=$?
+    # Immutable source directories must not make our private copy immutable.
+    # Adjust only copied permissions, preserving file executable bits.
+    rsync -a --chmod=Du+rwx,Fu+rw --from0 --files-from="$list" "$src"/ "$dest"/ >/dev/null 2>"$err" || rc=$?
     if [[ "$rc" -ne 0 ]]; then
       report_rsync_failure "$rc" "$err"
       return 1
@@ -8748,9 +8755,6 @@ kill_module_pgroups(){
 # shellcheck disable=SC2317,SC2329  # invoked via the EXIT trap and from on_interrupt
 cleanup(){
   early_cleanup
-  local dir="${TMPDIR_RUN:-}"
-  [[ -n "$dir" && "$dir" != "/" ]] || return 0
-  ubs_remove_temp -rf "$dir" 2>/dev/null || true
 }
 # On interrupt/termination, tear down any in-flight module process groups first
 # (so their cargo/ast-grep grandchildren don't reparent and survive), clean up,

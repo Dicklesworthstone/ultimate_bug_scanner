@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -953,6 +954,122 @@ class PostprocessStreamingTests(unittest.TestCase):
         self.assertLess(int(peak.read_text()), 128 * 1024)
         self.assertEqual(digest(self.findings), expected_digest)
         self.assertEqual(self.parse_report(self.summary.read_text(encoding="utf-8"), self.summary), doc)
+
+
+class ReadOnlyWorkspaceTest(unittest.TestCase):
+    """Issue #228: writable private copies and verdict-preserving cleanup.
+
+    Fixtures remain in artifacts. Cleanup faults are injected at the removal
+    boundary, while copy-tier checks use the actual available copy tools.
+    """
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="readonly-workspace-", dir=artifacts))
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX permission bits")
+    def test_readonly_sources_have_writable_copies_in_every_copy_tier(self):
+        source = self.root / "source"
+        nested = source / "nested dir" / "sub"
+        nested.mkdir(parents=True)
+        files = (nested / "a.rs", nested / "b.rs")
+        for path, mode in zip(files, (0o444, 0o555)):
+            path.write_text("pub fn answer() -> i32 { 42 }\n", encoding="utf-8")
+            path.chmod(mode)
+        for directory in (nested, nested.parent, source):
+            directory.chmod(0o555)
+        paths = [source, *source.rglob("*")]
+        before = {str(path): (path.stat().st_mode, path.read_bytes() if path.is_file() else None)
+                  for path in paths}
+        listing = self.root / "files.0"
+        listing.write_bytes(b"".join(os.fsencode(path.relative_to(source)) + b"\0" for path in files))
+        script = "\n".join([
+            "set -Eeuo pipefail", 'TMPDIR_RUN="$1"', "DIM= INFO= RESET= RED= X=",
+            'ensure_dir(){ mkdir -p "$1"; }', 'say(){ printf "%s\\n" "$*" >&2; }',
+            *(bash_function(name) for name in ("need_cmd", "ubs_remove_temp", "copy_file_list",
+                                               "report_copy_failure", "report_rsync_failure")),
+            'copy_file_list "$2" "$3" "$4"',
+        ])
+        tiers = (("rsync", {}), ("tar", {"UBS_TEST_NO_RSYNC": "1"}),
+                 ("python", {"UBS_TEST_NO_RSYNC": "1", "UBS_TEST_NO_TAR": "1"}))
+        for tier, overrides in tiers:
+            with self.subTest(tier=tier):
+                if tier != "python" and not shutil.which(tier):
+                    self.skipTest(f"real {tier} is required for this copy-tier check")
+                scratch = self.root / tier
+                scratch.mkdir()
+                destination = scratch / "shadow"
+                env = dict(os.environ, UBS_KEEP_TEMP="1", UBS_TEST_NO_RSYNC="0", UBS_TEST_NO_TAR="0")
+                env.update(overrides)
+                result = run_helper(["bash", "-c", script, "copy-test", str(scratch),
+                                     str(source), str(listing), str(destination)], env=env, text=True)
+                (scratch / "stdout.log").write_text(result.stdout, encoding="utf-8")
+                (scratch / "stderr.log").write_text(result.stderr, encoding="utf-8")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual({str(path): (path.stat().st_mode,
+                                             path.read_bytes() if path.is_file() else None)
+                                  for path in paths}, before)
+                for path in files:
+                    copied = destination / path.relative_to(source)
+                    self.assertEqual(copied.read_bytes(), path.read_bytes())
+                    self.assertEqual(copied.stat().st_mode & 0o111, path.stat().st_mode & 0o111)
+                    if tier == "rsync":
+                        self.assertEqual(copied.stat().st_mode & 0o600, 0o600, str(copied))
+                for directory in [destination, *destination.rglob("*")]:
+                    if directory.is_dir():
+                        self.assertEqual(directory.stat().st_mode & 0o700, 0o700, str(directory))
+
+    def test_cleanup_failures_preserve_exit_report_and_signal_status(self):
+        first, second, run = (self.root / name for name in ("first", "second", "run"))
+        first.write_text("retained\n", encoding="utf-8")
+        second.write_text("retained\n", encoding="utf-8")
+        run.mkdir()
+        lines = UBS.read_text(encoding="utf-8").splitlines()
+        early = next(line for line in lines if line.startswith("trap 'finish_early_exit' EXIT"))
+        normal = next(line for line in lines if line.startswith("trap 'ubs_exit_status=$?;"))
+        term = next(line for line in lines if line.startswith("trap 'on_interrupt TERM' TERM"))
+        on_err = next(line for line in lines if line.startswith("on_err(){"))
+        definitions = "\n".join(bash_function(name) for name in
+                                 ("early_cleanup", "finish_early_exit", "cleanup", "on_interrupt"))
+        cases = [(handler, status, 0, False) for handler in ("early", "normal")
+                 for status in (0, 1, 2, 130)]
+        cases += [(handler, 0, write_error, closed) for handler in ("early", "normal")
+                  for write_error, closed in ((1, False), (0, True))]
+        # Python exposes signal termination as a negative return code on POSIX.
+        if os.name == "posix":
+            cases += [("term", 0, 0, False), ("term", 0, 1, True)]
+        for handler, status, write_error, closed in cases:
+            label = f"{handler}-{status}-{write_error}-{closed}"
+            with self.subTest(case=label):
+                calls = self.root / (label + ".calls")
+                trap_line = early if handler == "early" else normal
+                script = "\n".join([
+                    "set -Eeuo pipefail", "RED= BOLD= DIM= WHITE= RESET=",
+                    'calls="$3"; write_error="$4"',
+                    'EARLY_TMP_PATHS=("$1/run" "$1/first" "$1/second"); TMPDIR_RUN="$1/run"',
+                    'say(){ printf "%s\\n" "$*"; }',
+                    'finish_primary_output(){ return "$write_error"; }',
+                    'kill_module_pgroups(){ :; }',
+                    'ubs_remove_temp(){ local path; for path; do :; done; printf "%s\\0" "$path" >> "$calls"; return 73; }',
+                    definitions, on_err, "trap on_err ERR", trap_line,
+                    term if handler == "term" else ":",
+                    'printf \'%s\\n\' \'{"status":"ok"}\'',
+                    "exec 2>&-" if closed else ":",
+                    'kill -TERM "$"' if handler == "term" else 'exit "$2"',
+                ])
+                result = run_helper(["bash", "-c", script, "cleanup-test", str(self.root),
+                                     str(status), str(calls), str(write_error)], text=True)
+                (self.root / (label + ".stdout.log")).write_text(result.stdout, encoding="utf-8")
+                (self.root / (label + ".stderr.log")).write_text(result.stderr, encoding="utf-8")
+                expected = -signal.SIGTERM if handler == "term" else (2 if write_error else status)
+                self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, '{"status":"ok"}\n')
+                self.assertEqual(calls.read_bytes().split(b"\0")[:-1],
+                                 [os.fsencode(path) for path in (run, first, second)])
+                if not closed:
+                    self.assertEqual(result.stderr.count("Could not remove scanner temporary path"), 3)
+                self.assertTrue(all(path.exists() for path in (run, first, second)))
 
 
 if __name__ == "__main__":

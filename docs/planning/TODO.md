@@ -300,13 +300,27 @@ these gaps. Existing broad detector and release goals remain open.
 - [ ] Complete repository-wide qualification. The changed-source self-scan
   reports partial analysis with exit 2; full-suite and release gates remain open.
 
-### Native JavaScript filter (`1b9j.6`)
+### Native JavaScript filter (`1b9j.6.9`)
 
 - [x] Freeze missed callback effects and false-positive controls against Node.
 - [x] Implement native filter through the shared finite array callback engine.
-- [ ] Verify independent cases, ordinary output formats, cache and suppression.
-- [ ] Publish the bounded feature; retain the existing computed-index precision
-  limitation and unresolved repository-wide qualification.
+- [x] Pass all 15 maintained source/native methods; their baseline has 25
+  failed assertions. The independent corpus passes 17 of 18 scanner cases and
+  all 36 native observations; the remaining scanner result is an existing
+  false positive for cleanup through a computed callback index.
+- [x] Pass all 17 actual public calls on pinned version 5.5.102: 12 module/runner
+  JSON/SARIF reports and five cache/edit/suppression controls. Exact locations,
+  statuses, exits and counts pass; log SHA256
+  `e87eac12bdced0be3cf4e8cb1001aec53363d0be29ee7030e08fd3c892f873f3`.
+- [x] Finish the adjacent callback cohort: all 72 methods pass across the
+  initial run and an unchanged isolated replay. Three native Node timeouts in
+  one reduction method all pass on replay (six subcases, 1.296 seconds); the
+  original 15-second deadlines and failed receipts are preserved.
+- [ ] Resolve full-heap/repository qualification. The earlier full heap run
+  was interrupted after 283 started methods with eight error entries and no
+  final traceback summary; it is not a passing cohort.
+- [x] Publish the bounded feature with canonical integrity pins. Keep computed
+  callback-index precision and whole-repository/release qualification open.
 
 ### Native Python stdin enumeration (`stdin-provenance`)
 

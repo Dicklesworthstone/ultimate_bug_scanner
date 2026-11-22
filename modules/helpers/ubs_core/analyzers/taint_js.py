@@ -1673,7 +1673,7 @@ class _Flow:
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
                                        'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed',
                                        'toSpliced', 'with', 'entries', 'map', 'flatMap', 'forEach',
-                                       'reduce', 'reduceRight', 'some', 'every'):
+                                       'reduce', 'reduceRight', 'some', 'every', 'filter'):
                             slots[method] = _alternatives(slots.get(method, _ABSENT), present)
                 elif self.array_index(key) is not None and length is not None:
                     state.array_lengths[ref] = max(length, int(key) + 1)
@@ -3033,13 +3033,16 @@ class _Flow:
         Reductions carry the returned accumulator in either traversal direction.
         Some/every return clean booleans and retain early-stop states separately
         from subsequent iterations so later writes cannot clean stopped paths.
+        Filter compacts selected input values, preserving their pre-callback
+        snapshots and shallow identities independently of predicate results.
         """
         actual, uncertain, _missing, _kinds = prepared
         callee = (_function_target(actual[0][0]) or callback) if actual else None
         reducing = method in {'reduce', 'reduceRight'}
         testing = method in {'some', 'every'}
+        filtering = method == 'filter'
         reverse = method == 'reduceRight'
-        produces_array = method in {'map', 'flatMap'}
+        produces_array = method in {'map', 'flatMap', 'filter'}
         result = (self.scope, location, 'array-' + method)
         returned = (_Fact(refs=(result,)) if produces_array else
                     actual[1][0] if reducing and len(actual) > 1 else frozenset())
@@ -3066,7 +3069,7 @@ class _Flow:
             return returned
         this_arg = actual[1][0] if not reducing and len(actual) > 1 else frozenset()
         result_kind = self.flatmap_result_kind(callee) if method == 'flatMap' else None
-        predicate_truth = self.predicate_result_truth(callee) if testing else None
+        predicate_truth = self.predicate_result_truth(callee) if testing or filtering else None
         if (not callee.arrow and not _refs(this_arg)
                 and re.search(r'\bthis\b', callee.code[callee.body_start:callee.body_end])):
             self.incomplete.add(f'Array.{method} callback requires a known this receiver')
@@ -3101,6 +3104,7 @@ class _Flow:
             selected = _Fact(refs=(ref,))
             limit = branch.array_lengths[ref]
             cursor, size, slots = limit - 1 if reverse else 0, limit if method == 'map' else 0, {}
+            minimum_size = maximum_size = 0
             initialized = reducing and len(actual) > 1
             uninitialized = reducing and not initialized
             accumulator = actual[1][0] if initialized else frozenset()
@@ -3175,6 +3179,21 @@ class _Flow:
                         accumulator = _join(mapped, retained, seed)
                     elif method == 'map':
                         slots[str(index)] = _Fact(mapped, _refs(mapped), absent=not definite)
+                    elif filtering and predicate_truth is not False:
+                        # The predicate chooses the original value; its return
+                        # fact is never the output element. Unknown choices and
+                        # optional input slots can shift every later element.
+                        # Keep all feasible compacted offsets, rather than a
+                        # wildcard that would taint names and out-of-range reads.
+                        following_minimum = minimum_size + int(definite and predicate_truth is True)
+                        self.engine.budget.spend(1 + maximum_size - minimum_size)
+                        for offset in range(minimum_size, maximum_size + 1):
+                            key = str(offset)
+                            present = _Fact(value, _refs(value))
+                            joined = _alternatives(slots.get(key, _ABSENT), present)
+                            slots[key] = _Fact(joined, _refs(joined), absent=offset >= following_minimum)
+                        minimum_size, maximum_size = following_minimum, maximum_size + 1
+                        size = minimum_size if minimum_size == maximum_size else None
                     elif method == 'flatMap':
                         if size is not None and exact and definite:
                             slots.update({str(size + offset): item for offset, item in enumerate(values)})
@@ -3220,7 +3239,7 @@ class _Flow:
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
         if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin',
                        'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flatMap', 'map', 'forEach',
-                       'reduce', 'reduceRight', 'some', 'every'}
+                       'reduce', 'reduceRight', 'some', 'every', 'filter'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
@@ -3238,7 +3257,7 @@ class _Flow:
                 if unknown:
                     fact = _join(fact, selected)
             cursor = selected_end
-            match = re.match(r'\s*\.\s*(flatMap|map|forEach|reduce|reduceRight|some|every|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
+            match = re.match(r'\s*\.\s*(flatMap|map|forEach|reduce|reduceRight|some|every|filter|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
             if match is None:
                 break
             opening = cursor + match.end() - 1
@@ -3326,7 +3345,7 @@ class _Flow:
             return self.array_sort(receiver, arguments, prepared, state, callback)
         if kind == 'array' and method in {'toSorted', 'toReversed', 'toSpliced', 'with'}:
             return self.array_copy(receiver, method, arguments, prepared, state, location, callback)
-        if kind == 'array' and method in {'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every'}:
+        if kind == 'array' and method in {'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter'}:
             return self.array_iteration(receiver, method, arguments, prepared, state, location, callback)
         if values and (kind == 'reflect' or (kind == 'object' and method in {
                 'defineProperty', 'defineProperties', 'freeze', 'seal', 'preventExtensions', 'setPrototypeOf'})):
@@ -3664,7 +3683,7 @@ class _Flow:
                 return None, receiver
             return candidate, receiver
         if (report and key in {'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed', 'toSpliced',
-                              'with', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every'}
+                              'with', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter'}
                 and _refs(receiver)
                 and all(ref in state.array_lengths for ref in _refs(receiver))
                 and self.native_target(name, state) is None):
@@ -4222,7 +4241,7 @@ class _Flow:
         cursor = start
         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
         if (primary_end is not None and primary_end < end - 1
-                and re.match(r'\s*\.\s*(?:flatMap|map|forEach|reduce|reduceRight|some|every|sort|toSorted|toReversed|toSpliced|with)\s*\(',
+                and re.match(r'\s*\.\s*(?:flatMap|map|forEach|reduce|reduceRight|some|every|filter|sort|toSorted|toReversed|toSpliced|with)\s*\(',
                              code[primary_end + 1:end])):
             primary = self.value(start, primary_end + 1, state)
             primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)
@@ -4296,7 +4315,7 @@ class _Flow:
             sink = self.engine.call_sinks.get(match_start)
             callback = (self.callable(*arguments[0], state)
                         if native is not None and native[0] == 'array' and native[2] in {
-                            'sort', 'toSorted', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every'}
+                            'sort', 'toSorted', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter'}
                         and arguments else None)
             if arguments and callback is None:
                 unmodeled = self.callable(*arguments[0], state)
@@ -5000,7 +5019,7 @@ class _Engine:
         self.flatmap_result_kinds = {}
         self.predicate_result_truths = {}
         self.has_array_callbacks = any(name in self.text for name in (
-            'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'sort', 'toSorted'))
+            'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter', 'sort', 'toSorted'))
         self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
         self.current_task = None
         self.heap_solve_depth = 0

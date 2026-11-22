@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Follow native JavaScript `Array.filter` callbacks through selected helper
+  summaries. Preserve captured writes, throws, element snapshots and shallow
+  aliases; compact sparse selections into fresh arrays and retain finite
+  possible output indices for unknown predicates. Unsupported callback,
+  species and property protocols report incomplete coverage.
+
 - Gate release cutting on the complete generation-capable candidate and the
   exact staged Git tree. Refuse mismatched or absent runtime files before
   committing, and refuse tagging if a commit hook changes the validated tree.

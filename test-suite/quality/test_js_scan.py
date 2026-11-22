@@ -1554,6 +1554,23 @@ class EvalPatternTests(unittest.TestCase):
         ]) + "\n"
         self.assertEqual(self.lines("js.security.new-function", src), [1, 2])
 
+    def test_debugger_reads_code_only_and_keeps_real_statements(self) -> None:
+        src = "\n".join([
+            'export function describeWaitFailure(): string {',
+            '  const msg = "Process exited before debugger readiness";',
+            '  const tpl = `Waiting for debugger port`;',
+            '  // Wait for debugger readiness',
+            '  /* debugger in block comment */',
+            '  const re = /debugger/;',
+            '  return `${msg} ${tpl} ${re.source}`;',
+            '}',
+            'export function halt(): void {',
+            '  debugger;',                                     # 10
+            '  const x = `${(() => { debugger; return 1; })()}`;',  # 11
+            '}',
+        ]) + "\n"
+        self.assertEqual(self.lines("js.debug.debugger", src), [10, 11])
+
 
 if __name__ == "__main__":
     unittest.main()

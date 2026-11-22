@@ -237,6 +237,164 @@ _NATIVE_CHECKS: list[NativeCheck] = [
 ]
 
 
+_FUNC_START_RE = re.compile(
+    r"^[ \t]*(?:function[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*(?:\(\))?|[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\))[ \t]*\{"
+)
+_FUNC_END_RE = re.compile(r"^\}[ \t]*(?:#.*)?$")
+_DECL_LINE_RE = re.compile(r"^[ \t]*(?:local|declare)[ \t]+([^#\n;]+)")
+_TRAP_CAPTURE_RE = re.compile(
+    r"""^[ \t]*(?:(?:local|declare)[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=["']?\$\([ \t]*trap[ \t]+-p[ \t]+([^)$`"'|;&]+)\)["']?[ \t]*(?:#.*)?$"""
+)
+_VAR_ASSIGN_RE = re.compile(r"(?:^|[ \t;&|])([A-Za-z_][A-Za-z0-9_]*)\+?=")
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SIGNAL_TOK_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_EVAL_SINGLE_VAR_RE = re.compile(
+    r"""(?:^|[ \t;&|]|then[ \t]+|do[ \t]+)eval[ \t]+(?:--[ \t]+)?(?:"\$(?:\{)?([A-Za-z_][A-Za-z0-9_]*)(?:\})?"|\$(?:\{)?([A-Za-z_][A-Za-z0-9_]*)(?:\})?)[ \t]*(?:#.*)?$"""
+)
+
+
+def _valid_trap_signal_args(raw_args: str) -> bool:
+    tokens = raw_args.split()
+    if tokens and tokens[0] == "--":
+        tokens = tokens[1:]
+    if not tokens:
+        return False
+    for token in tokens:
+        if not _SIGNAL_TOK_RE.match(token):
+            return False
+    return True
+
+
+def _extract_mutated_vars(line: str) -> list[str]:
+    names: list[str] = []
+    for match in _VAR_ASSIGN_RE.finditer(line):
+        names.append(match.group(1))
+    stripped = line.lstrip()
+    tokens = stripped.split()
+    if not tokens:
+        return names
+    cmd = tokens[0]
+    if cmd in ("unset", "for") and len(tokens) >= 2:
+        for tok in tokens[1:]:
+            if tok.startswith("-"):
+                continue
+            if cmd == "for":
+                if _IDENT_RE.match(tok):
+                    names.append(tok)
+                break
+            if _IDENT_RE.match(tok):
+                names.append(tok)
+    elif cmd == "printf":
+        for idx, tok in enumerate(tokens[:-1]):
+            if tok == "-v":
+                nxt = tokens[idx + 1]
+                if _IDENT_RE.match(nxt):
+                    names.append(nxt)
+    elif cmd in ("read", "mapfile", "readarray"):
+        for tok in tokens[1:]:
+            if tok.startswith("-") or tok.startswith("#"):
+                continue
+            if _IDENT_RE.match(tok):
+                names.append(tok)
+    return names
+
+
+def _trap_restore_eval_lines(content: str) -> set[int]:
+    """Return 1-based line numbers of `eval "$var"` restoring a sole `$(trap -p <SIG>)` capture.
+
+    Soundness constraints:
+    - Only exempts an `eval` whose sole argument is a single variable expansion.
+    - The variable's sole assignment/mutation in scope (and file-wide if not
+      declared `local` in the enclosing function) must be `var="$(trap -p <SIG>)"`
+      with literal signal name(s) and must precede the `eval` line.
+    - Any reassignment, external mutation, or unproven variable keeps `eval` flagged.
+    """
+    if "eval" not in content or "trap" not in content:
+        return set()
+    lines = content.splitlines()
+    scope = 0
+    next_scope = 0
+    local_vars: dict[int, set[str]] = {}
+    scope_assigns: dict[tuple[int, str], list[tuple[int, bool]]] = {}
+    file_assigns: dict[str, list[tuple[int, int, bool]]] = {}
+    eval_candidates: list[tuple[int, int, str]] = []
+    in_heredoc = False
+    heredoc_delimiter = ""
+    heredoc_strip_tabs = False
+
+    for lineno, line in enumerate(lines, 1):
+        if in_heredoc:
+            check_line = line.lstrip("\t") if heredoc_strip_tabs else line
+            if check_line.rstrip() == heredoc_delimiter:
+                in_heredoc = False
+                heredoc_delimiter = ""
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        has_subshell = bool(re.search(r"\$\(|`", line))
+        m_hd = _unquoted_heredoc_header(line) if not has_subshell else _HEREDOC_HEADER.search(line)
+        if m_hd:
+            delim = m_hd.group(2) or m_hd.group(3) or m_hd.group(4) or m_hd.group(5)
+            if delim:
+                in_heredoc = True
+                heredoc_delimiter = delim
+                heredoc_strip_tabs = (m_hd.group(1) == "-")
+
+        if scope == 0 and _FUNC_START_RE.match(line):
+            next_scope += 1
+            scope = next_scope
+            local_vars.setdefault(scope, set())
+            continue
+        if scope != 0 and _FUNC_END_RE.match(line):
+            scope = 0
+            continue
+
+        if scope != 0:
+            m_decl = _DECL_LINE_RE.match(line)
+            if m_decl:
+                for tok in m_decl.group(1).split():
+                    if tok.startswith("-"):
+                        continue
+                    var_name = tok.split("=", 1)[0].rstrip("+")
+                    if _IDENT_RE.match(var_name):
+                        local_vars.setdefault(scope, set()).add(var_name)
+
+        m_trap = _TRAP_CAPTURE_RE.match(line)
+        if m_trap and _valid_trap_signal_args(m_trap.group(2)):
+            var_name = m_trap.group(1)
+            scope_assigns.setdefault((scope, var_name), []).append((lineno, True))
+            file_assigns.setdefault(var_name, []).append((scope, lineno, True))
+        else:
+            for var_name in _extract_mutated_vars(line):
+                scope_assigns.setdefault((scope, var_name), []).append((lineno, False))
+                file_assigns.setdefault(var_name, []).append((scope, lineno, False))
+
+        if "eval" in line and line.count("eval") == 1:
+            m_eval = _EVAL_SINGLE_VAR_RE.search(line)
+            if m_eval:
+                var_name = m_eval.group(1) or m_eval.group(2)
+                if var_name:
+                    eval_candidates.append((lineno, scope, var_name))
+
+    exempt: set[int] = set()
+    for eval_line, eval_scope, var_name in eval_candidates:
+        if eval_scope != 0 and var_name in local_vars.get(eval_scope, set()):
+            assigns = scope_assigns.get((eval_scope, var_name), [])
+            if len(assigns) == 1 and assigns[0][1] and assigns[0][0] < eval_line:
+                exempt.add(eval_line)
+        else:
+            all_assigns = file_assigns.get(var_name, [])
+            if (
+                len(all_assigns) == 1
+                and all_assigns[0][2]
+                and all_assigns[0][0] in (0, eval_scope)
+                and all_assigns[0][1] < eval_line
+            ):
+                exempt.add(eval_line)
+    return exempt
+
+
 def scan_files_native(
     files: Sequence[Path],
     sink,
@@ -263,6 +421,7 @@ def scan_files_native(
             continue
         lines = content.splitlines()
         suppression = suppressions.index(path, content)
+        trap_eval_lines = _trap_restore_eval_lines(content)
         file_str = str(path)
 
         # Check POSIX sh shebang for bashisms
@@ -334,6 +493,8 @@ def scan_files_native(
                 ):
                     continue
                 if check.regex.search(line):
+                    if check.rule_id == "bash.security.eval_variable" and lineno in trap_eval_lines:
+                        continue
                     if suppression.is_suppressed(lineno, check.rule_id):
                         continue
                     key = (file_str, lineno, check.rule_id)
@@ -534,6 +695,7 @@ def scan_ast_rules(
     counters = {"critical": 0, "warning": 0, "info": 0}
     config = rule_dir / "sgconfig-bash.yml"
     suppressions = SourceSuppressions("bash")
+    trap_eval_cache: dict[str, set[int]] = {}
     if not config.is_file():
         if errors is not None:
             errors.append(f"ast-grep configuration not found: {config}")
@@ -632,6 +794,16 @@ def scan_ast_rules(
             cat = 3 if "security" in rule_id else (2 if "variable" in rule_id else 1)
             if cat in skip:
                 continue
+            if rule_id == "bash.security.eval-variable":
+                if file_p not in trap_eval_cache:
+                    try:
+                        trap_eval_cache[file_p] = _trap_restore_eval_lines(
+                            Path(file_p).read_text(encoding="utf-8", errors="replace")
+                        )
+                    except OSError:
+                        trap_eval_cache[file_p] = set()
+                if lineno in trap_eval_cache[file_p]:
+                    continue
             if suppressions.index(file_p).is_suppressed(lineno, rule_id):
                 continue
 

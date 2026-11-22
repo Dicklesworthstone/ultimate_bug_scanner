@@ -844,7 +844,7 @@ def scan_file(path: Path, sample_root: Path) -> list[tuple[str, int, str]]:
     # view only for this file; the shared index owns suppression separately.
     # Scope coordinates are absolute. Blank comments without shortening the
     # line so a later comparison cannot appear inside an earlier callback.
-    lexical_source, _lexical_code = javascript_lexical_views(text)
+    lexical_source, _lexical_code = javascript_lexical_views(text, mask_regex_in_source=True)
     code_lines = lexical_source.splitlines()
     sensitive_vars, call_results = collect_sensitive_bindings(lines, code_lines)
     response_ranges = playwright_response_ranges(text)

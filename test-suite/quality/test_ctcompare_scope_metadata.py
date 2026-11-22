@@ -412,6 +412,20 @@ const other = typeof link === "string" ? true : password === supplied;
                 source = f'const result = authToken + {literal}.source === supplied;\n'
                 self.assertEqual(scan_lines("js", source), [1])
 
+    def test_comparisons_inside_regular_expressions_do_not_report(self):
+        source = textwrap.dedent('''\
+            export const regexRules = [
+              { name: "token-eq", pattern: /authToken === expectedToken/ },
+              { name: "secret-neq", pattern: /apiSecret !== "placeholder"/i },
+              { name: "class-slash", pattern: /[a/b]authToken === expectedToken/g },
+            ];
+            export const stringControl = "authToken === expectedToken";
+            export function realUnsafe(authToken: string, expectedToken: string) {
+              return authToken === expectedToken;
+            }
+        ''')
+        self.assertEqual(scan_lines("js", source), [8])
+
 
 class JavascriptTimingSafeOperandTests(unittest.TestCase):
     """A safe equality call protects its result, not nearby secret comparisons."""

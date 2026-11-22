@@ -10,6 +10,26 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Fix JS/TS and Bash precision defects (#225, #226, #227) and harden read-only
+  temporary cleanup (#228):
+  - Enable `code_only=True` on `js.debug.debugger` so `"debugger"` inside
+    JS/TS strings, template text, comments, and regex literals no longer reports
+    as a critical finding while executable `debugger;` statements still report
+    (#225).
+  - Mask JavaScript/TypeScript regex literal spans in `ctcompare_js` via
+    `javascript_lexical_views(..., mask_regex_in_source=True)` so regex literals
+    such as `/authToken === expectedToken/` no longer trigger
+    `javascript.ctcompare.unsafe_secret_compare` (#226).
+  - Restrict the `bash.security.eval-variable` AST rule to `eval` commands with
+    an actual variable or command expansion, and exempt single-variable
+    `eval "$saved"` lines in both native and ast-grep Bash checks when the
+    variable's sole reaching assignment in scope is a literal
+    `$(trap -p <SIGNAL>)` capture (#227).
+  - Make `ubs_remove_temp()` restore owner write permission on scanner-owned
+    read-only temp paths before retrying removal, complementing `0ff4dc32`'s
+    `#228` read-only workspace fix with an end-to-end read-only CLI regression
+    test (#228).
+
 - Resolve selected Python helpers that return native `any`/`all` predicates
   when their iterator and comparison inputs have proved builtin identities.
   Preserve exact primitive equality during native consumption and predicate

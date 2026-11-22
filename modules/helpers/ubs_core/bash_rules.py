@@ -60,7 +60,21 @@ _RULES: list[tuple[str, str]] = [
         r"""id: bash.security.eval-variable
 language: bash
 rule:
-  pattern: eval $$$ARGS
+  kind: command
+  has:
+    field: name
+    regex: '^eval$'
+  all:
+    - any:
+        - has:
+            kind: simple_expansion
+            stopBy: end
+        - has:
+            kind: expansion
+            stopBy: end
+        - has:
+            kind: command_substitution
+            stopBy: end
 severity: error
 message: "Dynamic code execution via eval; avoid eval with variable arguments"
 """,

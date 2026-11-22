@@ -58,7 +58,7 @@ _RUST_CHAR_RE = re.compile(
 )
 
 
-def javascript_lexical_views(text: str) -> tuple[str, str]:
+def javascript_lexical_views(text: str, *, mask_regex_in_source: bool = False) -> tuple[str, str]:
     """Return comment-free source and executable code at original offsets.
 
     Template text is inert, but ${expressions} (including nested templates)
@@ -184,6 +184,9 @@ def javascript_lexical_views(text: str) -> tuple[str, str]:
                         end += 1
                     mask(code, i, end)
                     code[i] = '0'
+                    if mask_regex_in_source:
+                        mask(source, i, end)
+                        source[i] = '0'
                     i = end
                     break
                 end += 1

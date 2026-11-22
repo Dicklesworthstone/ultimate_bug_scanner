@@ -1056,7 +1056,7 @@ class ReadOnlyWorkspaceTest(unittest.TestCase):
                     term if handler == "term" else ":",
                     'printf \'%s\\n\' \'{"status":"ok"}\'',
                     "exec 2>&-" if closed else ":",
-                    'kill -TERM "$"' if handler == "term" else 'exit "$2"',
+                    'kill -TERM "$$"' if handler == "term" else 'exit "$2"',
                 ])
                 result = run_helper(["bash", "-c", script, "cleanup-test", str(self.root),
                                      str(status), str(calls), str(write_error)], text=True)
@@ -1157,3 +1157,60 @@ class SizeGuardExcludeTest(unittest.TestCase):
         self.assertGreaterEqual(self.measure("ignored"), 9)
         self.assertGreaterEqual(self.measure("/ignored/**"), 9)
         self.assertGreaterEqual(self.measure("sparse.py"), 5)
+
+
+class ReadOnlyTargetedScanTest(unittest.TestCase):
+    """GH #228: targeted multi-file scan of a read-only tree must keep source
+    permissions intact, clean its shadow workspace completely, and exit 0."""
+
+    def test_readonly_multifile_scan_cleans_shadow_and_preserves_exit_zero(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-ro228-") as tmp:
+            base = Path(tmp)
+            ro = base / "ro"
+            (ro / "src" / "sub").mkdir(parents=True)
+            a_rs = ro / "src" / "sub" / "a.rs"
+            b_rs = ro / "src" / "sub" / "b.rs"
+            a_rs.write_text("pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n", encoding="utf-8")
+            b_rs.write_text("pub fn mul(a: i32, b: i32) -> i32 {\n    a * b\n}\n", encoding="utf-8")
+            os.chmod(a_rs, 0o444)
+            os.chmod(b_rs, 0o444)
+            os.chmod(ro / "src" / "sub", 0o555)
+            os.chmod(ro / "src", 0o555)
+            os.chmod(ro, 0o555)
+            try:
+                for fmt in ("json", "text"):
+                    with self.subTest(fmt=fmt):
+                        scan_tmp = base / f"tmp-{fmt}"
+                        scan_tmp.mkdir()
+                        env = os.environ.copy()
+                        env["UBS_NO_AUTO_UPDATE"] = "1"
+                        env["UBS_NO_CACHE"] = "1"
+                        env["NO_COLOR"] = "1"
+                        env["TMPDIR"] = str(scan_tmp)
+                        res = subprocess.run(  # ubs:ignore[py.security.command-injection] Fixed repo script and test-owned paths.
+                            [str(UBS), "--no-auto-update", "--no-cache", "--no-color",
+                             "--only=rust", "--no-cargo", f"--format={fmt}",
+                             "src/sub/a.rs", "src/sub/b.rs"],
+                            cwd=str(ro),
+                            env=env,
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=120,
+                        )
+                        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                        if fmt == "json":
+                            doc = json.loads(res.stdout)
+                            self.assertEqual(doc["status"], "ok")
+                            self.assertEqual(doc["totals"]["critical"], 0)
+                            self.assertEqual(doc["totals"]["files"], 2)
+                        else:
+                            self.assertNotIn("Error (exit", res.stdout + res.stderr)
+                        self.assertEqual(list(scan_tmp.rglob("*")), [])
+                        self.assertEqual(os.stat(ro).st_mode & 0o777, 0o555)
+                        self.assertEqual(os.stat(ro / "src" / "sub").st_mode & 0o777, 0o555)
+                        self.assertEqual(os.stat(a_rs).st_mode & 0o777, 0o444)
+            finally:
+                for p in (ro, ro / "src", ro / "src" / "sub", a_rs, b_rs):
+                    if p.exists():
+                        os.chmod(p, 0o755 if p.is_dir() else 0o644)

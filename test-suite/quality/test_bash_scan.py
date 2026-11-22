@@ -868,6 +868,83 @@ class BashPolicyIntegrationTest(unittest.TestCase):
         self.assertIn("custom-elixir-policy", result.stdout)
         self.assertGreater(decode_report(self, result.stdout)["totals"]["critical"], 0)
 
+    def test_eval_variable_exempts_trap_restore_and_constants_but_flags_dynamic_eval(self) -> None:
+        self.script.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "\n"
+            "run_with_temp_trap() {\n"
+            "  local saved_int\n"
+            "  saved_int=\"$(trap -p INT)\"\n"
+            "  trap 'echo interrupted' INT\n"
+            "  if [[ -n \"$saved_int\" ]]; then\n"
+            "    eval \"$saved_int\"\n"
+            "  else\n"
+            "    trap - INT\n"
+            "  fi\n"
+            "}\n"
+            "\n"
+            "run_compound_trap() {\n"
+            "  local saved_term\n"
+            "  saved_term=\"$(trap -p TERM)\"\n"
+            "  trap 'echo terminated' TERM\n"
+            "  [[ -n \"$saved_term\" ]] && eval \"$saved_term\"\n"
+            "}\n"
+            "\n"
+            "run_constant_eval() {\n"
+            "  eval 'echo constant'\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        res_clean = subprocess.run(
+            [str(ROOT / "ubs"), "--only=bash", "--jobs=1", "--format=json", str(self.script)],
+            cwd=self.root, env=dict(self.env, UBS_NO_CACHE="1"),
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        self.assertEqual(res_clean.returncode, 0, res_clean.stdout + res_clean.stderr)
+        doc_clean = decode_report(self, res_clean.stdout)
+        self.assertEqual(doc_clean["status"], "ok")
+        self.assertEqual(doc_clean["totals"]["critical"], 0)
+
+        unsafe_script = self.project / "unsafe-eval.sh"
+        unsafe_script.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "bad_direct() {\n"
+            "  local cmd=\"$1\"\n"
+            "  eval \"$cmd\"\n"
+            "}\n"
+            "bad_reassigned() {\n"
+            "  local saved\n"
+            "  saved=\"$(trap -p INT)\"\n"
+            "  saved=\"$1\"\n"
+            "  eval \"$saved\"\n"
+            "}\n"
+            "bad_extra_arg() {\n"
+            "  local saved\n"
+            "  saved=\"$(trap -p INT)\"\n"
+            "  [[ -n \"$saved\" ]] && eval \"$saved $1\"\n"
+            "}\n"
+            "bad_dynamic_signal() {\n"
+            "  local sig=\"$1\" saved\n"
+            "  saved=\"$(trap -p \"$sig\")\"\n"
+            "  eval \"$saved\"\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        res_unsafe = subprocess.run(
+            [str(ROOT / "ubs"), "--only=bash", "--jobs=1", "--format=json", str(unsafe_script)],
+            cwd=self.root, env=dict(self.env, UBS_NO_CACHE="1"),
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        self.assertEqual(res_unsafe.returncode, 1, res_unsafe.stdout + res_unsafe.stderr)
+        doc_unsafe = decode_report(self, res_unsafe.stdout)
+        eval_lines = sorted(
+            f["line"] for f in doc_unsafe["findings"]
+            if f["rule_id"] in ("bash.security.eval_variable", "bash.security.eval-variable")
+        )
+        self.assertEqual(eval_lines, [5, 11, 16, 21], res_unsafe.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

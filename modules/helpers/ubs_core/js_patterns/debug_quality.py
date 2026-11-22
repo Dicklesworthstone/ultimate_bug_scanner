@@ -28,6 +28,7 @@ PATTERNS: list[Pattern] = [
         title="debugger statements in code",
         regex=re.compile(r"\bdebugger\b"),
         thresholds=((0, "critical"),),
+        code_only=True,
     ),
     Pattern(
         category=11,

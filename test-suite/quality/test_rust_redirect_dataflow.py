@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1503,6 +1504,328 @@ class RustDetectorFailureTests(SourceCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0].text, 'a genuine finding')
         self.assertIn('limit reached', scanner.scan_errors[0])
+
+
+class CommandExecutableFlowTests(SourceCase):
+    """Executable provenance shares flow semantics, never URL validation."""
+
+    def command(self, code):
+        from ubs_core.rust_detectors import command_executable
+        code = textwrap.dedent(code).lstrip('\n')
+        artifacts = ROOT / 'test-suite/artifacts/rust-command-flow'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='source-', dir=artifacts))
+        path = scratch / 'handler.rs'
+        path.write_text(code, encoding='utf-8')
+        findings = list(command_executable.find([path]))
+        expected = [(path, number, 1) for number, line in enumerate(code.splitlines(), 1)
+                    if '// HIT' in line]
+        self.assertEqual([(path, line, col) for path, line, col, _ in findings], expected,
+                         (code, findings))
+        for _path, line, _col, message in findings:
+            self.assertIn(code.splitlines()[line - 1].strip(), message)
+        return findings
+
+    def test_environment_and_arguments_survive_ordinary_local_names(self):
+        for source in ('std::env::var("UBS_PROGRAM").unwrap()',
+                       'std::env::var_os("UBS_PROGRAM").unwrap()',
+                       'std::env::args().nth(1).unwrap()',
+                       'std::env::args_os().nth(1).unwrap()'):
+            with self.subTest(source=source):
+                self.command('fn main() {\nlet selected = ' + source + ';\n'
+                             'let copy = selected;\nstd::process::Command::new(copy); // HIT\n}')
+
+    def test_fixed_suspicious_names_and_overwrites_are_clean(self):
+        self.command('''
+            fn main() {
+                let user_input = "/usr/bin/printf";
+                std::process::Command::new(user_input);
+                let mut command = std::env::var("UBS_PROGRAM").unwrap();
+                command = "/usr/bin/printf".to_owned();
+                std::process::Command::new(command);
+            }
+        ''')
+
+    def test_lexical_shadow_restores_source_and_does_not_cross_functions(self):
+        self.command('''
+            fn first() {
+                let selected = std::env::var("UBS_PROGRAM").unwrap();
+                { let selected = "/usr/bin/printf"; std::process::Command::new(selected); }
+                std::process::Command::new(selected); // HIT
+            }
+            fn second(selected: &str) { std::process::Command::new(selected); }
+        ''')
+
+    def test_branch_and_loop_writes_keep_reaching_sources(self):
+        self.command('''
+            fn main(flag: bool) {
+                let mut selected = "/usr/bin/printf".to_owned();
+                if flag { selected = std::env::var("UBS_PROGRAM").unwrap(); }
+                std::process::Command::new(&selected); // HIT
+                if flag { selected = "echo".to_owned(); } else { selected = "printf".to_owned(); }
+                std::process::Command::new(&selected);
+                while flag {
+                    std::process::Command::new(&selected); // HIT
+                    selected = std::env::var("UBS_PROGRAM").unwrap();
+                }
+            }
+        ''')
+
+    def test_helper_returns_and_sink_parameters_are_contextual(self):
+        self.command('''
+            fn identity(value: String) -> String { value }
+            fn fixed(command: String) -> String { "/usr/bin/printf".to_owned() }
+            fn launch(command: String) { std::process::Command::new(command); } // HIT
+            fn launch_fixed(command: &str) { std::process::Command::new(command); }
+            fn main() {
+                let selected = identity(std::env::var("UBS_PROGRAM").unwrap());
+                std::process::Command::new(selected); // HIT
+                std::process::Command::new(fixed(std::env::var("UBS_PROGRAM").unwrap()));
+                launch(std::env::var("UBS_PROGRAM").unwrap());
+                launch_fixed("/usr/bin/printf");
+            }
+        ''')
+
+    def test_recursive_helpers_reach_fixed_point_without_name_contamination(self):
+        self.command('''
+            fn relay(value: String, repeat: bool) -> String {
+                if repeat { relay(value, false) } else { value }
+            }
+            fn main() {
+                std::process::Command::new(relay(std::env::var("UBS_PROGRAM").unwrap(), true)); // HIT
+                std::process::Command::new(relay("/usr/bin/printf".to_owned(), true));
+            }
+        ''')
+
+    def test_recursive_entry_parameters_are_not_erased_by_internal_callers(self):
+        self.command('''
+            fn launch(command: &str, repeat: bool) {
+                if repeat { forward(command); }
+                std::process::Command::new(command); // HIT
+            }
+            fn forward(selected: &str) { launch(selected, false); }
+        ''')
+        self.command('''
+            fn launch(command: &str, repeat: bool) {
+                if repeat { forward(command); }
+                std::process::Command::new(command);
+            }
+            fn forward(selected: &str) { launch(selected, false); }
+            fn main() { launch("/usr/bin/printf", true); }
+        ''')
+        self.command('''
+            fn main() { launch(std::env::var("UBS_PROGRAM").unwrap(), true); }
+            fn launch(selected: String, repeat: bool) {
+                if repeat { forward(selected); } else {
+                    std::process::Command::new(selected); // HIT
+                }
+            }
+            fn forward(selected: String) { launch(selected, false); }
+        ''')
+
+    def test_native_grouped_and_renamed_imports_keep_identity(self):
+        for imports, source, sink in (
+                ('use std::process::Command as Proc; use std::env::var as read;', 'read("UBS_PROGRAM")', 'Proc'),
+                ('use std::{env as input, process::{self, Command as Proc}};', 'input::var("UBS_PROGRAM")', 'Proc'),
+                ('use std::env::{self as input, args}; use std::process;', 'args().nth(1)', 'process::Command'),
+                ('use std as native;', 'native::env::var("UBS_PROGRAM")', 'native::process::Command'),
+                ('extern crate std as native;', 'native::env::var("UBS_PROGRAM")', 'native::process::Command')):
+            with self.subTest(imports=imports):
+                self.command(imports + '\nfn main() {\nlet selected = ' + source + '.unwrap();\n'
+                             + sink + '::new(selected); // HIT\n}')
+
+    def test_local_command_namespaces_are_not_native_sinks(self):
+        self.command('''
+            struct Command;
+            impl Command { fn new(value: String) {} }
+            mod process { pub struct Command; impl Command { pub fn new(value: String) {} } }
+            fn main() {
+                let user_input = std::env::var("UBS_PROGRAM").unwrap();
+                Command::new(user_input.clone());
+                process::Command::new(user_input.clone());
+                std::process::Command::new(user_input); // HIT
+            }
+        ''')
+
+    def test_explicit_extern_aliases_cannot_borrow_standard_library_identity(self):
+        self.command('''
+            extern crate std as native;
+            extern crate other as std;
+            fn main() {
+                let selected = native::env::var("UBS_PROGRAM").unwrap();
+                std::process::Command::new(selected.clone());
+                ::std::process::Command::new(selected.clone());
+                native::process::Command::new(std::env::var("UBS_PROGRAM"));
+                native::process::Command::new(::std::env::var("UBS_PROGRAM"));
+                native::process::Command::new(selected); // HIT
+                ::native::process::Command::new(::native::env::args().nth(1).unwrap()); // HIT
+            }
+            mod nested {
+                fn run() {
+                    native::process::Command::new(native::env::var("UBS_PROGRAM").unwrap()); // HIT
+                    ::std::process::Command::new(native::env::var("UBS_PROGRAM").unwrap());
+                }
+            }
+        ''')
+
+    def test_native_reexports_and_relative_aliases_keep_lexical_identity(self):
+        for source in (
+                'use std as native; use native::process::Command as Runner;\n'
+                'fn main() { Runner::new(native::env::var("UBS_PROGRAM").unwrap()); } // HIT\n',
+                'use std::process::Command as Native; use self::Native as Runner;\n'
+                'fn main() { Runner::new(std::env::var("UBS_PROGRAM").unwrap()); } // HIT\n',
+                'use std::process::Command as Native;\n'
+                'mod helper { use super::Native as Runner;\n'
+                'pub fn run() { Runner::new(std::env::var("UBS_PROGRAM").unwrap()); } // HIT\n}\n',
+                'mod helper { pub use ::std::process::Command as Runner; }\n'
+                'fn main() { helper::Runner::new(std::env::var("UBS_PROGRAM").unwrap()); } // HIT\n'):
+            with self.subTest(source=source):
+                self.command(source)
+
+    def test_generic_and_imported_lookalikes_do_not_acquire_native_identity(self):
+        for source in (
+                'fn run<Command>(user_input: String) { Command::new(user_input); }',
+                'use external::Command; fn run(user_input: String) { Command::new(user_input); }',
+                'use external::*; fn run(user_input: String) { Command::new(user_input); }',
+                'mod Command { pub fn new(input: String) {} }\n'
+                'fn run() { Command::new(std::env::var("UBS_PROGRAM").unwrap()); }'):
+            with self.subTest(source=source):
+                self.command(source)
+
+    def test_plain_type_aliases_keep_native_constructor_identity(self):
+        self.command('''
+            type Native = ::std::process::Command;
+            type Command = Native;
+            fn main() {
+                let selected = std::env::var("UBS_PROGRAM").unwrap();
+                Command::new(selected); // HIT
+                let user_input = "/usr/bin/printf";
+                Command::new(user_input);
+            }
+        ''')
+        self.command('''
+            struct Local;
+            impl Local { fn new(value: String) {} }
+            type Command = Local;
+            fn main() { Command::new(std::env::var("UBS_PROGRAM").unwrap()); }
+        ''')
+
+    def test_imported_native_names_are_shadowed_by_inner_items(self):
+        self.command('''
+            use std::process::Command;
+            fn main() {
+                let selected = std::env::var("UBS_PROGRAM").unwrap();
+                { struct Command; impl Command { fn new(value: String) {} }
+                  Command::new(selected.clone()); }
+                Command::new(selected); // HIT
+            }
+        ''')
+
+    def test_local_environment_functions_do_not_become_native_sources(self):
+        self.command('''
+            mod env { pub fn var(key: &str) -> String { "printf".to_owned() } }
+            fn main() {
+                let selected = env::var("UBS_PROGRAM");
+                std::process::Command::new(selected);
+            }
+        ''')
+        self.command('''
+            mod std { pub mod env { pub fn var(key: &str) -> String { "printf".to_owned() } } }
+            fn main() {
+                let selected = std::env::var("UBS_PROGRAM");
+                ::std::process::Command::new(selected);
+                ::std::process::Command::new(::std::env::var("UBS_PROGRAM").unwrap()); // HIT
+            }
+        ''')
+
+    def test_url_guards_never_sanitize_executable_selection(self):
+        self.command('''
+            fn main() {
+                let selected = std::env::var("UBS_PROGRAM").unwrap();
+                if selected.starts_with('/') && !selected.starts_with("//")
+                    && !selected.contains('\\\\') && !selected.chars().any(char::is_control) {
+                    std::process::Command::new(selected); // HIT
+                }
+            }
+        ''')
+
+    def test_implicit_format_captures_keep_source_provenance(self):
+        self.command('''
+            fn main() {
+                let selected = std::env::var("UBS_PROGRAM").unwrap();
+                std::process::Command::new(format!("tool-{selected}")); // HIT
+                let command = "fixed";
+                std::process::Command::new(format!("tool-{command}"));
+                std::process::Command::new(format!("tool-{{selected}}"));
+            }
+        ''')
+
+    def test_exact_sink_suppression_cannot_erase_an_input(self):
+        self.command('''
+            fn main() {
+                let selected = std::env::var("UBS_PROGRAM").unwrap(); // ubs:ignore
+
+                std::process::Command::new(&selected); // HIT
+                std::process::Command::new(&selected); // ubs:ignore[rust.security.open-redirect] // HIT
+                std::process::Command::new(&selected); // ubs:ignore[rust.security.command-executable]
+                std::process::Command::new(&selected); // ubs:ignore
+                let note = "std::process::Command::new(user_input)";
+                // std::process::Command::new(user_input);
+            }
+        ''')
+
+    def test_saved_constructor_and_malformed_command_source_remain_explicit(self):
+        with self.assertRaisesRegex(AnalysisLimit, 'saved command constructors'):
+            self.command('fn main() { let launch=std::process::Command::new; launch("printf"); }')
+        with self.assertRaisesRegex(ValueError, 'Unbalanced Rust'):
+            self.command('fn main() { std::process::Command::new(std::env::args()); (] }')
+
+    def test_unreadable_selected_source_does_not_become_clean(self):
+        from ubs_core.rust_detectors import command_executable
+        with self.assertRaisesRegex(OSError, 'Cannot read Rust command input'):
+            list(command_executable.find([ROOT / 'test-suite/artifacts/rust-command-flow/nonexistent-input.rs']))
+
+    def test_other_constructors_do_not_expand_command_parsing(self):
+        # An independent detector, not this command policy, owns syntax in a
+        # source that contains no native command API or import.
+        self.command('fn unrelated() { let value = Foreign::new(); unfamiliar! { (] } }')
+
+    def test_native_command_program_witness_without_spawning_commands(self):
+        rustc = os.environ.get('UBS_TEST_RUSTC') or shutil.which('rustc')
+        if rustc is None:
+            self.skipTest('native executable-selection witness requires rustc')
+        artifacts = ROOT / 'test-suite/artifacts/rust-command-flow'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='native-', dir=artifacts))
+        target, executable = scratch / 'witness.rs', scratch / 'witness'
+        target.write_text('''extern crate std as native;
+extern crate core as std;
+use native::{env as input, process::Command as Proc};
+mod helper { pub use ::native::process::Command as Runner; }
+type Runner = helper::Runner;
+fn identity(value: String) -> String { value }
+fn main() {
+    let selected = identity(input::var("UBS_PROGRAM").unwrap());
+    let user_input = "/usr/bin/printf";
+    let supplied = Proc::new(selected);
+    let fixed = Proc::new(user_input);
+    println!("{}", supplied.get_program().to_str().unwrap());
+    println!("{}", fixed.get_program().to_str().unwrap());
+    let via_module = Runner::new(input::args().nth(1).unwrap());
+    println!("{}", via_module.get_program().to_str().unwrap());
+}
+''', encoding='utf-8')
+        compiled = subprocess.run([rustc, '--edition=2021', str(target), '-o', str(executable)],
+                                  capture_output=True, text=True, timeout=60, check=False)
+        (scratch / 'compile.stdout.log').write_text(compiled.stdout, encoding='utf-8')
+        (scratch / 'compile.stderr.log').write_text(compiled.stderr, encoding='utf-8')
+        self.assertEqual(compiled.returncode, 0, compiled.stderr)
+        result = subprocess.run([str(executable), 'review-argument'], env={**os.environ, 'UBS_PROGRAM': 'review-input'},
+                                capture_output=True, text=True, timeout=15, check=False)
+        (scratch / 'runtime.stdout.log').write_text(result.stdout, encoding='utf-8')
+        (scratch / 'runtime.stderr.log').write_text(result.stderr, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ['review-input', '/usr/bin/printf', 'review-argument'])
 
 
 if __name__ == '__main__':

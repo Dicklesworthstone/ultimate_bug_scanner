@@ -2134,6 +2134,46 @@ fn probe_text_version(client: &Client, url: &str) {
     let example = r#"std::env::args(); client.get(url); Command::new(user.program); // ubs:ignore"#;
 }
 ''')
+        add("command-native-environment.rs", '''fn main() {
+    let selected = std::env::var("UBS_EXECUTABLE").unwrap_or_default();
+    std::process::Command::new(selected);
+}
+''', command_lines=(3,))
+        add("command-native-alias.rs", '''use std::{env as settings, process::Command as Process};
+fn main() {
+    let chosen = settings::args_os().nth(1).unwrap_or_default();
+    Process::new(chosen);
+}
+''', command_lines=(4,))
+        add("command-native-helpers.rs", '''fn launch(value: String) { std::process::Command::new(value); }
+fn relay(value: String) -> String { value }
+fn main() {
+    launch(relay(std::env::var("UBS_EXECUTABLE").unwrap_or_default()));
+}
+''', command_lines=(1,))
+        add("command-fixed-names.rs", '''fn fixed(input: &str) { std::process::Command::new(input); }
+fn main() {
+    let user_input = "/usr/bin/printf";
+    std::process::Command::new(user_input);
+    let mut program = std::env::var("UBS_EXECUTABLE").unwrap_or_default();
+    program = "/usr/bin/printf".to_owned();
+    std::process::Command::new(program);
+    fixed("/usr/bin/printf");
+}
+''')
+        add("command-local-type.rs", '''struct Command;
+impl Command { fn new(value: String) -> Self { Self } }
+fn main() {
+    let selected = std::env::var("UBS_EXECUTABLE").unwrap_or_default();
+    Command::new(selected);
+}
+''')
+        add("command-flow-markers.rs", '''fn main() {
+    let selected = std::env::var("UBS_EXECUTABLE").unwrap_or_default(); // ubs:ignore
+    std::process::Command::new(&selected); // ubs:ignore[rust.security.command-executable]
+    std::process::Command::new(&selected);
+}
+''', command_lines=(4,))
         for path, source in sources.items():
             path.write_text(source, encoding="utf-8")
         return project, sources, expected
@@ -2223,6 +2263,67 @@ fn probe_text_version(client: &Client, url: &str) {
                 partial = scan(paths, "json", remaining, len(paths) - 1)
                 self.assertEqual(partial, [record for record in cold if record["path"] != str(changed)])
                 self.assertEqual(scan(paths, "sarif", remaining, len(paths)), partial)
+
+    @unittest.skipUnless(shutil.which("ast-grep") or os.environ.get("UBS_AST_GREP_BIN"),
+                         "real command-executable integration requires ast-grep")
+    def test_native_command_meta_runner_formats_selection_and_source_changes(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts" / "rust-command-public"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="formats-", dir=artifacts))
+        project, sources, _expected = self._fixtures(root)
+        scratch = root / "scratch"
+        scratch.mkdir()
+        unsafe = project / "command-native-environment.rs"
+        clean = project / "command-fixed-names.rs"
+        excluded = project / "unselected-command.rs"
+        excluded.write_text(sources[unsafe], encoding="utf-8")
+        skip = ",".join(str(category) for category in range(1, 25) if category != 8)
+        env = dict(os.environ, UBS_NO_AUTO_UPDATE="1", UBS_KEEP_TEMP="1", UBS_NO_CACHE="0",
+                   UBS_CACHE_DIR=str(root / "cache"), UBS_SKIP_RUST_BUILD="1",
+                   UBS_SKIP_TYPE_NARROWING="1", UBS_PROFILE="1", TMPDIR=str(scratch))
+
+        def scan(target, output_format, expected_lines, label):
+            command = [str(REPO_ROOT / "ubs"), str(target), "--only=rust", "--ci",
+                       "--no-config", "--no-color", f"--skip={skip}", f"--format={output_format}"]
+            result = subprocess.run(command, cwd=project, env=env, text=True,
+                                    capture_output=True, timeout=180)
+            (root / f"{label}.stdout.log").write_text(result.stdout, encoding="utf-8")
+            (root / f"{label}.stderr.log").write_text(result.stderr, encoding="utf-8")
+            context = f"{command}\nexit={result.returncode}\n{result.stdout}\n{result.stderr}"
+            self.assertEqual(result.returncode, int(bool(expected_lines)), context)
+            report = json.loads(result.stdout)
+            wanted = [(self.COMMAND_RULE, target.name, line, 1) for line in expected_lines]
+            if output_format == "json":
+                self.assertEqual(report["status"], "ok", context)
+                self.assertEqual([report["totals"][key] for key in ("files", "critical", "warning", "info")],
+                                 [1, len(expected_lines), 0, 0], context)
+                records = report.get("findings", [])
+                actual = [(row["rule_id"], Path(row["file"]).name, row["line"], row["col"])
+                          for row in records]
+                self.assertTrue(all(row["severity"] == "critical" for row in records), context)
+            else:
+                self.assertEqual(report["version"], "2.1.0", context)
+                actual = []
+                for run in report["runs"]:
+                    self.assertFalse(any(inv.get("executionSuccessful") is False
+                                         for inv in run.get("invocations", [])), context)
+                    for row in run.get("results", []):
+                        physical = row["locations"][0]["physicalLocation"]
+                        actual.append((row["ruleId"], Path(physical["artifactLocation"]["uri"]).name,
+                                       physical["region"]["startLine"], physical["region"]["startColumn"]))
+                        self.assertEqual(row["level"], "error", context)
+            self.assertCountEqual(actual, wanted, context)
+
+        for output_format in ("json", "sarif"):
+            for target, lines in ((unsafe, [3]), (clean, [])):
+                scan(target, output_format, lines, f"{target.stem}-{output_format}")
+        unsafe.write_text('fn main() { std::process::Command::new("/usr/bin/printf"); }\n', encoding="utf-8")
+        scan(unsafe, "json", [], "edited-clean")
+        unsafe.write_text(sources[unsafe].replace("Command::new(selected);", "Command::new(selected); // ubs:ignore[rust.security.command-executable]"),
+                          encoding="utf-8")
+        scan(unsafe, "json", [], "edited-suppressed")
+        unsafe.write_text(sources[unsafe], encoding="utf-8")
+        scan(unsafe, "json", [3], "restored-source")
 
 
 class AstIngestionTests(unittest.TestCase):

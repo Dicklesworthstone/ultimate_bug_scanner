@@ -647,6 +647,10 @@ class Source:
             return None
         return target
 
+    def flow(self, function):
+        """Share transfer semantics while allowing sink-specific contracts."""
+        return Flow(self, function)
+
     def solve(self):
         pending = deque(self.functions)
         queued = set(pending)
@@ -654,7 +658,7 @@ class Source:
             self.budget.spend()
             function = pending.popleft()
             queued.discard(function)
-            flow = Flow(self, function)
+            flow = self.flow(function)
             state = State()
             for index, names in enumerate(function.params):
                 for name in names:
@@ -674,7 +678,7 @@ class Source:
                         queued.add(caller)
                         pending.append(caller)
         # Top-level snippets and initializers are a separate lexical scope.
-        flow = Flow(self, None)
+        flow = self.flow(None)
         flow.block(0, len(self.code), State())
         findings = dict(flow.sinks)
         for summary in self.summaries.values():
@@ -685,6 +689,8 @@ class Source:
 
 
 class Flow:
+    url_validation = True
+
     def __init__(self, source, function):
         self.source = source
         self.function = function
@@ -1064,6 +1070,8 @@ class Flow:
         if code in {'true', 'false'}:
             return (state.copy(), None) if code == 'true' else (None, state.copy())
         yes, no = state.copy(), state.copy()
+        if not self.url_validation:
+            return yes, no
         raw = src.raw[start:end].strip()
         local = re.fullmatch(r'''([A-Za-z_]\w*)\s*\.\s*starts_with\s*\(\s*(["'])(/{1,2})\2\s*\)''', raw)
         if local:
@@ -1104,6 +1112,8 @@ class Flow:
             state.checked(parsed, check)
 
     def binding_contract(self, name, start, end, state):
+        if not self.url_validation:
+            return
         src = self.source
         start, end = src.trim(start, end)
         raw = src.raw[start:end]
@@ -1209,7 +1219,7 @@ class Flow:
                 arguments = [self.expr(a, b, state) for a, b in spans]
                 if not state.reachable:
                     return CLEAN
-                catalogued = self.sink_target(name, spans, chained)
+                catalogued = self.sink_target(name, spans, chained, pos, state)
                 local = (src.resolve(name, pos, state)
                          if not chained and not macro and not opaque_path
                          and not ('::' in name and catalogued is not None) else None)
@@ -1236,11 +1246,10 @@ class Flow:
                     # Unknown helpers retain their arguments' taint. A name
                     # such as safe_redirect_url is not a sanitizer contract.
                     value = join(value, *arguments)
-                raw_call = src.raw[pos:close + 1]
-                direct = rules.source_re.match(raw_call)
-                if direct and rules.has_request_source(src.raw[pos:self.chain_end(close + 1, end)]):
-                    value = join(value, frozenset({Origin('source', pos, ' '.join(direct.group().split()))}))
-                target = catalogued if local is None and name not in state.values and not opaque_path else None
+                value = join(value, self.call_source(name, pos, close, end, state,
+                                                    local, chained, macro, opaque_path))
+                target = (catalogued if local is None and name not in state.values
+                          and self.supported_sink_path(name, pos, state, opaque_path) else None)
                 if target is not None:
                     self.emit(pos, arguments[target] if target >= 0 else arguments[0])
                     value = CLEAN
@@ -1255,16 +1264,27 @@ class Flow:
                 result = join(result, value)
                 pos = close + 1
             else:
-                raw_name = src.raw[pos:path_end]
-                direct = rules.source_re.fullmatch(raw_name)
-                if direct:
-                    value = join(value, frozenset({Origin('source', pos, ' '.join(direct.group().split()))}))
+                value = join(value, self.value_source(name, pos, path_end, state))
                 receiver = value
                 result = join(result, value)
                 pos = path_end
         return result
 
-    def sink_target(self, name, spans, chained):
+    def call_source(self, name, pos, close, end, state, local, chained, macro, opaque_path):
+        src = self.source
+        direct = rules.source_re.match(src.raw[pos:close + 1])
+        if direct and rules.has_request_source(src.raw[pos:self.chain_end(close + 1, end)]):
+            return frozenset({Origin('source', pos, ' '.join(direct.group().split()))})
+        return CLEAN
+
+    def value_source(self, name, pos, end, state):
+        direct = rules.source_re.fullmatch(self.source.raw[pos:end])
+        return frozenset({Origin('source', pos, ' '.join(direct.group().split()))}) if direct else CLEAN
+
+    def supported_sink_path(self, name, pos, state, opaque_path):
+        return not opaque_path
+
+    def sink_target(self, name, spans, chained, pos=None, state=None):
         leaf = name.split('.')[-1]
         if re.fullmatch(r'(?:(?:axum|rocket)::response::|poem::web::)?Redirect::(?:to|temporary|permanent|found|see_other|moved_permanently)', name):
             return 0 if spans else None

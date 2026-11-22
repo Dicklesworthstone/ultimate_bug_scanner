@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Audit exact PyPI package versions from supported `uv.lock` files without
+  resolving dependencies or building project packages. Check every locked
+  version, including development dependencies and alternative resolution
+  branches, and reconcile the auditor's report with the selected inventory.
+  Keep unsupported origins, workspace escapes, unresolved manifest roots,
+  missing pins and malformed reports explicitly partial while retaining valid advisories.
+  Lockfile freshness is reported as unchecked.
+
 - Pin default verified installations to the exact tag resolved from GitHub's
   latest release, and bind the authenticated runner's literal version to that
   selection before execution or publication. Reject unresolved latest aliases,

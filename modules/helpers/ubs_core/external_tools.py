@@ -25,7 +25,7 @@ import subprocess
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -352,8 +352,145 @@ def _array(doc: object, key: str) -> list:
     return doc[key]
 
 
+def _audit_toml(path: Path) -> dict:
+    try:
+        import tomllib
+    except ImportError:
+        import tomli as tomllib
+    with path.open("rb") as source:
+        raw = source.read(OUTPUT_RECORD_LIMIT + 1)
+    if len(raw) > OUTPUT_RECORD_LIMIT:
+        raise ValueError(f"{path.name} exceeds the manifest size limit")
+    return tomllib.loads(raw.decode("utf-8"))
+
+
+def _audit_package_name(value: object) -> str:
+    name = _text(value)
+    if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", name) is None:
+        raise ValueError("invalid package name")
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _uv_audit_inventory(manifest: Path, errors: list[str]) -> tuple[set[tuple[str, str]], list[str]]:
+    """Collect all locked PyPI identities without resolving or building code.
+
+    uv's lock format is private and versioned. This adapter intentionally
+    handles only the observed v1/revision 0–5 package graph. Revisions 4–5
+    alter declaration/default-group metadata, not this all-pins inventory.
+    Unsupported
+    origins and graph obligations retain a partial verdict while independent
+    PyPI pins can still contribute vulnerability findings. Manifest freshness
+    and environment/marker selection are outside this all-pins audit.
+    """
+    doc = _audit_toml(manifest)
+    if type(doc.get("version")) is not int or doc["version"] != 1:
+        raise ValueError("unsupported uv.lock schema version (expected 1)")
+    revision = doc.get("revision", 0)
+    if type(revision) is not int or revision not in range(6):
+        raise ValueError("unsupported uv.lock schema revision (expected 0–5)")
+    packages = _array(doc, "package")
+    if not packages:
+        raise ValueError("empty uv.lock package inventory")
+    metadata = doc.get("manifest", {})
+    if not isinstance(metadata, dict):
+        raise ValueError("invalid uv.lock manifest table")
+    members = metadata.get("members", [])
+    if not isinstance(members, list):
+        raise ValueError("invalid uv.lock manifest.members list")
+    member_names = {_audit_package_name(name) for name in members}
+    # Non-project workspaces place PEP 508 requirements here, rather than
+    # resolved package edges. Do not mistake auditing the surviving package
+    # rows for proof that those group requirements have been represented.
+    groups = metadata.get("dependency-groups", {})
+    if not isinstance(groups, dict) or groups:
+        errors.append("pip-audit: uv.lock manifest.dependency-groups coverage is unsupported")
+    requirements = metadata.get("requirements", [])
+    if not isinstance(requirements, list) or requirements:
+        errors.append("pip-audit: uv.lock manifest.requirements coverage is unsupported")
+    root = manifest.parent.resolve()
+    pins: set[tuple[str, str]] = set()
+    projects: set[str] = set()
+    inventory: list[tuple[str, str, dict, dict]] = []
+    for index, package in enumerate(packages, 1):
+        try:
+            if not isinstance(package, dict):
+                raise ValueError("invalid package record")
+            name = _audit_package_name(package.get("name"))
+            version = _text(package.get("version"))
+            # Only literal version tokens may enter the temporary requirements
+            # file. pip-audit remains authoritative for PEP 440 validity.
+            if re.fullmatch(r"[A-Za-z0-9]+(?:[.!+_-][A-Za-z0-9]+)*", version) is None:
+                raise ValueError("invalid locked version")
+            source = package.get("source")
+            if (not isinstance(source, dict) or len(source) != 1
+                    or any(not isinstance(value, str) or not value for value in source.values())):
+                raise ValueError("invalid package source")
+            inventory.append((name, version, source, package))
+            if source.get("registry", "").rstrip("/") == "https://pypi.org/simple":
+                if (name, version) in pins:
+                    raise ValueError("duplicate locked PyPI identity")
+                pins.add((name, version))
+            elif "editable" in source or "virtual" in source:
+                directory = (root / next(iter(source.values()))).resolve()
+                project_path = (directory / "pyproject.toml").resolve()
+                if (root not in (directory, *directory.parents)
+                        or root not in project_path.parents):
+                    raise ValueError("workspace path escapes the selected project")
+                if directory != root and name not in member_names:
+                    raise ValueError("local package is not a declared workspace member")
+                project = _audit_toml(project_path).get("project")
+                if not isinstance(project, dict) or _audit_package_name(project.get("name")) != name:
+                    raise ValueError("workspace package identity does not match pyproject.toml")
+                projects.add(str(project_path))
+            else:
+                raise ValueError("unsupported package origin (only PyPI registry and workspace projects are supported)")
+        except (OSError, ValueError, UnicodeError, RuntimeError) as exc:
+            errors.append(f"pip-audit: uv.lock package {index}: {exc}")
+
+    for member in sorted(member_names):
+        if not any(name == member for name, _version, _source, _package in inventory):
+            errors.append(f"pip-audit: uv.lock workspace member {member} is missing from the package inventory")
+
+    by_name: dict[str, list[tuple[str, str, dict, dict]]] = {}
+    for item in inventory:
+        by_name.setdefault(item[0], []).append(item)
+
+    def check_edges(edges: object, context: str) -> None:
+        if not isinstance(edges, list):
+            errors.append(f"pip-audit: uv.lock {context} is not a dependency list")
+            return
+        for edge in edges:
+            try:
+                if not isinstance(edge, dict):
+                    raise ValueError("invalid dependency record")
+                name = _audit_package_name(edge.get("name"))
+                if "version" in edge:
+                    _text(edge["version"])
+                if "source" in edge and not isinstance(edge["source"], dict):
+                    raise ValueError("invalid dependency source selector")
+                matches = [item for item in by_name.get(name, [])
+                           if ("version" not in edge or item[1] == edge["version"])
+                           and ("source" not in edge or item[2] == edge["source"])]
+                if len(matches) != 1:
+                    raise ValueError(f"dependency {name} does not identify one locked package")
+            except (TypeError, ValueError) as exc:
+                errors.append(f"pip-audit: uv.lock {context}: {exc}")
+
+    for name, _version, _source, package in inventory:
+        check_edges(package.get("dependencies", []), f"{name}.dependencies")
+        for field in ("optional-dependencies", "dev-dependencies"):
+            groups = package.get(field, {})
+            if not isinstance(groups, dict):
+                errors.append(f"pip-audit: uv.lock {name}.{field} is not a group table")
+                continue
+            for group, edges in groups.items():
+                check_edges(edges, f"{name}.{field}.{group}")
+    return pins, sorted(projects)
+
+
 def parse_pip_audit_report(output: str | BinaryIO, manifest: Path, sink: TextIO,
-                           errors: list[str]) -> dict[str, int]:
+                           errors: list[str], *,
+                           expected: set[tuple[str, str]] | None = None) -> dict[str, int]:
     """Keep audited inventory and advisories separate from collection failures.
 
     pip-audit uses exit 1 for both advisories and fatal errors. Only its JSON
@@ -365,6 +502,7 @@ def parse_pip_audit_report(output: str | BinaryIO, manifest: Path, sink: TextIO,
     counts = {"dependencies": 0, "vulnerabilities": 0, "skipped": 0}
     seen_fields: set[str] = set()
     seen_findings: set[tuple[str, str, str]] = set()
+    audited: set[tuple[str, str]] = set()
     try:
         for field in reader.members():
             if field not in {"dependencies", "fixes"}:
@@ -392,6 +530,13 @@ def parse_pip_audit_report(output: str | BinaryIO, manifest: Path, sink: TextIO,
                     continue
                 counts["dependencies"] += 1
                 package = re.sub(r"[-_.]+", "-", name).lower()
+                identity = (package, version)
+                if expected is not None:
+                    if identity in audited:
+                        problems.append(f"pip-audit: duplicate audited identity {package}=={version}")
+                    if identity not in expected:
+                        problems.append(f"pip-audit: unexpected audited identity {package}=={version}")
+                audited.add(identity)
                 for vulnerability in vulnerabilities:
                     try:
                         advisory = _text(vulnerability["id"])
@@ -434,6 +579,9 @@ def parse_pip_audit_report(output: str | BinaryIO, manifest: Path, sink: TextIO,
             raise reader.error("unexpected data after pip-audit report")
     except (OSError, UnicodeError, ValueError, RecursionError) as exc:
         problems.append(f"pip-audit: invalid or incomplete report: {exc}")
+    if expected is not None:
+        for name, version in sorted(expected - audited):
+            problems.append(f"pip-audit: locked dependency {name}=={version} was not audited")
     return counts
 
 
@@ -442,8 +590,8 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
                       diagnostics: TextIO | None = None) -> dict:
     """Audit selected project dependencies, never the tool's own environment.
 
-    Requirements have precedence over PEP 751 locks, then PEP 621 runtime
-    dependencies. ``--path`` is intentionally absent: pip-audit reserves it
+    Requirements have precedence over PEP 751 locks, then uv locks and PEP 621
+    runtime dependencies. ``--path`` is intentionally absent: pip-audit reserves it
     for installed distributions, and a manifest passed there audits nothing.
     Missing tools/inputs are explicit skips; empty or failed audits are partial.
     """
@@ -453,10 +601,11 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
         outcome["reason"] = "selected-file scan has no dependency manifest"
         return outcome
     requirements, pyproject = root / "requirements.txt", root / "pyproject.toml"
+    uv_lock = root / "uv.lock"
     locks = sorted(path for path in root.glob("pylock.*.toml") if path.is_file())
     if (root / "pylock.toml").is_file():
         locks.insert(0, root / "pylock.toml")
-    unsupported_locks = [root / name for name in ("uv.lock", "poetry.lock", "Pipfile.lock")
+    unsupported_locks = [root / name for name in ("poetry.lock", "Pipfile.lock")
                          if (root / name).is_file()]
     unsupported_projects = [root / name for name in ("setup.py", "setup.cfg", "Pipfile")
                             if (root / name).is_file()]
@@ -469,6 +618,10 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
         # Record the entire input set; the first path anchors project findings.
         manifest, arguments = locks[0], ["--locked", str(root)]
         outcome.update(input_kind="pylock", inputs=[str(path) for path in locks])
+    elif uv_lock.is_file():
+        manifest, arguments = uv_lock, []
+        outcome.update(input_kind="uv-lock", inputs=[str(uv_lock)],
+                       coverage="all-locked-registry-packages", lock_freshness="not-checked")
     elif unsupported_locks:
         manifest, arguments = unsupported_locks[0], []
         outcome.update(input_kind="unsupported-lock", inputs=[str(path) for path in unsupported_locks])
@@ -497,21 +650,30 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
         errors.append("pip-audit: " + input_error)
         outcome["status"] = "partial"
         return outcome
+    pins: set[tuple[str, str]] | None = None
+    if manifest == uv_lock:
+        try:
+            pins, projects = _uv_audit_inventory(manifest, errors)
+            outcome.update(locked_dependencies=len(pins), workspace_projects=projects)
+            outcome["inputs"].extend(projects)
+            if not pins:
+                raise ValueError("empty dependency inventory; no locked PyPI packages were collected")
+        except ImportError:
+            errors.append("pip-audit: validating uv.lock requires Python 3.11+ or tomli; "
+                          "export resolved requirements.txt")
+            outcome["status"] = "partial"
+            return outcome
+        except (OSError, ValueError, UnicodeError, RuntimeError) as exc:
+            errors.append(f"pip-audit: cannot collect uv.lock dependencies: {exc}")
+            outcome["status"] = "partial"
+            return outcome
     if manifest == pyproject:
         # pip-audit 2.x treats a missing dependencies array as empty even if
         # the project declares dynamic dependencies. Reject that hollow pass.
         # TOML parsing is optional for core scans, including the Python 3.9
         # helper floor; older runtimes can supply tomli or requirements.txt.
         try:
-            try:
-                import tomllib
-            except ImportError:
-                import tomli as tomllib
-            with manifest.open("rb") as source:
-                raw = source.read(OUTPUT_RECORD_LIMIT + 1)
-            if len(raw) > OUTPUT_RECORD_LIMIT:
-                raise ValueError("pyproject.toml exceeds the manifest size limit")
-            project = tomllib.loads(raw.decode("utf-8")).get("project")
+            project = _audit_toml(manifest).get("project")
             if not isinstance(project, dict):
                 raise ValueError("no PEP 621 project section; export resolved requirements.txt")
             dynamic = project.get("dynamic", [])
@@ -544,31 +706,66 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
     environment.pop("CLICOLOR_FORCE", None)
     # Explicit options prevent a user's output/format defaults from redirecting
     # audit evidence out of the scanner or changing its machine-readable shape.
-    argv = [*command, "--format=json", "--progress-spinner=off", "--desc=off",
-            "--aliases=on", "--output", "stdout", *arguments]
+    base_argv = [*command, "--format=json", "--progress-spinner=off", "--desc=off",
+                 "--aliases=on", "--output", "stdout"]
     counts = {"dependencies": 0, "vulnerabilities": 0, "skipped": 0}
-    with run_command_stream("pip-audit", argv, root, timeout, errors, env=environment) as output:
-        if output is not None:
-            counts = parse_pip_audit_report(output.stdout, manifest, sink, errors)
-            outcome["exit_code"] = output.returncode
-            if counts["dependencies"] == 0:
-                errors.append("pip-audit: empty dependency inventory; no packages were audited")
-            if output.returncode not in (0, 1):
-                errors.append(f"pip-audit exited {output.returncode}")
-            elif (output.returncode == 1) != bool(counts["vulnerabilities"]):
-                errors.append(f"pip-audit exit {output.returncode} contradicts "
-                              f"{counts['vulnerabilities']} valid advisory findings")
-            if diagnostics is not None:
-                # Keep both streams on a failed invocation (including timeout
-                # evidence) without copying JSON inventory on successful runs.
-                streams = [output.stderr_stream]
-                if len(errors) != before:
-                    output.stdout.seek(0)
-                    streams.insert(0, output.stdout)
-                for stream in streams:
-                    if stream is not None:
-                        for chunk in iter(lambda: stream.read(64 * 1024), b""):
-                            diagnostics.write(chunk.decode("utf-8", "replace"))
+    batches: list[set[tuple[str, str]] | None] = [None]
+    if pins is not None:
+        # pip-audit's no-resolver requirements source rejects two versions of
+        # one name, even when they are valid disjoint uv resolution branches.
+        # Audit every identity in nonconflicting batches under one deadline.
+        batches = []
+        offsets: dict[str, int] = {}
+        for name, version in sorted(pins):
+            offset = offsets.get(name, 0)
+            if offset == len(batches):
+                batches.append(set())
+            batches[offset].add((name, version))
+            offsets[name] = offset + 1
+        outcome["audit_batches"] = len(batches)
+    deadline = time.monotonic() + timeout
+    exit_codes: list[int] = []
+    for batch in batches:
+        remaining = timeout if batch is None else deadline - time.monotonic()
+        if batch is not None and remaining <= 0:
+            errors.append("pip-audit: shared audit deadline exhausted before all locked packages were audited")
+            break
+        with ExitStack() as stack:
+            if batch is not None:
+                scratch = Path(stack.enter_context(temporary_directory(prefix="ubs-pip-audit-")))
+                resolved = scratch / "requirements.txt"
+                resolved.write_text("".join(f"{name}=={version}\n" for name, version in sorted(batch)),
+                                    encoding="utf-8")
+                arguments = ["--no-deps", "--disable-pip", "-r", str(resolved)]
+            output = stack.enter_context(run_command_stream(
+                "pip-audit", [*base_argv, *arguments], root, remaining, errors, env=environment))
+            if output is not None:
+                collected = parse_pip_audit_report(output.stdout, manifest, sink, errors, expected=batch)
+                for key, value in collected.items():
+                    counts[key] += value
+                exit_codes.append(output.returncode)
+                if collected["dependencies"] == 0:
+                    errors.append("pip-audit: empty dependency inventory; no packages were audited")
+                if output.returncode not in (0, 1):
+                    errors.append(f"pip-audit exited {output.returncode}")
+                elif (output.returncode == 1) != bool(collected["vulnerabilities"]):
+                    errors.append(f"pip-audit exit {output.returncode} contradicts "
+                                  f"{collected['vulnerabilities']} valid advisory findings")
+                if diagnostics is not None:
+                    # Retain complete failure evidence, including advisories
+                    # received before timeout or a malformed report tail.
+                    streams = [output.stderr_stream]
+                    if len(errors) != before:
+                        output.stdout.seek(0)
+                        streams.insert(0, output.stdout)
+                    for stream in streams:
+                        if stream is not None:
+                            for chunk in iter(lambda: stream.read(64 * 1024), b""):
+                                diagnostics.write(chunk.decode("utf-8", "replace"))
+    if exit_codes:
+        outcome["exit_code"] = next((code for code in exit_codes if code not in (0, 1)), max(exit_codes))
+        if len(batches) > 1:
+            outcome["exit_codes"] = exit_codes
     outcome.update(counts)
     outcome["status"] = "partial" if len(errors) != before else "ok"
     return outcome

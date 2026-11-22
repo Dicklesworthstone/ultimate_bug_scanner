@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.102-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.103-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1862,7 +1862,13 @@ available dependency inventory in this order:
    `pip-audit --locked PROJECT_DIR`. All listed package versions in all of
    these lockfiles are checked; the audit does not filter lockfile markers or
    validate that a lockfile is current with the project manifest.
-3. Static runtime dependencies declared in `[project]` in `pyproject.toml`,
+3. `uv.lock` schema version 1, revisions 0–5. Every exact package/version from
+   the canonical PyPI registry is audited, including transitive, development,
+   optional and platform-specific branches. Each batch uses `--no-deps
+   --disable-pip`; project packages are never built and dependency versions are
+   never re-resolved. Locks with multiple versions of one package use separate
+   nonconflicting batches under one total audit deadline.
+4. Static runtime dependencies declared in `[project]` in `pyproject.toml`,
    resolved by pip-audit's positional project-directory interface.
 
 A manifest is never treated as an installed-package directory, and the tool's
@@ -1878,11 +1884,24 @@ The Python summary's `extras.external_tools` records the audit input, status,
 dependency and vulnerability counts, and skipped packages. For a lockfile audit,
 `inputs` lists every selected lockfile; findings use the generic lockfile, or
 the first sorted named lockfile, as their project-level location.
+For uv locks, `coverage` is `all-locked-registry-packages` and `lock_freshness`
+is `not-checked`: this audits the versions in the lock, without proving that
+`pyproject.toml` is still satisfied. Use `uv lock --check` separately to verify
+freshness. Checked local workspace project metadata is included in `inputs`;
+these projects are excluded from the PyPI audit only after their declared
+identity and containment inside the selected project have been verified.
 A missing manifest or unavailable tool is explicit skipped coverage. Dynamic
-dependencies, legacy project metadata, and unsupported lockfiles (`uv.lock`,
-`poetry.lock`, `Pipfile.lock`) require an exported resolved `requirements.txt`
+dependencies, legacy project metadata, and unsupported lockfiles (`poetry.lock`,
+`Pipfile.lock`) require an exported resolved `requirements.txt`
 or PEP 751 lockfile. An unsupported lockfile is never silently replaced with
 fresh resolution of potentially different versions from `pyproject.toml`.
+For uv locks, unsupported origins (including private indexes, Git and direct
+URLs), unresolved or ambiguous dependency edges, future schemas, unverified
+local packages and non-project `[manifest.dependency-groups]` declarations
+or `manifest.requirements` produce partial coverage while retaining advisories
+for supported PyPI pins.
+Every reported audited identity must match the selected pin inventory; missing,
+unexpected, duplicate and skipped identities cannot become a complete audit.
 
 These unsupported inputs, failed resolution, skipped packages, invalid reports,
 timeouts, and **any attempted audit with zero audited packages** make the scan
@@ -1912,7 +1931,8 @@ UBS_TEST_PIP_AUDIT="$(command -v pip-audit)" \
 ```
 
 These live tests check a known vulnerable package through requirements, project,
-and PEP 751 inputs, plus empty inventories and failed dependency resolution.
+PEP 751 and uv inputs, including multiple locked versions and partial origins,
+plus empty inventories and failed dependency resolution.
 
 ### Python pattern count export
 

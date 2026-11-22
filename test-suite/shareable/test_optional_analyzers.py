@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import shutil
 import signal
@@ -36,11 +37,17 @@ def audit_dependency(**changes: object) -> dict:
     return result
 
 
+def uv_lock(*pins: tuple[str, str], revision: int = 3) -> str:
+    return f"version = 1\nrevision = {revision}\n" + "".join(
+        f'\n[[package]]\nname = {json.dumps(name)}\nversion = {json.dumps(version)}\n'
+        'source = { registry = "https://pypi.org/simple" }\n' for name, version in pins)
+
+
 class PipAuditResults(unittest.TestCase):
-    def parse(self, doc=None, *, raw=None):
+    def parse(self, doc=None, *, raw=None, expected=None):
         sink, errors = io.StringIO(), []
         counts = external_tools.parse_pip_audit_report(
-            json.dumps(doc) if raw is None else raw, Path("requirements.txt"), sink, errors,
+            json.dumps(doc) if raw is None else raw, Path("requirements.txt"), sink, errors, expected=expected,
         )
         return counts, [json.loads(line) for line in sink.getvalue().splitlines()], errors
 
@@ -157,6 +164,222 @@ class PipAuditResults(unittest.TestCase):
                 self.assertTrue(errors)
 
 
+    def test_expected_pins_require_exact_unique_audited_identities(self):
+        expected = {("example-package", "1.0"), ("second", "2.0")}
+        cases = (
+            ([audit_dependency()], "second==2.0 was not audited"),
+            ([audit_dependency(version="2.0")], "unexpected audited identity"),
+            ([audit_dependency(), audit_dependency()], "duplicate audited identity"),
+            ([audit_dependency(), {"name": "second", "skip_reason": "not on PyPI"}], "second==2.0 was not audited"),
+        )
+        for dependencies, message in cases:
+            with self.subTest(message=message):
+                counts, findings, errors = self.parse({"dependencies": dependencies}, expected=expected)
+                self.assertGreaterEqual(counts["vulnerabilities"], 1)
+                self.assertTrue(findings)
+                self.assertTrue(any(message in error for error in errors), errors)
+        counts, findings, errors = self.parse(
+            {"dependencies": [audit_dependency(name="Example_Package"),
+                              audit_dependency(name="second", version="2.0", vulns=[])]}, expected=expected)
+        self.assertFalse(errors, errors)
+        self.assertEqual(counts["dependencies"], 2)
+        self.assertEqual(len(findings), 1)
+
+    def test_truncated_expected_inventory_preserves_prefix_and_missing_obligation(self):
+        raw = '{"dependencies":[' + json.dumps(audit_dependency()) + ',{"name":'
+        counts, findings, errors = self.parse(raw=raw, expected={("example-package", "1.0"), ("missing", "2")})
+        self.assertEqual(counts["vulnerabilities"], 1)
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(any("incomplete report" in error for error in errors), errors)
+        self.assertTrue(any("missing==2 was not audited" in error for error in errors), errors)
+
+
+class UvLockAudit(unittest.TestCase):
+    """Inventory/transport proofs; native pip-audit witnesses are separate."""
+
+    def setUp(self):
+        artifacts = ROOT / "test-suite/artifacts"
+        artifacts.mkdir(exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="uv-lock-audit-", dir=artifacts))
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.lock = self.project / "uv.lock"
+        self.lock.write_text(uv_lock(("example-package", "1.0")))
+        self.calls = []
+
+    def audit(self, *, transform=None, timeout=30):
+        @contextmanager
+        def run(tool, argv, root, remaining, errors, *, env):
+            self.assertEqual(tool, "pip-audit")
+            self.assertIn("--no-deps", argv)
+            self.assertIn("--disable-pip", argv)
+            self.assertNotIn("--path", argv)
+            requirements = Path(argv[argv.index("-r") + 1])
+            pins = [tuple(line.split("==", 1)) for line in requirements.read_text().splitlines()]
+            self.assertEqual(len({name for name, _version in pins}), len(pins))
+            self.calls.append({"argv": argv, "pins": pins, "remaining": remaining})
+            rows = [audit_dependency(name=name, version=version,
+                                     vulns=audit_dependency()["vulns"] if name == "example-package" else [])
+                    for name, version in pins]
+            if transform is not None:
+                rows = transform(rows)
+            code = 1 if any(row.get("vulns") for row in rows) else 0
+            yield external_tools.ToolStreamOutput(code, io.BytesIO(json.dumps({"dependencies": rows}).encode()), "")
+        sink, errors = io.StringIO(), []
+        with patch.object(external_tools, "run_command_stream", side_effect=run):
+            outcome = external_tools.scan_python_audit(str(self.project), sink, timeout, errors, command=["pip-audit"])
+        findings = [json.loads(line) for line in sink.getvalue().splitlines()]
+        return outcome, findings, errors
+
+    def test_exact_lock_pins_precede_conflicting_project_constraints(self):
+        (self.project / "pyproject.toml").write_text(
+            '[project]\nname = "project"\nversion = "0.0.0"\ndependencies = ["example-package>=9"]\n')
+        outcome, findings, errors = self.audit()
+        self.assertFalse(errors, errors)
+        self.assertEqual(outcome["status"], "ok")
+        self.assertEqual(outcome["input_kind"], "uv-lock")
+        self.assertEqual(outcome["coverage"], "all-locked-registry-packages")
+        self.assertEqual(outcome["lock_freshness"], "not-checked")
+        self.assertEqual((outcome["locked_dependencies"], outcome["dependencies"]), (1, 1))
+        self.assertEqual(self.calls[0]["pins"], [("example-package", "1.0")])
+        self.assertEqual(findings[0]["extras"]["version"], "1.0")
+        self.assertEqual(findings[0]["path"], str(self.lock))
+
+    def test_all_versions_are_audited_in_nonconflicting_batches(self):
+        self.lock.write_text(uv_lock(("example-package", "1.0"), ("example-package", "2.0"), ("other", "3.0")))
+        outcome, findings, errors = self.audit()
+        self.assertFalse(errors, errors)
+        self.assertEqual((outcome["audit_batches"], outcome["dependencies"], outcome["vulnerabilities"]), (2, 3, 2))
+        self.assertEqual({(row["extras"]["package"], row["extras"]["version"]) for row in findings},
+                         {("example-package", "1.0"), ("example-package", "2.0")})
+        self.assertLessEqual(self.calls[1]["remaining"], self.calls[0]["remaining"])
+
+    def test_known_schema_revisions_keep_the_same_all_pins_inventory(self):
+        for revision in range(6):
+            with self.subTest(revision=revision):
+                self.lock.write_text(uv_lock(("example-package", "1.0"), revision=revision))
+                outcome, findings, errors = self.audit()
+                self.assertFalse(errors, errors)
+                self.assertEqual(outcome["status"], "ok")
+                self.assertEqual(outcome["dependencies"], 1)
+                self.assertEqual(len(findings), 1)
+
+    def test_shared_deadline_does_not_restart_for_each_version(self):
+        self.lock.write_text(uv_lock(("example-package", "1.0"), ("example-package", "2.0")))
+        with patch.object(external_tools.time, "monotonic", side_effect=[0, 0, 31]):
+            outcome, findings, errors = self.audit()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(outcome["status"], "partial")
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(any("shared audit deadline" in error for error in errors), errors)
+
+    def test_project_members_are_excluded_only_after_identity_and_containment_proof(self):
+        (self.project / "pyproject.toml").write_text('[project]\nname = "root-project"\nversion = "0.0.0"\n')
+        member = self.project / "packages/member"
+        member.mkdir(parents=True)
+        (member / "pyproject.toml").write_text('[project]\nname = "local-member"\nversion = "0.0.0"\n')
+        self.lock.write_text(uv_lock(("example-package", "1.0")) + '''
+[manifest]
+members = ["root-project", "local-member"]
+[[package]]
+name = "root-project"
+version = "0.0.0"
+source = { virtual = "." }
+[package.dev-dependencies]
+dev = [{ name = "example-package" }]
+[[package]]
+name = "local-member"
+version = "0.0.0"
+source = { editable = "packages/member" }
+[package.optional-dependencies]
+extra = [{ name = "example-package" }]
+''')
+        outcome, findings, errors = self.audit()
+        self.assertFalse(errors, errors)
+        self.assertEqual(outcome["dependencies"], 1)
+        self.assertEqual(len(outcome["workspace_projects"]), 2)
+        self.assertEqual(len(findings), 1)
+        (member / "pyproject.toml").write_text('[project]\nname = "different"\n')
+        outcome, findings, errors = self.audit()
+        self.assertEqual(outcome["status"], "partial")
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(any("identity does not match" in error for error in errors), errors)
+
+    def test_workspace_symlink_escape_cannot_disappear_from_coverage(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "pyproject.toml").write_text('[project]\nname = "local-member"\n')
+        (self.project / "member").symlink_to(outside, target_is_directory=True)
+        self.lock.write_text(uv_lock(("example-package", "1.0")) + '''
+[manifest]
+members = ["local-member"]
+[[package]]
+name = "local-member"
+version = "0.0.0"
+source = { editable = "member" }
+''')
+        outcome, findings, errors = self.audit()
+        self.assertEqual(outcome["status"], "partial")
+        self.assertEqual(len(findings), 1)
+        self.assertTrue(any("escapes the selected project" in error for error in errors), errors)
+
+    def test_unsupported_origins_and_manifest_groups_retain_registry_advisories(self):
+        additions = (
+            '\n[[package]]\nname = "private"\nversion = "1.0"\nsource = { registry = "https://private.invalid/simple" }\n',
+            '\n[[package]]\nname = "git-package"\nversion = "1.0"\nsource = { git = "https://example.invalid/repo#abc" }\n',
+            '\n[[package]]\nname = "local"\nversion = "1.0"\nsource = { editable = "vendor" }\n',
+            '\n[manifest.dependency-groups]\ndev = [{ name = "missing", specifier = ">=1" }]\n',
+            '\n[manifest]\nrequirements = [{ name = "missing", specifier = ">=1" }]\n',
+            '\n[manifest]\nrequirements = "missing"\n',
+        )
+        for addition in additions:
+            with self.subTest(addition=addition):
+                self.lock.write_text(uv_lock(("example-package", "1.0")) + addition)
+                outcome, findings, errors = self.audit()
+                self.assertEqual(outcome["status"], "partial")
+                self.assertEqual(outcome["dependencies"], 1)
+                self.assertEqual(len(findings), 1)
+                self.assertTrue(errors)
+
+    def test_missing_ambiguous_and_malformed_dependency_edges_are_partial(self):
+        fields = ('dependencies = [{ name = "missing" }]\n',
+                  '[package.optional-dependencies]\nextra = [{ name = "missing" }]\n',
+                  '[package.dev-dependencies]\ndev = [{ name = "missing" }]\n',
+                  'dependencies = "missing"\n')
+        for field in fields:
+            with self.subTest(field=field):
+                self.lock.write_text(uv_lock(("example-package", "1.0")) + field)
+                outcome, findings, errors = self.audit()
+                self.assertEqual(outcome["status"], "partial")
+                self.assertEqual(len(findings), 1)
+                self.assertTrue(errors)
+        self.lock.write_text(uv_lock(("example-package", "1.0"), ("example-package", "2.0"))
+                            + 'dependencies = [{ name = "example-package" }]\n')
+        outcome, _findings, errors = self.audit()
+        self.assertEqual(outcome["status"], "partial")
+        self.assertTrue(any("does not identify one locked package" in error for error in errors), errors)
+
+    def test_future_empty_and_injectable_inventories_never_launch_an_audit(self):
+        for content in ('version = 2\n', 'version = 1\nrevision = 6\n', 'version = 1\npackage = []\n',
+                        uv_lock(("example-package", "1.0;python_version > '2'")),
+                        uv_lock(("-r requirements.txt", "1.0"))):
+            with self.subTest(content=content):
+                self.lock.write_text(content)
+                outcome, findings, errors = self.audit()
+                self.assertEqual(outcome["status"], "partial")
+                self.assertFalse(self.calls)
+                self.assertFalse(findings)
+                self.assertTrue(errors)
+
+    def test_missing_duplicate_and_wrong_report_pins_are_partial(self):
+        for transform in (lambda rows: [], lambda rows: rows + rows,
+                          lambda rows: [dict(rows[0], version="9.0")]):
+            with self.subTest(transform=transform):
+                outcome, _findings, errors = self.audit(transform=transform)
+                self.assertEqual(outcome["status"], "partial")
+                self.assertTrue(errors)
+
+
 @unittest.skipUnless(os.environ.get("UBS_TEST_PIP_AUDIT"),
                      "set UBS_TEST_PIP_AUDIT to explicitly enable live dependency audits")
 class RealPipAuditIntegration(unittest.TestCase):
@@ -212,6 +435,29 @@ class RealPipAuditIntegration(unittest.TestCase):
         self.assert_vulnerable("pylock.toml",
                                'lock-version = "1.0"\ncreated-by = "ubs-regression-witness"\n'
                                '[[packages]]\nname = "urllib3"\nversion = "1.26.4"\n')
+
+    def test_real_uv_lock_audits_known_vulnerable_package_without_resolution(self):
+        self.assert_vulnerable("uv.lock", uv_lock(("urllib3", "1.26.4")))
+
+    def test_real_uv_lock_audits_multiple_versions_of_one_package(self):
+        outcome, findings, errors = self.audit("uv.lock", uv_lock(("urllib3", "1.26.4"), ("urllib3", "1.26.5")))
+        self.assertFalse(errors, errors)
+        self.assertEqual(outcome["status"], "ok", outcome)
+        self.assertEqual((outcome["dependencies"], outcome["audit_batches"]), (2, 2))
+        self.assertEqual({row["extras"]["version"] for row in findings}, {"1.26.4", "1.26.5"})
+        self.assertEqual(outcome["lock_freshness"], "not-checked")
+
+    def test_real_uv_lock_retains_known_advisory_when_other_origins_are_uncovered(self):
+        outcome, findings, errors = self.audit("uv.lock", uv_lock(("urllib3", "1.26.4")) + '''
+[[package]]
+name = "private-package"
+version = "1.0"
+source = { registry = "https://private.invalid/simple" }
+''')
+        self.assertEqual(outcome["status"], "partial", outcome)
+        self.assertEqual(outcome["dependencies"], 1)
+        self.assertTrue(findings)
+        self.assertTrue(any("unsupported package origin" in error for error in errors), errors)
 
     def test_real_empty_requirements_is_partial(self):
         outcome, findings, errors = self.audit("requirements.txt", "# empty inventory\n")
@@ -635,6 +881,10 @@ import json, os, sys
 from pathlib import Path
 with open(os.environ["AUDIT_CALLS"], "a") as stream:
     stream.write(json.dumps(sys.argv[1:]) + "\n")
+if "--disable-pip" in sys.argv:
+    requirements = Path(sys.argv[sys.argv.index("-r") + 1]).read_text()
+    with open(Path(os.environ["AUDIT_CALLS"]).with_name("requirements.jsonl"), "a") as stream:
+        stream.write(json.dumps(requirements) + "\n")
 sys.stdout.write(Path(os.environ["AUDIT_CALLS"]).with_name("audit.json").read_text())
 sys.exit(CODE)
 '''.replace("CODE", str(code))
@@ -755,6 +1005,51 @@ sys.exit(CODE)
         self.assertEqual(outcome["inputs"], [str(lock)])
         self.assertEqual(outcome["dependencies"], 1)
         self.assertEqual(len(self.calls.read_text().splitlines()), 2)
+
+    def test_uv_lock_advisories_and_partial_coverage_reach_all_public_formats(self):
+        self.source.write_text("answer = 42\n")
+        lock = self.project / "uv.lock"
+        (self.project / "pyproject.toml").write_text(
+            '[project]\nname = "project"\ndependencies = ["example-package>=9.0"]\n')
+        self.audit_tool([audit_dependency()], code=1)
+        for unsupported in (False, True):
+            lock.write_text(uv_lock(("example-package", "1.0")) + (
+                '\n[manifest.dependency-groups]\ndev = [{ name = "missing", specifier = ">=1" }]\n'
+                if unsupported else ""))
+            for format in ("text", "json", "sarif"):
+                with self.subTest(unsupported=unsupported, format=format):
+                    proc, summary = self.scan("pip-audit", format=format)
+                    self.assertEqual(proc.returncode, 2 if unsupported else 1, proc.stdout + proc.stderr)
+                    self.assertEqual(summary["status"], "partial" if unsupported else "ok", summary)
+                    outcome = summary["extras"]["external_tools"][0]
+                    self.assertEqual((outcome["input_kind"], outcome["dependencies"]), ("uv-lock", 1))
+                    self.assertEqual(outcome["lock_freshness"], "not-checked")
+                    self.assertEqual(summary["critical"], 1)
+                    self.assertEqual(len(summary["findings"]), 1)
+                    finding = summary["findings"][0]
+                    title = "example-package 1.0: PYSEC-2026-123 (fixed in 1.1)"
+                    self.assertEqual((finding["rule"], finding["title"], finding["count"], finding["severity"]),
+                                     ("py.pip-audit.PYSEC-2026-123.example-package", title, 1, "critical"))
+                    self.assertEqual(finding["samples"], [{"file": str(lock), "line": 1, "code": "version = 1"}])
+                    if format == "text":
+                        self.assertIn(title, proc.stdout)
+                    elif format == "json":
+                        self.assertEqual(json.loads(proc.stdout), summary)
+                    if format == "sarif":
+                        run = json.loads(proc.stdout)["runs"][0]
+                        if unsupported:
+                            self.assertFalse(run["invocations"][0]["executionSuccessful"])
+                            self.assertEqual(run["invocations"][0]["exitCode"], 2)
+                        else:
+                            self.assertNotIn("invocations", run)
+                        self.assertEqual(len(run["results"]), 1)
+                        self.assertEqual(run["results"][0]["ruleId"], finding["rule"])
+                        self.assertEqual(run["results"][0]["message"]["text"], title)
+                        self.assertEqual(run["results"][0]["properties"]["extras"]["version"], "1.0")
+                        self.assertTrue(run["results"][0]["locations"][0]["physicalLocation"]
+                                        ["artifactLocation"]["uri"].endswith("uv.lock"))
+        for line in (self.root / "requirements.jsonl").read_text().splitlines():
+            self.assertEqual(json.loads(line), "example-package==1.0\n")
 
     def test_unsupported_project_inventory_is_partial_without_guessing_versions(self):
         self.audit_tool([audit_dependency(vulns=[])])

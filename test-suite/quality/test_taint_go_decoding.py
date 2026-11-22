@@ -17,6 +17,7 @@ import time
 import unittest
 from unittest.mock import patch
 import test_taint_go_packages as packages
+from ubs_core.io import temporary_directory
 
 
 class DecodingFlowTests(packages.PackageTestCase):
@@ -2300,6 +2301,537 @@ class HigherOrderNativeFlowTests(packages.PackageTestCase):
                            ('handler.go', 'false-escaper', 'fmt.Fprint', 'xss')])
 
 
+class BoundDecoderMethodTests(packages.PackageTestCase):
+    """A saved decoder method captures its receiver, not a clean free function."""
+
+    def assert_sites(self, sites):
+        lines = self.sources['handler.go'].read_text(encoding='utf-8').splitlines()
+        expected = []
+        for marker, callee, rule in sites:
+            matches = [(number, line) for number, line in enumerate(lines, 1)
+                       if '// ' + marker in line]
+            self.assertEqual(len(matches), 1, (marker, lines))
+            number, line = matches[0]
+            expected.append(('handler.go', number, line.index(callee) + 1, 'go.taint.' + rule))
+        findings = self.scan()
+        actual = [(str(Path(row['path']).relative_to(self.root)), row['line'], row['col'], row['rule'])
+                  for row in findings]
+        self.assertEqual(sorted(actual), sorted(expected), findings)
+
+    def test_bound_decode_writes_payload_in_each_domain_but_not_its_error(self):
+        for codec in ('encoding/json', 'encoding/xml'):
+            with self.subTest(codec=codec):
+                self.source('handler.go', '''
+                    package app
+                    import codec "''' + codec + '''"
+                    func h() {
+                        decoder := codec.NewDecoder(r.Body)
+                        decode := decoder.Decode
+                        var p Payload
+                        err := decode(&p)
+                        db.Query(p.SQL) // sql
+                        fmt.Fprint(w, p.HTML) // html
+                        exec.Command("sh", "-c", p.Command) // command
+                        db.Query(err.Error())
+                        db.Query("SELECT $1", p.SQL)
+                    }
+                ''')
+                self.assert_sites([('sql', 'db.Query', 'sql'), ('html', 'fmt.Fprint', 'xss'),
+                                   ('command', 'exec.Command', 'command')])
+
+    def test_bound_copy_keeps_original_receiver_after_decoder_and_method_rebinding(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings")
+            func h() {
+                decoder := json.NewDecoder(r.Body)
+                decode := (decoder.Decode)
+                saved := decode
+                decoder = json.NewDecoder(strings.NewReader(`"fixed"`))
+                decode = decoder.Decode
+                var original, fixed string
+                ((saved))(&original)
+                decode(&fixed)
+                db.Query(original) // captured
+                db.Query(fixed)
+            }
+        ''')
+        self.assert_sites([('captured', 'db.Query', 'sql')])
+
+    def test_bound_receiver_survives_pointer_cell_rebinding(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings")
+            func h() {
+                decoder := json.NewDecoder(r.Body)
+                decode := decoder.Decode
+                cell := &decoder
+                *cell = json.NewDecoder(strings.NewReader(`"fixed"`))
+                var original, fixed string
+                decode(&original)
+                decoder.Decode(&fixed)
+                db.Query(original) // captured
+                db.Query(fixed)
+            }
+        ''')
+        self.assert_sites([('captured', 'db.Query', 'sql')])
+
+    def test_bound_method_weak_pointer_install_keeps_unknown_alternatives(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for target in ('first', 'second'):
+            with self.subTest(target=target):
+                self.source('handler.go', 'package app\nimport "encoding/json"\nfunc h() {\n'
+                            'var first, second func(any) error\np := &first\n'
+                            'if choose { p = &second }\n*p = json.NewDecoder(r.Body).Decode\n'
+                            'var value Payload\n' + target + '(&value)\ndb.Query(value.SQL)\n}\n')
+                with self.assertRaisesRegex(AnalysisLimit, 'decoder.*alternative'):
+                    self.scan()
+
+    def test_bound_method_on_constructor_and_selected_factory_results(self):
+        self.source('factory.go', '''
+            package app
+            import ("encoding/json"; "io")
+            func factory(input io.Reader) *json.Decoder { return json.NewDecoder(input) }
+        ''')
+        self.source('handler.go', '''
+            package app
+            import (codec "encoding/json"; "strings")
+            func h() {
+                first := codec.NewDecoder(r.Body).Decode
+                second := factory(r.Body).Decode
+                safe := factory(strings.NewReader(`"fixed"`)).Decode
+                var a, b, c string
+                first(&a)
+                second(&b)
+                safe(&c)
+                db.Query(a) // constructed
+                db.Query(b) // helper-result
+                db.Query(c)
+            }
+        ''')
+        self.assert_sites([('constructed', 'db.Query', 'sql'), ('helper-result', 'db.Query', 'sql')])
+
+    def test_bound_method_arguments_and_returns_keep_destination_and_tuple_slots(self):
+        self.source('helper.go', '''
+            package app
+            import ("encoding/json"; "io")
+            func method(input io.Reader) (string, func(any) error) {
+                decoder := json.NewDecoder(input)
+                return "fixed", decoder.Decode
+            }
+            func invoke(decode func(any) error, out *Payload) error { return decode(out) }
+            func relay(decode func(any) error, out *Payload) error { return invoke(decode, out) }
+        ''')
+        self.source('handler.go', '''
+            package app
+            import "strings"
+            func h() {
+                fixed, decode := method(r.Body)
+                var p, clean Payload
+                err := relay(decode, &p)
+                db.Query(p.SQL) // transported
+                db.Query(fixed)
+                db.Query(err.Error())
+                _, safe := method(strings.NewReader(`{}`))
+                relay(safe, &clean)
+                db.Query(clean.SQL)
+            }
+        ''')
+        self.assert_sites([('transported', 'db.Query', 'sql')])
+
+    def test_bound_tokens_keep_payload_and_error_result_positions(self):
+        for codec, method in (('encoding/json', 'Token'), ('encoding/xml', 'Token'),
+                              ('encoding/xml', 'RawToken')):
+            with self.subTest(codec=codec, method=method):
+                self.source('handler.go', '''
+                    package app
+                    import codec "''' + codec + '''"
+                    func h() {
+                        decoder := codec.NewDecoder(r.Body)
+                        token := decoder.''' + method + '''
+                        value, err := token()
+                        fmt.Fprint(w, value) // payload
+                        fmt.Fprint(w, err)
+                    }
+                ''')
+                self.assert_sites([('payload', 'fmt.Fprint', 'xss')])
+
+    def test_bound_metadata_results_stay_clean(self):
+        self.source('handler.go', '''
+            package app
+            import "encoding/json"
+            func h() {
+                decoder := json.NewDecoder(r.Body)
+                more, offset := decoder.More, decoder.InputOffset
+                fmt.Fprint(w, more())
+                fmt.Fprint(w, offset())
+            }
+        ''')
+        self.assert_sites([])
+
+    def test_bound_buffered_result_remains_a_reader(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "io")
+            func h() {
+                decoder := json.NewDecoder(r.Body)
+                var ignored any
+                decoder.Decode(&ignored)
+                buffered := decoder.Buffered
+                value, err := io.ReadAll(buffered())
+                db.Query(string(value)) // buffered
+                db.Query(err.Error())
+            }
+        ''')
+        self.assert_sites([('buffered', 'db.Query', 'sql')])
+
+    def test_bound_safe_queries_and_html_sanitizers_remain_domain_specific(self):
+        self.source('handler.go', '''
+            package app
+            import (. "encoding/json"; "html"; "strings")
+            func h() {
+                decoder := NewDecoder(r.Body)
+                decode := decoder.Decode
+                var value string
+                decode(&value)
+                escaped := html.EscapeString(value)
+                fmt.Fprint(w, escaped)
+                db.Query("SELECT $1", value)
+                db.Query(escaped) // query-domain
+                exec.Command("sh", "-c", escaped) // command-domain
+                fixed := NewDecoder(strings.NewReader(`"SELECT 1"`))
+                decode = fixed.Decode
+                var clean string
+                decode(&clean)
+                db.Query(clean)
+            }
+        ''')
+        self.assert_sites([('query-domain', 'db.Query', 'sql'),
+                           ('command-domain', 'exec.Command', 'command')])
+
+    def test_bound_method_local_pointer_storage_preserves_the_receiver(self):
+        self.source('handler.go', '''
+            package app
+            import "encoding/json"
+            func h() {
+                decoder := json.NewDecoder(r.Body)
+                var decode func(any) error
+                pointer := &decode
+                *pointer = decoder.Decode
+                var value string
+                decode(&value)
+                db.Query(value) // indirect
+            }
+        ''')
+        self.assert_sites([('indirect', 'db.Query', 'sql')])
+
+    def test_bound_native_branch_keeps_possible_request_receiver(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings")
+            func h() {
+                fixed := json.NewDecoder(strings.NewReader(`"fixed"`))
+                incoming := json.NewDecoder(r.Body)
+                decode := fixed.Decode
+                if choose { decode = incoming.Decode }
+                var value string
+                decode(&value)
+                db.Query(value) // branch
+            }
+        ''')
+        self.assert_sites([('branch', 'db.Query', 'sql')])
+
+    def test_bound_method_side_effects_run_before_destination_write(self):
+        self.source('handler.go', '''
+            package app
+            import "encoding/json"
+            func h() {
+                decoder := json.NewDecoder(r.Body)
+                decode := decoder.Decode
+                var value string
+                decode(func() *string {
+                    db.Query(r.FormValue("q")) // argument
+                    return &value
+                }())
+                db.Query(value) // decoded
+            }
+        ''')
+        self.assert_sites([('argument', 'db.Query', 'sql'), ('decoded', 'db.Query', 'sql')])
+
+    def test_bound_method_unknown_alternative_cannot_certify_a_clean_scan(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        self.source('handler.go', '''
+            package app
+            import "encoding/json"
+            func h() {
+                decoder := json.NewDecoder(r.Body)
+                decode := decoder.Decode
+                if choose { decode = foreign }
+                var value string
+                decode(&value)
+                db.Query(value)
+            }
+        ''')
+        with self.assertRaisesRegex(AnalysisLimit, 'decoder.*alternative'):
+            self.scan()
+
+    def test_bound_method_opaque_overwrite_is_refusal_only_and_keeps_saved_copy(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        self.source('handler.go', '''
+            package app
+            import "encoding/json"
+            func h() {
+                decoder := json.NewDecoder(r.Body)
+                decode := decoder.Decode
+                saved := decode
+                decode = foreign
+                var value string
+                saved(&value)
+                db.Query(value) // saved-copy
+            }
+        ''')
+        self.assert_sites([('saved-copy', 'db.Query', 'sql')])
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings")
+            func h() {
+                decoder := json.NewDecoder(strings.NewReader(`"fixed"`))
+                decode := decoder.Decode
+                decode = foreign
+                var value string
+                decode(&value)
+                db.Query(value)
+            }
+        ''')
+        with self.assertRaisesRegex(AnalysisLimit, 'decoder.*alternative'):
+            self.scan()
+
+    def test_bound_decode_element_includes_supplied_start_attributes(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/xml"; "strings")
+            func h() {
+                decoder := xml.NewDecoder(strings.NewReader("<Value></Value>"))
+                decoder.Token()
+                decode := decoder.DecodeElement
+                start := xml.StartElement{Name: xml.Name{Local: "Value"},
+                    Attr: []xml.Attr{{Name: xml.Name{Local: "q"}, Value: r.FormValue("q")}}}
+                var value Payload
+                err := decode(&value, &start)
+                db.Query(value.SQL) // attribute
+                db.Query(err.Error())
+            }
+        ''')
+        self.assert_sites([('attribute', 'db.Query', 'sql')])
+
+    def test_bound_method_immediate_closure_replacement_uses_current_cell(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings")
+            func h() {
+                unsafeDecoder := json.NewDecoder(r.Body)
+                safeDecoder := json.NewDecoder(strings.NewReader(`"fixed"`))
+                decode := safeDecoder.Decode
+                func() { decode = unsafeDecoder.Decode }()
+                var first, second string
+                decode(&first)
+                db.Query(first) // installed-source
+                func() { decode = safeDecoder.Decode }()
+                decode(&second)
+                db.Query(second)
+            }
+        ''')
+        self.assert_sites([('installed-source', 'db.Query', 'sql')])
+
+    def test_bound_method_callee_survives_argument_replacement_only_for_that_call(self):
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings")
+            func h() {
+                decoder := json.NewDecoder(r.Body)
+                fixed := json.NewDecoder(strings.NewReader(`"fixed"`))
+                decode := decoder.Decode
+                var value, clean string
+                decode(func() *string { decode = fixed.Decode; return &value }())
+                db.Query(value) // selected-callee
+                decode(&clean)
+                db.Query(clean)
+            }
+        ''')
+        self.assert_sites([('selected-callee', 'db.Query', 'sql')])
+
+    def test_bound_method_delayed_captured_cell_is_not_a_fixed_receiver(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings")
+            func h() {
+                fixed := json.NewDecoder(strings.NewReader(`"fixed"`))
+                decode := fixed.Decode
+                later := func() {
+                    var value string
+                    decode(&value)
+                    db.Query(value)
+                }
+                decoder := json.NewDecoder(r.Body)
+                decode = decoder.Decode
+                later()
+            }
+        ''')
+        with self.assertRaisesRegex(AnalysisLimit, 'decoder.*alternative'):
+            self.scan()
+
+    def test_bound_method_receiver_object_mutation_is_an_explicit_boundary(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for mutation in ('*decoder = *incoming', 'decoder.Strict = flag',
+                         'cell := &decoder; **cell = *incoming'):
+            with self.subTest(mutation=mutation):
+                self.source('handler.go', 'package app\nimport ("encoding/xml"; "strings")\n'
+                            'func h() {\ndecoder := xml.NewDecoder(strings.NewReader("<Value/>"))\n'
+                            'decode := decoder.Decode\nincoming := xml.NewDecoder(r.Body)\n'
+                            + mutation + '\nvar value Payload\ndecode(&value)\ndb.Query(value.SQL)\n}\n')
+                with self.assertRaisesRegex(AnalysisLimit, 'decoder receiver mutation'):
+                    self.scan()
+
+    def test_bound_method_selected_inside_stored_closure_is_not_a_fixed_handle(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        self.source('handler.go', '''
+            package app
+            import ("encoding/json"; "strings")
+            func h() {
+                decoder := json.NewDecoder(strings.NewReader(`"fixed"`))
+                later := func() {
+                    decode := decoder.Decode
+                    var value string
+                    decode(&value)
+                    db.Query(value)
+                }
+                decoder = json.NewDecoder(r.Body)
+                later()
+            }
+        ''')
+        with self.assertRaisesRegex(AnalysisLimit, 'decoder.*alternative'):
+            self.scan()
+
+    def test_bound_grouped_receiver_selection_preserves_input(self):
+        self.source('handler.go', '''
+            package app
+            import "encoding/json"
+            func h() {
+                decoder := json.NewDecoder(r.Body)
+                first := ((decoder)).Decode
+                second := ((json.NewDecoder(r.Body))).Decode
+                var a, b string
+                first(&a)
+                second(&b)
+                db.Query(a) // grouped-handle
+                db.Query(b) // grouped-constructor
+            }
+        ''')
+        self.assert_sites([('grouped-handle', 'db.Query', 'sql'), ('grouped-constructor', 'db.Query', 'sql')])
+
+    def test_bound_method_unmodeled_storage_cannot_drop_decoder_contents(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for assignment, invocation in (
+                ('callbacks := []func(any) error{decoder.Decode}', 'callbacks[0](&value)'),
+                ('holder := Holder{}; holder.decode = decoder.Decode', 'holder.decode(&value)'),
+                ('decode := opaque(decoder.Decode)', 'decode(&value)')):
+            with self.subTest(assignment=assignment):
+                self.source('handler.go', 'package app\nimport "encoding/json"\nfunc h() {\n'
+                            'decoder := json.NewDecoder(r.Body)\n' + assignment + '\n'
+                            'var value string\n' + invocation + '\ndb.Query(value)\n}\n')
+                with self.assertRaisesRegex(AnalysisLimit, 'decoder.*(?:storage|transport)'):
+                    self.scan()
+
+    @unittest.skipUnless(os.environ.get('UBS_GO_DECODER_NATIVE') == '1',
+                         'set UBS_GO_DECODER_NATIVE=1 for the real Go decoder-method witness')
+    def test_native_method_capture_tokens_buffer_and_xml_attributes_match_findings(self):
+        from test_keep_temp import prevent_child_deletion
+
+        source = textwrap.dedent('''
+            package main
+            import ("encoding/json"; "encoding/xml"; "strings"; "strconv"; "os"; "io"; "fmt")
+            type Recorder struct { Queries []string }
+            func (db *Recorder) Query(query string) { db.Queries = append(db.Queries, query) }
+            func invoke(decode func(any) error, out *string) error { return decode(out) }
+            func method(input io.Reader) func(any) error { return json.NewDecoder(input).Decode }
+            type Value struct { SQL string `xml:"q,attr"` }
+            func main() {
+                db := &Recorder{}
+                input := os.Getenv("UBS_GO_DECODER_INPUT")
+                decoder := json.NewDecoder(strings.NewReader(strconv.Quote(input)))
+                decode := decoder.Decode
+                cell := &decoder
+                *cell = json.NewDecoder(strings.NewReader(`"fixed"`))
+                var captured, fixed, passed, returned string
+                if err := decode(&captured); err != nil { panic(err) }
+                decoder.Decode(&fixed)
+                db.Query(captured) // captured-native
+                db.Query(fixed)
+                second := json.NewDecoder(strings.NewReader(strconv.Quote(input)))
+                if err := invoke(second.Decode, &passed); err != nil { panic(err) }
+                db.Query(passed) // passed-native
+                clean := method(strings.NewReader(`"fixed"`))
+                clean(&returned)
+                db.Query(returned)
+                tokens := json.NewDecoder(strings.NewReader(strconv.Quote(input)))
+                token := tokens.Token
+                value, tokenErr := token()
+                db.Query(fmt.Sprint(value)) // token-native
+                db.Query(fmt.Sprint(tokenErr))
+                bufferedDecoder := json.NewDecoder(strings.NewReader("0 " + input))
+                var ignored any
+                bufferedDecoder.Decode(&ignored)
+                buffered := bufferedDecoder.Buffered
+                rest, readErr := io.ReadAll(buffered())
+                if readErr != nil { panic(readErr) }
+                db.Query(string(rest)) // buffered-native
+                elementDecoder := xml.NewDecoder(strings.NewReader("<Value></Value>"))
+                if _, err := elementDecoder.Token(); err != nil { panic(err) }
+                decodeElement := elementDecoder.DecodeElement
+                start := xml.StartElement{Name: xml.Name{Local: "Value"},
+                    Attr: []xml.Attr{{Name: xml.Name{Local: "q"}, Value: input}}}
+                var element Value
+                if err := decodeElement(&element, &start); err != nil { panic(err) }
+                db.Query(element.SQL) // attribute-native
+                if err := json.NewEncoder(os.Stdout).Encode(db.Queries); err != nil { panic(err) }
+            }
+        ''').lstrip('\n')
+        self.source('handler.go', source)
+        artifacts = packages.ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        native = Path(tempfile.mkdtemp(prefix='go-bound-decoder-', dir=artifacts))
+        program = native / 'main.go'
+        program.write_text(source, encoding='utf-8')
+        executable = native / 'decoder-witness'
+        environment = dict(os.environ, GO111MODULE='off', GOWORK='off', GOTOOLCHAIN='local',
+                           GOMAXPROCS='2', GOFLAGS='-p=2', UBS_GO_DECODER_INPUT='<supplied>')
+        compiler = os.environ.get('UBS_GO_COMPILER', 'go')
+        print(f'[{self.id()}] compiler={compiler} source={program}', flush=True)
+        build = subprocess.run([compiler, 'build', '-work', '-o', str(executable), str(program)],
+                               cwd=native, env=environment, capture_output=True, text=True,
+                               timeout=180, preexec_fn=prevent_child_deletion)
+        (native / 'build.stdout.log').write_text(build.stdout)
+        (native / 'build.stderr.log').write_text(build.stderr)
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        result = subprocess.run([str(executable)], cwd=native, env=environment, capture_output=True,
+                                text=True, timeout=30, preexec_fn=prevent_child_deletion)
+        (native / 'native.stdout.log').write_text(result.stdout)
+        (native / 'native.stderr.log').write_text(result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout), ['<supplied>', 'fixed', '<supplied>', 'fixed',
+                                                    '<supplied>', '<nil>', ' <supplied>', '<supplied>'])
+        self.assert_sites([(marker, 'db.Query', 'sql') for marker in (
+            'captured-native', 'passed-native', 'token-native', 'buffered-native', 'attribute-native')])
+
+
 class HigherOrderContextLimitTests(packages.PackageTestCase):
     def test_exhausted_context_budget_is_partial_and_never_cached_as_complete(self):
         from ubs_core.findings_merge import to_sarif
@@ -2830,6 +3362,102 @@ class ImportIdentityTests(packages.PackageTestCase):
 
 @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1', 'set UBS_TAINT_E2E=1 for real scanner tests')
 class DecodingRunnerTests(unittest.TestCase):
+    def test_bound_decoder_methods_in_public_reports(self):
+        from test_keep_temp import prevent_child_deletion
+
+        cases = (
+            ('captured', 'decoder := json.NewDecoder(r.Body)\ndecode := decoder.Decode\n'
+             'decoder = json.NewDecoder(strings.NewReader(`"fixed"`))\n'
+             'var value string\nerr := decode(&value)\ndb.Query(value) // expect-sql\n'
+             'fmt.Fprint(w, err)\ndb.Query("SELECT $1", value)', False),
+            ('token', 'decoder := json.NewDecoder(r.Body)\ntoken := decoder.Token\n'
+             'value, err := token()\nfmt.Fprint(w, value) // expect-xss\nfmt.Fprint(w, err)', False),
+            ('fixed', 'decoder := json.NewDecoder(strings.NewReader(`"fixed"`))\n'
+             'decode := decoder.Decode\nvar value string\ndecode(&value)\ndb.Query(value)', False),
+            ('suppressed', 'decoder := json.NewDecoder(r.Body)\ndecode := decoder.Decode\n'
+             'var value string\ndecode(&value)\ndb.Query(value) // ubs:ignore[go.taint.sql]', False),
+            ('xml-attribute', 'decoder := xml.NewDecoder(strings.NewReader("<Value></Value>"))\ndecoder.Token()\n'
+             'decode := decoder.DecodeElement\nstart := xml.StartElement{Name: xml.Name{Local: "Value"},\n'
+             'Attr: []xml.Attr{{Name: xml.Name{Local: "q"}, Value: r.FormValue("q")}}}\n'
+             'var value Payload\nerr := decode(&value, &start)\n'
+             'db.Query(value.SQL) // expect-sql\nfmt.Fprint(w, err)', False),
+            ('partial', 'db.Query(r.FormValue("q")) // expect-sql\n'
+             'decoder := json.NewDecoder(r.Body)\ndecode := decoder.Decode\n'
+             'if choose { decode = foreign }\nvar value string\ndecode(&value)\ndb.Query(value)', True),
+            ('weak-pointer', 'db.Query(r.FormValue("q")) // expect-sql\n'
+             'var first, second func(any) error\np := &first\nif choose { p = &second }\n'
+             '*p = json.NewDecoder(r.Body).Decode\nvar value string\nfirst(&value)\ndb.Query(value)', True),
+        )
+        artifacts = packages.ROOT / 'test-suite' / 'artifacts'
+        artifacts.mkdir(exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix='go-bound-decoder-public-', dir=artifacts))
+        skipped = ','.join(str(category) for category in range(1, 23) if category != 9)
+        for name, body, partial in cases:
+            folder = root / name
+            folder.mkdir()
+            source = ('package app\nimport ("encoding/json"; "encoding/xml"; "strings"; "fmt")\n'
+                      'func h() {\n' + body + '\n}\n')
+            path = folder / 'handler.go'
+            path.write_text(source)
+            (folder / 'unselected.go').write_text('package app\nfunc h() { db.Query(r.FormValue("q")) }\n')
+            expected = [(number, line.index(callee) + 1, 'go.taint.' + rule)
+                        for number, line in enumerate(source.splitlines(), 1)
+                        for rule, callee in (('sql', 'db.Query'), ('xss', 'fmt.Fprint'))
+                        if '// expect-' + rule in line]
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, format=output):
+                        command = [str(packages.ROOT / ('ubs' if meta else 'modules/ubs-golang.sh')),
+                                   str(path), '--ci', '--no-color', '--format=' + output, '--skip=' + skipped]
+                        if meta:
+                            command.append('--only=golang')
+                        result = subprocess.run(command, cwd=folder, capture_output=True, text=True,
+                                                timeout=45, preexec_fn=prevent_child_deletion,
+                                                env=dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1',
+                                                         UBS_NO_CACHE='1', UBS_CACHE_DIR=str(folder / 'cache')))
+                        prefix = folder / f'{meta}-{output}'
+                        prefix.with_suffix('.stdout.log').write_text(result.stdout)
+                        prefix.with_suffix('.stderr.log').write_text(result.stderr)
+                        self.assertEqual(result.returncode, 2 if partial else 1 if expected else 0,
+                                         (command, result.stdout, result.stderr))
+                        report = json.loads(result.stdout)
+                        if output == 'json':
+                            self.assertEqual(report['status'], 'partial' if partial else 'ok', report)
+                            totals = report['totals'] if meta else report
+                            self.assertEqual([totals[key] for key in ('files', 'critical', 'warning', 'info')],
+                                             [1, len(expected), 0, 0], report)
+                            actual = [(row['line'], row['col'], row['rule_id' if meta else 'rule'])
+                                      for row in report['findings']]
+                            for row in report['findings']:
+                                self.assertEqual(Path(row['file' if meta else 'path']).name, path.name, row)
+                                self.assertEqual(row['severity'], 'critical', row)
+                        else:
+                            self.assertEqual(report['version'], '2.1.0', report)
+                            runs = [run for run in report['runs']
+                                    if run['tool']['driver']['name'] == 'ubs-golang-heuristics']
+                            self.assertTrue(runs, report)
+                            if partial:
+                                self.assertTrue(any(
+                                    not invocation['executionSuccessful'] and invocation.get('exitCode') == 2
+                                    and any('decoder' in notice.get('message', {}).get('text', '')
+                                            for notice in invocation.get('toolExecutionNotifications', []))
+                                    for run in runs for invocation in run.get('invocations', [])), report)
+                            actual = []
+                            for run in report['runs']:
+                                for invocation in run.get('invocations', []):
+                                    if not partial:
+                                        self.assertTrue(invocation['executionSuccessful'], invocation)
+                                for row in run.get('results', []):
+                                    location = row['locations'][0]['physicalLocation']
+                                    region = location['region']
+                                    self.assertEqual(Path(location['artifactLocation']['uri']).name, path.name, row)
+                                    self.assertEqual(row['level'], 'error', row)
+                                    actual.append((region['startLine'], region['startColumn'], row['ruleId']))
+                        self.assertEqual(sorted(actual), sorted(expected), report)
+                        if partial:
+                            self.assertIn('decoder', json.dumps(report), report)
+                        print('GO_BOUND_DECODER_PUBLIC_PASS', name, 'runner' if meta else 'module', output, flush=True)
+
     def test_actual_json_and_sarif_include_decoded_request_flows(self):
         cases = [
             ('decode-sql', '', '', 'var p Payload; json.NewDecoder(r.Body).Decode(&p); db.Query(p.SQL)', {'sql'}),
@@ -2884,7 +3512,7 @@ class DecodingRunnerTests(unittest.TestCase):
         artifacts = packages.ROOT / 'test-suite/artifacts/go-decoding'
         for name, imports, helper, body, expected in cases:
             for format_name in ('json', 'sarif'):
-                with self.subTest(case=name, format=format_name), tempfile.TemporaryDirectory(prefix='ubs-decode-e2e-') as tmp:
+                with self.subTest(case=name, format=format_name), temporary_directory(prefix='ubs-decode-e2e-') as tmp:
                     project = Path(tmp)
                     (project / 'handler.go').write_text('package app\n' + imports + '\nfunc h() { ' + body + ' }\n')
                     (project / 'helper.go').write_text('package app\n' + helper + '\n')
@@ -3070,7 +3698,7 @@ class DecodingRunnerTests(unittest.TestCase):
             for entrypoint in ('module', 'runner'):
                 for format_name in ('json', 'sarif'):
                     with self.subTest(case=name, entrypoint=entrypoint, format=format_name), \
-                            tempfile.TemporaryDirectory(prefix='ubs-higher-order-e2e-') as tmp:
+                            temporary_directory(prefix='ubs-higher-order-e2e-') as tmp:
                         project = Path(tmp)
                         (project / 'handler.go').write_text(handler)
                         (project / 'helper.go').write_text(helper)
@@ -3125,7 +3753,7 @@ class DecodingRunnerTests(unittest.TestCase):
                   'func h(r *http.Request, w http.ResponseWriter) {\n' + '\n'.join(calls) + '\n}\n')
         artifacts = packages.ROOT / 'test-suite/artifacts/go-higher-order-budget'
         for entrypoint in ('module', 'runner'):
-            with tempfile.TemporaryDirectory(prefix='ubs-native-budget-e2e-') as tmp:
+            with temporary_directory(prefix='ubs-native-budget-e2e-') as tmp:
                 project = Path(tmp)
                 (project / 'handler.go').write_text(source)
                 for attempt, format_name in enumerate(('json', 'json', 'sarif')):

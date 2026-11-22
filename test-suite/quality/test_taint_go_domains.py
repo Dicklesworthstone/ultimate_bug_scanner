@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "modules" / "helpers"))
 from ubs_core.analyzers import taint_go
 from ubs_core.registry import RunContext
+from ubs_core.io import temporary_directory
 import test_taint_go_packages as packages
 
 
@@ -42,7 +43,7 @@ class GoTaintDomainTests(unittest.TestCase):
         return self.scan_source(source)
 
     def scan_source(self, source: str):
-        with tempfile.TemporaryDirectory(prefix="ubs-go-domain-") as tmp:
+        with temporary_directory(prefix="ubs-go-domain-") as tmp:
             path = Path(tmp) / "handler.go"
             path.write_text(textwrap.dedent(source), encoding="utf-8")
             return list(taint_go.run(RunContext(lang="go", files=[path])))
@@ -1543,7 +1544,7 @@ class GoSanitizerRunnerTests(unittest.TestCase):
         ]
         for name, imports, helper, body, expected in cases:
             for output in ('json', 'sarif'):
-                with self.subTest(case=name, format=output), tempfile.TemporaryDirectory(prefix='ubs-go-sanitizer-') as tmp:
+                with self.subTest(case=name, format=output), temporary_directory(prefix='ubs-go-sanitizer-') as tmp:
                     project = Path(tmp)
                     (project / 'handler.go').write_text('package app\n' + imports + '\nfunc h() { ' + body + ' }\n')
                     (project / 'helper.go').write_text('package app\n' + helper + '\n')
@@ -1733,7 +1734,7 @@ class NativeCallableRuntimeTests(unittest.TestCase):
                 if err := json.NewEncoder(os.Stdout).Encode(observed); err != nil { panic(err) }
             }
         ''')
-        with tempfile.TemporaryDirectory(prefix='ubs-go-parenthesized-native-') as tmp:
+        with temporary_directory(prefix='ubs-go-parenthesized-native-') as tmp:
             path = Path(tmp) / 'main.go'
             path.write_text(source, encoding='utf-8')
             native = subprocess.run(['go', 'run', '-work', str(path)], cwd=tmp, text=True,
@@ -1828,7 +1829,7 @@ class NativeCallableRuntimeTests(unittest.TestCase):
                 if err := json.NewEncoder(os.Stdout).Encode(observed); err != nil { panic(err) }
             }
         ''')
-        with tempfile.TemporaryDirectory(prefix='ubs-go-native-callable-') as tmp:
+        with temporary_directory(prefix='ubs-go-native-callable-') as tmp:
             path = Path(tmp) / 'main.go'
             path.write_text(source, encoding='utf-8')
             native = subprocess.run(['go', 'run', str(path)], cwd=tmp, text=True,
@@ -1908,7 +1909,7 @@ class NativeCallableRuntimeTests(unittest.TestCase):
                 if err := json.NewEncoder(os.Stdout).Encode(observed); err != nil { panic(err) }
             }
         ''')
-        with tempfile.TemporaryDirectory(prefix='ubs-go-native-writes-') as tmp:
+        with temporary_directory(prefix='ubs-go-native-writes-') as tmp:
             path = Path(tmp) / 'main.go'
             path.write_text(source, encoding='utf-8')
             native = subprocess.run(['go', 'run', str(path)], cwd=tmp, text=True,
@@ -1996,7 +1997,7 @@ class NativeCallableRuntimeTests(unittest.TestCase):
                 if err := json.NewEncoder(os.Stdout).Encode(observed); err != nil { panic(err) }
             }
         ''')
-        with tempfile.TemporaryDirectory(prefix='ubs-go-higher-native-') as tmp:
+        with temporary_directory(prefix='ubs-go-higher-native-') as tmp:
             path = Path(tmp) / 'main.go'
             path.write_text(source, encoding='utf-8')
             native = subprocess.run(['go', 'run', str(path)], cwd=tmp, text=True,

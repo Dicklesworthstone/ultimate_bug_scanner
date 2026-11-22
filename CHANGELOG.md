@@ -10,6 +10,15 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve native Go JSON/XML decoder methods saved in variables or passed
+  through selected helpers. Keep captured receiver identity, output-pointer
+  writes, token payloads, buffered contents and error/metadata result slots
+  distinct, including XML start-element attributes. Receiver-variable rebinding
+  remains supported; receiver-object mutation, uncertain callable writes and
+  delayed captures are explicitly incomplete. Source and actual JSON/SARIF checks
+  cover exact findings, clean controls, retained prior findings, selection and
+  suppression.
+
 - Track Python callable/sentinel stdin iterators such as
   `iter(sys.stdin.readline, "")` through native reader aliases, selected helpers
   and lazy or eager consumers. Keep iterator handles and metadata distinct from

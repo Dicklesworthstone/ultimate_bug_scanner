@@ -22,14 +22,15 @@ sys.path.insert(0, str(ROOT / 'modules' / 'helpers'))
 from ubs_core.analyzers import taint_go
 from ubs_core.registry import RunContext
 from ubs_core import go_scan
+from ubs_core.io import temporary_directory
 
 
 class PackageTestCase(unittest.TestCase):
     def setUp(self):
         self.started = time.monotonic()
-        self.directory = tempfile.TemporaryDirectory(prefix='ubs-go-packages-')
-        self.addCleanup(self.directory.cleanup)
-        self.root = Path(self.directory.name)
+        resources = contextlib.ExitStack()
+        self.addCleanup(resources.close)
+        self.root = Path(resources.enter_context(temporary_directory(prefix='ubs-go-packages-')))
         self.sources = {}
         print(f'[{self.id()}] RUN', flush=True)
 

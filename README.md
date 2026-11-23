@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.125-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.126-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -2158,6 +2158,30 @@ options can execute callbacks that change a request before transport. Unproved
 protocols, custom transports/hooks, request mutation and opaque escapes produce
 explicit incomplete analysis while preserving already established findings.
 Requests Session prepared sends remain outside this HTTPX slice.
+
+### Python HTTP client timeouts
+
+Category 7's `py.security.http-timeout` checks the timeout policy of selected
+native HTTP clients. HTTPX and aiohttp supply finite defaults, so omitting a
+timeout on those clients does not by itself produce a warning. An explicit
+request override can still disable a configured client's timeout:
+
+```python
+import httpx
+
+client = httpx.Client(timeout=5)
+client.get("https://example.com", timeout=None)  # Unbounded request: warns
+client.get("https://example.com")                # Inherits five-second timeout
+```
+
+For aiohttp, `ClientSession(timeout=None)` keeps the native default, while
+request-level `timeout=None` or an unbounded `ClientTimeout` disables it.
+Requests, urllib and urllib3 calls without a bounded timeout retain their
+warnings. Local import aliases, saved methods, client reassignment and timeout
+overrides keep their selected identities and Python argument evaluation order.
+Unknown external configuration remains unproved and does not create a
+missing-timeout warning. This check does not prove whole-program deadlines or
+cancellation behavior.
 
 ### Python subprocess taint
 

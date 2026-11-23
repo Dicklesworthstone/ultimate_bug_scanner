@@ -1810,7 +1810,7 @@
     },
     {
       "id": "python-http-timeout-buggy",
-      "description": "Python outbound HTTP calls should use explicit bounded timeouts.",
+      "description": "Native Python outbound HTTP calls with known unbounded timeouts should warn.",
       "path": "test-suite/python/security/http_timeout_buggy.py",
       "language": "python",
       "tags": ["python", "security", "timeout", "buggy"],
@@ -1826,7 +1826,7 @@
             "min": 1
           }
         },
-        "require_substrings": ["Outbound HTTP call has no explicit timeout"]
+        "require_substrings": ["Outbound HTTP call has no bounded timeout"]
       }
     },
     {
@@ -1850,7 +1850,7 @@
             "max": 0
           }
         },
-        "forbid_substrings": ["Outbound HTTP call has no explicit timeout"]
+        "forbid_substrings": ["Outbound HTTP call has no bounded timeout"]
       }
     },
     {

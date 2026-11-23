@@ -8396,5 +8396,454 @@ class PrototypePollutionPublicTests(unittest.TestCase):
                         print(f'[prototype-{label}] PASS {time.monotonic() - started:.3f}s', flush=True)
 
 
+class PythonHTTPTimeoutPrecisionTests(unittest.TestCase):
+    """Independent native-client timeout contracts, bindings and public reports.
+
+    The expected sites describe known unbounded native operations, not the
+    presence or absence of a keyword. HTTPX supplies a five-second default;
+    aiohttp supplies a finite session default and treats constructor None
+    differently from a request override. Requests and urllib have no such
+    default. Reference contracts:
+    https://www.python-httpx.org/advanced/timeouts/
+    https://docs.aiohttp.org/en/stable/client_quickstart.html#timeouts
+    https://docs.aiohttp.org/en/stable/_modules/aiohttp/client.html
+    https://requests.readthedocs.io/en/latest/user/quickstart/#timeouts
+    """
+
+    RULE = "py.security.http-timeout"
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="python-http-timeout-", dir=artifacts))
+
+    def run(self, result=None):
+        started = time.monotonic()
+        print(f"[{self.id()}] RUN", flush=True)
+        result = super().run(result)
+        failed = any(case is self or getattr(case, "test_case", None) is self
+                     for case, _ in (*result.failures, *result.errors))
+        print(f"[{self.id()}] {'FAIL' if failed else 'PASS'} "
+              f"({time.monotonic() - started:.3f}s)", flush=True)
+        return result
+
+    def check_source(self, name, source, expected):
+        from ubs_core.py_detectors import http_timeout
+
+        path = self.root / (name + ".py")
+        path.write_text(source, encoding="utf-8")
+        records = list(http_timeout.find([path]))
+        (self.root / (name + ".json")).write_text(
+            json.dumps({"source": source, "expected_lines": expected,
+                        "actual": [(str(p), line, col, detail)
+                                   for p, line, col, detail in records]}, indent=2),
+            encoding="utf-8")
+        self.assertEqual([(p, line, col) for p, line, col, _ in records],
+                         [(path, line, 1) for line in expected],
+                         {"source": source, "records": records})
+
+    def test_native_httpx_and_aiohttp_defaults_are_bounded(self):
+        cases = {
+            "httpx_module": 'import httpx\nhttpx.get("https://example.invalid")\n',
+            "httpx_client": 'import httpx\nclient = httpx.Client()\nclient.get("https://example.invalid")\n',
+            "httpx_async": 'import httpx\nasync def fetch():\n    async with httpx.AsyncClient() as client:\n        await client.get("https://example.invalid")\n',
+            "aiohttp_session": 'import aiohttp\nasync def fetch():\n    async with aiohttp.ClientSession() as client:\n        await client.get("https://example.invalid")\n',
+            "aiohttp_constructor_none": 'import aiohttp\nasync def fetch():\n    async with aiohttp.ClientSession(timeout=None) as client:\n        await client.get("https://example.invalid")\n',
+        }
+        for name, source in cases.items():
+            with self.subTest(name=name):
+                self.check_source(name, source, [])
+
+    def test_explicit_request_none_overrides_a_bounded_client(self):
+        for library, constructor, method in (
+            ("httpx", "httpx.Client(timeout=5)", 'get("https://example.invalid", timeout=None)'),
+            ("aiohttp", "aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))",
+             'get("https://example.invalid", timeout=None)'),
+            ("urllib3", "urllib3.PoolManager(timeout=5)",
+             'request("GET", "https://example.invalid", timeout=None)'),
+        ):
+            with self.subTest(library=library):
+                self.check_source("request-none-" + library,
+                                  f"import {library}\nclient = {constructor}\nclient.{method}\n", [3])
+
+    def test_explicit_unbounded_configurations_keep_constructor_and_request_sites(self):
+        for name, imports, constructor, method in (
+            ("httpx-none", "import httpx", "httpx.Client(timeout=None)", "get"),
+            ("httpx-timeout-none", "import httpx", "httpx.Client(timeout=httpx.Timeout(None))", "get"),
+            ("aiohttp-empty", "import aiohttp", "aiohttp.ClientSession(timeout=aiohttp.ClientTimeout())", "get"),
+            ("aiohttp-total-none", "import aiohttp", "aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None))", "get"),
+        ):
+            with self.subTest(name=name):
+                self.check_source(name, imports + "\nclient = " + constructor
+                                  + f'\nclient.{method}("https://example.invalid")\n', [2, 3])
+
+    def test_partial_timeout_objects_cannot_hide_an_unbounded_read(self):
+        self.check_source("httpx-read-disabled",
+                          'import httpx\nclient = httpx.Client(timeout=httpx.Timeout(5, read=None))\n'
+                          'client.get("https://example.invalid")\n', [2, 3])
+        self.check_source("aiohttp-connect-only",
+                          'import aiohttp\nclient = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, sock_connect=5))\n'
+                          'client.get("https://example.invalid")\n', [2, 3])
+        self.check_source("finite-timeout-configs",
+                          'import httpx\nimport aiohttp\n'
+                          'first = httpx.Client(timeout=httpx.Timeout(5))\n'
+                          'second = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))\n'
+                          'first.get("https://example.invalid")\n'
+                          'second.get("https://example.invalid")\n', [])
+
+    def test_native_zero_timeout_meanings_are_distinct(self):
+        self.check_source("httpx-zero",
+                          'import httpx\nclient = httpx.Client(timeout=0)\n'
+                          'client.get("https://example.invalid", timeout=0)\n', [])
+        self.check_source("aiohttp-request-zero",
+                          'import aiohttp\nclient = aiohttp.ClientSession()\n'
+                          'client.get("https://example.invalid", timeout=0)\n', [3])
+
+    def test_requests_urllib_and_urllib3_missing_timeouts_still_warn(self):
+        cases = (
+            ("requests", 'import requests\nrequests.get("https://example.invalid")\n', [2]),
+            ("requests-session", 'import requests\nclient = requests.Session()\nclient.get("https://example.invalid")\n', [3]),
+            ("urllib", 'import urllib.request\nurllib.request.urlopen("https://example.invalid")\n', [2]),
+            ("urllib3", 'import urllib3\nclient = urllib3.PoolManager()\nclient.request("GET", "https://example.invalid")\n', [2, 3]),
+            ("finite", 'import requests\nfrom urllib.request import urlopen\n'
+             'requests.get("https://example.invalid", timeout=(2, 3))\n'
+             'urlopen("https://example.invalid", None, 3)\n', []),
+        )
+        for name, source, expected in cases:
+            with self.subTest(name=name):
+                self.check_source("unbounded-" + name, source, expected)
+
+    def test_import_client_and_saved_method_aliases_retain_native_identity(self):
+        self.check_source("import-alias",
+                          'from httpx import Client as Builder\nclient = Builder(timeout=5)\n'
+                          'alias = client\nfetch = alias.get\nfetch("https://example.invalid", timeout=None)\n', [5])
+        self.check_source("saved-callable",
+                          'import requests as network\nfetch = network.get\n'
+                          'network = object()\nfetch("https://example.invalid")\n', [4])
+        self.check_source("qualified-alias-default",
+                          'import httpx as network\nfrom aiohttp import ClientSession as Session\n'
+                          'network.get("https://example.invalid")\nclient = Session()\n'
+                          'client.get("https://example.invalid")\n', [])
+
+    def test_reassignment_removes_stale_client_and_callable_identity(self):
+        self.check_source("reassigned-client",
+                          'import httpx\nclient = httpx.Client(timeout=None)\n'
+                          'client = local_cache\nclient.get("key")\n', [2])
+        self.check_source("reassigned-callable",
+                          'from requests import get as fetch\nfetch = local_lookup\nfetch("key")\n', [])
+        self.check_source("reassigned-module",
+                          'import requests\nrequests = local_cache\nrequests.get("key")\n', [])
+
+    def test_module_client_and_parameter_scopes_do_not_bleed(self):
+        self.check_source("client-scope",
+                          'import urllib3\ndef configured():\n'
+                          '    client = urllib3.PoolManager(timeout=3)\n'
+                          '    return client.request("GET", "https://example.invalid")\n'
+                          'def local_lookup(client):\n    return client.get("key")\n', [])
+        self.check_source("parameter-module-shadow",
+                          'import requests\ndef local_lookup(requests):\n'
+                          '    return requests.get("key")\n'
+                          'requests.get("https://example.invalid")\n', [4])
+        self.check_source("local-import-only",
+                          'def fetch_remote():\n    import requests as client\n'
+                          '    return client.get("https://example.invalid")\n'
+                          'def lookup(client):\n    return client.get("key")\n', [3])
+
+    def test_local_and_relative_import_lookalikes_are_not_native_clients(self):
+        self.check_source("relative-import", 'from .requests import get\nget("key")\n', [])
+        self.check_source("lookalike-import", 'from application import requests\nrequests.get("key")\n', [])
+        self.check_source("parameter-constructor",
+                          'def lookup(httpx):\n    client = httpx.Client()\n'
+                          '    return client.get("key")\n', [])
+        self.check_source("local-lexical-shadow",
+                          'import requests\ndef lookup():\n'
+                          '    requests.get("key")\n    requests = local_cache\n', [])
+
+    def test_branch_join_preserves_a_possible_unbounded_client(self):
+        self.check_source("possible-disabled-client",
+                          'import httpx\nclient = httpx.Client(timeout=5)\n'
+                          'if enabled:\n    client = httpx.Client(timeout=None)\n'
+                          'client.get("https://example.invalid")\n', [4, 5])
+        self.check_source("both-clients-bounded",
+                          'import httpx\nif enabled:\n    client = httpx.Client(timeout=5)\n'
+                          'else:\n    client = httpx.Client(timeout=10)\n'
+                          'client.get("https://example.invalid")\n', [])
+
+    def test_saved_none_config_and_timeout_mutation_apply_at_the_request(self):
+        self.check_source("timeout-alias",
+                          'import httpx\ndisabled = None\nclient = httpx.Client(timeout=5)\n'
+                          'client.get("https://example.invalid", timeout=disabled)\n', [4])
+        self.check_source("client-timeout-mutation",
+                          'import httpx\nclient = httpx.Client(timeout=5)\n'
+                          'alias = client\nalias.timeout = None\n'
+                          'client.get("https://example.invalid")\n', [5])
+        self.check_source("separate-client-mutation",
+                          'import httpx\nfirst = httpx.Client(timeout=5)\n'
+                          'second = httpx.Client(timeout=5)\nsecond.timeout = None\n'
+                          'first.get("https://example.invalid")\n'
+                          'second.get("https://example.invalid")\n', [6])
+
+    def test_exact_rule_suppression_preserves_an_unsuppressed_sibling(self):
+        self.check_source("suppression",
+                          'import httpx\nclient = httpx.Client(timeout=5)\n'
+                          'client.get("https://example.invalid", timeout=None)  # ubs:ignore[py.security.http-timeout]\n'
+                          'client.get("https://example.invalid", timeout=None)  # ubs:ignore[python.unrelated]\n', [4])
+
+    def test_literal_dead_operands_do_not_create_timeout_findings(self):
+        cases = (
+            ("dead-conditional", 'client = httpx.Client(timeout=None) if False else httpx.Client()\nclient.get("https://example.invalid")\n'),
+            ("live-conditional", 'client = httpx.Client() if True else httpx.Client(timeout=None)\nclient.get("https://example.invalid")\n'),
+            ("dead-and", 'False and httpx.Client(timeout=None)\n'),
+            ("dead-or", 'True or httpx.get("https://example.invalid", timeout=None)\n'),
+        )
+        for name, body in cases:
+            with self.subTest(name=name):
+                self.check_source(name, "import httpx\n" + body, [])
+        self.check_source("possible-short-circuit-disable",
+                          'import httpx\nclient = httpx.Client(timeout=5)\n'
+                          'enabled and (client := httpx.Client(timeout=None))\n'
+                          'client.get("https://example.invalid")\n', [3, 4])
+
+    def test_keyword_mapping_omission_preserves_native_inheritance(self):
+        self.check_source("kwargs-optional-none",
+                          'import httpx\noptions = {} if enabled else {"timeout": None}\n'
+                          'client = httpx.Client(timeout=5)\n'
+                          'client.get("https://example.invalid", **options)\n', [4])
+        self.check_source("kwargs-requests-optional-finite",
+                          'import requests\noptions = {} if enabled else {"timeout": 5}\n'
+                          'requests.get("https://example.invalid", **options)\n', [3])
+        self.check_source("kwargs-native-default-or-finite",
+                          'import httpx\noptions = {} if enabled else {"timeout": 5}\n'
+                          'httpx.get("https://example.invalid", **options)\n', [])
+        self.check_source("kwargs-opaque-is-unproved",
+                          'import requests\nrequests.get("https://example.invalid", **external_options)\n', [])
+
+    def test_invalid_configs_and_starred_operands_are_not_known_unbounded_calls(self):
+        self.check_source("httpx-invalid-empty-timeout",
+                          'import httpx\nclient = httpx.Client(timeout=httpx.Timeout())\n'
+                          'client.get("https://example.invalid")\n', [])
+        self.check_source("httpx-invalid-partial-timeout",
+                          'import httpx\nclient = httpx.Client(timeout=httpx.Timeout(connect=5))\n'
+                          'client.get("https://example.invalid")\n', [])
+        self.check_source("aiohttp-invalid-scalar-constructor",
+                          'import aiohttp\nclient = aiohttp.ClientSession(timeout=5)\n'
+                          'client.get("https://example.invalid")\n', [])
+        self.check_source("urllib-starred-position",
+                          'import urllib.request\n'
+                          'urllib.request.urlopen("https://example.invalid", *external_options)\n', [])
+
+    def test_client_method_rebinding_keeps_saved_native_methods_and_other_clients(self):
+        self.check_source("client-method-override",
+                          'import requests\ndef local_lookup(*args, **kwargs): return "cached"\n'
+                          'client = requests.Session()\nsaved = client.get\nalias = client\n'
+                          'alias.get = local_lookup\nclient.get("cached-key")\n'
+                          'saved("https://example.invalid")\n', [8])
+        self.check_source("client-method-other-owner",
+                          'import httpx\ndef local_lookup(*args, **kwargs): return "cached"\n'
+                          'first = httpx.Client()\nsecond = httpx.Client()\n'
+                          'first.get = local_lookup\n'
+                          'second.get("https://example.invalid", timeout=None)\n', [6])
+        self.check_source("client-method-conditional-override",
+                          'import httpx\ndef local_lookup(*args, **kwargs): return "cached"\n'
+                          'client = httpx.Client()\nif enabled:\n    client.get = local_lookup\n'
+                          'client.get("https://example.invalid", timeout=None)\n', [6])
+
+    def test_timeout_arguments_keep_their_values_before_later_keyword_effects(self):
+        self.check_source("timeout-captured-none",
+                          'import httpx\nclient = httpx.Client(timeout=5)\nlimit = None\n'
+                          'client.get("https://example.invalid", timeout=limit, '
+                          'follow_redirects=(limit := 5) and False)\n', [4])
+        self.check_source("timeout-captured-finite",
+                          'import httpx\nclient = httpx.Client(timeout=5)\nlimit = 5\n'
+                          'client.get("https://example.invalid", timeout=limit, '
+                          'follow_redirects=(limit := None) or False)\n', [])
+
+    @unittest.skipUnless(importlib.util.find_spec("httpx"), "native HTTPX witness requires httpx")
+    def test_native_httpx_captures_options_and_saved_methods_without_network(self):
+        import httpx
+
+        observed = []
+
+        def respond(request):
+            observed.append(dict(request.extensions["timeout"]))
+            return httpx.Response(200, text="transport")
+
+        with httpx.Client(transport=httpx.MockTransport(respond), trust_env=False) as client:
+            limit = None
+            client.get("https://example.invalid", timeout=limit,
+                       follow_redirects=(limit := 5) and False)
+            self.assertEqual(limit, 5)
+            client.get("https://example.invalid", timeout=limit,
+                       follow_redirects=(limit := None) or False)
+            self.assertIsNone(limit)
+            saved = client.get
+            alias = client
+            alias.get = lambda *args, **kwargs: "cached"
+            self.assertEqual(client.get("cached-key"), "cached")
+            self.assertEqual(saved("https://example.invalid", timeout=None).text, "transport")
+
+        phases = ("connect", "read", "write", "pool")
+        self.assertEqual(observed, [{phase: value for phase in phases}
+                                    for value in (None, 5, None)])
+        (self.root / "httpx-binding-evaluation-witness.json").write_text(
+            json.dumps({"version": httpx.__version__, "observed": observed}, indent=2), encoding="utf-8")
+
+    @unittest.skipUnless(importlib.util.find_spec("httpx"), "native HTTPX witness requires httpx")
+    def test_native_httpx_request_timeout_witness_without_network(self):
+        import httpx
+        import inspect
+
+        observed = []
+
+        def receive(request):
+            observed.append(dict(request.extensions["timeout"]))
+            return httpx.Response(200, text="ok")
+
+        with httpx.Client(transport=httpx.MockTransport(receive), trust_env=False) as client:
+            client.get("https://example.invalid")
+            client.get("https://example.invalid", timeout=None)
+            client.get("https://example.invalid", timeout=0)
+            alias = client
+            alias.timeout = None
+            client.get("https://example.invalid")
+        expected = [dict.fromkeys(("connect", "read", "write", "pool"), value)
+                    for value in (5.0, None, 0, None)]
+        self.assertEqual(observed, expected)
+        self.assertEqual(inspect.signature(httpx.get).parameters["timeout"].default.as_dict(), expected[0])
+        (self.root / "httpx-native-witness.json").write_text(
+            json.dumps({"version": httpx.__version__, "observed": observed}, indent=2), encoding="utf-8")
+
+    @unittest.skipUnless(importlib.util.find_spec("httpx"), "native HTTPX witness requires httpx")
+    def test_native_httpx_rejects_missing_required_timeout_fields(self):
+        import httpx
+
+        for options in ({}, {"connect": 5}):
+            with self.subTest(options=options):
+                with self.assertRaises(ValueError):
+                    httpx.Timeout(**options)
+        self.assertEqual(httpx.Timeout(None).as_dict(),
+                         dict.fromkeys(("connect", "read", "write", "pool"), None))
+        self.assertEqual(httpx.Timeout(connect=2, read=3, write=4, pool=5).as_dict(),
+                         {"connect": 2, "read": 3, "write": 4, "pool": 5})
+
+    @unittest.skipUnless(importlib.util.find_spec("aiohttp"), "native aiohttp witness requires aiohttp")
+    def test_native_aiohttp_constructor_and_request_none_have_different_meanings(self):
+        import aiohttp
+        import asyncio
+
+        class ObservedBeforeNetwork(Exception):
+            pass
+
+        observed = []
+
+        async def witness():
+            async with aiohttp.ClientSession(timeout=None) as client:
+                self.assertEqual(client.timeout.total, 300)
+
+                async def intercept_connection(request, *, traces, timeout):
+                    observed.append({name: getattr(timeout, name)
+                                     for name in ("total", "connect", "sock_connect", "sock_read")})
+                    raise ObservedBeforeNetwork
+
+                client.connector.connect = intercept_connection
+                for options in ({}, {"timeout": None}, {"timeout": 0}):
+                    with self.assertRaises(ObservedBeforeNetwork):
+                        await client.get("https://example.invalid", **options)
+
+        asyncio.run(witness())
+        self.assertEqual([item["total"] for item in observed], [300, None, 0])
+        self.assertTrue(all(observed[1][name] is None for name in observed[1]))
+        (self.root / "aiohttp-native-witness.json").write_text(
+            json.dumps({"version": aiohttp.__version__, "observed": observed}, indent=2), encoding="utf-8")
+
+    def public_scan(self, source, *, surface, format_, cache, label):
+        output = self.root / label
+        output.mkdir()
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith(("UBS_", "XDG_"))}
+        env.update({"UBS_KEEP_TEMP": "1", "UBS_NO_AUTO_UPDATE": "1",
+                    "UBS_CACHE_DIR": str(cache), "ENABLE_UV_TOOLS": "0",
+                    "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(output),
+                    "UBS_ALLOW_UNVERIFIED_HELPERS": "0", "UBS_ALLOW_PARTIAL": "0"})
+        command = [str(REPO_ROOT / ("ubs" if surface == "runner" else "modules/ubs-python.sh")),
+                   "--ci", "--fail-on-warning", "--no-color", f"--format={format_}",
+                   "--skip=" + ",".join(str(n) for n in range(1, 26) if n != 7)]
+        if surface == "runner":
+            command.append("--only=python")
+        command.append(str(source))
+        started = time.monotonic()
+        proc = subprocess.run(command, text=True, capture_output=True, cwd=self.root,
+                              env=env, timeout=90)
+        (output / "stdout.log").write_text(proc.stdout, encoding="utf-8")
+        (output / "stderr.log").write_text(proc.stderr, encoding="utf-8")
+        (output / "command.json").write_text(json.dumps({
+            "command": command, "elapsed": time.monotonic() - started,
+            "exit": proc.returncode, "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "detector_sha256": hashlib.sha256((HELPERS_DIR / "ubs_core/py_detectors/http_timeout.py").read_bytes()).hexdigest(),
+        }, indent=2), encoding="utf-8")
+        context = f"{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        self.assertIn(proc.returncode, (0, 1), context)
+        doc = json.loads(proc.stdout)
+        if format_ == "json":
+            self.assertEqual(doc["status"], "ok", context)
+            rule_key = "rule_id" if surface == "runner" else "rule"
+            target_rows = [row for row in doc.get("findings", []) if row[rule_key] == self.RULE]
+            if surface == "runner":
+                sites = sorted(row["line"] for row in target_rows)
+            else:
+                sites = sorted(sample["line"] for row in target_rows for sample in row["samples"])
+                self.assertEqual(sum(row["count"] for row in target_rows), len(sites), context)
+                self.assertTrue(all(row["severity"] == "warning" for row in target_rows), context)
+            totals = doc["totals"] if surface == "runner" else doc
+            self.assertEqual(totals["critical"], 0, context)
+            self.assertEqual(totals["warning"], len(sites), context)
+        else:
+            self.assertEqual(doc["version"], "2.1.0", context)
+            rows = [row for run in doc["runs"] for row in run.get("results", [])]
+            sites = sorted(row["locations"][0]["physicalLocation"]["region"]["startLine"]
+                           for row in rows if row["ruleId"] == self.RULE)
+            self.assertTrue(all(row["level"] == "warning" for row in rows if row["ruleId"] == self.RULE), context)
+            self.assertEqual(sum(row.get("level") in {"warning", "error"} for row in rows), len(sites), context)
+            for run in doc["runs"]:
+                for invocation in run.get("invocations", []):
+                    self.assertIs(invocation["executionSuccessful"], True, context)
+        self.assertEqual(proc.returncode, int(bool(sites)), context)
+        print(f"[{label}] PASS ({time.monotonic() - started:.3f}s)", flush=True)
+        return sites
+
+    @unittest.skipUnless(os.environ.get("UBS_RUN_HTTP_TIMEOUT_E2E") == "1",
+                         "set UBS_RUN_HTTP_TIMEOUT_E2E=1 for real module/runner qualification")
+    def test_public_module_runner_json_and_sarif_agree_on_native_timeout_sites(self):
+        for value, expected in (("None", [3]), ("5", [])):
+            source = self.root / ("public-" + value + ".py")
+            source.write_text('import httpx\nclient = httpx.Client(timeout=5)\n'
+                              f'client.get("https://example.invalid", timeout={value})\n', encoding="utf-8")
+            for surface in ("module", "runner"):
+                for format_ in ("json", "sarif"):
+                    label = f"http-timeout-{surface}-{format_}-{value}"
+                    with self.subTest(label=label):
+                        self.assertEqual(self.public_scan(source, surface=surface, format_=format_,
+                                                         cache=self.root / (label + "-cache"), label=label), expected)
+
+    @unittest.skipUnless(os.environ.get("UBS_RUN_HTTP_TIMEOUT_E2E") == "1",
+                         "set UBS_RUN_HTTP_TIMEOUT_E2E=1 for real module/runner qualification")
+    def test_public_cached_edits_and_exact_suppression_do_not_replay_old_timeout_findings(self):
+        source = self.root / "public-changing.py"
+        prefix = 'import httpx\nclient = httpx.Client(timeout=5)\n'
+        cache = self.root / "public-changing-cache"
+        for label, statement, expected in (
+            ("cold", 'client.get("https://example.invalid", timeout=None)', [3]),
+            ("warm", 'client.get("https://example.invalid", timeout=None)', [3]),
+            ("repaired", 'client.get("https://example.invalid", timeout=5)', []),
+            ("suppressed", 'client.get("https://example.invalid", timeout=None)  # ubs:ignore[py.security.http-timeout]', []),
+        ):
+            source.write_text(prefix + statement + "\n", encoding="utf-8")
+            with self.subTest(label=label):
+                self.assertEqual(self.public_scan(source, surface="runner", format_="json", cache=cache,
+                                                 label="http-timeout-cache-" + label), expected)
+        self.assertTrue(list(cache.glob("*/files/**/*.json")), "public runs must exercise the real file cache")
+
+
 if __name__ == "__main__":
     unittest.main()

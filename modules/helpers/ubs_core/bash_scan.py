@@ -83,32 +83,104 @@ _HEREDOC_HEADER = re.compile(r"(?<!<)<<(-?)\s*(?:'([^']+)'|\"([^\"]+)\"|\\([a-zA
 def _unquoted_heredoc_header(line: str) -> re.Match | None:
     """Find an operator outside literal shell words, not their data.
 
-    The caller excludes command substitutions. This is a quote/escape check
-    for a physical source line, not a replacement for the Bash parser.
-    A later, genuine redirection on the same line must still be recognized.
+    Command substitutions have their own quoting context even inside double
+    quotes. Arithmetic shifts are not redirections. This remains a physical
+    source-line check, not a replacement for the Bash parser.
     """
     quote = ""
-    escaped = False
-    for offset, character in enumerate(line):
-        if escaped:
-            escaped = False
-            continue
+    closer = ""
+    parentheses = 0
+    cases: list[str] = []
+    command_start = True
+    contexts: list[tuple[str, str, int, list[str], bool]] = []
+    offset = 0
+    while offset < len(line):
+        character = line[offset]
         if character == "\\" and quote != "'":
-            escaped = True
+            offset += 2
+            continue
+        if quote == "'":
+            if character == quote:
+                quote = ""
+            offset += 1
+            continue
+        if character == "`":
+            if closer == "`":
+                quote, closer, parentheses, cases, command_start = contexts.pop()
+            else:
+                contexts.append((quote, closer, parentheses, cases, False))
+                quote, closer, parentheses = "", "`", 0
+                cases, command_start = [], True
+            offset += 1
+            continue
+        if line.startswith("$(", offset):
+            arithmetic = line.startswith("$((", offset)
+            contexts.append((quote, closer, parentheses, cases, False))
+            quote, closer, parentheses = "", "))" if arithmetic else ")", 0
+            cases, command_start = [], True
+            offset += 3 if arithmetic else 2
             continue
         if quote:
             if character == quote:
                 quote = ""
+            offset += 1
             continue
         if character in {"'", '"'}:
             quote = character
+            command_start = False
+            offset += 1
             continue
-        if character == "#" and (offset == 0 or line[offset - 1].isspace()
-                                  or line[offset - 1] in ";|&()"):
-            break
-        match = _HEREDOC_HEADER.match(line, offset)
-        if match is not None:
-            return match
+        if closer != "))" and line.startswith("((", offset):
+            contexts.append((quote, closer, parentheses, cases, False))
+            quote, closer, parentheses = "", "))", 0
+            cases, command_start = [], True
+            offset += 2
+            continue
+        if closer != "))" and (word := re.match(r"[A-Za-z_][A-Za-z_0-9]*", line[offset:])):
+            token = word.group()
+            if token == "case" and command_start:
+                cases.append("subject")
+            elif cases and token == "in" and cases[-1] == "subject":
+                cases[-1] = "pattern"
+            elif cases and token == "esac" and (command_start or cases[-1] == "pattern"):
+                cases.pop()
+            command_start = command_start and token in {"if", "then", "elif", "else", "while", "until", "do"}
+            offset += len(token)
+            continue
+        if character == "(":
+            parentheses += 1
+            command_start = not cases or cases[-1] != "pattern"
+        elif character == ")":
+            if parentheses:
+                parentheses -= 1
+                if cases and cases[-1] == "pattern" and not parentheses:
+                    cases[-1] = "body"
+                    command_start = True
+            elif cases and cases[-1] in {"subject", "pattern"}:
+                # A case arm ends with ')', but the surrounding $(...) does not.
+                cases[-1] = "body"
+                command_start = True
+            elif closer == ")" or (closer == "))" and line.startswith("))", offset)):
+                offset += len(closer)
+                quote, closer, parentheses, cases, command_start = contexts.pop()
+                continue
+        elif character in ";|&":
+            if cases and (line.startswith(";;", offset) or line.startswith(";&", offset)):
+                cases[-1] = "pattern"
+                command_start = False
+                offset += 2
+                continue
+            command_start = not cases or cases[-1] != "pattern"
+        elif not character.isspace():
+            command_start = False
+        if closer != "))":
+            if character == "#" and (offset == 0 or line[offset - 1].isspace()
+                                      or line[offset - 1] in ";|&()"):
+                break
+            match = _HEREDOC_HEADER.match(line, offset)
+            if match is not None:
+                return match
+        offset += 1
     return None
 
 
@@ -332,8 +404,7 @@ def _trap_restore_eval_lines(content: str) -> set[int]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        has_subshell = bool(re.search(r"\$\(|`", line))
-        m_hd = _unquoted_heredoc_header(line) if not has_subshell else _HEREDOC_HEADER.search(line)
+        m_hd = _unquoted_heredoc_header(line)
         if m_hd:
             delim = m_hd.group(2) or m_hd.group(3) or m_hd.group(4) or m_hd.group(5)
             if delim:
@@ -452,7 +523,7 @@ def scan_files_native(
             # Quoted shell text does not start a heredoc in this script.
             # Keep genuine unquoted redirections, including those following
             # an earlier quoted look-alike on the same output command.
-            m_hd = _unquoted_heredoc_header(line) if not has_subshell else _HEREDOC_HEADER.search(line)
+            m_hd = _unquoted_heredoc_header(line)
             if m_hd:
                 delim = m_hd.group(2) or m_hd.group(3) or m_hd.group(4) or m_hd.group(5)
                 if delim:

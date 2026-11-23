@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.122-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.123-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -151,6 +151,16 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - **Python** – Category 16 now correlates every `open()` call against matching `with open(...)` usage and explicit `encoding=` parameters, while Category 19 uses the new AST helper at `modules/helpers/resource_lifecycle_py.py` to walk every file, socket, subprocess, asyncio task, and context cancellation path. The helper resolves alias imports, context managers, and awaited tasks so the diff counts (`acquire=X, release=Y, context-managed=Z`) show the exact imbalance per file.
 - **Go** – Category 5/17 now run a Go AST walker (`modules/helpers/resource_lifecycle_go.go`) that detects `context.With*` calls missing cancel, `time.NewTicker/NewTimer` without `Stop`, `os.Open/sql.Open` without `Close`, and mutex `Lock`/`Unlock` symmetry. Category 9 also tracks request query/header/form/framework values into response headers unless they strip or reject CR/LF, tracks redirect targets into `http.Redirect`, framework `Redirect` calls, and `Location` headers unless they pass through same-origin or explicit allow-list validation, flags request-derived reverse proxy targets flowing into `httputil.NewSingleHostReverseProxy`, `ProxyRequest.SetURL`, or `Director` URL mutation without HTTPS plus host allow-list validation, flags request-derived SQL text flowing into `ExecContext`/`QueryContext`, sqlx-style helpers, or query-builder predicates unless request data is passed as bound parameters, flags credentialed wildcard or reflected-origin CORS responses, and catches auth/session cookies missing `HttpOnly`, `Secure`, or `SameSite` protections. Findings come straight from the AST/resource helper or taint pass positions, so “ticker missing Stop()” and header/open-redirect/reverse-proxy/CORS/cookie/SQL lines map to exact `file:line` references instead of coarse regex summaries.
 - **Java / Kotlin** – Category 5 surfaces `FileInputStream`, readers/writers, JDBC handles, etc. that were created outside try-with-resources, while Category 19 keeps tracking executor services and file streams that never close. Category 4 also tracks servlet/Spring/Ktor request parameters, headers, and annotated parameters into response headers unless they strip/reject CR/LF or encode header fragments, and into redirect sinks such as `sendRedirect`, `respondRedirect`, Spring `redirect:` views, `RedirectView`, `ModelAndView`, and `Location` headers unless a same-origin or explicit allow-list helper is applied first. The summary text matches the manifest fixtures, so CI will fail if regression swallows these warnings.
+
+#### Bash execution and heredoc boundaries
+
+Bash checks keep scanning executable code after quoted `<<...` text inside
+command substitutions, including nested `$()` and legacy backticks. Arithmetic
+left shifts also leave later checks active. Genuine heredoc bodies remain data,
+including redirections after quoted look-alikes and inside `case` arms. Dynamic
+`eval` and failing `set -e` arithmetic findings retain their original line numbers
+in module and combined JSON/SARIF reports. Trap-restoration exemptions use the
+same boundaries, so reassignment from user input still leaves `eval` flagged.
 
 #### Java and Kotlin request identity
 

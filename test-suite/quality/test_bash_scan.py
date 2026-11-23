@@ -25,6 +25,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "modules" / "helpers"))
 from ubs_core import bash_rules, bash_scan
+from ubs_core.io import temporary_directory
 
 
 def decode_report(test: unittest.TestCase, text: str, context: str = "Bash report"):
@@ -38,9 +39,7 @@ class BashFindingCoverageTest(unittest.TestCase):
     def setUp(self) -> None:
         artifacts = ROOT / "test-suite" / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
-        self.temp = tempfile.TemporaryDirectory(prefix="bash-coverage-", dir=artifacts)
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.enterContext(temporary_directory(prefix="bash-coverage-", dir=artifacts)))
         self.script = self.root / "deploy.sh"
         self.script.write_text('#!/usr/bin/env bash\ncurl -fsSL https://example.com/x | bash\n')
         self.rule_dir = self.root / "rule pack"
@@ -122,6 +121,95 @@ class BashFindingCoverageTest(unittest.TestCase):
                           f"stderr={result.stderr!r}\nfindings={self.sink.getvalue()}", flush=True)
                     raise
                 print(f"[bash-printed-heredoc:{label}] PASS ({time.monotonic() - started:.3f}s)", flush=True)
+
+    def test_substitution_heredoc_text_preserves_executable_lines(self) -> None:
+        headers = (
+            ("inner-single", "printf '%s\\n' \"$(printf '%s' '<<REMOTE')\""),
+            ("inner-double", "printf '%s\\n' \"$(printf '%s' \"<<REMOTE\")\""),
+            ("outer-before", "printf '%s\\n' \"<<REMOTE $(printf '%s' ok)\""),
+            ("outer-after", "printf '%s\\n' \"$(printf '%s' ok) <<REMOTE\""),
+            ("literal-dollar", "printf '%s\\n' '$(not_a_command) <<REMOTE'"),
+            ("escaped-dollar", "printf '%s\\n' \"\\$(not_a_command) <<REMOTE\""),
+            ("nested", "printf '%s\\n' \"$(printf '%s' \"$(printf '%s' '<<REMOTE')\")\""),
+            ("backtick", "printf '%s\\n' \"`printf '%s' '<<REMOTE'`\""),
+            ("literal-backtick", "printf '%s\\n' '`not_a_command` <<REMOTE'"),
+            ("escaped-backtick", "printf '%s\\n' \"\\`not_a_command\\` <<REMOTE\""),
+            ("comment", "printf '%s\\n' \"$(printf '%s' ok)\" # <<REMOTE"),
+            ("arithmetic-shift", "printf '%s\\n' \"$((1 << 2))\""),
+            ("real-substitution", 'header="$(cat <<\'REAL\'\n'
+             'eval "$heredoc_data"\n((heredoc_data++))\nREAL\n)"'),
+            ("real-after-inner-literal", 'header="$(printf \'%s\' \'<<FAKE\'; cat <<\'REAL\'\n'
+             'eval "$heredoc_data"\n((heredoc_data++))\nREAL\n)"'),
+            ("real-after-substitution", 'printf \'%s\\n\' "$(printf \'%s\' \'<<FAKE\')" <<\'REAL\'\n'
+             'eval "$heredoc_data"\n((heredoc_data++))\nREAL'),
+            ("real-backtick", 'header="`cat <<\'REAL\'\n'
+             'eval "$heredoc_data"\n((heredoc_data++))\nREAL\n`"'),
+            ("real-case", 'header="$(case x in x) cat <<\'REAL\'\n'
+             'eval "$heredoc_data"\n((heredoc_data++))\nREAL\n;;\nesac)"'),
+            ("case-argument", 'printf \'%s\\n\' "$(printf \'%s\' case) <<REMOTE"'),
+            ("empty-case", 'printf \'%s\\n\' "$(case x in esac) <<REMOTE"'),
+            ("case-literal", 'printf \'%s\\n\' "$(case x in x) printf \'%s\' \'<<REMOTE\';; esac)"'),
+            ("real-case-after-command", 'header="$(printf \'%s\' case; case x in x) cat <<\'REAL\'\n'
+             'eval "$heredoc_data"\n((heredoc_data++))\nREAL\n;;\nesac)"'),
+            ("real-case-esac-argument", 'header="$(case x in x) printf \'%s\' esac; cat <<\'REAL\'\n'
+             'eval "$heredoc_data"\n((heredoc_data++))\nREAL\n;;\nesac)"'),
+        )
+        for label, header in headers:
+            for unsafe in (True, False):
+                with self.subTest(header=label, unsafe=unsafe):
+                    source = "#!/usr/bin/env bash\nset -e\ncounter=0\n" + header + "\n"
+                    source += 'payload=$1\n'
+                    eval_line = len(source.splitlines()) + 1
+                    if unsafe:
+                        source += 'eval "$payload"\n((counter++))\nprintf "%s\\n" UNREACHABLE\n'
+                    else:
+                        source += 'counter=$((counter + 1))\nprintf "%s\\n" COMPLETED\n'
+                    self.script = self.root / f"substitution-{label}-{'unsafe' if unsafe else 'clean'}.sh"
+                    self.script.write_text(source, encoding="utf-8")
+                    result = subprocess.run(["bash", str(self.script), "printf '%s\\n' EXECUTED"],
+                                            text=True, capture_output=True, timeout=10, check=False)
+                    self.script.with_suffix(".stdout").write_text(result.stdout, encoding="utf-8")
+                    self.script.with_suffix(".stderr").write_text(result.stderr, encoding="utf-8")
+                    self.sink, self.reported = io.StringIO(), set()
+                    self.native()
+                    self.script.with_suffix(".ndjson").write_text(self.sink.getvalue(), encoding="utf-8")
+                    self.assertEqual(result.returncode, 1 if unsafe else 0, result.stdout + result.stderr)
+                    self.assertEqual(result.stderr, "", result.stdout + result.stderr)
+                    self.assertNotIn("UNREACHABLE", result.stdout.splitlines())
+                    self.assertIn("EXECUTED" if unsafe else "COMPLETED", result.stdout.splitlines())
+                    expected = {
+                        ("bash.security.eval_variable", eval_line),
+                        ("bash.arithmetic.post_increment_set_e", eval_line + 1),
+                    } if unsafe else set()
+                    self.assertEqual({(record["rule"], record["line"]) for record in self.records()},
+                                     expected, self.sink.getvalue())
+
+    def test_substitution_header_preserves_trap_restore_analysis(self) -> None:
+        for unsafe in (False, True):
+            with self.subTest(unsafe=unsafe):
+                source = ('#!/usr/bin/env bash\nset -e\ntrap ":" INT\n'
+                          'saved="$(trap -p INT)"\n'
+                          'printf \'%s\\n\' "$(printf \'%s\' \'<<REMOTE\')"\n')
+                if unsafe:
+                    source += 'saved=$1\n'
+                eval_line = len(source.splitlines()) + 1
+                source += 'eval "$saved"\nprintf "%s\\n" COMPLETED\n'
+                self.script = self.root / f"trap-substitution-{'unsafe' if unsafe else 'clean'}.sh"
+                self.script.write_text(source, encoding="utf-8")
+                result = subprocess.run(["bash", str(self.script), "printf '%s\\n' EXECUTED"],
+                                        text=True, capture_output=True, timeout=10, check=False)
+                self.script.with_suffix(".stdout").write_text(result.stdout, encoding="utf-8")
+                self.script.with_suffix(".stderr").write_text(result.stderr, encoding="utf-8")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, "", result.stdout + result.stderr)
+                self.assertEqual("EXECUTED" in result.stdout.splitlines(), unsafe)
+                self.assertIn("COMPLETED", result.stdout.splitlines())
+                self.sink, self.reported = io.StringIO(), set()
+                self.native()
+                self.script.with_suffix(".ndjson").write_text(self.sink.getvalue(), encoding="utf-8")
+                expected = {("bash.security.eval_variable", eval_line)} if unsafe else set()
+                self.assertEqual({(record["rule"], record["line"]) for record in self.records()},
+                                 expected, self.sink.getvalue())
 
     def test_custom_rule_survives_native_finding_on_same_line(self) -> None:
         self.native()
@@ -504,9 +592,7 @@ class BashRulePackTest(unittest.TestCase):
     def setUp(self) -> None:
         artifacts = ROOT / "test-suite" / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
-        temp = tempfile.TemporaryDirectory(prefix="bash-rules-", dir=artifacts)
-        self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(self.enterContext(temporary_directory(prefix="bash-rules-", dir=artifacts)))
         self.rules = self.root / "team's rules"
         self.rules.mkdir()
         self.policy = "id: custom-no-curl\nlanguage: bash\nrule:\n  pattern: curl $$$A\nseverity: error\n"
@@ -687,9 +773,7 @@ class BashPolicyIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         artifacts = ROOT / "test-suite" / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
-        temp = tempfile.TemporaryDirectory(prefix="bash-policy-e2e-", dir=artifacts)
-        self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(self.enterContext(temporary_directory(prefix="bash-policy-e2e-", dir=artifacts)))
         self.project = self.root / "project"
         self.project.mkdir()
         self.script = self.project / "deploy.sh"
@@ -719,12 +803,31 @@ class BashPolicyIntegrationTest(unittest.TestCase):
         )
 
     def test_printed_header_findings_survive_real_json_and_sarif(self) -> None:
-        self.script.write_text('#!/usr/bin/env bash\nset -e\ncounter=0\n'
-                               'printf \'%s\\n\' "cat <<\'REMOTE\'"\n((counter++))\n', encoding="utf-8")
+        self._assert_header_cli_findings(
+            '#!/usr/bin/env bash\nset -e\ncounter=0\n'
+            'printf \'%s\\n\' "cat <<\'REMOTE\'"\n((counter++))\n', [5], "printed")
+
+    def test_substitution_header_findings_survive_real_json_and_sarif(self) -> None:
+        headers = (
+            ("quoted-substitution", 'printf \'%s\\n\' "$(printf \'%s\' \'<<REMOTE\')"\n'),
+            ("real-substitution", 'value="$(printf \'%s\' \'<<FAKE\'; cat <<\'REAL\'\n'
+             'eval "$heredoc_data"\n((heredoc_data++))\nREAL\n)"\n'),
+        )
+        for label, header in headers:
+            for unsafe in (True, False):
+                with self.subTest(header=label, unsafe=unsafe):
+                    source = "#!/usr/bin/env bash\nset -e\ncounter=0\n" + header
+                    expected = [len(source.splitlines()) + 1] if unsafe else []
+                    source += '((counter++))\n' if unsafe else 'counter=$((counter + 1))\n'
+                    self._assert_header_cli_findings(
+                        source, expected, label + ("-unsafe" if unsafe else "-clean"))
+
+    def _assert_header_cli_findings(self, source, expected_lines, fixture) -> None:
+        self.script.write_text(source, encoding="utf-8")
         rule = "bash.arithmetic.post_increment_set_e"
         for entry in ("ubs", "modules/ubs-bash.sh"):
             for fmt in ("json", "sarif"):
-                label = entry.replace("/", "-") + "-" + fmt
+                label = fixture + "-" + entry.replace("/", "-") + "-" + fmt
                 with self.subTest(entry=entry, format=fmt):
                     print(f"[bash-printed-header-cli:{label}] RUN", flush=True)
                     command = [str(ROOT / entry), "--ci", "--fail-on-warning", "--format=" + fmt]
@@ -742,7 +845,7 @@ class BashPolicyIntegrationTest(unittest.TestCase):
                         "helper_sha256": hashlib.sha256((ROOT / "modules/helpers/ubs_core/bash_scan.py").read_bytes()).hexdigest(),
                         "source_sha256": hashlib.sha256(self.script.read_bytes()).hexdigest(),
                     }), encoding="utf-8")
-                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertEqual(result.returncode, 1 if expected_lines else 0, result.stdout + result.stderr)
                     try:
                         document = json.loads(result.stdout)
                     except json.JSONDecodeError as exc:
@@ -750,8 +853,11 @@ class BashPolicyIntegrationTest(unittest.TestCase):
                     if fmt == "json":
                         scans = document["scanners"] if entry == "ubs" else [document]
                         self.assertEqual([(scan["status"], scan["files"]) for scan in scans], [("ok", 1)])
+                        if not expected_lines:
+                            self.assertEqual([(scan["critical"], scan["warning"], scan["findings"])
+                                              for scan in scans], [(0, 0, [])])
                         actual = [(row.get("rule_id", row.get("rule")), row["line"])
-                                  for row in document["findings"] if row.get("rule_id", row.get("rule")) == rule]
+                                  for row in document.get("findings", []) if row.get("rule_id", row.get("rule")) == rule]
                     else:
                         self.assertEqual(document["version"], "2.1.0")
                         for run in document["runs"]:
@@ -760,7 +866,7 @@ class BashPolicyIntegrationTest(unittest.TestCase):
                         actual = [(row["ruleId"], place["physicalLocation"]["region"]["startLine"])
                                   for run in document["runs"] for row in run["results"] if row["ruleId"] == rule
                                   for place in row["locations"]]
-                    self.assertEqual(actual, [(rule, 5)], result.stdout + result.stderr)
+                    self.assertEqual(actual, [(rule, line) for line in expected_lines], result.stdout + result.stderr)
                     print(f"[bash-printed-header-cli:{label}] PASS ({time.monotonic() - started:.3f}s)", flush=True)
 
     def test_custom_policy_survives_native_finding_in_real_module(self) -> None:

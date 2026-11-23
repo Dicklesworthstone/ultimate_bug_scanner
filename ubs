@@ -101,7 +101,7 @@ if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
   unset _ubs_arg
 fi
 
-UBS_VERSION="5.5.127"
+UBS_VERSION="5.5.128"
 # Installed releases prepare a complete, version-bound cache before publication.
 # This literal marker is parsed as data by the updater, never evaluated remotely.
 UBS_RELEASE_GENERATIONS=1
@@ -215,21 +215,21 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='2467aad233162d4f7daf7f63872d4ded94d247e9ae670d631ec708fe67921fb0'
-  [cpp]='83ae1e4f19a126916e94c8f1313e63cac245e181be13bf186d964587f635d1b6'
-  [csharp]='541591ad9812c5e342670443694f790928f59d0b85a5eae112121b2f100fcf73'
-  [elixir]='47ac27a1ac2c8e9d89563780e8d5a87069496ebc9f96e616ab58a637ebd8c045'
-  [golang]='e4039057b17132a33f429ba9734defd6cd98b355fb6d1998007676ba11795a0c'
-  [hcl]='9f7b8d042e064b1c923c08f92b02f84850dfcae8eaa6a992ab13e9b7f8d8b2a8'
-  [java]='37fb46b70bedaf3a06115ead5d84cfb2e7877edcdb51e58ba6df78e2e276e183'
-  [js]='937600e7ffb6abfb42b8ffb92c1c88f00e400402bde43ce8a3d9fa13245b5a90'
-  [kotlin]='95acb7daf839548fc29bf148a8fd3cea02e740351c0d89bec416f9c85d0029a9'
-  [php]='1a6ad03d3f1abfc1c5444e650a6cf12f6a7d51de22fe4bd149b674a8abf36341'
-  [python]='407ff5576ba8a6b27922bb2dd17812c7523f3160eff1e468d7b5a89f6f1d4804'
-  [ruby]='ebf95bc867bec66d0a08b5d93b0f30f95f673dac134ebde306305744a8f6b2bf'
-  [rust]='584d8b0f82eac3c1e54c1554ac718b3c39743f88308c9b402fbdbda9947cce9d'
-  [sql]='5823c73e563ef5f7e9494a80344d5cbf4f106ab600098e723caeb75e241b1964'
-  [swift]='48d781690b69513453bdbf1ea278f83d1cee5e2e90fb33dd836d9565bf47883a'
+  [bash]='9df0cb8d92ca5846aa65b1a6c368d2560b13b71a159b2b498d3b9e3abbb7c407'
+  [cpp]='309b3e03ad92ef649be971d904c31984315b0a7a0d1a916a65a925a27e374a90'
+  [csharp]='e521525e5159e9fcf3a7f8aef8d193c285a185570912c813c47a88cf9d3889f1'
+  [elixir]='a74de8a1649ee55fd5eb039890773bb81c60a84ce35c4bf9bcf236a094e5db68'
+  [golang]='06f745a197dd11c44c0bd3a65d786fafb89ed0416f314efef783ada2aedb7776'
+  [hcl]='d7a611d29fdc348c3037114afdb00ced7f614d06f04c183af578ef6c31bd1df9'
+  [java]='1217ae999be399ed2dbf81e989cac4d7dda4eb80961d463d60d43d0cc8b6326c'
+  [js]='5e87f619fd95c747c63df9b54ad116dd4c3b13ac5bdc91c373a41c05d7eaa25c'
+  [kotlin]='eee46818d57bf8dd3f4ecac1d3980d551064b2c62cb6bf7ccd35211fb6903c3b'
+  [php]='b3abd67029c58b0c0ade43f51e6a6cb40287d4a8d473b452daa0e2eae5dfcbab'
+  [python]='f3b0e2bcf05b1d5034a2c67f5411c3f173d08b93af757f7cf34d270e8b6a8cbb'
+  [ruby]='a2170e2d3c8409b6d1eec25c013de2004c3293a51aba0a771a17f2d4c0004cc4'
+  [rust]='49843a841d5b5a333416d113595a5cdbdd9effc4329d2f30555b2c641dde9eb2'
+  [sql]='fccc1af7c36deb0a509cc34e6715ef47932657c82da3dfcb99dc1fce36794078'
+  [swift]='0c5179088838f9c96c3ab48965f447bf99a311e20cdd5230021e7f618026adbd'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -332,10 +332,10 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/analyzers/taint_elixir_traversal.py']='26939c1285b3193efb1feebbd4eeff46e2c20bd1e6e8a797cf1f96a3b286d112'
   ['helpers/ubs_core/analyzers/taint_go.py']='f37bf721228fd1dbc79236b01055ec693240d20dc4a23104ad3ee508d69e8500'
   ['helpers/ubs_core/analyzers/taint_java_redirect.py']='9b692ef24912c2a9fe1276bf19b8328d451fab5913aeaa1d9908a2aaf26f1e0d'
-  ['helpers/ubs_core/analyzers/taint_java_sql.py']='010070f2cd8538e268588f39486da0b4ad1984a710f2d25ba1326eebf86d8d7d'
-  ['helpers/ubs_core/analyzers/taint_java_traversal.py']='69da21ec5f2d99b0603e6af028948bfc0f7f54e31c493cc52eac5c67b8680aa8'
+  ['helpers/ubs_core/analyzers/taint_java_sql.py']='56ff633be1543bbbdaeed6df03cfc8df80d157ee9b4a41d500048cd560e61278'
+  ['helpers/ubs_core/analyzers/taint_java_traversal.py']='2b780e675840f251f6f5545e3856ff3c50e22358433e7bfab09bddebadd334fd'
   ['helpers/ubs_core/analyzers/taint_js.py']='a3753f05bb9d6e24ff0dc6ada02227e0d74818611c3e188f4bda6ce33179af81'
-  ['helpers/ubs_core/analyzers/taint_kotlin_sql.py']='dc16b75056c7811304168cf2071a58db4b9979847e74c6c6c3bb6899e62c71d3'
+  ['helpers/ubs_core/analyzers/taint_kotlin_sql.py']='c52803389df70d21da5479cf6094a81940c04258a697b131f9dcd2d3d97a20bd'
   ['helpers/ubs_core/analyzers/taint_php.py']='52cf7dd562645eef1a1eefaac2fc0243837a4c5a57aec5248a308f8c96cd6b21'
   ['helpers/ubs_core/analyzers/taint_py.py']='5f7efffdcc17dea4e0d48cedcb7b20489799a11c2a56dd03cd1899dc58185927'
   ['helpers/ubs_core/analyzers/taint_ruby_traversal.py']='3b84ba11792ea34aaedf384c7f45fdb149f23cbf6712c5f1c385428d0e78d6e3'
@@ -605,7 +605,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='7543f49117b6549a56771e737c8d57a828c238af50a660faf27b65a1227bfd5f'
   ['helpers/ubs_core/taint_flow.py']='b50925e0f4bf7263f41650a1274c208b5e2c2a994d7cdfd518fb26b3dd5251cf'
-  ['lib/ubs-common.sh']='9b86644144c75000f6c7c677ff7766e443d182a2d1473486945807804e0374c2'
+  ['lib/ubs-common.sh']='db207930a13ca13d05fb890af6d4833363c575d94c72d9114aa3af84267ef6ed'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out
@@ -2259,7 +2259,7 @@ Environment Variables:
   CI=true                     Disable the opt-in auto-update check (like --ci)
   UBS_ENABLE_AUTO_UPDATE=1    Opt in to the 24h auto-update check
   UBS_NO_AUTO_UPDATE=1        Force-disable auto-update (like --no-auto-update)
-  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go scans;
+  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go/Java scans;
                               unsupported languages and update/service modes exit 2.
                               Use TMPDIR to choose storage. Caller removes retained files.
   FORCE_SELF_UPDATE=1         Force an immediate verified self-update check
@@ -2428,7 +2428,7 @@ cat <<'JSON'
     {"name": "UBS_SKIP_TYPE_NARROWING", "value": "1", "description": "Skip the type-narrowing helpers."},
     {"name": "UBS_ENABLE_AUTO_UPDATE", "value": "1", "description": "Opt in to the 24h auto-update check."},
     {"name": "UBS_NO_AUTO_UPDATE", "value": "1", "description": "Force-disable auto-update."},
-    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go; unsupported languages and update/service modes refuse with exit 2. Requested external tools that cannot retain scratch report incomplete coverage. Go's compiled lifecycle helper requires --skip=17 for a complete static scan. Use TMPDIR to choose storage."},
+    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go/Java; unsupported languages and update/service modes refuse with exit 2. Requested external tools that cannot retain scratch report incomplete coverage. Go's compiled lifecycle helper requires --skip=17 for a complete static scan. Use TMPDIR to choose storage."},
     {"name": "UBS_RULES", "value": "DIR[:DIR...]", "description": "Custom rule directories (':'-separated, like PATH) used when no --rules is given; empty entries are ignored."},
     {"name": "UBS_NO_CACHE", "value": "1", "description": "Disable scan caching (like --no-cache)."},
     {"name": "UBS_CACHE_DIR", "value": "PATH", "description": "Override root directory for scan cache (like --cache-dir)."},
@@ -10908,11 +10908,11 @@ if [[ ${#langs[@]} -eq 0 ]]; then emit_no_langs_result; fi
 if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
   for L in "${langs[@]}"; do
     case "$L" in
-      rust|python|js|bash|hcl|csharp|kotlin|cpp|sql|ruby|php|golang) ;;
+      rust|python|js|bash|hcl|csharp|kotlin|cpp|sql|ruby|php|golang|java) ;;
       *)
-        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang."
+        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang, java."
         emit_error_envelope "environment" "error" "retention-unsupported-language" \
-          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang" \
+          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang, java" \
           '"failed_modules":[]'
         exit 2 ;;
     esac

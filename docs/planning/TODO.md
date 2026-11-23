@@ -834,3 +834,105 @@ Final Ruby log SHA256 receipts:
 - Public module/runner: `1c27168d94d14c3a62469ce50c220769cc46e38ca6901a8c316cabe34d669103`.
 - Native CRuby witness: `80aa058b7805ec69a5e0bd531fa34c33b89d36419b420219c59eb2bf823a406c`.
 - Integrity: `beea5e178ee0a626079527c7dea78aa105dd3a1d3754f1650937dd288ce9f6c3`.
+
+## 19. November 23 continuation: consumed JVM request bodies
+
+### Implemented behavior (`ultimate_bug_scanner-mj1j.4`)
+
+- [x] Track proven javax/jakarta Servlet readers and input streams, including
+  Kotlin synthetic properties, through supported consumption, wrappers,
+  aliases and selected local helpers into path, redirect, response-header,
+  outbound-URL and SQL policies. Distinguish stream handles and metadata from
+  consumed body text/bytes; keep fixed readers and unrelated receivers clean.
+- [x] Preserve Java/Kotlin native-member precedence over extensions and local
+  extension receiver provenance. Unknown or escaped handles, deferred reads,
+  unsupported buffer writes and unresolved bindings remain incomplete.
+- [x] Add Java to the existing retained-scratch runner contract and route all
+  five affected Java cleanup sites through the shared retention helper.
+  Seven guarded module/runner scans pass. Strict syscall tracing was blocked
+  by kernel ptrace EPERM; this does not prove zero attempted removals.
+
+### Scoped evidence and concurrent integration
+
+The original fixed baseline missed 180 unsafe policy observations. Independent
+review then exposed 15 fluent-handle/native-member/local-extension failures;
+all were corrected before qualification. The frozen 5.5.125 candidate passes
+23 source methods covering 510 value outcomes (296 unsafe, 214 clean),
+65 explicit incomplete boundaries and two local-extension controls. Actual
+JDK 17 compilation uses the unchanged `--release 17` and 90-second child
+deadline; actual Kotlin 2.2.21 compiles all 43 selected source witnesses.
+
+Public module/runner JSON/SARIF, selection, suppression and cache checks pass.
+Ordinary unfiltered Java scans retain exact totals of 47 critical, seven
+warnings, four informational findings and 19 files. Selected Kotlin scans
+retain 104 critical findings, zero warnings and 39 files. An initial public
+harness incorrectly relied on a runner-cleared category environment variable;
+its failed receipts remain retained. Corrected selection uses the documented
+`--skip` option and also verifies ordinary Java output with all seven warnings.
+
+The reconciled 5.5.126 candidate preserves the concurrently published JS
+concat implementation and passes three JVM public/native/retention methods
+plus all 17 JS concat public calls. Further main advances added Python HTTP
+timeout semantics and native lazy map. Final reconciliation preserves those
+implementations, the appended HTTP precision-test class and all 420 Beads
+records; only this JVM implementation and its integrity/version chain change.
+
+Final 5.5.128 reconciliation on main `7127a0c` passes all six focused methods
+with no skips: 39 actual public calls (10 JVM, 17 JS concat, 12 Python HTTP
+timeout) plus the unchanged real Java 17 Servlet compiler gate. DSR elapsed
+53.818 seconds within the original 180-second outer budget. All 27 frozen
+code-file identities remain unchanged after execution, and all 58 generated
+public JVM source programs match the previously qualified source bytes.
+The canonical updater and both integrity checks also pass on this candidate.
+Native Kotlin and the full source corpus retain their earlier passing receipts
+and exact qualified source identity; they were not rerun on 5.5.128.
+
+Scoped DSR log SHA256 receipts:
+
+- Source outcomes: `eacc042a8567c6f814452323e6e07a4e4341266e752ec51a37ca01a271791f48`.
+- Native Java 17: `007f530c57648c525bb0cb4cccb463740afd3f0f2044a169be4722b80b10e06c`.
+- Native Kotlin 42: `52ae09130af56d93cd29910634c00e028cea1028e1c79dab82f3df21cef3f9d6`.
+- Native Kotlin buffer control: `550bdb80ca034e1a5ee71b92e7a3d094ebd577b3e8d4a34c18ab2e4ad1c7ae8e`.
+- Guarded Java retention: `d95abc6e75ec268010dc8bf0267179b8f286a725516097442040ad9029e38768`.
+- Public selection/cache: `b1a60254b576c95ccb8f8520f2e0d8b53409a18d1b94ad8c05e10cde7ee64473`.
+- Public default/selected totals: `de53fca67f241244a1c24ee8337c5138b1f7d5af2dcc8152ae5d3011daafe8fa`.
+- Frozen integrity: `482b5753c25667a7c3a33a7925291dcdca122be9367bb0c7d74c321e59198eae`.
+- Reconciled 5.5.126 JVM: `a5df29abfbca174c03c548b101c0791744791ce10d1774a8c990837a0c9dfda1`.
+- Reconciled 5.5.126 JS concat: `60e95124b87557da2146d43a215bd1aff2f93edbf3f238f28023dbc42fb44176`.
+- Final 5.5.128 focused integration: `2643dc93b1bbe560e10f302822a5e64234848b3ba644ee5251e663a919b2cc5c`.
+- Final 5.5.128 canonical integrity: `238f5c192c5384adc67ce1abd9dcdd90070c41fda9450f167a2443399205256e`.
+
+### Required broad qualification: attempted, not green
+
+These attempts used the frozen JVM 5.5.125 candidate, before the concurrent
+JS concat, HTTP timeout and Python map changes; they do not qualify the final
+combined tree. Original assertions and timeouts remain unchanged.
+
+- [ ] Full `shellcheck ubs modules/ubs-*.sh scripts/*.sh` was killed with
+  exit 137 after 9.803 seconds, without a completed diagnostic summary.
+  ShellCheck is now installed; no cause beyond the observed signal is claimed.
+  Log: `138f138487f4112adbc8832ff1928ac9f6846faa81a0c8346309f9c5abd16b4e`.
+- [ ] UBS scanning the five touched production Python helpers returns exit 2,
+  `ANALYSIS_INCOMPLETE`, with zero critical, zero warning and 973 informational
+  findings. Generator/protocol uncertainty and function work-budget limits
+  prevent strict completion. Source identities are unchanged.
+  Log: `925e8313e8ead178f576656f66561686662890fb3e0dd819110593e2f41c7516`.
+- [ ] The unchanged full suite reaches its fixed 600-second outer deadline
+  (exit 124). Checksums and all 12 rule inventories pass. The Swift fixture
+  pair fails, quality-unit discovery is killed with exit 137, and contract
+  setup fails when its stdlib temporary-file probe attempts deletion under
+  the deletion fence. The manifest records 156 passes, seven failures and
+  one unfinished case; this is not a completed aggregate result.
+  Log: `c3e39951123b90d57c8aa097a0836610afa22231244860931d8821cc1d340180`.
+- [x] All 16 Bash feature public calls pass again within that full-suite
+  attempt, using installed tools and project-selected CPython 3.14.10.
+  This scoped success does not change the failed aggregate.
+- [ ] The manifest failures are `meta-explicit-files-bypass-size-guard`,
+  `python-redos-regex-clean`, `python-ssrf-clean`, `python-http-timeout-clean`,
+  `python-random-security-clean`, `python-tls-verification-clean` and
+  `js-typescript-prototype-pollution-clean`; the unfinished case is
+  `js-typescript-post-message-wildcard-buggy`. Later concurrent code may alter
+  these outcomes; no unobserved rerun is claimed.
+- [ ] Broader framework, heap and deferred-reader analysis, strict whole-tree
+  acceptance, version-tag and release qualification remain open. No umbrella
+  Bead is closed by this bounded implementation.

@@ -1542,6 +1542,215 @@ class JVMRequestReceiverIdentityTests(unittest.TestCase):
         (self.root / "observations.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
 
     @classmethod
+    def servlet_bodies(cls, language, namespace):
+        """Real Servlet body readers expose contents, not availability metadata.
+
+        These expectations follow the Servlet/JDK contracts independently of
+        the scanner. readLine/readAllBytes return body data; ready/available
+        report boolean/numeric state and do not return the request's text.
+        https://jakarta.ee/specifications/servlet/6.1/apidocs/jakarta.servlet/jakarta/servlet/ServletRequest.html
+        https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/io/BufferedReader.html
+        https://docs.oracle.com/en/java/javase/17/docs/api/java.base/java/io/InputStream.html
+        """
+        original = dict(cls.cases(language, namespace))["renamed_receiver"]
+        original = ("import java.io.BufferedReader;\nimport java.io.InputStream;\n"
+                    "import java.io.InputStreamReader;\nimport java.io.StringReader;\n"
+                    "import java.nio.charset.StandardCharsets;\nimport java.sql.Statement;\n" + original)
+        original = original.replace("HttpClient client)", "HttpClient client, Statement statement)").replace(
+            "client: HttpClient)", "client: HttpClient, statement: Statement)")
+        original = original.replace("Files.readString(Path.of(value)); // expect-path",
+            "Files.readString(Path.of(value)); // expect-path\n"
+            'statement.executeQuery("SELECT * FROM accounts WHERE name = \'" + value + "\'"); // expect-sql')
+        getter = 'incoming.getParameter("next")'
+        declaration = "String value" if language == "java" else "var value"
+
+        def probe(expression, *, prefix="", members="", unsafe=True):
+            result = original.replace(getter, expression).replace(declaration + " = ", prefix + declaration + " = ")
+            result = result.replace("class RequestProbe {", "class RequestProbe {\n" + members)
+            return result if unsafe else re.sub(r" // expect-(?:redirect|header|ssrf|path|sql)", "", result)
+
+        yield "reader_line", probe("incoming.getReader().readLine()")
+        alias = "BufferedReader body" if language == "java" else "val body: BufferedReader"
+        yield "reader_alias", probe("body.readLine()", prefix=alias + " = incoming.getReader();\n")
+        helper = ("BufferedReader same(BufferedReader selected) { return selected; }" if language == "java" else
+                  "fun same(selected: BufferedReader): BufferedReader { return selected }")
+        yield "reader_helper_return", probe("same(incoming.getReader()).readLine()", members=helper)
+        helper = ("String read(BufferedReader selected) throws Exception { return selected.readLine(); }"
+                  if language == "java" else
+                  "fun read(selected: BufferedReader): String { return selected.readLine() }")
+        yield "reader_helper_consume", probe("read(incoming.getReader())", members=helper)
+        yield "reader_transform", probe("incoming.getReader().readLine().trim()")
+        constructor = "new String" if language == "java" else "String"
+        yield "stream_bytes", probe(constructor + "(incoming.getInputStream().readAllBytes(), StandardCharsets.UTF_8)")
+        alias = "InputStream body" if language == "java" else "val body: InputStream"
+        yield "stream_alias", probe(constructor + "(body.readAllBytes(), StandardCharsets.UTF_8)",
+            prefix=alias + " = incoming.getInputStream();\n")
+        helper = ("InputStream same(InputStream selected) { return selected; }" if language == "java" else
+                  "fun same(selected: InputStream): InputStream { return selected }")
+        yield "stream_helper_return", probe(constructor +
+            "(same(incoming.getInputStream()).readAllBytes(), StandardCharsets.UTF_8)", members=helper)
+        yield "servlet_base_body", probe("incoming.getReader().readLine()").replace(
+            "HttpServletRequest incoming", "ServletRequest incoming").replace(
+            "incoming: HttpServletRequest", "incoming: ServletRequest")
+        yield "reader_ready", probe("java.lang.String.valueOf(incoming.getReader().ready())", unsafe=False)
+        yield "reader_mark_supported", probe("java.lang.String.valueOf(incoming.getReader().markSupported())", unsafe=False)
+        yield "stream_available", probe("java.lang.String.valueOf(incoming.getInputStream().available())", unsafe=False)
+        yield "stream_mark_supported", probe("java.lang.String.valueOf(incoming.getInputStream().markSupported())", unsafe=False)
+        fixed = "new BufferedReader(new StringReader(\"/fixed\"))" if language == "java" else "BufferedReader(StringReader(\"/fixed\"))"
+        yield "fixed_reader", probe(fixed + ".readLine()", unsafe=False)
+        fake = ('static class Local { BufferedReader getReader() { return new BufferedReader(new StringReader("/fixed")); } }'
+                if language == "java" else
+                'class Local { fun getReader(): BufferedReader { return BufferedReader(StringReader("/fixed")) } }')
+        yield "lookalike_request", probe("incoming.getReader().readLine()", members=fake, unsafe=False).replace(
+            "HttpServletRequest incoming", "Local incoming").replace("incoming: HttpServletRequest", "incoming: Local")
+        yield "reassigned_value", probe('"/fixed"', prefix=declaration + "Before = incoming.getReader().readLine();\n", unsafe=False)
+        yield "grouped_reader", probe("(incoming.getReader()).readLine()")
+        yield "grouped_reader_metadata", probe("java.lang.String.valueOf((incoming.getReader()).ready())", unsafe=False)
+        prefix = "new " if language == "java" else ""
+        yield "wrapped_stream_reader", probe(prefix + "BufferedReader(" + prefix +
+            "InputStreamReader(incoming.getInputStream(), StandardCharsets.UTF_8)).readLine()")
+        array_size = ".length" if language == "java" else ".size"
+        yield "byte_array_size", probe("java.lang.String.valueOf(incoming.getInputStream().readAllBytes()" + array_size + ")", unsafe=False)
+        overwritten = probe("incoming.getReader().readLine()", unsafe=False)
+        yield "overwritten_value", overwritten.replace(
+            declaration + " = incoming.getReader().readLine();", declaration +
+            ' = incoming.getReader().readLine();\nvalue = "/fixed";')
+        yield "reader_header_controls_removed", probe('incoming.getReader().readLine().replace("\\r", "").replace("\\n", "")').replace(
+            "// expect-header", "// controls removed")
+        fake_consumer = ('interface LocalReader { String ready(String value); }' if language == "java" else
+                         'interface LocalReader { fun ready(value: String): String }')
+        lookalike = probe("given.ready(incoming.getReader().readLine())", members=fake_consumer)
+        yield "custom_consumer_name", lookalike.replace("Statement statement)", "Statement statement, LocalReader given)").replace(
+            "statement: Statement)", "statement: Statement, given: LocalReader)")
+        if language == "kotlin":
+            yield "reader_property", probe("incoming.reader.readLine()")
+            yield "stream_property", probe("String(incoming.inputStream.readAllBytes(), StandardCharsets.UTF_8)")
+            yield "reader_native_member_extension", probe("body.readLine()",
+                prefix="val body: BufferedReader = incoming.getReader();\n") + (
+                '\nfun BufferedReader.readLine(): String { return "/fixed" }\n')
+            yield "stream_native_member_extension", probe("String(body.readAllBytes(), StandardCharsets.UTF_8)",
+                prefix="val body: InputStream = incoming.getInputStream();\n") + (
+                '\nfun InputStream.readAllBytes(): ByteArray { return byteArrayOf(47, 111, 107) }\n')
+            yield "reader_native_metadata_extension", probe("java.lang.String.valueOf(body.ready())",
+                prefix="val body: BufferedReader = incoming.getReader();\n", unsafe=False) + (
+                '\nfun BufferedReader.ready(): String { return this.readLine() }\n')
+
+    def test_servlet_request_bodies_preserve_value_and_metadata(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.analyzers import taint_java_sql, taint_kotlin_sql
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        policies = (("redirect", RedirectEngine), ("header", HeaderEngine),
+                    ("ssrf", SSRFEngine), ("path", Engine), ("sql", None))
+        observations = []
+        for language in ("java", "kotlin"):
+            for namespace in ("jakarta", "javax"):
+                for name, text in self.servlet_bodies(language, namespace):
+                    path = self.root / f"body-{language}-{namespace}-{name}{'.java' if language == 'java' else '.kt'}"
+                    path.write_text(text, encoding="utf-8")
+                    for policy, engine in policies:
+                        with self.subTest(language=language, namespace=namespace, case=name, policy=policy):
+                            expected = [line for line, content in enumerate(text.splitlines(), 1)
+                                        if "// expect-" + policy in content]
+                            started = time.monotonic()
+                            actual, error = [], None
+                            try:
+                                if engine is not None:
+                                    actual = sorted(engine(path, text).analyze())
+                                else:
+                                    module = taint_java_sql if language == "java" else taint_kotlin_sql
+                                    actual = sorted(row["line"] for row in module.analyze_source(path, text))
+                            except Exception as exc:
+                                error = f"{type(exc).__name__}: {exc}"
+                            observations.append({"language": language, "namespace": namespace,
+                                "case": name, "policy": policy, "source_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                                "expected_lines": expected, "actual_lines": actual, "error": error,
+                                "elapsed_s": time.monotonic() - started})
+                            self.assertIsNone(error)
+                            self.assertEqual(actual, expected)
+        (self.root / "body-observations.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
+        print(f"[jvm-servlet-bodies] {self.root}", flush=True)
+
+    @classmethod
+    def servlet_body_protocols(cls, language):
+        original = dict(cls.servlet_bodies(language, "jakarta"))["reader_line"]
+        for name, expression in (("lazy_lines", "incoming.getReader().lines().findFirst().orElse(\"/fixed\")"),
+                                 ("buffer_write", "java.lang.String.valueOf(incoming.getReader().read(buffer))"),
+                                 ("single_character", "java.lang.String.valueOf(incoming.getReader().read())"),
+                                 ("handle_string", "java.lang.String.valueOf(incoming.getReader())"),
+                                 ("handle_concat", '\"reader=\" + incoming.getReader()'),
+                                 ("fluent_consumer", ("new " if language == "java" else "") + "String(buffer)")):
+            text = original.replace("incoming.getReader().readLine()", expression)
+            if name in {"buffer_write", "fluent_consumer"}:
+                text = text.replace("String value =", "char[] buffer = new char[32];\nString value =") if language == "java" else (
+                    text.replace("var value =", "val buffer = CharArray(32);\nvar value ="))
+            if name == "fluent_consumer":
+                declaration = "String value" if language == "java" else "var value"
+                text = text.replace(declaration + " =", "consumer.self().fill(incoming.getReader(), buffer);\n" + declaration + " =")
+                contract = ("interface Consumer { Consumer self(); void fill(BufferedReader body, char[] buffer) throws Exception; }"
+                            if language == "java" else
+                            "interface Consumer { fun self(): Consumer; fun fill(body: BufferedReader, buffer: CharArray) }")
+                text = text.replace("class RequestProbe {", "class RequestProbe {\n" + contract)
+                text = text.replace("Statement statement)", "Statement statement, Consumer consumer)").replace(
+                    "statement: Statement)", "statement: Statement, consumer: Consumer)")
+            yield name, text
+
+        if language == "kotlin":
+            source = dict(cls.servlet_bodies(language, "jakarta"))["reader_alias"]
+            source = source.replace("body.readLine()", "java.lang.String.valueOf(body.read(buffer))").replace(
+                "var value =", "val buffer = CharArray(32);\nvar value =")
+            source += "\nfun BufferedReader.read(buffer: CharArray): Int { return 0 }\n"
+            yield "native_buffer_extension", source
+
+    def test_servlet_body_protocol_boundaries_remain_explicit(self):
+        from ubs_core.analyzers.taint_java_redirect import RedirectEngine
+        from ubs_core.analyzers.taint_java_traversal import Engine
+        from ubs_core.analyzers import taint_java_sql, taint_kotlin_sql
+        from ubs_core.java_detectors.header_injection import HeaderEngine
+        from ubs_core.java_detectors.ssrf_outbound_url import SSRFEngine
+
+        observations = []
+        for language in ("java", "kotlin"):
+            for name, text in self.servlet_body_protocols(language):
+                path = self.root / ("body-incomplete-" + language + "-" + name + (".java" if language == "java" else ".kt"))
+                path.write_text(text, encoding="utf-8")
+                for policy, engine in (("redirect", RedirectEngine), ("header", HeaderEngine),
+                                       ("ssrf", SSRFEngine), ("path", Engine), ("sql", None)):
+                    with self.subTest(language=language, case=name, policy=policy):
+                        error = None
+                        try:
+                            if engine is not None:
+                                engine(path, text).analyze()
+                            else:
+                                (taint_java_sql if language == "java" else taint_kotlin_sql).analyze_source(path, text)
+                        except ValueError as exc:
+                            error = str(exc)
+                        observations.append({"language": language, "case": name, "policy": policy,
+                            "source_sha256": hashlib.sha256(text.encode()).hexdigest(), "error": error})
+                        self.assertIsNotNone(error)
+                        self.assertRegex(error, "(?:Request body consumer|Kotlin SQL member/extension overload).*incomplete")
+        (self.root / "body-incomplete-observations.json").write_text(json.dumps(observations, indent=2), encoding="utf-8")
+
+    def test_kotlin_body_library_extensions_keep_local_binding(self):
+        from ubs_core.analyzers import taint_kotlin_sql
+
+        original = dict(self.servlet_bodies("kotlin", "jakarta"))["reader_alias"]
+        for name, returned, unsafe in (("fixed", '\"/fixed\"', False), ("body", "this.readLine()", True)):
+            source = "package jvm_body_extension_" + name + "\n" + original.replace("body.readLine()", "body.readText()")
+            source += "\nfun BufferedReader.readText(): String { return " + returned + " }\n"
+            path = self.root / ("body-local-extension-" + name + ".kt")
+            path.write_text(source, encoding="utf-8")
+            with self.subTest(case=name):
+                actual = taint_kotlin_sql.analyze_source(path, source)
+                expected = [line for line, text in enumerate(source.splitlines(), 1) if "// expect-sql" in text] if unsafe else []
+                (self.root / ("body-local-extension-" + name + ".json")).write_text(json.dumps({
+                    "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "findings": actual,
+                    "expected_lines": expected}, indent=2), encoding="utf-8")
+                self.assertEqual([row["line"] for row in actual], expected)
+
+    @classmethod
     def servlet_collections(cls, language, namespace):
         """Servlet parameters/headers expose values; their sizes do not.
 
@@ -1869,7 +2078,8 @@ class JVMRequestReceiverIdentityTests(unittest.TestCase):
     @staticmethod
     def expected_sites(language, source, filename):
         rules = {"redirect": ".taint.open_redirect", "header": ".security.header-injection",
-                 "ssrf": ".security.ssrf-outbound-url", "path": ".taint.path_traversal"}
+                 "ssrf": ".security.ssrf-outbound-url", "path": ".taint.path_traversal",
+                 "sql": ".security.sql-injection"}
         return sorted((filename, language + suffix, line, 1) for policy, suffix in rules.items()
                       for line, content in enumerate(source.splitlines(), 1) if "// expect-" + policy in content)
 
@@ -1939,15 +2149,22 @@ class Example {
         with self.assertRaisesRegex(ValueError, "Servlet initialization.*incomplete"):
             Engine(real_path, real).analyze()
 
-    def scan(self, language, target, surface, format_, expected, label, *, options=(), cache=False, files=1):
+    def scan(self, language, target, surface, format_, expected, label, *, options=(), cache=False,
+             files=1, warnings=(), select_categories=True):
         entry = REPO_ROOT / ("modules/ubs-" + language + ".sh" if surface == "module" else "ubs")
         directory = target if target.is_dir() else target.parent
-        command = [str(entry), "--only=4" if surface == "module" else "--only=" + language,
-                   "--format=" + format_, "--ci", *options, str(target)]
+        categories = "4,13" if language == "kotlin" else "4"
+        # Runner --only selects languages. Use its public category skips so
+        # both surfaces execute the same security policies and exact oracle.
+        selection = ["--only=" + (categories if surface == "module" else language)]
+        if surface == "runner" and select_categories:
+            selection.append("--skip=" + ",".join(str(category) for category in range(1, 23)
+                                                   if str(category) not in categories.split(",")))
+        command = [str(entry), *selection, "--format=" + format_, "--ci", *options, str(target)]
         stats = directory / (label + ".cache.json")
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", UBS_NO_AUTO_UPDATE="1", ENABLE_UV_TOOLS="0",
                    UBS_NO_CACHE="0" if cache else "1", UBS_CACHE_DIR=str(directory / "cache"),
-                   UBS_CACHE_FILE=str(stats), UBS_CATEGORY_FILTER="4")
+                   UBS_CACHE_FILE=str(stats), UBS_CATEGORY_FILTER=categories)
         started = time.monotonic()
         proc = subprocess.run(command, cwd=directory, capture_output=True, text=True, timeout=180, env=env)
         (directory / (label + ".stdout")).write_text(proc.stdout, encoding="utf-8")
@@ -1972,20 +2189,26 @@ class Example {
             rows = payload["findings"]
             actual = sorted((Path(row[path_key]).name, row[key], row["line"], row["col"]) for row in rows
                             if row["severity"] in {"critical", "warning"})
+            actual_warnings = sorted((Path(row[path_key]).name, row[key], row["line"], row["col"])
+                                     for row in rows if row["severity"] == "warning")
             totals = payload["totals"] if surface == "runner" else payload
-            self.assertEqual((totals["critical"], totals["warning"]), (len(expected), 0), context)
+            self.assertEqual((totals["critical"], totals["warning"]), (len(expected), len(warnings)), context)
             self.assertEqual(totals["files"], files, context)
         else:
             rows = [row for run in payload["runs"] for row in run.get("results", [])
                     if row.get("level", "warning") in {"error", "warning"}]
-            self.assertTrue(all(row["level"] == "error" for row in rows), context)
             actual = sorted((sarif_location_path(row["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]).name,
                              row["ruleId"], row["locations"][0]["physicalLocation"]["region"]["startLine"],
                              row["locations"][0]["physicalLocation"]["region"]["startColumn"]) for row in rows)
+            actual_warnings = sorted((sarif_location_path(row["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]).name,
+                                      row["ruleId"], row["locations"][0]["physicalLocation"]["region"]["startLine"],
+                                      row["locations"][0]["physicalLocation"]["region"]["startColumn"])
+                                     for row in rows if row["level"] == "warning")
             for run in payload["runs"]:
                 self.assertTrue(all(invocation.get("executionSuccessful", True)
                                     for invocation in run.get("invocations", [])), context)
-        self.assertEqual(actual, expected, context)
+        self.assertEqual(actual_warnings, sorted(warnings), context)
+        self.assertEqual(actual, sorted([*expected, *warnings]), context)
         return json.loads(stats.read_text()) if cache else None
 
     def test_public_json_sarif_api_identity(self):
@@ -1999,7 +2222,13 @@ class Example {
             for name in ("parameter_array", "parameter_map", "header_values", "array_iteration_sanitizer",
                          "helper_element", "array_length", "map_size", "conventional_name_local_array"):
                 selected.append((name, collections[name]))
+            bodies = dict(self.servlet_bodies(language, "jakarta"))
+            for name in ("reader_line", "reader_helper_consume", "stream_bytes", "wrapped_stream_reader",
+                         "reader_ready", "byte_array_size", "fixed_reader", "lookalike_request"):
+                selected.append(("body_" + name, bodies[name]))
             if language == "kotlin":
+                for name in ("reader_native_member_extension", "stream_native_member_extension", "reader_native_metadata_extension"):
+                    selected.append(("body_" + name, bodies[name]))
                 selected.extend(self.kotlin_overloads())
                 for name in ("property_map", "property_map_nullable", "property_header_names", "numeric_getter_extension_request"):
                     selected.append((name, collections[name]))
@@ -2020,6 +2249,22 @@ class Example {
                 for format_ in ("json", "sarif"):
                     with self.subTest(language=language, surface=surface, format=format_):
                         self.scan(language, directory, surface, format_, sorted(expected), surface + "-" + format_, files=len(selected))
+            if language == "java":
+                # Ordinary scans retain unrelated resource/SQL-style warnings
+                # as well as the exact source-flow sites checked above.
+                warnings = [
+                    ("Probe_body_lookalike_request.java", "java.io.twr", 17, 1),
+                    ("Probe_body_lookalike_request.java", "java.sql.concat", 25, 1),
+                    ("Probe_body_lookalike_request.java", "java.sql.exec-concat", 25, 1),
+                    ("Probe_body_wrapped_stream_reader.java", "java.io.twr", 20, 1),
+                    ("Probe_body_fixed_reader.java", "java.io.twr", 20, 1),
+                    ("Probe_body_fixed_reader.java", "java.sql.concat", 25, 1),
+                    ("Probe_body_fixed_reader.java", "java.sql.exec-concat", 25, 1),
+                ]
+                for format_ in ("json", "sarif"):
+                    with self.subTest(language=language, surface="runner-default", format=format_):
+                        self.scan(language, directory, "runner", format_, sorted(expected), "default-" + format_,
+                                  files=len(selected), warnings=warnings, select_categories=False)
 
     def test_public_selection_suppression_and_cache_identity(self):
         for language in ("java", "kotlin"):

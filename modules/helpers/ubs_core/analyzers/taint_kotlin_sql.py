@@ -44,6 +44,7 @@ RULE_METADATA = {
 _PROPERTIES = {
     "queryString": "getQueryString", "requestURI": "getRequestURI",
     "pathInfo": "getPathInfo", "servletPath": "getServletPath",
+    "reader": "getReader", "inputStream": "getInputStream",
     "requestHeaders": "getRequestHeaders", "query": "getQuery", "rawQuery": "getRawQuery",
 }
 _EXTENSION_RE = re.compile(r"\bfun\s+(?:<[^{}\n]+>\s*)?[\w.?<>]+\s*\.\s*[A-Za-z_]\w*\s*\(")
@@ -463,6 +464,27 @@ class KotlinSqlEngine(jdbc.SqlEngine):
             signature = ("java.lang.String",) * arity
         elif method in {"toString", "hashCode"} and arity == 0:
             signature = ()
+        elif actual in jdbc.BODY_TYPES:
+            kind = jdbc.BODY_TYPES[actual]
+            zero = {"read", "markSupported", "close", "reset"}
+            if kind in {"reader", "buffered-reader"}:
+                zero.add("ready")
+            if kind == "buffered-reader":
+                zero.update({"readLine", "lines"})
+            if kind in {"stream", "servlet-stream"}:
+                zero.update({"available", "readAllBytes"})
+            if kind == "servlet-stream":
+                zero.update({"isReady", "isFinished"})
+            if arity == 0 and method in zero:
+                signature = ()
+            elif (method == "read" and arity in {1, 3}
+                  or method in {"mark", "skip", "transferTo"} and arity == 1
+                  or kind in {"stream", "servlet-stream"} and method in {"readNBytes", "skipNBytes"} and arity in {1, 3}
+                  or kind == "servlet-stream" and (method, arity) in {("readLine", 3), ("setReadListener", 1)}):
+                # Buffer/stream overloads need exact native argument proof.
+                # A competing extension cannot manufacture a clean summary
+                # for a native mutation that remains intentionally incomplete.
+                return None
         elif actual in jdbc._STATEMENTS and method in jdbc._EXECUTE:
             if arity == 0 and (actual in jdbc._PREPARED or method in jdbc._BATCH_EXECUTE):
                 signature = ()
@@ -577,8 +599,9 @@ class KotlinSqlEngine(jdbc.SqlEngine):
         actual = self.extension_types.get(self.function.key)
         if actual:
             state = dict(state)
+            body = frozenset({jdbc.BODY_PREFIX + jdbc.BODY_TYPES[actual]}) if actual in jdbc.BODY_TYPES else frozenset()
             state["this"] = frozenset({Trace("parameter", (self.function.key, len(self.function.parameters)),
-                tags=jdbc._type_tags(actual), evidence=(self.step(self.function.key, "parameter", "this"),))})
+                tags=jdbc._type_tags(actual) | body, evidence=(self.step(self.function.key, "parameter", "this"),))})
         return super().transfer(action, state)
 
     def source(self, offset, label):

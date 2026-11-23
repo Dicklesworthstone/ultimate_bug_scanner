@@ -66,8 +66,9 @@ REQUEST_TYPES = SERVLET_TYPES | HTTP_SERVLET_TYPES
 REQUEST_GETTERS = {'getParameter': 1, 'getHeader': 1, 'getQueryString': 0,
                    'getRequestURI': 0, 'getPathInfo': 0, 'getServletPath': 0,
                    'getParameterValues': 1, 'getParameterMap': 0, 'getParameterNames': 0,
-                   'getHeaders': 1, 'getHeaderNames': 0}
-SERVLET_BASE_GETTERS = frozenset({'getParameter', 'getParameterValues', 'getParameterMap', 'getParameterNames'})
+                   'getHeaders': 1, 'getHeaderNames': 0, 'getReader': 0, 'getInputStream': 0}
+SERVLET_BASE_GETTERS = frozenset({'getParameter', 'getParameterValues', 'getParameterMap', 'getParameterNames',
+                                'getReader', 'getInputStream'})
 REQUEST_COLLECTIONS = {'getParameterValues': 'string-array', 'getParameterMap': 'parameter-map',
                        'getParameterNames': 'string-enumeration', 'getHeaders': 'string-enumeration',
                        'getHeaderNames': 'string-enumeration'}
@@ -75,11 +76,21 @@ COLLECTION_PREFIX = 'jvm-collection:'
 COLLECTION_KINDS = frozenset({'string-array', 'parameter-map', 'string-enumeration',
                              'string-collection', 'array-collection', 'string-iterator', 'array-iterator'})
 COLLECTION_TAGS = frozenset(COLLECTION_PREFIX + kind for kind in COLLECTION_KINDS)
+BODY_PREFIX = 'jvm-body:'
+BODY_TYPES = {
+    'java.io.BufferedReader': 'buffered-reader', 'java.io.Reader': 'reader',
+    'java.io.InputStreamReader': 'reader', 'java.io.StringReader': 'reader',
+    'java.io.InputStream': 'stream', 'java.io.BufferedInputStream': 'stream',
+    'java.io.ByteArrayInputStream': 'stream',
+    'jakarta.servlet.ServletInputStream': 'servlet-stream', 'javax.servlet.ServletInputStream': 'servlet-stream',
+}
+BODY_HANDLES = frozenset({'buffered-reader', 'reader', 'stream', 'servlet-stream'})
+BODY_TAGS = frozenset(BODY_PREFIX + kind for kind in BODY_HANDLES | {'bytes'})
 REQUEST_GETTER_RE = re.compile(r'\.\s*(?:' + '|'.join(REQUEST_GETTERS) + r')\s*\(')
 REQUEST_PROPERTIES = {'queryString': 'getQueryString', 'requestURI': 'getRequestURI',
                       'pathInfo': 'getPathInfo', 'servletPath': 'getServletPath',
                       'parameterMap': 'getParameterMap', 'parameterNames': 'getParameterNames',
-                      'headerNames': 'getHeaderNames'}
+                      'headerNames': 'getHeaderNames', 'reader': 'getReader', 'inputStream': 'getInputStream'}
 REQUEST_PROPERTY_RE = re.compile(r'\.\s*(?:' + '|'.join(REQUEST_PROPERTIES) + r')\b')
 REQUEST_PROPERTY_PREFIX_RE = re.compile(
     r'(?:this\s*\.\s*)?[A-Za-z_]\w*' + REQUEST_PROPERTY_RE.pattern)
@@ -906,6 +917,9 @@ class Engine:
     def request_call(self, name, arguments, offset, bindings, state, receiver=CLEAN):
         if not self.request_receiver_sources:
             return None
+        body = self.request_body_access(name, arguments, offset, bindings, state, receiver)
+        if body is not None:
+            return body
         collection = self.request_collection_access(name, arguments, offset, bindings, state, receiver)
         if collection is not None:
             return collection
@@ -931,9 +945,105 @@ class Engine:
             # of its arguments. An unsupported signature is not a sanitizer.
             return None
         source = self.source(offset, name if property_ else name + '(')
+        if method in {'getReader', 'getInputStream'}:
+            return self.body_value(source, 'buffered-reader' if method == 'getReader' else 'servlet-stream')
         if method in REQUEST_COLLECTIONS:
             return self.collection_value(source, REQUEST_COLLECTIONS[method])
         return retag(source, add=frozenset({'jvm-string'}))
+
+    @staticmethod
+    def body_value(value, kind):
+        """Keep a native body handle distinct from text/bytes read from it."""
+        tags = frozenset({'jvm-string'} if kind == 'string' else {BODY_PREFIX + kind})
+        return retag(value, add=tags, remove=BODY_TAGS | COLLECTION_TAGS | PATH_PROOF_TAGS |
+                     frozenset({'jvm-string', 'jvm-path'}))
+
+    @staticmethod
+    def body_kinds(value):
+        return frozenset(tag.removeprefix(BODY_PREFIX) for trace in value for tag in trace.tags & BODY_TAGS)
+
+    def body_escape(self, value, offset):
+        """Defer an unsupported protocol until summaries prove request input.
+
+        A fixed reader in an unrelated helper must not make a scan incomplete.
+        Symbolic parameters use the existing escape summaries, so a selected
+        caller supplying a real request body cannot be certified clean either.
+        """
+        escaped = retag(value, add=frozenset({'unmodeled-body-protocol'}))
+        self.escapes[offset] = join(self.escapes.get(offset, CLEAN),
+            advance(escaped, self.step(offset, 'body-protocol', 'unmodeled request body consumer')))
+
+    def body_member(self, receiver, member, arguments, offset):
+        kinds = self.body_kinds(receiver)
+        if not kinds:
+            return None
+        # A ServletInputStream passed through an InputStream helper carries
+        # both compatible contracts. Every possible kind must agree below;
+        # a trace with no body identity cannot borrow either contract.
+        if any(not trace.tags & BODY_TAGS for trace in receiver):
+            if kinds & BODY_HANDLES:
+                self.body_escape(receiver, offset)
+            return retag(receiver, remove=BODY_TAGS)
+        arity = None if arguments is None else len(arguments)
+        result = None
+        for kind in kinds:
+            selected = None
+            if kind == 'bytes':
+                if (member, arity) == ('size' if self.parser.kotlin else 'length', None):
+                    selected = 'metadata'
+            else:
+                if kind == 'buffered-reader' and (member, arity) == ('readLine', 0):
+                    selected = 'string'
+                elif kind in {'stream', 'servlet-stream'} and (member, arity) == ('readAllBytes', 0):
+                    selected = 'bytes'
+                elif ((member, arity) in {('markSupported', 0), ('close', 0), ('reset', 0)}
+                      or kind in {'reader', 'buffered-reader'} and (member, arity) == ('ready', 0)
+                      or kind in {'stream', 'servlet-stream'} and (member, arity) == ('available', 0)
+                      or kind == 'servlet-stream' and (member, arity) in {('isReady', 0), ('isFinished', 0)}):
+                    selected = 'metadata'
+            if selected is None or result is not None and result != selected:
+                if kinds & BODY_HANDLES:
+                    # Buffer writes, transferTo, lazy lines/callbacks and
+                    # custom/extension consumers need separate state effects.
+                    self.body_escape(receiver, offset)
+                return retag(join(receiver, *(arguments or [])), remove=BODY_TAGS)
+            result = selected
+        if result == 'metadata':
+            return CLEAN
+        return advance(self.body_value(receiver, result), self.step(offset, 'body-read', member))
+
+    def body_constructor(self, name, arguments, offset):
+        if not arguments:
+            return None
+        index = self.request_index() if self.request_receiver_sources else self.jdbc
+        actual = index.constructor_type(name, offset)
+        kinds = self.body_kinds(arguments[0])
+        if actual == 'java.lang.String' and kinds == {'bytes'}:
+            return self.body_value(join(*arguments), 'string')
+        constructors = {'java.io.BufferedReader': {'reader', 'buffered-reader'},
+                        'java.io.InputStreamReader': {'stream', 'servlet-stream'},
+                        'java.io.BufferedInputStream': {'stream', 'servlet-stream'},
+                        'java.io.ByteArrayInputStream': {'bytes'}}
+        if actual in constructors and kinds and kinds <= constructors[actual] and len(arguments) in {1, 2}:
+            return self.body_value(arguments[0], BODY_TYPES[actual])
+        return None
+
+    def request_body_access(self, name, arguments, offset, bindings, state, receiver=CLEAN):
+        if arguments is not None:
+            constructed = self.body_constructor(name, arguments, offset)
+            if constructed is not None:
+                return constructed
+        parts = name.split('.')
+        if len(parts) < 2:
+            return None
+        count = 2 if parts[0] == 'this' and len(parts) > 2 else 1
+        root = '.'.join(parts[:count])
+        value = state.get(bindings.get(root, root), receiver)
+        for position, member in enumerate(parts[count:]):
+            value = self.body_member(value, member, arguments if position == len(parts[count:]) - 1 else None, offset)
+            if value is None:
+                return None
+        return value
 
     @staticmethod
     def collection_value(value, kind):
@@ -1343,7 +1453,7 @@ class Engine:
         if not self.request_receiver_sources:
             return value
         return retag(value, remove=frozenset(tag for trace in value for tag in trace.tags
-                                            if tag.startswith(REQUEST_TYPE_PREFIX) or tag == KTOR_MAP_TAG) | COLLECTION_TAGS)
+                                            if tag.startswith(REQUEST_TYPE_PREFIX) or tag == KTOR_MAP_TAG) | COLLECTION_TAGS | BODY_TAGS)
 
     def parameter_tags(self, declaration):
         declaration = declaration.split('=', 1)[0].strip()
@@ -1375,6 +1485,8 @@ class Engine:
             resolved = self.request_index().resolve_type(actual, function.key if function else 0)
             if resolved in REQUEST_TYPES | KTOR_TYPES:
                 request_tags = frozenset({REQUEST_TYPE_PREFIX + resolved})
+            elif resolved in BODY_TYPES:
+                request_tags = frozenset({BODY_PREFIX + BODY_TYPES[resolved]})
         types = {'String': 'jvm-string', 'java.lang.String': 'jvm-string', 'kotlin.String': 'jvm-string',
                  'Path': 'jvm-path', 'java.nio.file.Path': 'jvm-path', 'File': 'jvm-path', 'java.io.File': 'jvm-path'}
         tag = types.get(actual)
@@ -1640,6 +1752,63 @@ class Engine:
                 selected.append((function, bound))
         return selected
 
+    def postfix(self, atom, cursor, end, state, bindings, depth, constructor=None):
+        """Use one member evaluator for ordinary and grouped body receivers."""
+        while cursor < end:
+            tail = self.parser.skip(cursor, end)
+            if self.parser.kotlin and self.request_receiver_sources and self.code[tail:tail + 2] == '!!':
+                # A successful assertion preserves the same array/map
+                # contents before a following index or member read.
+                tail = self.parser.skip(tail + 2, end)
+            member = re.match(r'\.\s*([A-Za-z_]\w*)', self.code[tail:end])
+            if member is None and self.parser.kotlin and self.request_receiver_sources:
+                # ?. evaluates the same member on its non-null branch.
+                # The null branch contributes no attacker-controlled text.
+                member = re.match(r'\?\.\s*([A-Za-z_]\w*)', self.code[tail:end])
+            if self.code[tail:tail + 1] == '[':
+                close = self.parser.pairs[tail]
+                index = self.expression(tail + 1, close, state, bindings, depth + 1)
+                selected_value = self.collection_member(atom, '[]', [index], spans=[(tail + 1, close)]) if self.request_receiver_sources else None
+                atom = selected_value if selected_value is not None else join(atom, index)
+                if any(KTOR_MAP_TAG in trace.tags for trace in atom):
+                    atom = retag(self.without_request_identity(atom), add=frozenset({'jvm-string'}))
+                cursor = close + 1
+            elif member:
+                method = member.group(1)
+                arguments = None
+                receiver = atom
+                cursor = self.parser.skip(tail + member.end(), end)
+                if cursor < end and self.code[cursor] == '(':
+                    close = self.parser.pairs[cursor]
+                    call_arguments = self.call_arguments(cursor + 1, close, state, bindings, depth)
+                    arguments = call_arguments.values
+                    atom = join(atom, *arguments)
+                    if self.call_sink('.' + method, call_arguments, atom, tail, bindings):
+                        constructor = tail
+                    cursor = close + 1
+                request_result = self.request_call('.' + method, arguments, tail, bindings, state, receiver)
+                if request_result is None and arguments:
+                    # Unknown fluent consumers can mutate a caller's buffer
+                    # even when their return value is discarded. Preserve the
+                    # same escape effect as an ordinary unresolved call.
+                    for argument in arguments:
+                        if self.body_kinds(argument) & BODY_HANDLES:
+                            self.body_escape(argument, tail)
+                atom = (request_result if request_result is not None else
+                        self.without_request_identity(self.member_value(method, atom, tail, arguments, receiver=receiver)))
+                if method in {'getFileName', 'getName', 'fileName', 'name'} and all('basename-path' in trace.tags for trace in atom):
+                    # This getter discharges the earlier path construction.
+                    # A later String extension must not rewrite that site.
+                    constructor = None
+                if method == 'resolve' and self.path_constructors:
+                    constructor = tail
+            else:
+                break
+        if constructor is not None:
+            atom = retag(atom, add=frozenset({f'ctor-site:{constructor}'}))
+            self.record(constructor, retag(atom, add=frozenset({'path-construction'})))
+        return atom, cursor
+
     def expression(self, start, end, state, bindings, depth=0):
         if depth > 64:
             raise AnalysisLimit('Java/Kotlin expression depth limit exceeded')
@@ -1651,6 +1820,8 @@ class Engine:
                 close = self.parser.pairs[cursor]
                 atom = self.expression(cursor + 1, close, state, bindings, depth + 1)
                 cursor = close + 1
+                if self.body_kinds(atom):
+                    atom, cursor = self.postfix(atom, cursor, end, state, bindings, depth)
                 value = join(value, atom)
                 continue
             if not match:
@@ -1709,6 +1880,10 @@ class Engine:
                     if self.call_sink(name, call_arguments, atom, offset, bindings):
                         constructor = offset
                     request_result = self.request_call(name, arguments, offset, bindings, state)
+                    if request_result is None and self.request_receiver_sources:
+                        for argument in arguments:
+                            if self.body_kinds(argument) & BODY_HANDLES:
+                                self.body_escape(argument, offset)
                     atom = (request_result if request_result is not None else
                             self.without_request_identity(self.external_call(name, arguments, atom, offset, bindings, state)))
                 cursor = close + 1
@@ -1722,54 +1897,11 @@ class Engine:
             if '.' in name and not selected and request_result is None:
                 atom = self.without_request_identity(
                     self.member_value(name.rsplit('.', 1)[-1], atom, offset, arguments, direct_call=arguments is not None))
-            while cursor < end:
-                tail = self.parser.skip(cursor, end)
-                if self.parser.kotlin and self.request_receiver_sources and self.code[tail:tail + 2] == '!!':
-                    # A successful assertion preserves the same array/map
-                    # contents before a following index or member read.
-                    tail = self.parser.skip(tail + 2, end)
-                member = re.match(r'\.\s*([A-Za-z_]\w*)', self.code[tail:end])
-                if member is None and self.parser.kotlin and self.request_receiver_sources:
-                    # ?. evaluates the same member on its non-null branch.
-                    # The null branch contributes no attacker-controlled text.
-                    member = re.match(r'\?\.\s*([A-Za-z_]\w*)', self.code[tail:end])
-                if self.code[tail:tail + 1] == '[':
-                    close = self.parser.pairs[tail]
-                    index = self.expression(tail + 1, close, state, bindings, depth + 1)
-                    selected_value = self.collection_member(atom, '[]', [index], spans=[(tail + 1, close)]) if self.request_receiver_sources else None
-                    atom = selected_value if selected_value is not None else join(atom, index)
-                    if any(KTOR_MAP_TAG in trace.tags for trace in atom):
-                        atom = retag(self.without_request_identity(atom), add=frozenset({'jvm-string'}))
-                    cursor = close + 1
-                elif member:
-                    method = member.group(1)
-                    arguments = None
-                    receiver = atom
-                    cursor = self.parser.skip(tail + member.end(), end)
-                    if cursor < end and self.code[cursor] == '(':
-                        close = self.parser.pairs[cursor]
-                        call_arguments = self.call_arguments(cursor + 1, close, state, bindings, depth)
-                        arguments = call_arguments.values
-                        atom = join(atom, *arguments)
-                        if self.call_sink('.' + method, call_arguments, atom, tail, bindings):
-                            constructor = tail
-                        cursor = close + 1
-                    request_result = self.request_call('.' + method, arguments, tail, bindings, state, receiver)
-                    atom = (request_result if request_result is not None else
-                            self.without_request_identity(self.member_value(method, atom, tail, arguments, receiver=receiver)))
-                    if method in {'getFileName', 'getName', 'fileName', 'name'} and all('basename-path' in trace.tags for trace in atom):
-                        # This getter discharges the earlier path construction.
-                        # A later String extension must not rewrite that site.
-                        constructor = None
-                    if method == 'resolve' and self.path_constructors:
-                        constructor = tail
-                else:
-                    break
-            if constructor is not None:
-                atom = retag(atom, add=frozenset({f'ctor-site:{constructor}'}))
-                self.record(constructor, retag(atom, add=frozenset({'path-construction'})))
+            atom, cursor = self.postfix(atom, cursor, end, state, bindings, depth, constructor)
             value = join(value, atom)
         if '+' in self.code[start:end]:
+            if self.body_kinds(value) & BODY_HANDLES:
+                self.body_escape(value, start)
             value = retag(value, remove=PATH_PROOF_TAGS | frozenset({'jvm-path'}))
         return value
 
@@ -2027,6 +2159,8 @@ class Engine:
                     fact = substitute(fact, exposed, self.step(key, 'entry', function.name))
                 if any(trace.kind == 'source' for trace in fact):
                     site = self.step(offset, 'escape', 'unmodeled field/element write')
+                    if any('unmodeled-body-protocol' in trace.tags for trace in fact):
+                        raise ValueError(f'{site.path}:{site.line}: Request body consumer needs buffer/callback state; analysis is incomplete')
                     if any('unmodeled-global-capture' in trace.tags for trace in fact):
                         raise ValueError(f'{site.path}:{site.line}: Request-derived Kotlin global capture needs capture-state analysis; analysis is incomplete')
                     raise ValueError(f'{site.path}:{site.line}: Request-derived field/element write needs heap-state analysis; analysis is incomplete')

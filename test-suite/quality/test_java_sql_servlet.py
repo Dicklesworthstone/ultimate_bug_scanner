@@ -258,6 +258,18 @@ class JavaSqlServletCompilerTests(unittest.TestCase):
             path = target / ("Case_" + case.name + ".java")
             path.write_text(case.source, encoding="utf-8")
             sources.append(path)
+        from test_security_precision import JVMRequestReceiverIdentityTests
+        for namespace in ("jakarta", "javax"):
+            for name, source in JVMRequestReceiverIdentityTests.servlet_bodies("java", namespace):
+                class_name = "Body_" + namespace + "_" + name
+                path = target / (class_name + ".java")
+                path.write_text(source.replace("class RequestProbe", "class " + class_name), encoding="utf-8")
+                sources.append(path)
+        for name, source in JVMRequestReceiverIdentityTests.servlet_body_protocols("java"):
+            class_name = "Body_protocol_" + name
+            path = target / (class_name + ".java")
+            path.write_text(source.replace("class RequestProbe", "class " + class_name), encoding="utf-8")
+            sources.append(path)
         classes = target / "classes"
         classes.mkdir()
         command = [java, "-m", "jdk.compiler/com.sun.tools.javac.Main", "--release", "17",

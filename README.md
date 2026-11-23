@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.127-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.128-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -199,6 +199,22 @@ extension-only request APIs such as `uri`, `path()`, `header()` and `receive*`.
 Request-derived field initialization that requires unmodeled object state reports
 incomplete analysis. Unknown calls preserve existing input taint while dropping
 unsupported request-object identity; the separate JDBC analysis is unchanged.
+
+#### Servlet request body contents
+
+The Java and Kotlin redirect, response-header, outbound-URL, path-traversal and
+SQL analyses follow selected Servlet body reads. Proven `javax.servlet` and
+`jakarta.servlet` requests carry body identity through `getReader()` and
+`getInputStream()`, including Kotlin's corresponding properties. Native
+`readLine()` and `readAllBytes()` expose request contents through supported
+aliases, same-file helpers, reader wrappers and byte-to-string conversions.
+
+Reader readiness, stream availability and byte-array size remain metadata.
+Fixed readers and unrelated lookalike APIs do not acquire Servlet provenance.
+Kotlin's real native members retain precedence over same-named extensions;
+selected local extensions such as `readText` keep their own function summaries.
+Deferred readers, caller-owned buffer writes and unknown body consumers remain
+explicitly incomplete when their effects require unmodeled state.
 
 #### Kotlin JDBC SQL extensions
 

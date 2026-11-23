@@ -33,7 +33,9 @@ from pathlib import Path
 import re
 from typing import Iterable
 
-from ubs_core.analyzers.taint_java_traversal import Engine, Statement, lexical_source
+from ubs_core.analyzers.taint_java_traversal import (
+    BODY_HANDLES, BODY_PREFIX, BODY_TAGS, BODY_TYPES, Engine, Statement, lexical_source,
+)
 from ubs_core.java_detectors.tls_verification import VerifierSource
 from ubs_core.registry import Analyzer, RunContext, register
 from ubs_core.taint_flow import AnalysisLimit, Budget, CLEAN, Trace, advance, join, retag
@@ -71,7 +73,7 @@ _SERVLET_HTTP_ARITY = {
 _EXECUTORS = frozenset({"java.util.concurrent.Executor", "java.util.concurrent.ExecutorService",
                         "java.util.concurrent.ScheduledExecutorService"})
 _BUILDERS = frozenset({"java.lang.StringBuilder", "java.lang.StringBuffer"})
-_OBJECTS = _STATEMENTS | _SPRING | _HTTP | _SERVLET | _SERVLET_HTTP | _BUILDERS | {"java.sql.Connection"}
+_OBJECTS = _STATEMENTS | _SPRING | _HTTP | _SERVLET | _SERVLET_HTTP | _BUILDERS | frozenset(BODY_TYPES) | {"java.sql.Connection"}
 _APIS = _OBJECTS | _EXECUTORS | {"java.lang.String", "java.lang.CharSequence", "java.lang.Object",
                                "java.net.URI", "com.sun.net.httpserver.Headers",
                                "java.lang.Integer", "java.lang.Long"}
@@ -86,7 +88,7 @@ _SQL_OPERATION_RE = re.compile(r"\.\s*(?:executeQuery|executeUpdate|executeLarge
 _MEMBER_CALL_RE = re.compile(r"\.\s*[A-Za-z_$][\w$]*\s*\(")
 _SOURCE_RE = re.compile(
     r"\b[A-Za-z_$][\w$]*\s*\.\s*(?P<method>getRequestURI|getRequestHeaders|getParameter|"
-    r"getHeader|getQueryString|getPathInfo|getServletPath)\s*\(")
+    r"getHeader|getQueryString|getPathInfo|getServletPath|getReader|getInputStream)\s*\(")
 _LITERAL = re.compile(r'"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 _NAME = re.compile(r"[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*")
 
@@ -118,6 +120,12 @@ def _request_result_type(types: frozenset[str], method: str, arity: int) -> str 
             return "com.sun.net.httpserver.Headers"
     if method == "getParameter" and arity == 1 and types & (_SERVLET | _SERVLET_HTTP):
         return "java.lang.String"
+    if arity == 0 and types & (_SERVLET | _SERVLET_HTTP):
+        if method == "getReader":
+            return "java.io.BufferedReader"
+        if method == "getInputStream":
+            namespace = "jakarta" if any(actual.startswith("jakarta.") for actual in types) else "javax"
+            return namespace + ".servlet.ServletInputStream"
     if types & _SERVLET_HTTP and _SERVLET_HTTP_ARITY.get(method) == arity:
         return "java.lang.String"
     return None
@@ -465,7 +473,8 @@ class SqlEngine(Engine):
     def parameter_tags(self, declaration):
         spelling = self.parameter_type(declaration)
         actual = self.jdbc.resolve_type(spelling, self.function.key) if spelling else None
-        return _type_tags(actual)
+        body = frozenset({BODY_PREFIX + BODY_TYPES[actual]}) if actual in BODY_TYPES else frozenset()
+        return _type_tags(actual) | body
 
     def _receiver(self, name, offset, bindings, state):
         root = name.removeprefix("this.")
@@ -499,7 +508,10 @@ class SqlEngine(Engine):
         actual = _request_result_type(types, match.group("method"), arity)
         if actual is None:
             return CLEAN
-        return retag(super().source(offset, label), add=_type_tags(actual))
+        value = super().source(offset, label)
+        if actual in BODY_TYPES:
+            value = self.body_value(value, BODY_TYPES[actual])
+        return retag(value, add=_type_tags(actual))
 
     def safe_sink_trace(self, trace):
         return False
@@ -726,10 +738,12 @@ class SqlEngine(Engine):
         return advance(contents, self.step(offset, "builder-read", "builder contents"))
 
     def _string_value(self, value, state, offset):
+        if self.body_kinds(value) & BODY_HANDLES:
+            self.body_escape(value, offset)
         builders = frozenset(trace for trace in value if _types((trace,)) & _BUILDERS)
         contents = self._builder_contents(builders, state, offset) if builders else CLEAN
         data = join(_data(value), contents)
-        remove = frozenset(tag for trace in data for tag in trace.tags if tag.startswith(_TYPE_PREFIX))
+        remove = frozenset(tag for trace in data for tag in trace.tags if tag.startswith(_TYPE_PREFIX)) | BODY_TAGS
         return retag(data, add=_type_tags("java.lang.String"), remove=remove)
 
     def _constant_value(self, offset, label):
@@ -793,12 +807,24 @@ class SqlEngine(Engine):
             return CLEAN
         raise ValueError(f"SQL builder {method} needs character/object-effect analysis; analysis is incomplete")
 
+    def _body_result(self, body, offset):
+        if not body:
+            return self._constant_value(offset, "request body metadata")
+        remove = frozenset(tag for trace in body for tag in trace.tags if tag.startswith(_TYPE_PREFIX))
+        string = any('jvm-string' in trace.tags for trace in body)
+        return retag(body, add=_type_tags("java.lang.String") if string else frozenset(), remove=remove)
+
     def _known_call(self, method, arguments, value, offset, types, receiver=CLEAN):
+        body = self.body_member(receiver, method, arguments, offset)
+        if body is not None:
+            return self._body_result(body, offset)
         if types & _BUILDERS:
             return self._builder_call(method, arguments, receiver, offset, self.contexts[-1][3])
         request_type = _request_result_type(types, method, len(arguments))
         if request_type is not None:
             actual = Engine.source(self, offset, self.text[offset:self.text.find("(", offset) + 1].strip())
+            if request_type in BODY_TYPES:
+                return retag(self.body_value(actual, BODY_TYPES[request_type]), add=_type_tags(request_type))
             return join(_data(value), retag(actual, add=_type_tags(request_type)))
         if "java.net.URI" in types and method in {"getQuery", "getRawQuery", "toString"} and not arguments:
             return retag(_data(value), add=_type_tags("java.lang.String"), remove=_type_tags("java.net.URI"))
@@ -834,6 +860,10 @@ class SqlEngine(Engine):
 
     def external_call(self, name, arguments, value, offset, bindings, state):
         actual = self.jdbc.constructor_type(name, offset)
+        body = self.body_constructor(name, arguments, offset)
+        if body is not None:
+            remove = frozenset(tag for trace in body for tag in trace.tags if tag.startswith(_TYPE_PREFIX))
+            return retag(body, add=_type_tags(actual), remove=remove)
         if actual in _SPRING_TEMPLATES:
             return self._object(actual, offset)
         constructed = self._builder_constructor(name, arguments, offset, state)
@@ -849,6 +879,9 @@ class SqlEngine(Engine):
             return self._string_value(arguments[0], state, offset)
         if any(_types(argument) & _BUILDERS for argument in arguments):
             raise ValueError("SQL builder passed to an unresolved call may mutate or escape; analysis is incomplete")
+        for argument in arguments:
+            if self.body_kinds(argument) & BODY_HANDLES:
+                self.body_escape(argument, offset)
         if any(_types(argument) & _SPRING for argument in arguments):
             raise ValueError("Spring JDBC receiver passed to an unresolved call needs object-flow analysis; analysis is incomplete")
         if self.batch_sites and any(_types(argument) & _STATEMENTS for argument in arguments):
@@ -856,12 +889,22 @@ class SqlEngine(Engine):
         if method in {"parseInt", "parseLong"} and arguments and self.jdbc.resolve_type(root, offset) in {
                 "java.lang.Integer", "java.lang.Long"} and self.jdbc.binding(root.split(".", 1)[0], offset) is None:
             return frozenset({Trace("literal", (str(self.path), offset), evidence=(self.step(offset, "value", "validated integer"),))})
-        remove = frozenset(tag for trace in value for tag in trace.tags if tag.startswith(_TYPE_PREFIX))
+        remove = frozenset(tag for trace in value for tag in trace.tags if tag.startswith(_TYPE_PREFIX)) | BODY_TAGS
         return join(retag(_data(value), remove=remove), frozenset({Trace("unknown", (str(self.path), offset, name))}))
 
     def member_value(self, name, value, offset, arguments=None, direct_call=False, receiver=CLEAN):
         if direct_call:
             return value
+        if arguments is None:
+            if not receiver and self.contexts:
+                match = _NAME.match(self.code, offset)
+                if match and "." in match.group():
+                    _, _, bindings, state = self.contexts[-1]
+                    root = re.sub(r"\s+", "", match.group()).rpartition(".")[0]
+                    receiver, _ = self._receiver(root, offset, bindings, state)
+            body = self.body_member(receiver, name, None, offset)
+            if body is not None:
+                return self._body_result(body, offset)
         if arguments is not None:
             known = self._known_call(name, arguments, value, offset, _types(receiver) & _APIS, receiver)
             if known is not None:
@@ -869,7 +912,7 @@ class SqlEngine(Engine):
         if name in _EXECUTE and arguments is not None:
             return CLEAN
         if arguments is not None:
-            remove = frozenset(tag for trace in value for tag in trace.tags if tag.startswith(_TYPE_PREFIX))
+            remove = frozenset(tag for trace in value for tag in trace.tags if tag.startswith(_TYPE_PREFIX)) | BODY_TAGS
             return join(retag(_data(value), remove=remove),
                         frozenset({Trace("unknown", (str(self.path), offset, name))}))
         return _data(value)

@@ -52,6 +52,11 @@ CASES = {
     "kotlin": ("kt", "kotlin.security.processbuilder-shell", "critical",
                "fun run(text: String) {\n  ProcessBuilder(\"sh\", \"-c\", text).start()\n}\n",
                "fun total(values: List<Int>): Int {\n  return values.sum()\n}\n"),
+    "java": ("java", "java.taint.open_redirect", "critical",
+             "import jakarta.servlet.http.HttpServletRequest; import jakarta.servlet.http.HttpServletResponse;\n"
+             "class Demo { void run(HttpServletRequest incoming, HttpServletResponse response) throws Exception { "
+             "response.sendRedirect(incoming.getReader().readLine()); } }\n",
+             "class Calculator {\n  int twice(int value) { return value + value; }\n}\n"),
 }
 DELETION_GUARD = {"backend": "libseccomp.so.2", "default": "ALLOW",
                   "denied_syscalls": ["unlink", "unlinkat", "rmdir"],
@@ -1092,16 +1097,109 @@ class KeepTempCliTests(unittest.TestCase):
         self.assertEqual(set(listed), dumped, context)
         self.assertTrue(observations["created_paths"], context)
 
-    def test_unsupported_java_refuses_before_module_execution(self) -> None:
-        source = self.source("Unsupported.java", 'class Unsupported {}\n')
+    def test_java_module_retains_request_body_findings_and_scratch(self) -> None:
+        suffix, rule, severity, buggy, clean = CASES["java"]
+        for label, text, unsafe in (("unsafe", buggy, True), ("clean", clean, False)):
+            source = self.source("java-body-" + label + "." + suffix, text)
+            with self.subTest(case=label):
+                result, observations, run = self.run_scan(
+                    "java", source, "--only=4", "--ci", str(source),
+                    command_mode="--format=json", direct_module=True,
+                )
+                context = f"{run}\n{result.stdout}\n{result.stderr}"
+                self.assertEqual(result.returncode, int(unsafe), context)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["status"], "ok", context)
+                self.assertEqual((report["files"], report["critical"], report["warning"]), (1, int(unsafe), 0), context)
+                actual = [(row["rule"], row["line"], row["col"], row["severity"])
+                          for row in report.get("findings", [])]
+                self.assertEqual(actual, [(rule, 2, 1, severity)] if unsafe else [], context)
+                self.assertTrue(observations["created_paths"], context)
+
+    def test_java_guarded_reports_preserve_body_findings_and_scratch(self) -> None:
+        """Actual outputs and retained bytes, separate from syscall tracing.
+
+        The kernel fence prevents deletion throughout the real scanner tree.
+        The independent strace test remains required to prove zero attempts;
+        this test does not substitute a simulated or permissive trace result.
+        """
+        _, rule, severity, buggy, clean = CASES["java"]
+        source = self.source("GuardedBody.java", buggy)
+        good = self.source("GuardedClean.java", clean)
+        before_assets = scanner_assets()
+        cases = [(surface, format_, source, True) for surface in ("module", "runner")
+                 for format_ in ("json", "sarif")]
+        cases += [("module", "text", source, True), ("module", "json", good, False),
+                  ("runner", "json", good, False)]
+        for index, (surface, format_, selected, unsafe) in enumerate(cases):
+            with self.subTest(surface=surface, format=format_, unsafe=unsafe):
+                run = self.root / f"guarded-java-{index}"
+                run.mkdir()
+                scratch = run / "tmp"
+                scratch.mkdir()
+                env = {key: value for key, value in os.environ.items() if not key.startswith("UBS_")}
+                env.update(UBS_KEEP_TEMP="1", UBS_NO_CACHE="1", UBS_NO_AUTO_UPDATE="1", UBS_ENABLE_AUTO_UPDATE="0",
+                           PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", TMPDIR=str(scratch), TMP=str(scratch),
+                           TEMP=str(scratch), UBS_CATEGORY_FILTER="4", UBS_CACHE_DIR=str(run / "cache"))
+                entry = ROOT / ("modules/ubs-java.sh" if surface == "module" else "ubs")
+                command = ["bash", str(entry), "--only=" + ("4" if surface == "module" else "java"),
+                           "--format=" + format_, "--ci", str(selected)]
+                started = time.monotonic()
+                result = subprocess.run(command, cwd=run, capture_output=True, text=True, timeout=180,
+                                        env=env, preexec_fn=prevent_child_deletion)
+                (run / "stdout").write_text(result.stdout, encoding="utf-8")
+                (run / "stderr").write_text(result.stderr, encoding="utf-8")
+                retained = [path for path in scratch.rglob("*") if path.is_file()]
+                (run / "receipt.json").write_text(json.dumps({
+                    "command": command, "exit": result.returncode, "elapsed_s": time.monotonic() - started,
+                    "source_sha256": digest(selected), "scanner_assets": before_assets,
+                    "deletion_guard": {**DELETION_GUARD, "installed_before": "scanner exec"},
+                    "syscall_trace_observed": False,
+                    "retained": {str(path.relative_to(scratch)): digest(path) for path in retained},
+                }, indent=2) + "\n", encoding="utf-8")
+                context = f"{run}\n{result.stdout}\n{result.stderr}"
+                self.assertEqual(result.returncode, int(unsafe), context)
+                self.assertEqual(scanner_assets(), before_assets, context)
+                self.assertTrue(any(path.read_bytes() == os.fsencode(selected) + b"\0" for path in retained),
+                                "selected source list was not retained\n" + context)
+                self.assertTrue(list(scratch.rglob("*.yml")), "generated AST rules were not retained\n" + context)
+                if format_ == "text":
+                    self.assertIn("Unvalidated redirect", result.stdout, context)
+                    self.assertTrue(any("Unvalidated redirect" in path.read_text(encoding="utf-8", errors="replace")
+                                        for path in retained), "rendered text was not retained\n" + context)
+                    continue
+                report = json.loads(result.stdout)
+                if format_ == "json":
+                    self.assertEqual(report["status"], "ok", context)
+                    key = "rule" if surface == "module" else "rule_id"
+                    actual = [(row[key], row["line"], row["col"], row["severity"])
+                              for row in report.get("findings", [])]
+                else:
+                    actual = [(row["ruleId"], row["locations"][0]["physicalLocation"]["region"]["startLine"],
+                               row["locations"][0]["physicalLocation"]["region"]["startColumn"],
+                               "critical" if row["level"] == "error" else row["level"])
+                              for report_run in report["runs"] for row in report_run.get("results", [])]
+                self.assertEqual(actual, [(rule, 2, 1, severity)] if unsafe else [], context)
+                documents = []
+                for path in retained:
+                    try:
+                        documents.append(json.loads(path.read_text(encoding="utf-8")))
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                self.assertTrue(any(isinstance(doc, dict) and doc.get("status") == "ok" and
+                                    isinstance(doc.get("findings"), list) for doc in documents),
+                                "JSON findings report was not retained\n" + context)
+
+    def test_unsupported_swift_refuses_before_module_execution(self) -> None:
+        source = self.source("Unsupported.swift", 'struct Unsupported {}\n')
         (source.parent / "supported.py").write_text(CASES["python"][3], encoding="utf-8")
-        for languages, target in (("java", source), ("python,java", source.parent)):
+        for languages, target in (("swift", source), ("python,swift", source.parent)):
             with self.subTest(languages=languages):
                 result, observations, run = self.run_scan(languages, target)
                 context = f"{run}\n{result.stdout}\n{result.stderr}"
                 self.assertEqual(result.returncode, 2, context)
                 self.assertIn("UBS_KEEP_TEMP", result.stderr + result.stdout, context)
-                self.assertIn("java", (result.stderr + result.stdout).lower(), context)
+                self.assertIn("swift", (result.stderr + result.stdout).lower(), context)
                 self.assertEqual(json.loads(result.stdout)["reason"],
                                  "retention-unsupported-language", context)
                 self.assertFalse(any(re.search(r"ubs-[a-z]+\.sh", line)

@@ -18,7 +18,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="9b86644144c75000f6c7c677ff7766e443d182a2d1473486945807804e0374c2"
+UBS_LIB_CHECKSUM="db207930a13ca13d05fb890af6d4833363c575d94c72d9114aa3af84267ef6ed"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -82,7 +82,7 @@ cleanup() {
   local p
   for p in "${TEMP_PATHS[@]:-}"; do
     if [[ -n "$p" && "$p" != "/" && "$p" != "." ]]; then
-      rm -rf -- "$p" 2>/dev/null || true
+      ubs_remove_temp -rf -- "$p" 2>/dev/null || true
     fi
   done
 }
@@ -507,7 +507,7 @@ generate(Path('$DUMP_RULES_DIR'))
 
   if [[ -n "$text_out" ]]; then
     cat "$text_out" 2>/dev/null || true
-    rm -f "$text_out" 2>/dev/null || true
+    ubs_remove_temp -f "$text_out" 2>/dev/null || true
   fi
   if [[ -n "$v2_json_out" && "$FORMAT" == "json" ]]; then
     cat "$v2_json_out" 2>/dev/null || true
@@ -521,14 +521,14 @@ generate(Path('$DUMP_RULES_DIR'))
   fi
 
   if [[ -n "$v2_json_out" ]]; then
-    rm -f "$v2_json_out" 2>/dev/null || true
+    ubs_remove_temp -f "$v2_json_out" 2>/dev/null || true
   fi
   if [[ -n "$REPORT_JSON" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi
-  rm -f "$list_file" "$sink" 2>/dev/null || true
+  ubs_remove_temp -f "$list_file" "$sink" 2>/dev/null || true
   if [[ -n "$ast_rule_dir" ]]; then
-    rm -rf "$ast_rule_dir" 2>/dev/null || true
+    ubs_remove_temp -rf "$ast_rule_dir" 2>/dev/null || true
   fi
   return "$exit_code"
 }

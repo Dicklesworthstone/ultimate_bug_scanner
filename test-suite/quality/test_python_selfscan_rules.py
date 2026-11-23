@@ -499,6 +499,73 @@ class TypeEqualityTests(unittest.TestCase):
         self.assertEqual(lines, [2, 3, 7, 9])
 
 
+class AsyncTaskNoAwaitTests(unittest.TestCase):
+    # The handler from GH #210 awaits and cancels its task in a finally
+    # block; it was reported because the rule checked the assignment's
+    # ancestors, which never include `await $TASK`.
+    SOURCE = '''
+        import asyncio
+
+        async def awaited(work):
+            task = asyncio.create_task(work())
+            await task
+
+        async def cancelled(work):
+            task = asyncio.create_task(work())
+            task.cancel()
+
+        async def handler(work):
+            watcher = asyncio.create_task(work())
+            try:
+                return 1
+            finally:
+                watcher.cancel()
+                try:
+                    await watcher
+                except asyncio.CancelledError:
+                    pass
+
+        async def callback(work):
+            task = asyncio.create_task(work())
+            task.add_done_callback(print)
+
+        async def forgotten(work):
+            task = asyncio.create_task(work())
+            return 1
+
+        async def awaits_another(work, other):
+            task = asyncio.create_task(work())
+            await other
+
+        async def outer(work):
+            def inner():
+                task = asyncio.create_task(work())
+            await task
+
+        task = asyncio.create_task(work())
+    '''
+
+    @unittest.skipUnless(shutil.which("ast-grep") or os.environ.get("UBS_AST_GREP_BIN"),
+                         "ast-grep is not installed")
+    def test_await_or_cancel_in_the_same_function_satisfies_the_rule(self) -> None:
+        sg = os.environ.get("UBS_AST_GREP_BIN") or shutil.which("ast-grep")
+        with tempfile.TemporaryDirectory(prefix="ubs_selfscan_rules_") as tmp:
+            rule = Path(tmp) / "rule.yml"
+            rule.write_text(dict(_RULES)["async-task-no-await"], encoding="utf-8")
+            sample = Path(tmp) / "sample.py"
+            sample.write_text(textwrap.dedent(self.SOURCE).lstrip("\n"), encoding="utf-8")
+            proc = subprocess.run(  # ubs:ignore[py.security.command-injection,python.taint.command] - operator-selected ast-grep executable; fixed argv list, no shell
+                [sg, "scan", "-r", str(rule), "--json=compact", str(sample)],
+                capture_output=True, text=True, timeout=60, check=False,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = sorted(match["range"]["start"]["line"] + 1 for match in json.loads(proc.stdout))  # ubs:ignore[py.parsing.json-loads-no-try] - malformed scanner output must fail the test
+        # Reported: a task that is returned unawaited, one whose function
+        # awaits something else, a nested function's task awaited only by
+        # its caller's same-named local, and a module-level task.
+        self.assertEqual(lines, [27, 31, 36, 39])
+
+
 class FinallyTransferTests(unittest.TestCase):
     RULE = "py.control-flow.finally-transfer"
 

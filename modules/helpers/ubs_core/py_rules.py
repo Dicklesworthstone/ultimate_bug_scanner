@@ -787,15 +787,24 @@ message: "Signal handlers should be minimal (set a flag); avoid I/O, locks, or c
         "async-task-no-await",
         # run_async_error_checks (ubs-python.sh 686-698) — the one pack rule
         # legacy category-gates (cat 5) via CATEGORY_MAP above.
+        # The await/cancel/callback belongs to the nearest enclosing function,
+        # not to an ancestor of the assignment: an assignment is never inside
+        # `await $TASK`, so an `inside` check alone reported every task.
         r'''id: py.async.task-no-await
 language: python
 rule:
   pattern: $TASK = asyncio.create_task($$$)
   not:
-    any:
-      - inside: { pattern: await $TASK }
-      - inside: { pattern: $TASK.cancel() }
-      - inside: { pattern: $TASK.add_done_callback($CB) }
+    inside:
+      kind: function_definition
+      stopBy:
+        kind: function_definition
+      has:
+        stopBy: end
+        any:
+          - pattern: await $TASK
+          - pattern: $TASK.cancel()
+          - pattern: $TASK.add_done_callback($CB)
 severity: warning
 message: "asyncio.create_task result neither awaited nor cancelled"
 ''',

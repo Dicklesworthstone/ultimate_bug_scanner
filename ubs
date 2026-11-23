@@ -215,21 +215,21 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='c342dbeb3ece5a5178bc1308ce3e7e8dd20265a06939d004edfedaa294cf36c9'
-  [cpp]='8cb26b74055544877976da32e7fdc6154a5d759114f9fd70a46599757679d8e0'
-  [csharp]='726873f1f411cc5e4c57683db27e64df46e79bd60c6c304d970039dece188e96'
-  [elixir]='d6a8af11e94667e07e12b34be8b7bc38aa83cee21e66eefbc0242a9cbdb11554'
-  [golang]='7adf69a62aa06c622bf9ea8d4d22a86a6faea6343a4e4063974e0935e3f19cf9'
-  [hcl]='1ac22df079e33a0f4607611b545c81d0600bcd66fe78c990519fd4f442f442c4'
-  [java]='e565181dbb01913fb86580e5f4e154c7156228f2de6df8d2c24d12f2fa22d8ca'
-  [js]='0d1c45664774d7d8bd03f32fc21e9862a4df8de1e3f7d2f753a27e09dba73722'
-  [kotlin]='662ab09277608315ac2bf2a3f199e197bd690d85781c8e33ab6a18153796ad9f'
-  [php]='b0760adce996f004241e72740f81b188d51fbd6db61616e1cbbce11109fe8246'
-  [python]='1918eb8e869e32c0ee0eded3681f6a3483bad96e0aa68b21f91dafc3771aa1ac'
-  [ruby]='c14e71c4c36dfc8eceedeac9ddb5a9e3f78674f0b8f892a2afd740c865600de9'
-  [rust]='826ee206cb4112d9abb18c2b9f5c02ae88ebede246eebfbcdcb87ad6604df23d'
-  [sql]='6a31edb9ce56d091097e409bfe5abad92f5ee66911b7a8c4d3d50b5b850ebdd6'
-  [swift]='0a97371c37ed1c6429e6b57d298e33d420c9dfeb798ca336ebd62c4e951e1f42'
+  [bash]='de3b99b20e814d7498a4b2491148f6b00616de27cfc28edf535742bd1a08d5b1'
+  [cpp]='a06384aab25bb52e17b9db860f89736b751bc5b45ce93ab6ee185f7315599f88'
+  [csharp]='9ba879d7b6e7fd0ce4560ec603533d1a5921d4ddcede021ff6346df7e83d98dd'
+  [elixir]='51f79ba273d0faf245ff5ccb5067e1c752f33b7ef6ae9ee2c90c7b2e9da793eb'
+  [golang]='034324f6ee1ff3d2a69752a7c511f2864c3952b121626daa7534c91d60b9850c'
+  [hcl]='301266d973ddf9624426f24920c544ff121af573a5a1727400566521ee4def3c'
+  [java]='908d3fde0bc4b8b8f847fc4663d321e39fea546e5b635c3bc5e30533f70e3bd3'
+  [js]='1d10707b0d373abcfee04da42f5f81bd6d3e31286af29850fce834794f03241e'
+  [kotlin]='c8537d51300c0c90289194ccc9b1ff24a4f418dfe9816a71e8169419adb476bb'
+  [php]='6648026d2e6f1c71efcf0ee74e5fbbcf344a494f8e55b5785338626ec2e04d86'
+  [python]='d0b3591ab0f211fff6b3d331545f8314a44427aeaf371d101f3cc1de95231e40'
+  [ruby]='350e4ba94653038e439e6606a926ae6b9b9cbfe73ddc0fa06ca68325193e72fe'
+  [rust]='44d50f55da6ed786f19c291f2e1bbf77f1aeba0b537787fc8283a8fc8890db33'
+  [sql]='a6333e9544aff587d2d0eb128f831e0a7713dba2f55ca9d21947dac2d5218911'
+  [swift]='40eb88c2cd483456a28da8909e5c8337aec210394e7466c4825d95abdd76ab4c'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -530,7 +530,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/py_patterns/io_files.py']='6f521478ceabb33daaec1b411448c932e22e7d878d983640297b21c8dee56b6a'
   ['helpers/ubs_core/py_patterns/quality.py']='9d5c30686414b7d4fc967347b7dc6dfbfeaa055ca8d1b117a7eb93c7e9c772e7'
   ['helpers/ubs_core/py_patterns/security_rg.py']='72add761922edef8a654d3e7798aa9393db604d0c7bc24c067300871018e8ffb'
-  ['helpers/ubs_core/py_rules.py']='e35ae329bddcaed0a0e9d4244b9907455d00d76abe9d46d3dad2a69a1313db13'
+  ['helpers/ubs_core/py_rules.py']='4601d68119fdd57ea0c45dcc0c19f365606cf2ae440617de21d8e33a4ffe3156'
   ['helpers/ubs_core/py_scan.py']='409280255b0ea2cba20b1f08a2ab3e6652927caf1243b564d0b46a49b85804d9'
   ['helpers/ubs_core/registry.py']='782a14714bc9e5e6d3d048572e1c0ef9a65639be5d3d3a691eae3c39f026a19c'
   ['helpers/ubs_core/ruby_ast.py']='fe4372cbd257e2725e4fd584dfa6cffa338a17b252962ea6062f5c22c152d472'
@@ -605,7 +605,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='7543f49117b6549a56771e737c8d57a828c238af50a660faf27b65a1227bfd5f'
   ['helpers/ubs_core/taint_flow.py']='b50925e0f4bf7263f41650a1274c208b5e2c2a994d7cdfd518fb26b3dd5251cf'
-  ['lib/ubs-common.sh']='adc8712ce0fb7aa920e25c75f4ae5db01d80e93be1244e8da1135f4ef255fc75'
+  ['lib/ubs-common.sh']='5f1d57781bbf7220348f34f0e4e0d47fcc60ab3b947e7a672dadf389fcbcb606'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out

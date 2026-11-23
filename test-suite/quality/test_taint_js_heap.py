@@ -1580,6 +1580,215 @@ class HeapTaintTests(unittest.TestCase):
                 self.assertEqual([row['line'] for row in found], [3])
                 self.assert_runtime_sends(source, ['review-input'])
 
+    def test_concat_preserves_receiver_and_donor_shallow_aliases(self):
+        for expression, index in (('items.concat([])', 0), ('["prefix"].concat(items)', 1),
+                                  ('items["concat"](items)', 1)):
+            with self.subTest(expression=expression):
+                source = ('const items=[{html:"safe"}]; const copied=' + expression + ';\n'
+                          f'copied[{index}].html=req.query.html;\nres.send(items[0].html);')
+                found = self.scan_sort(source, 'xss')
+                self.assertEqual([row['line'] for row in found], [3])
+                self.assert_runtime_sends(source, ['review-input'])
+
+    def test_concat_creates_fresh_outer_slots_and_scalar_snapshots(self):
+        source = ('const items=[req.query.html,"safe"]; const copied=items.concat([]);\n'
+                  'items[0]="safe"; copied[1]=req.query.html;\n'
+                  'res.send(items[0]); res.send(items[1]);\n'
+                  'res.send(copied[0]); res.send(copied[1]);')
+        found = self.scan_sort(source, 'xss', 'xss')
+        self.assertEqual([row['line'] for row in found], [4, 4])
+        self.assert_runtime_sends(source, ['safe', 'safe', 'review-input', 'review-input'])
+
+    def test_concat_keeps_precise_positions_holes_and_named_properties(self):
+        source = ('const items=[,"safe"]; items.note=req.query.html;\n'
+                  'const donor=[req.query.html,,"tail"]; donor.extra=req.query.html;\n'
+                  'const copied=items.concat([],donor);\n'
+                  'res.send(copied[0]); res.send(copied[1]);\n'
+                  'res.send(copied[2]); res.send(copied[3]); res.send(copied[4]);\n'
+                  'res.send(copied.note); res.send(copied.extra); res.send(copied.length);')
+        found = self.scan_sort(source, 'xss')
+        self.assertEqual([row['line'] for row in found], [5])
+        self.assert_runtime_sends(source, [None, 'safe', 'review-input', None, 'tail', None, None, 5])
+
+    def test_concat_appends_plain_objects_and_flattens_arrays_once(self):
+        source = ('const item={html:"safe",0:"named",length:1}; const nested=[item];\n'
+                  'const copied=[].concat(item,[nested]);\n'
+                  'copied[0].html=req.query.html;\n'
+                  'res.send(item.html); res.send(copied[1][0].html);\n'
+                  'res.send(copied[0][0]); res.send(copied[0].length); res.send(copied.length);')
+        self.scan_sort(source, 'xss', 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'review-input', 'named', 1, 2])
+
+    def test_concat_primitives_are_single_slots_and_argument_holes_are_undefined(self):
+        source = ('const items=[]; const copied=items.concat("word",null,false,undefined,...[,7],[req.query.html]);\n'
+                  'res.send(copied[0]); res.send(copied[1]); res.send(copied[2]);\n'
+                  'res.send(copied[3]); res.send(copied[4]); res.send(copied[5]);\n'
+                  'res.send(copied[6]); res.send(copied.length);')
+        found = self.scan_sort(source, 'xss')
+        self.assertEqual([row['line'] for row in found], [4])
+        self.assert_runtime_sends(source, ['word', None, False, None, None, 7, 'review-input', 7])
+
+    def test_concat_captures_receiver_and_callee_before_argument_effects(self):
+        source = ('let items=[{html:"safe"}]; const original=items;\n'
+                  'const copied=items.concat((items=["other"]));\n'
+                  'copied[0].html=req.query.html;\nres.send(original[0].html); res.send(items[0]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'other'])
+        source = ('const items=[req.query.html]; const copied=items.concat((items.concat=()=>["safe"],[]));\n'
+                  'res.send(copied[0]); res.send(items.concat()[0]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+
+    def test_concat_reads_live_array_contents_after_all_arguments(self):
+        source = ('const items=[req.query.html]; const donor=["safe"];\n'
+                  'const copied=items.concat(donor,(items.fill("safe"),donor[0]=req.query.html,[]));\n'
+                  'res.send(copied[0]); res.send(copied[1]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['safe', 'review-input'])
+
+    def test_concat_helpers_and_call_chains_keep_context_and_sanitizer_domains(self):
+        source = ('function append(items,extra){return items.concat(extra);}\n'
+                  'const box={html:"safe"}; const copied=append([], [box]).concat([]).slice();\n'
+                  'copied[0].html=req.query.html;\nres.send(box.html);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort('const dirty=[req.query.html]; const clean=[DOMPurify.sanitize(req.query.html)]; '
+                       'const copied=clean.concat(dirty); res.send(copied[0]); res.send(copied[1]); '
+                       'eval(copied[0]);', 'xss', 'eval')
+        source = ('function copy(items){return items.concat([]);}\n'
+                  'const first=copy([{html:"safe"}]); const second=copy([{html:"safe"}]);\n'
+                  'first[0].html=req.query.html; res.send(first[0].html); res.send(second[0].html);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+
+    def test_concat_joined_inputs_preserve_possible_positions_and_aliases(self):
+        self.scan_sort('const left=[{html:"safe"}]; const right=[{html:"safe"}]; '
+                       'const copied=[].concat(flag?left:right); copied[0].html=req.query.html; '
+                       'res.send(left[0].html); res.send(right[0].html);', 'xss', 'xss')
+        self.scan_sort('const items=["safe"]; const donor=flag?[]:["other"]; '
+                       'const copied=items.concat(donor,[req.query.html]); '
+                       'res.send(copied[1]); res.send(copied[2]);', 'xss', 'xss', partial='Array.concat')
+
+    def test_concat_missing_arguments_are_present_undefined_elements(self):
+        source = ('const box={}; const copied=[].concat(box.missing,[req.query.html]); '
+                  'res.send(copied[0]); res.send(copied[1]); res.send(copied.length);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, [None, 'review-input', 2])
+        self.scan_sort('const box={}; if(flag) box.items=[]; '
+                       'const copied=[].concat(box.items,[req.query.html]); '
+                       'res.send(copied[0]); res.send(copied[1]);', 'xss', 'xss', partial='Array.concat')
+        self.scan_sort('const box={}; if(flag) box.items=["safe"]; '
+                       'const copied=[].concat(box.items,[req.query.html]); '
+                       'res.send(copied[0]); res.send(copied[1]);', 'xss')
+
+    def test_concat_mixed_object_and_primitive_slots_cannot_prove_cleanup(self):
+        source = ('const flag=false; const box={html:req.query.html}; '
+                  'const copied=[].concat(flag?[box]:["safe"]); '
+                  'copied[0].html="safe"; res.send(box.html);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.assert_runtime_sends(source.replace('const flag=false;', 'const flag=true;'), ['safe'])
+        source = ('const box={html:req.query.html}; const copied=[].concat([box]); '
+                  'copied[0].html="safe"; res.send(box.html);')
+        self.scan_sort(source)
+        self.assert_runtime_sends(source, ['safe'])
+
+    def test_concat_selected_own_methods_keep_their_actual_behavior(self):
+        source = ('const items=[req.query.html]; items.concat=function(extra){return ["safe"];}; '
+                  'const copied=items.concat([req.query.html]); res.send(copied[0]);')
+        self.scan_sort(source)
+        self.assert_runtime_sends(source, ['safe'])
+        source = ('const items=[{html:"safe"}]; '
+                  'items.concat=function(){this[0].html=req.query.html;return this;}; '
+                  'items.concat(); res.send(items[0].html);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_concat_unknown_extents_spreads_and_shapes_remain_partial(self):
+        for call in ('items.concat(unknown)', 'items.concat(...unknown)', 'items.concat(req.query.html)',
+                     'items.concat(flag?["safe"]:"safe")'):
+            with self.subTest(call=call):
+                self.scan_sort('const items=[req.query.html]; const copied=' + call + '; '
+                               'res.send(copied[0]);', 'xss', partial='Array.concat')
+        self.scan_sort('const items=[req.query.html]; items.length=unknown; '
+                       'const copied=items.concat([]); res.send(copied[0]);', 'xss', partial='Array.concat')
+        self.scan_sort('const items=flag?[req.query.html]:"safe"; '
+                       'const copied=items.concat([]); res.send(copied[0]);', 'xss', partial='Array.concat')
+
+    def test_concat_spreadability_species_and_descriptor_contracts_remain_partial(self):
+        for setup in ('items[Symbol.isConcatSpreadable]=false;', 'items.constructor=foreign;',
+                      'Array.prototype[Symbol.isConcatSpreadable]=false;',
+                      'Object.defineProperty(Array,Symbol.species,{get(){return foreign;}});',
+                      'Object.defineProperty(items,"0",{get(){return req.query.html;}});',
+                      'Object.setPrototypeOf(items,foreign);', 'Array.prototype[0]=req.query.html;',
+                      'items.concat=external;', 'items[key]=external;'):
+            with self.subTest(setup=setup):
+                self.scan_sort('res.send(req.query.html); const items=["safe"]; '
+                               + setup + 'items.concat([]);', 'xss', partial='Array.concat|Object[.]|Own method')
+        for setup in ('donor[Symbol.isConcatSpreadable]=false;',
+                      'Object.setPrototypeOf(donor,foreign);',
+                      'Object.defineProperty(donor,Symbol.isConcatSpreadable,{get(){return true;}});'):
+            with self.subTest(donor=setup):
+                self.scan_sort('res.send(req.query.html); const items=[]; const donor={html:"safe"}; '
+                               + setup + 'items.concat(donor);', 'xss', partial='Array.concat')
+        self.scan_sort('const items=[]; const donor=[req.query.html]; donor.constructor=foreign; '
+                       'const copied=items.concat(donor); res.send(copied[0]);', 'xss')
+
+    def test_concat_sparse_cost_tracks_stored_slots_and_rejects_length_overflow(self):
+        self.scan_sort('const items=[]; items.length=4294967294; items[4294967293]=req.query.html; '
+                       'const copied=items.concat(["safe"]); '
+                       'res.send(copied[4294967293]); res.send(copied[4294967294]); '
+                       'res.send(copied[0]); res.send(copied.length);', 'xss')
+        self.scan_sort('const items=[]; items.length=4294967295; items[4294967294]=req.query.html; '
+                       'const copied=items.concat(["extra"]); res.send(copied[4294967294]);',
+                       'xss', partial='Array.concat.*length')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_concat_public_identity_positions_and_partial_status(self):
+        cases = (
+            ('alias', 'const items=[{html:"safe"}];\nconst copied=items.concat([]);\n'
+             'copied[0].html=req.query.html;\nres.send(items[0].html);\n',
+             [('javascript.taint.xss', 4, 1)], False),
+            ('clean', 'const items=["safe"];\nconst copied=items.concat([req.query.html]);\n'
+             'res.send(copied[0]);\nres.send(copied.length);\n', [], False),
+            ('partial', 'res.send(req.query.html);\nconst items=["safe"];\n'
+             'items.concat(unknown);\n', [('javascript.taint.xss', 1, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-concat-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Array.concat')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_concat_public_cache_invalidation_and_suppression(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-concat-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const items=[{html:"safe"}];\nconst copied=items.concat([]);\n'
+                  'copied[0].html=req.query.html;\nres.send(items[0].html);\n')
+        clean = unsafe.replace('copied[0].html=req.query.html;', 'copied[0]={html:req.query.html};')
+        suppressed = unsafe.replace('res.send(items[0].html);', 'res.send(items[0].html); // ubs:ignore')
+        for index, (source, expected) in enumerate((
+                (unsafe, [('javascript.taint.xss', 4, 1)]),
+                (unsafe, [('javascript.taint.xss', 4, 1)]),
+                (clean, []), (suppressed, []), (unsafe, [('javascript.taint.xss', 4, 1)]))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                        expected=expected, cache=True)
+
     def test_slice_preserves_shallow_element_aliases(self):
         for call in ('items.slice()', 'alias.slice(1)', 'items["slice"](-1)'):
             with self.subTest(call=call):

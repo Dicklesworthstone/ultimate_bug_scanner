@@ -1662,6 +1662,7 @@ class _Flow:
                 _sql_object_ref(ref) or _sql_name_ref(ref) or _sql_builtin_ref(ref) for ref in refs):
             self.incomplete.add('Drizzle SQL object or provider property mutation requires unsupported wrapper semantics')
         strong = (len(refs) == 1 and key is not None and not frozenset(fact)
+                  and not getattr(fact, 'scalar_alternative', False)
                   and not refs & state.weak_refs)
         for ref in refs:
             slots = state.heap.setdefault(ref, {})
@@ -1701,7 +1702,7 @@ class _Flow:
                         # Element spreads use the wildcard slot directly and
                         # must not be mistaken for prototype/method writes.
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
-                                       'splice', 'copyWithin', 'slice', 'sort', 'toSorted', 'toReversed',
+                                       'splice', 'copyWithin', 'slice', 'concat', 'sort', 'toSorted', 'toReversed',
                                        'toSpliced', 'with', 'entries', 'flat', 'map', 'flatMap', 'forEach',
                                        'reduce', 'reduceRight', 'some', 'every', 'filter',
                                        'find', 'findIndex', 'findLast', 'findLastIndex'):
@@ -2306,7 +2307,8 @@ class _Flow:
         return bool(refs) and not frozenset(fact) and all(
             ref in state.heap and isinstance(ref[0], _Scope)
             and (len(ref) == 2 or isinstance(ref[2], frozenset)
-                 or ref[2] in {'binding-rest', 'arguments-rest', 'commonjs', 'array-splice', 'array-copy', 'array-flat'})
+                 or ref[2] in {'binding-rest', 'arguments-rest', 'commonjs', 'array-splice', 'array-copy',
+                              'array-flat', 'array-concat'})
             for ref in refs)
 
     def plain_data_descriptor_call(self, method, arguments, prepared, state):
@@ -2732,6 +2734,95 @@ class _Flow:
                                                  for slots in variants)) for key in keys}
         state.array_lengths[result] = (lengths[0] if lengths
             and all(length == lengths[0] for length in lengths) else None)
+        return _Fact(refs=(result,))
+
+    def array_concat(self, receiver, prepared, state, location):
+        """Copy each native array's slots once, preserving holes and aliases.
+
+        Argument evaluation has already captured each value, but the arrays'
+        contents are read now, after all argument effects. Scalars and ordinary
+        nonarray objects occupy one slot. Unknown spreadability or extents keep
+        borrowed identities and force an explicit incomplete result instead of
+        inventing a safe offset for a later argument.
+        """
+        actual, uncertain, maybe_missing, kinds = prepared
+        pieces = [(receiver, False)]
+        for index, (value, missing) in enumerate(actual):
+            if (kinds.get(index) in {'undefined', 'null', 'noniterable'}
+                    or missing and index not in maybe_missing):
+                value = _Fact(value, _refs(value), non_array=True)
+            pieces.append((value, uncertain is not None and index >= uncertain))
+        copied, offset = {}, 0
+        for position, (value, uncertain_argument) in enumerate(pieces):
+            refs = _refs(value)
+            arrays = {ref for ref in refs if ref in state.array_lengths}
+            unknown = (uncertain_argument or getattr(value, 'scalar_alternative', False)
+                       or bool(frozenset(value)) and not getattr(value, 'non_array', False))
+            variants = []
+            for ref in refs:
+                slots = state.heap.get(ref, {})
+                self.engine.budget.spend(1 + len(slots))
+                ordinary = (ref in state.heap and None not in slots
+                            and self.array_mutation_contract(ref, state, species=position == 0))
+                if ref in arrays:
+                    length = state.array_lengths[ref]
+                    numeric = {key: item for key, item in slots.items()
+                               if self.array_index(key) is not None and (length is None or int(key) < length)}
+                    if ordinary and length is not None:
+                        variants.append((numeric, length))
+                    else:
+                        unknown = True
+                        # An opaque spreadability getter can append the array
+                        # itself; otherwise only its indexed values are copied.
+                        possible = _join(*numeric.values(), slots.get(None, _ABSENT),
+                                         _Fact(refs=(ref,)) if not ordinary else frozenset())
+                        variants.append(({None: possible}, None))
+                elif ordinary and self.ordinary_heap_object(_Fact(refs=(ref,)), state):
+                    variants.append(({'0': _Fact(refs=(ref,))}, 1))
+                else:
+                    unknown = True
+                    possible = _join(_Fact(refs=(ref,)), *(item for key, item in slots.items()
+                                      if key is None or self.array_index(key) is not None))
+                    variants.append(({None: possible}, None))
+            missing = getattr(value, 'absent', False)
+            if position and missing and refs:
+                # A possibly absent property argument becomes a present
+                # undefined element; it is not necessarily an empty array.
+                variants.append(({'0': _Fact(non_array=True)}, 1))
+            if not refs or frozenset(value) or getattr(value, 'scalar_alternative', False):
+                known_scalar = (not refs and (getattr(value, 'non_array', False)
+                                or missing and not frozenset(value)))
+                scalar = _Fact(value, non_array=known_scalar)
+                variants.append(({'0': scalar}, 1) if known_scalar else ({None: scalar}, None))
+                unknown = unknown or not known_scalar
+            lengths = [length for _slots, length in variants]
+            length = lengths[0] if lengths and all(size == lengths[0] for size in lengths) else None
+            if unknown or length is None:
+                self.incomplete.add('Array.concat requires known argument extents, ordinary spreadability and native species')
+            if not unknown and length is not None and offset is not None:
+                if offset + length > 4294967295:
+                    self.incomplete.add('Array.concat result length exceeds the native array limit')
+                    unknown = True
+                else:
+                    keys = set().union(*(slots.keys() for slots, _length in variants))
+                    self.engine.budget.spend(len(keys))
+                    for key in keys:
+                        copied[str(offset + int(key))] = _alternatives(*(
+                            slots.get(key, _ABSENT) for slots, _length in variants))
+                    offset += length
+                    continue
+            possible = _alternatives(*copied.values(), *(item for slots, _length in variants for item in slots.values()))
+            copied, offset = {None: _Fact(possible, _refs(possible), absent=True)}, None
+        result = (self.scope, location, 'array-concat')
+        if result in state.heap:
+            previous = state.heap[result]
+            copied = {key: _alternatives(previous.get(key, previous.get(None, _ABSENT)),
+                                         copied.get(key, copied.get(None, _ABSENT)))
+                      for key in previous.keys() | copied.keys()}
+            if state.array_lengths.get(result) != offset:
+                offset = None
+            state.weak_refs.add(result)
+        state.heap[result], state.array_lengths[result] = copied, offset
         return _Fact(refs=(result,))
 
     def array_flat(self, receiver, arguments, prepared, state, location):
@@ -3536,12 +3627,12 @@ class _Flow:
     def native_array_target(self, receiver, method, state):
         refs = _refs(receiver)
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
-        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin', 'slice',
+        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin', 'slice', 'concat',
                        'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flat', 'flatMap', 'map', 'forEach',
                        'reduce', 'reduceRight', 'some', 'every', 'filter',
                        'find', 'findIndex', 'findLast', 'findLastIndex'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
-                and not (method in {'flat', 'slice'} and getattr(receiver, 'scalar_alternative', False))
+                and not (method in {'flat', 'slice', 'concat'} and getattr(receiver, 'scalar_alternative', False))
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
         return None
@@ -3558,7 +3649,7 @@ class _Flow:
                 if unknown:
                     fact = _join(fact, selected)
             cursor = selected_end
-            match = re.match(r'\s*\.\s*(flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
+            match = re.match(r'\s*\.\s*(flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
             if match is None:
                 break
             opening = cursor + match.end() - 1
@@ -3673,6 +3764,8 @@ class _Flow:
             return self.array_sort(receiver, arguments, prepared, state, callback)
         if kind == 'array' and method in {'slice', 'toSorted', 'toReversed', 'toSpliced', 'with'}:
             return self.array_copy(receiver, method, arguments, prepared, state, location, callback)
+        if kind == 'array' and method == 'concat':
+            return self.array_concat(receiver, prepared, state, location)
         if kind == 'array' and method == 'flat':
             return self.array_flat(receiver, arguments, prepared, state, location)
         if kind == 'array' and method in {'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
@@ -4013,7 +4106,7 @@ class _Flow:
                     self.incomplete.add('Own method requires an unsupported escaped closure environment')
                 return None, receiver
             return candidate, receiver
-        if (report and key in {'splice', 'copyWithin', 'slice', 'sort', 'toSorted', 'toReversed', 'toSpliced',
+        if (report and key in {'splice', 'copyWithin', 'slice', 'concat', 'sort', 'toSorted', 'toReversed', 'toSpliced',
                               'with', 'flat', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
                               'find', 'findIndex', 'findLast', 'findLastIndex'}
                 and _refs(receiver)
@@ -4602,7 +4695,7 @@ class _Flow:
         cursor = start
         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
         if (primary_end is not None and primary_end < end - 1
-                and re.match(r'\s*\.\s*(?:flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|sort|toSorted|toReversed|toSpliced|with)\s*\(',
+                and re.match(r'\s*\.\s*(?:flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with)\s*\(',
                              code[primary_end + 1:end])):
             primary = self.value(start, primary_end + 1, state)
             primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)

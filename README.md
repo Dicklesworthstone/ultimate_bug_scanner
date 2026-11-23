@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.124-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.125-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -2083,6 +2083,27 @@ The rejection must dominate the write, and rebinding or shadowing revokes the
 proof. Arbitrary sanitizers and general interprocedural mutation effects remain
 outside this local model. Existing rule-specific statement suppressions apply
 at the sink; suppressing a source-line diagnostic does not clear its taint.
+
+### JavaScript array concatenation
+
+Native `Array.concat` preserves exact element positions, sparse holes and
+shallow object aliases in taint analysis. The result owns its outer slots,
+while object elements still refer to the original objects:
+
+```javascript
+const items = [{ html: "safe" }];
+const copied = items.concat([]);
+copied[0].html = req.query.html;
+res.send(items[0].html); // The shared object's write reaches this output.
+```
+
+Replacing `copied[0]` does not replace `items[0]`. Clean prefix elements and
+the result's length do not acquire a later argument's taint. Concatenation
+reads the selected arrays after all argument expressions have run, retains
+selected helper and method identities, and flattens array arguments once.
+Unknown argument lengths, spreadability, species and property protocols retain
+known findings and report incomplete analysis. Conditional object/scalar
+elements cannot turn a possible property write into a definite sanitization.
 
 ### JavaScript array predicate callbacks
 

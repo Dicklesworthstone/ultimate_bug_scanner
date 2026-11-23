@@ -298,25 +298,52 @@ class AnalyzerFailureTests(unittest.TestCase):
 
         selected = self.root / 'files.list'
         selected.write_bytes(os.fsencode(self.source) + b'\0')
-        report = self.root / 'result.json'
-        failure = AnalysisLimit('heap work limit exceeded; analysis is incomplete')
-        with mock.patch.object(registry, 'analyzers_for_lang', return_value=self.analyzers(failure)), \
-                mock.patch.object(ScanCache, 'store_scanned_files') as store, \
-                mock.patch.dict(os.environ, {'UBS_CACHE_DIR': str(self.root / 'cache'), 'UBS_NO_CACHE': '0'}):
-            code = js_scan.main([
-                '--files-from', str(selected), '--sink', str(self.root / 'findings.jsonl'),
-                '--json-out', str(report), '--project-dir', str(self.root),
-            ])
-        self.assertEqual(code, 2, report.read_text())
-        doc = json.loads(report.read_text())
-        self.assertEqual(doc['status'], 'partial', doc)
-        self.assertEqual(doc['module_error'], 'ANALYZER_ERROR', doc)
-        self.assertEqual(doc['files'], 1, doc)
-        self.assertEqual(doc['critical'], 2, doc)
-        self.assertIn('heap work limit exceeded', doc['message'])
-        self.assertEqual({item['rule'] for item in doc['findings']},
-                         {'javascript.taint.eval', 'javascript.taint.xss'})
-        store.assert_not_called()
+        # A work-budget limit is a coverage boundary (GH #177): partial and
+        # exit 2, but not an environment failure. A crash keeps its identity.
+        for failure, code_name, prefix in (
+                (AnalysisLimit('heap work limit exceeded; analysis is incomplete'),
+                 'ANALYSIS_INCOMPLETE', 'JavaScript semantic coverage is incomplete: '),
+                (RuntimeError('heap work limit exceeded; invalid transfer state'),
+                 'ANALYZER_ERROR', 'JavaScript analysis did not complete: ')):
+            with self.subTest(failure=type(failure).__name__):
+                report = self.root / f'result-{type(failure).__name__}.json'
+                text = self.root / f'result-{type(failure).__name__}.txt'
+                with mock.patch.object(registry, 'analyzers_for_lang', return_value=self.analyzers(failure)), \
+                        mock.patch.object(ScanCache, 'store_scanned_files') as store, \
+                        mock.patch.dict(os.environ, {'UBS_CACHE_DIR': str(self.root / 'cache'), 'UBS_NO_CACHE': '0'}):
+                    code = js_scan.main([
+                        '--files-from', str(selected), '--sink', str(self.root / f'findings-{code_name}.jsonl'),
+                        '--json-out', str(report), '--text-out', str(text), '--project-dir', str(self.root),
+                    ])
+                self.assertEqual(code, 2, report.read_text())
+                doc = json.loads(report.read_text())
+                self.assertEqual(doc['status'], 'partial', doc)
+                self.assertEqual(doc['module_error'], code_name, doc)
+                self.assertTrue(doc['message'].startswith(prefix + 'taint_js: '), doc['message'])
+                self.assertEqual(doc['files'], 1, doc)
+                self.assertEqual(doc['critical'], 2, doc)
+                self.assertIn('heap work limit exceeded', doc['message'])
+                self.assertEqual({item['rule'] for item in doc['findings']},
+                                 {'javascript.taint.eval', 'javascript.taint.xss'})
+                self.assertIn(f'Partial: [{code_name}] {prefix}taint_js: ', text.read_text())
+                store.assert_not_called()
+
+    def test_any_non_limit_failure_keeps_analyzer_error(self):
+        from ubs_core import js_scan
+        from ubs_core.taint_flow import AnalysisLimit
+
+        limit, crash = 'taint_js: AnalysisLimit: budget', 'guards: KeyError: node'
+        self.assertEqual(js_scan.execution_status([limit], [limit])[0], 'ANALYSIS_INCOMPLETE')
+        self.assertEqual(js_scan.execution_status([limit, crash], [limit])[0], 'ANALYZER_ERROR')
+        self.assertEqual(js_scan.execution_status([crash], [])[0], 'ANALYZER_ERROR')
+        # Only AnalysisLimit is collected as semantic; other exceptions are not.
+        from ubs_core import registry
+        for failure, semantic in ((AnalysisLimit('analysis is incomplete'), 1), (ValueError('bad'), 0)):
+            errors, semantic_errors = [], []
+            with mock.patch.object(registry, 'analyzers_for_lang', return_value=self.analyzers(failure)):
+                js_scan.run_analyzers([self.source], io.StringIO(), errors=errors,
+                                      semantic_errors=semantic_errors)
+            self.assertEqual((len(errors), len(semantic_errors)), (1, semantic), errors)
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "GNU time reports peak RSS in KiB")

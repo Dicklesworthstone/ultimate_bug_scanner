@@ -428,8 +428,15 @@ def run_analyzers(
     skip: set[int] | None = None,
     prefilter: Any = None,
     errors: list[str] | None = None,
+    semantic_errors: list[str] | None = None,
 ) -> None:
-    """Run registered javascript analyzers (taint, guards, ctcompare, async)."""
+    """Run registered javascript analyzers (taint, guards, ctcompare, async).
+
+    Every failure is appended to ``errors``. A bounded-analysis limit
+    (``AnalysisLimit``) is also appended to ``semantic_errors``, so callers
+    can tell a coverage boundary from broken analysis machinery.
+    """
+    from ubs_core.taint_flow import AnalysisLimit
     from ubs_core import analyzers  # noqa: F401  (populate registry)
     from ubs_core.registry import analyzers_for_lang
 
@@ -471,7 +478,22 @@ def run_analyzers(
             # Preserve findings already emitted and let the other analyzers
             # finish. Every exception, including a programming defect, remains
             # an explicit failed scan; it cannot become a cached clean result.
-            errors.append(f"{analyzer.name}: {type(exc).__name__}: {str(exc)[:350]}")
+            problem = f"{analyzer.name}: {type(exc).__name__}: {str(exc)[:350]}"
+            errors.append(problem)
+            if semantic_errors is not None and isinstance(exc, AnalysisLimit):
+                semantic_errors.append(problem)
+
+
+def execution_status(errors: Sequence[str], semantic_errors: Sequence[str]) -> tuple[str, str]:
+    """Module error code and message prefix for an incomplete scan.
+
+    Both kinds are partial and exit 2. Only a run whose every failure is a
+    bounded-analysis limit is a coverage boundary (ANALYSIS_INCOMPLETE); any
+    crash, AST-tool or infrastructure failure keeps ANALYZER_ERROR.
+    """
+    if errors and len(semantic_errors) == len(errors):
+        return "ANALYSIS_INCOMPLETE", "JavaScript semantic coverage is incomplete: "
+    return "ANALYZER_ERROR", "JavaScript analysis did not complete: "
 
 
 def _expand_module_misses(graph, files, cached_findings, files_to_scan, cache):
@@ -498,7 +520,7 @@ def _expand_module_misses(graph, files, cached_findings, files_to_scan, cache):
 
 
 def _render_text(args, files: Sequence[Path], counters: dict[str, int],
-                 errors: Sequence[str] = ()) -> None:
+                 errors: Sequence[str] = (), semantic_errors: Sequence[str] = ()) -> None:
     """Render the legacy-format text report from the NDJSON sink."""
     import datetime
 
@@ -524,8 +546,8 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int],
         f"Files scanned: {len(files)}",
     ]
     if errors:
-        lines.append("Partial: [ANALYZER_ERROR] JavaScript analysis did not complete: "
-                     + "; ".join(errors[:3])[:350])
+        code, prefix = execution_status(errors, semantic_errors)
+        lines.append(f"Partial: [{code}] {prefix}" + "; ".join(errors[:3])[:350])
     ordered_rules = sorted(
         by_rule,
         key=lambda rule: (by_rule[rule][0].get("category_id", ""), rule),
@@ -631,6 +653,7 @@ def main(argv: list[str] | None = None) -> int:
     # Every analysis layer that could not complete appends here, so a scan that
     # did not finish is never reported as a finished one (#111).
     scan_errors: list[str] = []
+    semantic_errors: list[str] = []  # The AnalysisLimit subset of scan_errors.
     capturing_sink = None
     if files_to_scan:
         from ubs_core.js_rules import _RULES
@@ -665,7 +688,8 @@ def main(argv: list[str] | None = None) -> int:
         source_files = [path for path in files_to_scan if path.suffix.lower() in suffixes]
         counters = scan_patterns(patterns, source_files, capturing_sink, skip,
                                  prefilter=prefilter_res, defer_global_checks=True)
-        run_analyzers(files_to_scan, capturing_sink, skip, prefilter=prefilter_res, errors=scan_errors)
+        run_analyzers(files_to_scan, capturing_sink, skip, prefilter=prefilter_res, errors=scan_errors,
+                      semantic_errors=semantic_errors)
         if args.ast_rule_dir:
             from ubs_core.js_ast import scan_all
             from ubs_core.js_rules import SEVERITY_MAP
@@ -778,10 +802,9 @@ def main(argv: list[str] | None = None) -> int:
             "findings": None,
         }
         if scan_errors:
-            doc["module_error"] = "ANALYZER_ERROR"
-            doc["message"] = (
-                "JavaScript analysis did not complete: " + "; ".join(scan_errors[:5])
-            )[:500]
+            code, prefix = execution_status(scan_errors, semantic_errors)
+            doc["module_error"] = code
+            doc["message"] = (prefix + "; ".join(scan_errors[:5]))[:500]
         profile_data = {
             "files_considered": prefilter_res.files_considered if files_to_scan else len(files),
             "files_after_prefilter": prefilter_res.files_after_prefilter if files_to_scan else 0,
@@ -798,7 +821,7 @@ def main(argv: list[str] | None = None) -> int:
         _write_summary(args.json_out, doc, () if args.defer_findings else iter_ndjson(args.sink))
 
     if args.text_out:
-        _render_text(args, files, counters, scan_errors)
+        _render_text(args, files, counters, scan_errors, semantic_errors)
 
     for problem in scan_errors:
         sys.stderr.write(f"ubs-js: analysis incomplete: {problem}\n")

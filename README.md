@@ -1548,7 +1548,8 @@ Exit Codes:
                            a refused scan (directory too large, $HOME or /), or a PARTIAL run in
                            which a scanner module timed out, crashed, or could not finish one of
                            its own analysis layers (ANALYZER_ERROR for failed machinery,
-                           ANALYSIS_INCOMPLETE for Python semantic coverage limits). Set
+                           ANALYSIS_INCOMPLETE for semantic coverage limits in the Python,
+                           C# and JavaScript modules). Set
                            UBS_ALLOW_PARTIAL=1 to exit on findings alone for partial runs.
   3                        Nothing was scanned: no supported languages detected, so no scanner ran.
                            This is NOT a pass. Set UBS_ALLOW_NO_SCAN=1 to restore the legacy exit-0
@@ -1635,6 +1636,9 @@ JSON, and SARIF preserve the partial status, diagnostic details, and findings
 already established. Both classifications exit 2 by default, and partial
 native results do not populate the reusable analysis cache. Installing tools
 with `ubs doctor --fix` does not resolve a semantic coverage boundary.
+The JavaScript module classifies its bounded-analysis limits, such as the
+taint dataflow work limit, the same way; an ast-grep failure or analyzer
+crash in the same run keeps `ANALYZER_ERROR`.
 
 **Directory size guard**
 

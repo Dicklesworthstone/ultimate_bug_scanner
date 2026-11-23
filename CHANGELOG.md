@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Trace native JavaScript `Array.slice` through the shared array model.
+  Selected ranges preserve sparse holes, copied outer slots and shared object
+  identities across aliases and helpers. Safe excluded elements and array
+  length stay clean; unproved bounds, species and property protocols retain
+  explicit incomplete coverage. Public JSON/SARIF, cache invalidation and
+  inline suppression use the same findings.
+
 - Analyze Python LDAP injection with the shared flow engine. Proven
   python-ldap and ldap3 receivers select each API's actual filter and DN
   operands, including saved methods and paged-search extensions. Filter

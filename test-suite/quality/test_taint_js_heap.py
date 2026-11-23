@@ -1579,6 +1579,212 @@ class HeapTaintTests(unittest.TestCase):
                 self.assertEqual([row['line'] for row in found], [3])
                 self.assert_runtime_sends(source, ['review-input'])
 
+    def test_slice_preserves_shallow_element_aliases(self):
+        for call in ('items.slice()', 'alias.slice(1)', 'items["slice"](-1)'):
+            with self.subTest(call=call):
+                initial = '[{html:"safe"}]' if call == 'items.slice()' else '["skip",{html:"safe"}]'
+                index = 0 if call == 'items.slice()' else 1
+                source = (f'const items={initial}; const alias=items; const copied={call};\n'
+                          f'copied[0].html=req.query.html;\nres.send(items[{index}].html);')
+                found = self.scan_sort(source, 'xss')
+                self.assertEqual([row['line'] for row in found], [3])
+                self.assert_runtime_sends(source, ['review-input'])
+
+    def test_slice_copies_outer_slots_and_snapshots_values(self):
+        source = ('const items=["safe"]; const copied=items.slice(); '
+                  'copied[0]=req.query.html;\nres.send(items[0]);\nres.send(copied[0]);')
+        found = self.scan_sort(source, 'xss')
+        self.assertEqual([row['line'] for row in found], [3])
+        self.assert_runtime_sends(source, ['safe', 'review-input'])
+        source = ('const items=[req.query.html]; const copied=items.slice(); '
+                  'items.fill("safe");\nres.send(items[0]);\nres.send(copied[0]);')
+        found = self.scan_sort(source, 'xss')
+        self.assertEqual([row['line'] for row in found], [3])
+        self.assert_runtime_sends(source, ['safe', 'review-input'])
+
+    def test_slice_literal_ranges_preserve_exact_positions(self):
+        cases = (
+            ('', ['review-input', 'safe', 'review-input', 3]),
+            ('1', ['safe', 'review-input', None, 2]),
+            ('1,2', ['safe', None, None, 1]),
+            ('-2,-1', ['safe', None, None, 1]),
+            ('-1', ['review-input', None, None, 1]),
+            ('1.9,2.8', ['safe', None, None, 1]),
+            ('3,0', [None, None, None, 0]),
+            ('-99,99', ['review-input', 'safe', 'review-input', 3]),
+            ('null,undefined', ['review-input', 'safe', 'review-input', 3]),
+            ('false,true', ['review-input', None, None, 1]),
+            ('NaN,Infinity', ['review-input', 'safe', 'review-input', 3]),
+            ('1e309', [None, None, None, 0]),
+            ('-1e309', ['review-input', 'safe', 'review-input', 3]),
+            ('0,NaN', [None, None, None, 0]),
+            ('0,null', [None, None, None, 0]),
+            ('0,-0.1', [None, None, None, 0]),
+            ('(+1),(-1)', ['safe', None, None, 1]),
+        )
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                source = ('const items=[req.query.html,"safe",req.query.html];\n'
+                          f'const copied=items.slice({arguments});\n'
+                          'res.send(copied[0]);\nres.send(copied[1]);\n'
+                          'res.send(copied[2]);\nres.send(copied.length);')
+                found = self.scan_sort(source, *('xss' for value in expected if value == 'review-input'))
+                self.assertEqual([row['line'] for row in found],
+                                 [3 + index for index, value in enumerate(expected) if value == 'review-input'])
+                self.assert_runtime_sends(source, expected)
+
+    def test_slice_preserves_holes_and_skips_absent_callbacks(self):
+        source = ('const items=[,"safe",,]; const copied=items.slice(); '
+                  'copied.forEach(value=>{res.send(value);}); res.send(copied.length);')
+        self.scan_sort(source)
+        self.assert_runtime_sends(source, ['safe', 3])
+        source = ('const items=[,,]; const copied=items.slice(); let html="safe"; '
+                  'copied.forEach(value=>{html=req.query.html;}); res.send(html);')
+        self.scan_sort(source)
+        self.assert_runtime_sends(source, ['safe'])
+        source = ('const items=[,req.query.html,,]; const copied=items.slice(1); '
+                  'copied.forEach(value=>{res.send(value);}); '
+                  'res.send(copied[1]); res.send(copied.length);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', None, 2])
+
+    def test_slice_keeps_named_properties_out_of_elements(self):
+        source = ('const items=["safe"]; items.extra=req.query.html; '
+                  'items["-1"]=req.query.html; items["01"]=req.query.html; '
+                  'items["4294967295"]=req.query.html; const copied=items.slice(); '
+                  'res.send(copied[0]); res.send(copied.extra); res.send(copied["-1"]); '
+                  'res.send(copied["01"]); res.send(copied["4294967295"]); res.send(copied.length);')
+        self.scan_sort(source)
+        self.assert_runtime_sends(source, ['safe', None, None, None, None, 1])
+
+    def test_slice_transports_selected_helper_results_and_captures(self):
+        source = ('function copy(items){return items.slice(1);} '
+                  'const items=["skip",{html:"safe"}]; const copied=copy(items); '
+                  'copied[0].html=req.query.html; res.send(items[1].html); '
+                  'res.send(copy([req.query.html,"safe"])[0]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        source = ('function outer(items){function copy(){return items.slice();}return copy();} '
+                  'const items=[{html:"safe"}]; const copied=outer(items); '
+                  'copied[0].html=req.query.html; res.send(items[0].html);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_slice_keeps_selected_own_methods_and_argument_order(self):
+        for body, expected, rules in (('return this;', ['review-input'], ('xss',)),
+                                      ('return ["safe"];', ['safe'], ())):
+            source = ('const items=["safe"]; items.slice=function(){' + body + '}; '
+                      'const copied=items.slice(); copied[0]=req.query.html; res.send(items[0]);')
+            with self.subTest(body=body):
+                self.scan_sort(source, *rules)
+                self.assert_runtime_sends(source, expected)
+        source = ('const items=[req.query.html]; '
+                  'const copied=items.slice(0,undefined,items.slice=function(){return ["safe"];}); '
+                  'res.send(copied[0]); res.send(items.slice()[0]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        source = ('const items=[req.query.html]; '
+                  'const copied=items.slice(0,undefined,items.fill("safe")); res.send(copied[0]);')
+        self.scan_sort(source)
+        self.assert_runtime_sends(source, ['safe'])
+
+    def test_slice_composes_literal_receivers_and_postfix_chains(self):
+        for source in (
+            'res.send(["safe",req.query.html].slice(1)[0]);',
+            'const items=["safe",req.query.html]; res.send((items).slice(1)[0]);',
+            'function make(){return ["safe",req.query.html];} res.send(make().slice(1).slice()[0]);',
+            'const items=["safe",req.query.html]; res.send(items["slice"](1).map(value=>value)[0]);',
+        ):
+            with self.subTest(source=source):
+                self.scan_sort(source, 'xss')
+                self.assert_runtime_sends(source, ['review-input'])
+
+    def test_slice_preserves_sanitizer_domains_and_callable_identity(self):
+        found = self.scan_sort('const items=[DOMPurify.sanitize(req.query.html)]; '
+                               'const copied=items.slice();\nres.send(copied[0]);\neval(copied[0]);', 'eval')
+        self.assertEqual([row['line'] for row in found], [3])
+        source = ('const items=[function(){return req.query.html;}]; '
+                  'const copied=items.slice(); const selected=copied[0]; res.send(selected());')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_slice_sparse_extent_cost_tracks_present_slots(self):
+        # No dense iteration over four billion absent slots is needed.
+        self.scan_sort('const items=[]; items.length=4294967295; items[4294967294]=req.query.html; '
+                       'const copied=items.slice(); const tail=copied.slice(-1); '
+                       'res.send(copied[4294967294]); res.send(tail[0]); '
+                       'res.send(copied[0]); res.send(tail[1]); res.send(copied.length);', 'xss', 'xss')
+
+    def test_slice_unknown_bounds_and_extents_remain_explicit(self):
+        for arguments in ('offset', '0,end', '0n', '...bounds', '{valueOf:external}', '"1"'):
+            with self.subTest(arguments=arguments):
+                self.scan_sort('const items=[req.query.html]; '
+                               f'const copied=items.slice({arguments}); res.send(copied[0]);',
+                               'xss', partial='Array.slice')
+        self.scan_sort('const items=[req.query.html]; items.length=unknown; '
+                       'const copied=items.slice(); res.send(copied[0]);', 'xss', partial='Array.slice')
+
+    def test_slice_species_descriptors_and_method_uncertainty_remain_explicit(self):
+        for setup in ('items.constructor=foreign;', 'Array.prototype.constructor=foreign;',
+                      'Object.defineProperty(Array,Symbol.species,{get(){return foreign;}});',
+                      'Object.defineProperty(items,"0",{get(){return req.query.html;}});',
+                      'Object.setPrototypeOf(items,foreign);', 'Array.prototype[0]=req.query.html;',
+                      'items.slice=external;', 'Array.prototype.slice=external;',
+                      'items[key]=external;'):
+            with self.subTest(setup=setup):
+                self.scan_sort('res.send(req.query.html); const items=["safe"]; '
+                               + setup + 'items.slice();', 'xss', partial='Array.slice|Object[.]|Own method')
+
+    def test_slice_array_scalar_alternatives_are_not_guaranteed_arrays(self):
+        self.scan_sort('const items=flag ? [req.query.html] : "safe"; '
+                       'const copied=items.slice(); res.send(copied[0]);', 'xss', partial='Array.slice')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_slice_public_identity_ranges_and_partial_status(self):
+        cases = (
+            ('alias', 'const items=[{html:"safe"}];\nconst copied=items.slice();\n'
+             'copied[0].html=req.query.html;\nres.send(items[0].html);\n',
+             [('javascript.taint.xss', 4, 1)], False),
+            ('clean', 'const items=[req.query.html,"safe"];\nconst copied=items.slice(1);\n'
+             'res.send(copied[0]);\nres.send(copied.length);\n', [], False),
+            ('partial', 'const items=["safe"];\nitems.slice({valueOf:external});\n'
+             'res.send(req.query.html);\n', [('javascript.taint.xss', 3, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-slice-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Array.slice')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_slice_public_cache_invalidation_and_suppression(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-slice-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const items=[{html:"safe"}];\nconst copied=items.slice();\n'
+                  'copied[0].html=req.query.html;\nres.send(items[0].html);\n')
+        clean = unsafe.replace('copied[0].html=req.query.html;', 'copied[0]={html:req.query.html};')
+        suppressed = unsafe.replace('res.send(items[0].html);', 'res.send(items[0].html); // ubs:ignore')
+        for index, (source, expected) in enumerate((
+                (unsafe, [('javascript.taint.xss', 4, 1)]),
+                (unsafe, [('javascript.taint.xss', 4, 1)]),
+                (clean, []), (suppressed, []), (unsafe, [('javascript.taint.xss', 4, 1)]))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                        expected=expected, cache=True)
+
     def test_copy_methods_create_fresh_containers_with_snapshot_values(self):
         for method in ('toReversed()', 'toSorted()', 'toSpliced()', 'with(1,"safe")'):
             with self.subTest(method=method):

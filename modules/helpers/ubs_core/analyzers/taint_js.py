@@ -1692,7 +1692,7 @@ class _Flow:
                         # Element spreads use the wildcard slot directly and
                         # must not be mistaken for prototype/method writes.
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
-                                       'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed',
+                                       'splice', 'copyWithin', 'slice', 'sort', 'toSorted', 'toReversed',
                                        'toSpliced', 'with', 'entries', 'flat', 'map', 'flatMap', 'forEach',
                                        'reduce', 'reduceRight', 'some', 'every', 'filter',
                                        'find', 'findIndex', 'findLast', 'findLastIndex'):
@@ -2564,11 +2564,12 @@ class _Flow:
         return receiver
 
     def array_copy(self, receiver, method, arguments, prepared, state, location, callback=None):
-        """Copy native indexed values into a fresh dense array.
+        """Copy native indexed values into a fresh array.
 
         Only the outer container is copied: object elements retain their heap
-        identities. Holes become present undefined values, named properties
-        are not copied, and neither source slots nor its length are changed.
+        identities. Slice preserves holes; the change-by-copy methods make
+        them present undefined values. Named properties are not copied, and
+        neither source slots nor its length are changed.
         """
         actual, uncertain, maybe_missing, kinds = prepared
         variants, lengths = [], []
@@ -2589,13 +2590,22 @@ class _Flow:
             numeric = {key: value for key, value in source.items()
                        if self.array_index(key) is not None and (length is None or int(key) < length)}
             self.engine.budget.spend(1 + len(source))
-            ordinary = self.array_mutation_contract(ref, state)
+            ordinary = self.array_mutation_contract(ref, state, species=method == 'slice')
             known = length is not None and None not in source and ordinary
             if not known:
                 self.incomplete.add(f'Array.{method} requires finite ordinary indexed properties')
             start = count = None
             inserted = []
-            if method in {'with', 'toSpliced'}:
+            if method == 'slice':
+                first, start_pure = self.array_integer_argument(arguments, prepared, 0, 0)
+                last, end_pure = self.array_integer_argument(arguments, prepared, 1, length)
+                start = self.array_relative_index(first, length)
+                stop = self.array_relative_index(last, length)
+                count = max(0, stop - start) if start is not None and stop is not None else None
+                if not start_pure or not end_pure or uncertain is not None or count is None:
+                    known = False
+                    self.incomplete.add('Array.slice bounds or spread require unsupported value semantics')
+            elif method in {'with', 'toSpliced'}:
                 first, pure = self.array_integer_argument(arguments, prepared, 0, 0)
                 if method == 'with':
                     inserted = [actual[1][0] if len(actual) > 1 else frozenset()]
@@ -2626,7 +2636,7 @@ class _Flow:
                 if not pure or uncertain is not None or start is None or count is None:
                     known = False
                     self.incomplete.add(f'Array.{method} bounds or spread require unsupported value semantics')
-            new_length = (length + len(inserted) - count
+            new_length = (count if known and method == 'slice' else length + len(inserted) - count
                           if known and method == 'toSpliced' else length if known else None)
             if new_length is not None and new_length > 4294967295:
                 known, new_length = False, None
@@ -2639,7 +2649,13 @@ class _Flow:
                         self.engine.escaped_callbacks.add(comparator)
                 if compare and default and any(_refs(value) for value in numeric.values()):
                     self.incomplete.add('Array.toSorted element coercion requires unsupported value semantics')
-            if known:
+            if known and method == 'slice':
+                # HasProperty skips holes without changing their offsets.
+                # Traverse stored slots, not the possibly enormous extent;
+                # optional properties retain their absence alternatives.
+                copied = {str(int(key) - start): value for key, value in numeric.items()
+                          if start <= int(key) < start + count}
+            elif known:
                 # Charge before expansion: sparse maximum-length arrays must
                 # fail the existing work budget without allocating their holes.
                 self.engine.budget.spend(new_length)
@@ -3412,12 +3428,12 @@ class _Flow:
     def native_array_target(self, receiver, method, state):
         refs = _refs(receiver)
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
-        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin',
+        if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin', 'slice',
                        'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flat', 'flatMap', 'map', 'forEach',
                        'reduce', 'reduceRight', 'some', 'every', 'filter',
                        'find', 'findIndex', 'findLast', 'findLastIndex'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
-                and not (method == 'flat' and getattr(receiver, 'scalar_alternative', False))
+                and not (method in {'flat', 'slice'} and getattr(receiver, 'scalar_alternative', False))
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
         return None
@@ -3434,7 +3450,7 @@ class _Flow:
                 if unknown:
                     fact = _join(fact, selected)
             cursor = selected_end
-            match = re.match(r'\s*\.\s*(flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
+            match = re.match(r'\s*\.\s*(flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
             if match is None:
                 break
             opening = cursor + match.end() - 1
@@ -3520,7 +3536,7 @@ class _Flow:
             return self.array_splice(receiver, arguments, prepared, state, location)
         if kind == 'array' and method == 'sort':
             return self.array_sort(receiver, arguments, prepared, state, callback)
-        if kind == 'array' and method in {'toSorted', 'toReversed', 'toSpliced', 'with'}:
+        if kind == 'array' and method in {'slice', 'toSorted', 'toReversed', 'toSpliced', 'with'}:
             return self.array_copy(receiver, method, arguments, prepared, state, location, callback)
         if kind == 'array' and method == 'flat':
             return self.array_flat(receiver, arguments, prepared, state, location)
@@ -3862,7 +3878,7 @@ class _Flow:
                     self.incomplete.add('Own method requires an unsupported escaped closure environment')
                 return None, receiver
             return candidate, receiver
-        if (report and key in {'splice', 'copyWithin', 'sort', 'toSorted', 'toReversed', 'toSpliced',
+        if (report and key in {'splice', 'copyWithin', 'slice', 'sort', 'toSorted', 'toReversed', 'toSpliced',
                               'with', 'flat', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
                               'find', 'findIndex', 'findLast', 'findLastIndex'}
                 and _refs(receiver)
@@ -4445,7 +4461,7 @@ class _Flow:
         cursor = start
         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
         if (primary_end is not None and primary_end < end - 1
-                and re.match(r'\s*\.\s*(?:flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|sort|toSorted|toReversed|toSpliced|with)\s*\(',
+                and re.match(r'\s*\.\s*(?:flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|sort|toSorted|toReversed|toSpliced|with)\s*\(',
                              code[primary_end + 1:end])):
             primary = self.value(start, primary_end + 1, state)
             primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)

@@ -651,6 +651,306 @@ class PooledHTTPClientTests(SourceTest):
                     self.scan(source)
 
 
+class Urllib3DestinationTests(SourceTest):
+    """Pool-manager requests consume URLs, independently of their payloads."""
+
+    def test_module_request_requires_native_import_identity(self):
+        for setup, call in (
+            ('import urllib3', 'urllib3.request'),
+            ('import urllib3 as transport', 'transport.request'),
+            ('from urllib3 import request as send', 'send'),
+            ('import urllib3\nsend = urllib3.request\nurllib3 = None', 'send'),
+        ):
+            with self.subTest(call=call, setup=setup):
+                self.assert_rules(setup + f'\n{call}("GET", input())\n', 'ssrf')
+                self.assert_rules(setup + f'\n{call}(method="POST", url="https://safe.invalid", '
+                                  'body=input())\n')
+        for source in (
+            'urllib3.request("GET", input())\n',
+            'from .urllib3 import request\nrequest("GET", input())\n',
+            'from custom.urllib3 import request\nrequest("GET", input())\n',
+            'import urllib3\nurllib3 = custom\nurllib3.request("GET", input())\n',
+            'from urllib3 import request\nrequest = custom\nrequest("GET", input())\n',
+        ):
+            with self.subTest(source=source):
+                self.assert_rules(source)
+
+    def test_native_pool_constructors_and_saved_methods(self):
+        for setup, constructor in (
+            ('import urllib3', 'urllib3.PoolManager'),
+            ('from urllib3 import PoolManager as make', 'make'),
+            ('import urllib3.poolmanager as transport', 'transport.PoolManager'),
+            ('from urllib3.poolmanager import PoolManager', 'PoolManager'),
+        ):
+            with self.subTest(constructor=constructor):
+                self.assert_rules(setup + f'\n{constructor}().request("GET", input())\n', 'ssrf')
+                self.assert_rules(setup + f'\nclient = {constructor}()\n'
+                                  'send = client.request\nclient = None\nsend("GET", input())\n', 'ssrf')
+                self.assert_rules(setup + f'\nwith {constructor}() as client:\n'
+                                  '    client.request("GET", input())\n', 'ssrf')
+
+    def test_request_methods_bind_url_separately_from_other_operands(self):
+        for method in ('request', 'urlopen', 'request_encode_url', 'request_encode_body'):
+            setup = 'import urllib3\nclient = urllib3.PoolManager()\n'
+            for operands in ('"GET", input()', '"GET", url=input()',
+                             'method="GET", url=input()', '*["GET", input()]',
+                             '**{"method": "GET", "url": input()}'):
+                with self.subTest(method=method, operands=operands):
+                    self.assert_rules(setup + f'client.{method}({operands})\n', 'ssrf')
+            with self.subTest(method=method, control='method-and-headers'):
+                self.assert_rules(setup + f'client.{method}(input(), "https://safe.invalid", '
+                                  'headers={"X-Value": input()})\n')
+        self.assert_rules('import urllib3\nclient = urllib3.PoolManager()\n'
+                          'client.request("POST", "https://safe.invalid", input())\n')
+        for method in ('request_encode_url', 'request_encode_body'):
+            self.assert_rules('import urllib3\nclient = urllib3.PoolManager()\n'
+                              f'client.{method}("POST", "https://safe.invalid", {{"q": input()}})\n')
+
+    def test_native_constructor_and_request_options_remain_data(self):
+        self.assert_rules('''
+            import urllib3
+            client = urllib3.PoolManager(4, {"X-Setting": input()}, maxsize=8,
+                                        block=True, timeout=2.0, retries=False)
+            client.request("POST", "https://safe.invalid", body=input(),
+                           headers={"X-Value": input()}, preload_content=False)
+            client.request_encode_url("GET", "https://safe.invalid", fields={"q": input()})
+            client.request("POST", "https://safe.invalid", json={"q": input()})
+            client.clear()
+        ''')
+        self.assert_rules('''
+            import urllib3
+            client = urllib3.PoolManager(headers={"X-Setting": input()})
+            unused = client.request
+            print(client)
+        ''')
+        # preload_content controls response reads, not whether the request runs.
+        self.assert_rules('import urllib3\nclient = urllib3.PoolManager()\n'
+                          'client.request("GET", input(), preload_content=False)\n', 'ssrf')
+
+    def test_factories_helpers_defaults_and_closures_retain_receivers(self):
+        cases = (
+            'def send(client, target):\n    return client.request("GET", target)\n'
+            'send(urllib3.PoolManager(), input())\n',
+            'def make():\n    return urllib3.PoolManager()\n'
+            'make().request("GET", input())\n',
+            'def make():\n    return urllib3.PoolManager().request\n'
+            'def send(call, target):\n    return call("GET", target)\n'
+            'send(make(), input())\n',
+            'def send(target, client=urllib3.PoolManager()):\n'
+            '    return client.request("GET", target)\nsend(input())\n',
+            'def make():\n    client = urllib3.PoolManager()\n'
+            '    def send(target):\n        return client.request("GET", target)\n'
+            '    return send\nmake()(input())\n',
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                self.assert_rules('import urllib3\n' + source, 'ssrf')
+                self.assert_rules('import urllib3\n' + source.replace('input()', '"https://safe.invalid"'))
+
+    def test_strong_updates_and_sink_specific_validation(self):
+        self.assert_rules('''
+            import urllib3
+            client = urllib3.PoolManager()
+            target = input()
+            target = "https://safe.invalid"
+            client.request("GET", target)
+        ''')
+        self.assert_rules('''
+            import urllib3
+            client = urllib3.PoolManager()
+            target = input()
+            if choose:
+                target = "https://safe.invalid"
+            client.request("GET", target)
+        ''', 'ssrf')
+        self.assert_rules(HTTPDestinationTests.url_guard_source() + '''
+import urllib3
+target = input()
+if not approved(target):
+    raise ValueError("blocked")
+urllib3.PoolManager().request("GET", target)
+''')
+        for expression in ('html.escape(input())', 'shlex.quote(input())'):
+            with self.subTest(expression=expression):
+                self.assert_rules('import urllib3, html, shlex\n'
+                                  f'urllib3.PoolManager().request("GET", {expression})\n', 'ssrf')
+
+    def test_non_native_pools_do_not_borrow_destination_contracts(self):
+        for source in (
+            'client = PoolManager()\nclient.request("GET", input())\n',
+            'from .urllib3 import PoolManager\nclient = PoolManager()\nclient.request("GET", input())\n',
+            'from other import PoolManager\nclient = PoolManager()\nclient.request("GET", input())\n',
+            'import urllib3\nurllib3 = custom\nclient = urllib3.PoolManager()\n'
+            'client.request("GET", input())\n',
+            'import urllib3\nclient = urllib3.PoolManager()\nclient = custom\n'
+            'client.request("GET", input())\n',
+        ):
+            with self.subTest(source=source):
+                self.assert_rules(source)
+
+    def test_unresolved_pool_protocols_are_explicit(self):
+        for body in (
+            'client = urllib3.PoolManager(**options)',
+            'client = urllib3.PoolManager(timeout=custom_timeout)',
+            'client = urllib3.PoolManager(ssl_context=custom_context)',
+            'client = urllib3.PoolManager()\nclient.request("GET", custom_url)',
+            'client = urllib3.PoolManager()\nclient.request("GET", "https://safe.invalid", body=custom_body)',
+            'client = urllib3.PoolManager()\nclient.request("GET", "https://safe.invalid", retries=custom_retry)',
+            'client = urllib3.PoolManager()\nclient.request("GET", **options)',
+            'client = urllib3.PoolManager()\nclient.get(input())',
+            'client = urllib3.PoolManager()\nclient.connection_from_url(input())',
+            'client = urllib3.ProxyManager(input())',
+            'client = urllib3.HTTPConnectionPool(input())',
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('import urllib3\n' + body + '\n')
+
+    def test_mutation_reflection_escape_and_subclasses_are_explicit(self):
+        for body in (
+            'client = urllib3.PoolManager()\nclient.request = custom\nclient.request("GET", input())',
+            'client = urllib3.PoolManager()\nalias = client\nalias.headers = custom',
+            'client = urllib3.PoolManager()\nconfigure(client)\nclient.request("GET", input())',
+            'client = urllib3.PoolManager()\nclients = [client]',
+            'urllib3.PoolManager = custom',
+            'urllib3.PoolManager.urlopen = custom',
+            'urllib3.poolmanager.pool_classes_by_scheme = custom',
+            'urllib3._DEFAULT_POOL.headers = custom',
+            'urllib3.PoolManager.connection_from_host = custom',
+            'from urllib3 import _DEFAULT_POOL\n_DEFAULT_POOL.request = custom',
+            'from urllib3.poolmanager import pool_classes_by_scheme as pools\npools["https"] = custom',
+            'from urllib3.poolmanager import key_fn_by_scheme as keys\nkeys["https"] = custom',
+            'from urllib3 import __dict__ as namespace\nnamespace["request"] = custom',
+            'from urllib3.poolmanager import __dict__ as namespace\nnamespace["PoolManager"] = custom',
+            'urllib3.request = custom',
+            'configure(urllib3)',
+            'namespace = urllib3.PoolManager.__dict__',
+            'class CustomPool(urllib3.PoolManager):\n    pass',
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('import urllib3\n' + body + '\n')
+
+    def test_live_constructor_metadata_aliases_revoke_the_pool_proof(self):
+        for body in (
+            'headers["X-Value"] = custom',
+            'alias = headers\nalias["X-Value"] = custom',
+            'def configure(values):\n    values["X-Value"] = custom\nconfigure(headers)',
+        ):
+            with self.subTest(body=body):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan('import urllib3\nheaders = {"X-Value": "safe"}\n'
+                              'client = urllib3.PoolManager(headers=headers)\n' + body +
+                              '\nclient.request("GET", "https://safe.invalid")\n')
+
+    def test_partial_protocol_retains_prior_and_peer_findings(self):
+        source = '''\
+import urllib3
+client = urllib3.PoolManager()
+client.request("GET", input())
+client.request("GET", "https://safe.invalid", body=custom_body)
+'''
+        with temporary_directory(prefix='ubs-urllib3-partial-') as tmp:
+            path = Path(tmp) / 'client.py'
+            path.write_text(source, encoding='utf-8')
+            peer = Path(tmp) / 'peer.py'
+            peer.write_text('import urllib3\nurllib3.request("GET", input())\n', encoding='utf-8')
+            findings = []
+            with self.assertRaises(taint_py.AnalysisLimit):
+                for finding in taint_py.run(RunContext(lang='python', files=[path, peer])):
+                    findings.append(finding)
+            sites = {(finding['rule'], Path(finding['path']).name, finding['line']) for finding in findings}
+            self.assertEqual(sites, {('python.taint.ssrf', 'client.py', 3),
+                                     ('python.taint.ssrf', 'peer.py', 2)})
+
+    @unittest.skipUnless(os.environ.get('UBS_URLLIB3_E2E') == '1', 'opt-in verified urllib3 scanner integration')
+    def test_public_formats_partial_findings_selection_and_cache(self):
+        setup = 'import urllib3\nclient = urllib3.PoolManager(timeout=3)\n'
+        unsafe = setup + 'client.request("GET", input(), timeout=3)\n'
+        safe = setup + 'client.request("POST", "https://safe.invalid", body=input(), timeout=3)\n'
+        cases = (
+            ('unsafe', unsafe, 3, False),
+            ('safe', safe, None, False),
+            ('suppressed', setup + 'client.request("GET", input(), timeout=3)  '
+             '# ubs:ignore[python.taint.ssrf]\n', None, False),
+            ('partial', unsafe + 'client.request("GET", "https://safe.invalid", '
+             'body=custom_body, timeout=3)\n', 3, True),
+        )
+        with temporary_directory(prefix='ubs-urllib3-public-') as temporary:
+            directory = Path(temporary)
+            skip = '--skip=' + ','.join(str(value) for value in range(1, 25) if value != 7)
+            env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'ENABLE_UV_TOOLS': '0',
+                   'UBS_KEEP_TEMP': '1', 'UBS_NO_CACHE': '1', 'UBS_ALLOW_PARTIAL': '0'}
+
+            def check(path, tag, line, partial, runner, output, *, cache=False):
+                entrypoint = ROOT / 'ubs' if runner else ROOT / 'modules' / 'ubs-python.sh'
+                command = [str(entrypoint), '--ci', '--no-color', skip, '--format=' + output]
+                command += ['--only=python'] if runner else ['--no-uv']
+                run_env = {**env, 'UBS_NO_CACHE': '0' if cache else '1',
+                           'UBS_CACHE_DIR': str(directory / 'cache')}
+                result = subprocess.run([*command, str(path)], cwd=directory, env=run_env,
+                                        capture_output=True, text=True, timeout=120)
+                (directory / (tag + '.stdout')).write_text(result.stdout, encoding='utf-8')
+                (directory / (tag + '.stderr')).write_text(result.stderr, encoding='utf-8')
+                detail = (tag, result.returncode, result.stdout, result.stderr)
+                self.assertEqual(result.returncode, 2 if partial else 1 if line else 0, detail)
+                document = json.loads(result.stdout)
+                expected = [('python.taint.ssrf', path.name, line)] if line is not None else []
+                if output == 'json':
+                    self.assertEqual(document['status'], 'partial' if partial else 'ok', detail)
+                    totals = document['totals'] if runner else document
+                    self.assertEqual((totals['files'], totals['critical'], totals['warning'], totals['info']),
+                                     (1, len(expected), 0, 0), detail)
+                    rows = document.get('findings', []) if runner else document['findings']
+                    if runner:
+                        actual = [(row['rule_id'], Path(row['file']).name, row['line']) for row in rows]
+                        self.assertTrue(all(row['col'] == 1 for row in rows), detail)
+                        if not expected:
+                            self.assertEqual([scanner['findings'] for scanner in document['scanners']], [[]], detail)
+                    else:
+                        self.assertTrue(all(row['count'] == 1 and len(row['samples']) == 1 for row in rows), detail)
+                        actual = [(row['rule_id'], Path(sample['file']).name, sample['line'])
+                                  for row in rows for sample in row['samples']]
+                    self.assertEqual(actual, expected, detail)
+                else:
+                    runs = document['runs']
+                    self.assertTrue(runs, detail)
+                    rows = [row for run in runs for row in run['results']]
+                    actual = []
+                    for row in rows:
+                        self.assertEqual(len(row['locations']), 1, detail)
+                        location = row['locations'][0]['physicalLocation']
+                        self.assertTrue(location['artifactLocation']['uri'].endswith(path.name), detail)
+                        self.assertEqual(location['region']['startColumn'], 1, detail)
+                        actual.append((row['ruleId'], path.name, location['region']['startLine']))
+                    self.assertEqual(actual, expected, detail)
+                    for run in runs:
+                        if partial:
+                            self.assertIs(run['invocations'][0]['executionSuccessful'], False, detail)
+                            self.assertEqual(run['invocations'][0]['exitCode'], 2, detail)
+                        else:
+                            self.assertTrue(all(inv['executionSuccessful'] is True
+                                                for inv in run.get('invocations', [])), detail)
+                print(f'[{tag}] PASS', flush=True)
+
+            for case, source, line, partial in cases:
+                path = directory / (case + '.py')
+                path.write_text(source, encoding='utf-8')
+                for runner in (False, True):
+                    for output in ('json', 'sarif'):
+                        with self.subTest(case=case, runner=runner, output=output):
+                            check(path, f'{case}-{"runner" if runner else "module"}-{output}',
+                                  line, partial, runner, output)
+            # The unsafe neighbor must stay outside a selected clean scan;
+            # an edit to the selected file must invalidate its cached result.
+            selected = directory / 'selected.py'
+            selected.write_text(safe, encoding='utf-8')
+            check(selected, 'selected-cold', None, False, True, 'json', cache=True)
+            check(selected, 'selected-warm', None, False, True, 'json', cache=True)
+            selected.write_text(unsafe, encoding='utf-8')
+            check(selected, 'selected-edited', 3, False, True, 'json', cache=True)
+
+
 class HTTPXPreparedRequestTests(SourceTest):
     """Native request construction fixes the URL; send consumes that URL."""
 
@@ -1581,6 +1881,23 @@ class CrossFileHTTPTransportTests(SourceTest):
     def assert_sites(self, findings, *expected):
         self.assertEqual(sorted((row['rule'], Path(row['path']).name, row['line'], row['col'])
                                 for row in findings), sorted(expected), findings)
+
+    def test_urllib3_factories_and_helpers_keep_native_sites(self):
+        for argument, suppressed in (('input()', False), ('"https://safe.invalid"', False),
+                                     ('input()', True)):
+            sources = {
+                'transport.py': 'from urllib3.poolmanager import PoolManager as make_pool\n'
+                                'def make():\n    return make_pool()\n'
+                                'def send(client, target):\n    return client.request("GET", target)'
+                                + ('  # ubs:ignore[python.taint.ssrf]' if suppressed else '') + '\n',
+                'view.py': 'from transport import make, send\nsend(make(), ' + argument + ')\n',
+            }
+            for selected in (tuple(sources), tuple(reversed(sources))):
+                with self.subTest(argument=argument, suppressed=suppressed, selected=selected):
+                    findings = self.project_findings(sources, selected=selected)
+                    expected = (('python.taint.ssrf', 'transport.py', 5, 12),) if (
+                        argument == 'input()' and not suppressed) else ()
+                    self.assert_sites(findings, *expected)
 
     def test_returned_pending_requests_keep_defining_sites(self):
         cases = (

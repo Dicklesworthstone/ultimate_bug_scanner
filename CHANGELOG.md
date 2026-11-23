@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Trace native Python `urllib3.request` and `PoolManager` destinations through
+  saved methods, constructors, helpers and selected cross-file calls. Distinguish
+  URL operands from method/body/header metadata and preserve eager request
+  behavior when response preloading is disabled. Unproved proxies, custom
+  pools, mutable registries, option protocols and receiver mutations retain
+  explicit incomplete coverage.
+
 - Trace native JavaScript `Array.slice` through the shared array model.
   Selected ranges preserve sparse holes, copied outer slots and shared object
   identities across aliases and helpers. Safe excluded elements and array

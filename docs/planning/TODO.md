@@ -628,3 +628,28 @@ This is preserved source work, not an activated scanner repair or release claim.
   patch contains failing regression witnesses and a partial capability scaffold;
   native transfer, alias/backing writes and helper integration are unfinished.
   No candidate runtime qualification is claimed.
+
+## 16. Native copy and HTTP destination semantics
+
+- [x] `1b9j.6.19`: implement native JavaScript `Array.slice` range selection,
+  sparse slots, fresh outer arrays and shared element identities (`69f8f7af`).
+  All 13 new source/native methods pass. The unchanged independent 28-case
+  corpus has 25 exact results, three explicitly incomplete results and no
+  incorrect complete results (baseline: 11 exact, 17 incorrect complete).
+- [ ] Complete the final 15-method JS public/cache replay after the original
+  ENOSPC failure. Dynamic bounds, custom species and property protocols
+  remain explicitly incomplete; broad D6 qualification remains open.
+- [x] `1b9j.6.20`: implement native `urllib3.request` and `PoolManager` URL
+  provenance across aliases, saved methods and selected helper summaries.
+  Keep request metadata separate and reject mutable/custom dispatch proofs.
+  Genuine DSR passes all 13 selected methods, including 19 public scanner
+  invocations; both integrity verifiers and source-stability checks pass.
+  Ten intercepted native requests independently confirm argument positions
+  and eager send behavior. Direct-import registry/reflection escapes are
+  covered by regressions after independent review exposed initial misses.
+- [ ] Preserve the failed broader integration receipt: the strict changed
+  Python helper self-scan is partial (0 critical, 66 warnings), and the full
+  ShellCheck process was killed with exit 137. Its receipt remains failed 3/5
+  (`035659a23da88c784333611efe3ab72561ab302ab70d786611b885b31cbfee6e`).
+  Repeat ShellCheck on the final combined tree; full HTTP/dataflow,
+  whole-repository and release qualification remain open.

@@ -193,21 +193,46 @@ _HTTP_CLIENT_CONSTRUCTORS = {
     'httpx.AsyncClient': 'httpx.async',
     'aiohttp.ClientSession': 'aiohttp',
     'aiohttp.client.ClientSession': 'aiohttp',
+    'urllib3.PoolManager': 'urllib3',
+    'urllib3.poolmanager.PoolManager': 'urllib3',
 }
 _AIOHTTP_REQUEST_APIS = frozenset({'aiohttp.request', 'aiohttp.client.request'})
 _AIOHTTP_API_NAMES = frozenset({'aiohttp', 'aiohttp.client', 'aiohttp.ClientSession',
                               'aiohttp.client.ClientSession', *_AIOHTTP_REQUEST_APIS})
 _HTTPX_API_NAMES = frozenset({'httpx', 'httpx.Client', 'httpx.AsyncClient',
                             'httpx.Request', 'httpx.URL'})
+_HTTP_REFLECTIVE_MEMBERS = frozenset({'__dict__', '__globals__', '__closure__', '__code__',
+                                     '__defaults__', '__kwdefaults__', '__class__', '__bases__'})
+_URLLIB3_UNMODELED = frozenset({
+    'urllib3.ProxyManager', 'urllib3.poolmanager.ProxyManager',
+    'urllib3.proxy_from_url', 'urllib3.poolmanager.proxy_from_url',
+    'urllib3.HTTPConnectionPool', 'urllib3.HTTPSConnectionPool',
+    'urllib3.connectionpool.HTTPConnectionPool', 'urllib3.connectionpool.HTTPSConnectionPool',
+    'urllib3.connection_from_url', 'urllib3.connectionpool.connection_from_url',
+})
+_URLLIB3_INTERNALS = frozenset({'urllib3._DEFAULT_POOL',
+                              'urllib3.poolmanager.pool_classes_by_scheme',
+                              'urllib3.poolmanager.key_fn_by_scheme'}) | frozenset(
+    f'{module}.{member}'
+    for module in ('urllib3', 'urllib3.poolmanager', 'urllib3.connectionpool', 'urllib3._request_methods')
+    for member in _HTTP_REFLECTIVE_MEMBERS)
+_URLLIB3_API_NAMES = _URLLIB3_UNMODELED | _URLLIB3_INTERNALS | frozenset({
+    'urllib3', 'urllib3.request', 'urllib3.PoolManager',
+    'urllib3.poolmanager', 'urllib3.poolmanager.PoolManager',
+    'urllib3.connectionpool', 'urllib3._request_methods', 'urllib3._request_methods.RequestMethods',
+})
 _HTTP_CLIENT_METHODS = {
     kind: {**{method: 0 for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options')},
            'request': 1, **({'stream': 1} if kind.startswith('httpx') else {})}
     for kind in frozenset(_HTTP_CLIENT_CONSTRUCTORS.values())
 }
+_HTTP_CLIENT_METHODS['urllib3'] = {
+    method: 1 for method in ('request', 'urlopen', 'request_encode_url', 'request_encode_body')}
 _HTTP_CLIENT_MEMBERS = {
     **{module: frozenset(name.rsplit('.', 1)[1] for name in _HTTP_CLIENT_CONSTRUCTORS
                          if name.rsplit('.', 1)[0] == module)
-       for module in ('requests', 'requests.sessions', 'httpx', 'aiohttp', 'aiohttp.client')},
+       for module in ('requests', 'requests.sessions', 'httpx', 'aiohttp', 'aiohttp.client',
+                      'urllib3', 'urllib3.poolmanager')},
     **{constructor: frozenset(_HTTP_CLIENT_METHODS[kind]) | {
         'send', '__init__', '__enter__', '__aenter__', '__aexit__',
         '_request', '_build_url', 'build_request', 'prepare_request'}
@@ -220,6 +245,12 @@ _HTTP_CLIENT_MEMBERS = {
     'aiohttp': frozenset({'ClientSession', 'request', 'client'}),
     'aiohttp.client': frozenset({'ClientSession', 'request'}),
     'httpx': frozenset({'Client', 'AsyncClient', 'Request', 'URL'}),
+    'urllib3': frozenset({'PoolManager', 'request', '_DEFAULT_POOL', 'poolmanager',
+                         'connectionpool', '_request_methods'}),
+    'urllib3.poolmanager': frozenset({'PoolManager', 'pool_classes_by_scheme', 'key_fn_by_scheme'}),
+    'urllib3.connectionpool': frozenset({'HTTPConnectionPool', 'HTTPSConnectionPool'}),
+    'urllib3._request_methods': frozenset({'RequestMethods'}),
+    'urllib3._request_methods.RequestMethods': frozenset(_HTTP_CLIENT_METHODS['urllib3']),
 }
 _URLLIB_APIS = frozenset(f'urllib.request.{name}' for name in
                        ('Request', 'urlopen', 'urlretrieve', 'build_opener', 'install_opener'))
@@ -1187,7 +1218,7 @@ _QUALIFIER_WIDTH = max(4, *(candidate.count('.') + 1 for candidate in SANITIZERS
 _KNOWN_QUALIFIER_PREFIXES = frozenset(
     '.'.join(qualified.split('.')[:size])
     for qualified in (*SANITIZERS, *_HTTP_URL_POSITIONS, *_HTTP_CLIENT_CONSTRUCTORS,
-                      *_AIOHTTP_REQUEST_APIS, *_URLLIB_APIS, *_HTTPX_API_NAMES,
+                      *_AIOHTTP_REQUEST_APIS, *_URLLIB_APIS, *_HTTPX_API_NAMES, *_URLLIB3_API_NAMES,
                       *_ALL_FRAMEWORK_NAMES, *_REQUEST_TYPES)
     for size in range(1, len(qualified.split('.')) + 1))
 
@@ -1785,7 +1816,7 @@ def _qualified(node: ast.AST, aliases: dict[str, object]) -> str:
         # Network clients and stream parsers require real import identities.
         # An unresolved relative import or local shadow cannot recover one
         # merely because its receiver has the standard library's spelling.
-        if node.id in {'requests', 'httpx', 'aiohttp', 'urllib', 'json', 'tomllib', 'csv'}:
+        if node.id in {'requests', 'httpx', 'aiohttp', 'urllib', 'urllib3', 'json', 'tomllib', 'csv'}:
             return ''
         return node.id
     if isinstance(node, ast.Attribute):
@@ -2554,6 +2585,8 @@ class _Flow:
                 raise AnalysisLimit('aiohttp namespace or API escape is unresolved; analysis is incomplete')
             if name in _HTTPX_API_NAMES:
                 raise AnalysisLimit('HTTPX namespace or API escape is unresolved; analysis is incomplete')
+            if name in _URLLIB3_API_NAMES:
+                raise AnalysisLimit('urllib3 namespace or API escape is unresolved; analysis is incomplete')
             if (isinstance(value, _CsvReader) or isinstance(value, _BoundCallable)
                     and isinstance(value.receiver_binding, _CsvReader)):
                 raise AnalysisLimit('CSV reader storage or escape is unresolved; analysis is incomplete')
@@ -4625,7 +4658,7 @@ class _Flow:
                 for choice in _binding_choices(namespace):
                     name = (choice if isinstance(choice, str) else choice.name
                             if isinstance(choice, _BoundCallable) and choice.namespace_proven else None)
-                    if (target.attr in _HTTP_CLIENT_MEMBERS.get(name, ())
+                    if (target.attr in _HTTP_CLIENT_MEMBERS.get(name, ()) or name in _URLLIB3_API_NAMES
                             or name in {'urllib.request.Request', 'urllib.request.OpenerDirector', 'httpx.Request'}):
                         raise AnalysisLimit('HTTP client API replacement is unmodeled; analysis is incomplete')
             if isinstance(target, ast.Attribute) and any(
@@ -7178,9 +7211,97 @@ class _Flow:
         self.possible_exception(state)
         return CLEAN
 
+    def urllib3_options(self, node, state, inputs, positional, allowed):
+        """Bind the native signature and refuse custom option protocols.
+
+        Field/body/header values are data, but their iteration or coercion
+        can execute arbitrary code. Only inert primitives and finite native
+        containers establish the ordinary PoolManager request contract.
+        """
+        if (None in inputs.keyword_nodes or len(node.args) > len(positional)
+                or any(isinstance(argument, ast.Starred) for argument in node.args)
+                or not set(inputs.keyword_nodes) <= allowed
+                or any(name in inputs.keyword_nodes for name in positional[:len(node.args)])):
+            raise AnalysisLimit('urllib3 argument binding or option is unresolved; analysis is incomplete')
+        supplied = dict(zip(positional, node.args))
+        supplied.update(inputs.keyword_nodes)
+        for name, expression in supplied.items():
+            if name in {'method', 'url'}:
+                continue
+            containers = name in {'headers', 'fields', 'json', 'source_address', 'socket_options'}
+            if not self.httpx_native_input(expression, state, containers=containers):
+                raise AnalysisLimit('urllib3 option or payload protocol is unresolved; analysis is incomplete')
+        return supplied
+
+    def urllib3_client(self, node, state, inputs):
+        allowed = {'num_pools', 'headers', 'timeout', 'retries', 'maxsize', 'block',
+                   'source_address', 'socket_options', 'blocksize', 'cert_reqs',
+                   'ca_certs', 'ca_cert_dir', 'ca_cert_data', 'cert_file', 'key_file',
+                   'key_password', 'ssl_version', 'ssl_minimum_version', 'ssl_maximum_version',
+                   'assert_hostname', 'assert_fingerprint', 'server_hostname'}
+        supplied = self.urllib3_options(node, state, inputs, ('num_pools', 'headers'), allowed)
+        # PoolManager retains headers/connection options, unlike clients
+        # which copy them at construction. Later alias writes revoke the
+        # same finite receiver proof, including through helper summaries.
+        references = frozenset({node}).union(*(
+            self.expression_references.get(expression, NO_REFERENCES)
+            for expression in supplied.values()))
+        self.expression_bindings[node] = _BoundCallable(
+            '@http.client', references, CLEAN, True, receiver_binding=_HTTPClient('urllib3'))
+        self.expression_references[node] = references
+        self.possible_exception(state)
+        return CLEAN
+
+    def urllib3_request(self, node, state, target, inputs):
+        pooled = _http_contract(target, _HTTPClient)
+        method = target.name.rsplit('.', 1)[-1] if pooled else 'request'
+        if pooled and method == 'clear':
+            if node.args or node.keywords:
+                raise AnalysisLimit('urllib3 clear argument binding is unresolved; analysis is incomplete')
+            self.expression_bindings[node] = None
+            self.possible_exception(state)
+            return CLEAN
+        signatures = {
+            'request': ('method', 'url', 'body', 'fields', 'headers', 'json'),
+            'urlopen': ('method', 'url', 'redirect'),
+            'request_encode_url': ('method', 'url', 'fields', 'headers'),
+            'request_encode_body': ('method', 'url', 'fields', 'headers',
+                                    'encode_multipart', 'multipart_boundary'),
+        }
+        if method not in signatures:
+            raise AnalysisLimit('urllib3 pool method is unmodeled; analysis is incomplete')
+        allowed = {'method', 'url', 'body', 'fields', 'headers', 'json', 'preload_content',
+                   'decode_content', 'redirect', 'retries', 'timeout'}
+        if pooled:
+            allowed |= {'assert_same_host', 'pool_timeout', 'release_conn', 'chunked', 'body_pos'}
+        if method == 'request_encode_body':
+            allowed |= {'encode_multipart', 'multipart_boundary'}
+        supplied = self.urllib3_options(
+            node, state, inputs, signatures[method] if pooled else ('method', 'url'), allowed)
+        for name in ('method', 'url'):
+            expression = supplied.get(name)
+            binding = self.expression_bindings.get(expression)
+            # An exact str cannot be changed through an alias. An opaque
+            # helper (including the URL guard's native parser) may mark its
+            # argument reference as mutated without revoking that immutable
+            # value proof. Producer callbacks must still have been ruled out.
+            native_string = self.native_string_binding(binding) and not self.unproved_producer(binding)
+            if expression is None or not (native_string or self.httpx_native_input(expression, state, text=True)):
+                raise AnalysisLimit('urllib3 method or URL protocol is unresolved; analysis is incomplete')
+        destination, _expression = self.http_destination(node, inputs, 1)
+        # These operations all send immediately. preload_content=False
+        # defers response-body reads, not the outbound request.
+        self.effect('ssrf', node, 'HTTP request URL', destination)
+        self.expression_bindings[node] = None
+        self.expression_references[node] = frozenset({node})
+        self.possible_exception(state)
+        return CLEAN
+
     def http_client(self, node, state, name, inputs):
         """Construct a native handle without tainting it with option data."""
         kind = _HTTP_CLIENT_CONSTRUCTORS[name]
+        if kind == 'urllib3':
+            return self.urllib3_client(node, state, inputs)
         aiohttp = kind == 'aiohttp'
         if (None in inputs.keyword_nodes or kind == 'requests' and inputs.keywords
                 or node.args and not aiohttp
@@ -7467,6 +7588,8 @@ class _Flow:
         method = target.name.rsplit('.', 1)[-1]
         if target.references & state.mutated:
             raise AnalysisLimit('HTTP client receiver was mutated; analysis is incomplete')
+        if contract.kind == 'urllib3':
+            return self.urllib3_request(node, state, target, inputs)
         if method in {'close', 'aclose'}:
             self.expression_bindings[node] = None
             self.possible_exception(state)
@@ -7565,6 +7688,10 @@ class _Flow:
             return self.urllib_call(node, state, target, inputs)
         if native_name in _HTTP_CLIENT_CONSTRUCTORS:
             return self.http_client(node, state, native_name, inputs)
+        if native_name == 'urllib3.request':
+            return self.urllib3_request(node, state, target, inputs)
+        if native_name in _URLLIB3_UNMODELED:
+            raise AnalysisLimit('urllib3 proxy or connection-pool protocol is unmodeled; analysis is incomplete')
         if native_name == 'httpx.Request':
             return self.httpx_prepared(node, state, target, inputs)
         if native_name in _AIOHTTP_REQUEST_APIS:
@@ -8035,7 +8162,7 @@ class _Flow:
                 if choices and all(isinstance(value, _SymbolicValue) for value in choices):
                     self.http_parameters.update(value.parameter for value in choices)
                 else:
-                    raise AnalysisLimit('HTTPX prepared-request helper requires proven native inputs; '
+                    raise AnalysisLimit('HTTP helper requires proven native inputs; '
                                         'analysis is incomplete')
             predicate_incomplete = summary.generator_predicate_incomplete
             for name in summary.generator_predicate_parameters:
@@ -8500,6 +8627,12 @@ class _Flow:
                 fact = state.value(slot)
                 binding = state.bindings[slot]
                 self.expression_facts[node] = fact
+            if any((value if isinstance(value, str) else value.name
+                    if isinstance(value, _BoundCallable) and value.namespace_proven else None)
+                   in _URLLIB3_INTERNALS for value in _binding_choices(binding)):
+                # A from-import is an alias to the live global pool or
+                # registry, not a harmless copy of that mutable object.
+                raise AnalysisLimit('urllib3 internal pool registry is unresolved; analysis is incomplete')
             if (binding == _STDIN_OPAQUE_ARGUMENTS
                     or isinstance(binding, frozenset) and _STDIN_OPAQUE_ARGUMENTS in binding):
                 raise AnalysisLimit('stdin handles through variadic helper arguments are unmodeled; '
@@ -8626,10 +8759,12 @@ class _Flow:
                 native = (base if isinstance(base, str) else base.name
                           if isinstance(base, _BoundCallable) and base.namespace_proven else None)
                 if (native in _URLLIB_APIS or native in _AIOHTTP_API_NAMES or native in _HTTPX_API_NAMES
-                        or native in {'urllib', 'urllib.request', 'urllib.request.OpenerDirector'}) and node.attr in {
-                        '__dict__', '__globals__', '__closure__', '__code__', '__defaults__',
-                        '__kwdefaults__', '__class__', '__bases__'}:
+                        or native in _URLLIB3_API_NAMES
+                        or native in {'urllib', 'urllib.request', 'urllib.request.OpenerDirector'}) and node.attr in _HTTP_REFLECTIVE_MEMBERS:
                     raise AnalysisLimit('HTTP reflective namespace access is unresolved; analysis is incomplete')
+                if native in {'urllib3', 'urllib3.poolmanager'} and node.attr in {
+                        '_DEFAULT_POOL', 'pool_classes_by_scheme', 'key_fn_by_scheme'}:
+                    raise AnalysisLimit('urllib3 internal pool registry is unresolved; analysis is incomplete')
                 if _http_contract(base, (_UrllibRequest, _UrllibOpener)):
                     if base.references & state.mutated:
                         raise AnalysisLimit('urllib receiver was mutated; analysis is incomplete')
@@ -8652,7 +8787,8 @@ class _Flow:
                     if base.references & state.mutated:
                         raise AnalysisLimit('HTTP client receiver was mutated; analysis is incomplete')
                     kind = base.receiver_binding.kind
-                    if (node.attr in _HTTP_CLIENT_METHODS[kind] or node.attr in {'close', 'aclose'}
+                    if (node.attr in _HTTP_CLIENT_METHODS[kind]
+                            or node.attr in ({'clear'} if kind == 'urllib3' else {'close', 'aclose'})
                             or kind.startswith('httpx') and node.attr in {'build_request', 'send'}):
                         candidates.append(_BoundCallable('@http.' + kind + '.' + node.attr,
                             base.references, base.receiver, True, receiver_binding=base.receiver_binding))
@@ -9620,6 +9756,8 @@ class _Flow:
                         raise AnalysisLimit('aiohttp session subclass dispatch is unresolved; analysis is incomplete')
                     if name in {'httpx.Client', 'httpx.AsyncClient', 'httpx.Request'}:
                         raise AnalysisLimit('HTTPX client or request subclass dispatch is unresolved; analysis is incomplete')
+                    if name in _URLLIB3_API_NAMES:
+                        raise AnalysisLimit('urllib3 pool subclass dispatch is unresolved; analysis is incomplete')
             for keyword in node.keywords:
                 self.expr(keyword.value, state)
             namespace = state.copy()
@@ -11584,7 +11722,7 @@ class _Analysis:
         self.budget.spend(len(self.summaries))
         qualified = {key[0] for key, value in self.summaries.items()
                      if isinstance(key, tuple) and not value.http_parameters and not value.incomplete}
-        reason = 'HTTPX prepared-request helper has unresolved native inputs; analysis is incomplete'
+        reason = 'HTTP helper has unresolved native inputs; analysis is incomplete'
         return tuple(self.scope_diagnostic(function, reason) for function in functions
                      if function not in qualified or not (
                          self.generator_helper_identity(function) or self.http_factory_callback(function)))

@@ -628,10 +628,11 @@ This is preserved source work, not an activated scanner repair or release claim.
   adds two unexecuted public methods. Independent replay, adjacent suites,
   public reports and canonical integrity/full gates remain pending; no
   production activation is claimed.
-- [ ] `1b9j.6.18`: complete Go native read-into-buffer transport. The archived
-  patch contains failing regression witnesses and a partial capability scaffold;
-  native transfer, alias/backing writes and helper integration are unfinished.
-  No candidate runtime qualification is claimed.
+- [ ] `1b9j.6.18`: qualify Go native read-into-buffer transport. The November 23
+  recovery patch adds native transfers, backing/alias state, selected helper
+  write contracts and 19 regression methods. Its final combination is unexecuted;
+  literal byte-length proofs and captured indexed writes have explicit review
+  follow-ups. No candidate runtime qualification or activation is claimed.
 
 ## 16. Native copy, HTTP destinations and command constructors
 

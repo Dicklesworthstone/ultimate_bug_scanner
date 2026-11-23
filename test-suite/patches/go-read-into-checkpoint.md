@@ -1,47 +1,73 @@
-# Go native read-into recovery checkpoint
+# Go native read-into-buffer candidate checkpoint
 
-**Status: incomplete and unactivated. Do not apply this patch to production without completing the implementation and validation.**
+Date: 2026-11-23
+Bead: `ultimate_bug_scanner-1b9j.6.18`
+Base commit: `b27c0dcc126a4181ca0766a69ed91cffb9ed305e`
+Candidate patch blob: `636a11e95ac737b93cdf5c13d5090708bd5d215e`
 
-Base commit: `d6c529ee94ae565ed6b66724d558b2de98d400d2`.
+## Status
 
-The accompanying patch reconstructs exactly the three manual edits applied before the execution environment became unavailable on 2026-11-23 UTC. Immutable base files were fetched through GitHub after the disconnect, all 25 manual hunks matched in order, and the resulting unified diff was replayed forward and backward in memory with exact content equality. This verifies recovery of recorded edits; it is not a Python syntax check, test run, or comparison with inaccessible post-edit disk bytes.
+**Unexecuted, unvalidated recovery candidate. Do not activate or close the bead from this checkpoint.**
 
-Base source blob: `ceb92e859c13b940408804aed7682de329fb2cbb`.
-Base regression-test blob: `6ac3b39223cf6c56c78391205a991b87f21593b1`.
+The candidate patch updates `modules/helpers/ubs_core/analyzers/taint_go.py` and `test-suite/quality/test_taint_go_decoding.py`. It contains the four manual source patches that successfully applied before the executor failed, the ten unchanged checkpoint regression methods, the subsequently drafted summary integration, two review fixes, and nine additional source/cache/public-report regression methods. The final combination has not been applied or executed in the recovered executor.
 
-## Reproduced defect and intended behavior
+The 45 unified hunks were checked against the two immutable base file strings in memory and reconstruct the intended candidate strings exactly. That is a patch reconstruction check, not a syntax check, DSR receipt, disk-byte comparison, runtime test, or native Go validation.
 
-On the base analyzer, `buffer := make([]byte, 128); io.ReadFull(r.Body, buffer); db.Query(string(buffer))` returns no findings and no incomplete-analysis error. Native `io.ReadFull` and `io.ReadAtLeast` must carry known Reader contents through byte-slice destination writes, while byte counts and native reader errors remain separate from payloads. Slice aliases share backing contents; string snapshots and independent allocations do not. Short reads can leave a mutated prefix, so a later read from a fixed stream must not erase earlier provenance.
+## Recovery provenance
 
-Official semantic reference: https://go.dev/src/io/io.go, ReadAtLeast lines 329–344 and ReadFull lines 353–355. ReadAtLeast with min <= 0 or min > len(buffer) does not invoke the Reader; ReadFull delegates with min = len(buffer). Thus a provably zero-length/no-read operation can complete even with an otherwise unknown Reader protocol.
+- Successfully applied patch-state reconstruction: GitHub blob `4bb8637c6f57bfc07fd4abb749148ab08671c3f1`. It preserves the four successful manual patch texts, resulting reconstructed file contents, base blob references, and the fresh baseline evidence. The recovered bytes were checked by forward/reverse patch reconstruction; the lost executor could not provide a final disk-byte comparison.
+- Pending summary integration origin: GitHub blob `d4a93003da5f79b3dbd36a1897b2d1c0783e6d7f`. The original tool attempt failed before reading the file. Its changes are now included in this combined candidate.
+- Source base blob: `f8deebfd78029c5d77f6574f4403691877e34c44`.
+- Test base blob: `a4020ab4c7cee6b2604d422ef74bc1f66b281ee3`.
 
-## Observed baseline evidence
+## Intended behavior awaiting validation
 
-Nine newly added source regression methods ran through the real DSR `_qg_run_single_check` execution path on the unchanged production analyzer:
+Bounded native `io.ReadFull`, `io.ReadAtLeast`, and supported native `Read` methods write source provenance into proven byte-slice backing cells. Aliases and supported reslices share backing contents; count/error values and `len`/`cap` stay clean. Short reads weakly join prior contents. Known zero length, nonpositive minimum, and impossible minimum bounds avoid reads before Reader protocol validation. Selected helper summaries carry buffer writes and escapes separately from slice-variable rebinding.
 
-- Result: **9 methods; 12 failing assertions; 1 error**. These are expected-red defect witnesses, not a passing feature.
-- Retained receipt directory: `test-suite/artifacts/session-go-readinto-baseline-picMLvz2/`.
-- Observed log SHA-256: `f23d9d734eb3212892f8ce96b821bb2caa21ab64a83dab30b5846717ae9778f6`.
-- Command: `cd test-suite/quality && PYTHONPATH=../../modules/helpers python -m unittest`, followed by the nine `NativeScanningFlowTests.test_readinto_*` source methods added in the patch, excluding the opt-in native compiler witness.
-- The opt-in `UBS_GO_READINTO_NATIVE=1` real Go witness was authored but **not executed**.
+Unknown Reader protocols, unknown destination capabilities, escaped backing storage, delayed writes, captured buffer-header replacement, and returned helper-local allocations remain explicit unsupported boundaries. Existing decoded/native/callable domains are intended to remain intact.
 
-A separately authored root-agent probe is preserved as `test-suite/patches/go-read-into-independent.py`, blob `5c493a97abcef905d4d274e7d40358433652b4ae`. Its independently reported baseline is 18 cases: 10 exact, 1 incomplete, 7 incorrect-complete. Receipt: `test-suite/artifacts/session-independent-go-baseline-ZkFvcMBR/`; observed log SHA-256: `7ac1fd7e2c99abc572bb1d720455498b3667651a683afae5dc82665553af1fb6`. Preserve those labels and assertions on replay.
+The final two review fixes preserve empty-slice views after writes through longer aliases and avoid classifying unrelated captured scalar assignments as unsupported buffer replacement.
 
-## What the partial patch contains
+## Evidence actually obtained
 
-- Nine source regression methods plus one opt-in native Go witness in the existing decoding test suite.
-- io operation identities and a bounded byte-buffer capability scaffold in the existing Go value domain.
-- Buffer metadata joins, initial escape/write fields, literal/buffer-expression recognition, and partial integration into metadata lookup.
+A fresh unchanged-production baseline ran the ten original restored methods through actual DSR `_qg_run_single_check`:
 
-**The read-into transfer does not exist yet. The patch is not a functional fix. No candidate test or syntax run was completed.**
+```
+PYTHONPATH=../modules/helpers:quality python3 -m unittest -v \
+  quality.test_taint_go_decoding.NativeScanningFlowTests -k readinto
+```
 
-## Required continuation
+Result: 10 discovered, 9 executed, 12 failures, 1 error, 1 optional native witness skipped. Baseline full log SHA-256: `37a2e3a74821a882d8b84ccbd05c1112e572d3ed7c56740c69e507962aae0149`.
 
-1. Complete native ReadFull/ReadAtLeast dispatch and destination weak writes. Keep no-read bounds, payload/result separation, and exact file-local import/callable authority.
-2. Finish buffer backing-cell initialization, assignment/rebinding, slice/alias reads, nil declarations, and generic/callback escape handling. Avoid false clean results for unknown/custom readers, escaped buffers, live backing readers, mutable globals, or delayed writes.
-3. Integrate buffer capabilities into selected-helper contexts, parameter writes, result transport, immediate closures, and summary joins. Treat unsupported escaping local allocations explicitly. Keep finite work/context bounds unchanged.
-4. Fix two known scaffold concerns before testing: `value_info` currently handles the bare identifier `nil` before reaching the new nil buffer recognition; byte-literal length calculation currently looks at masked rune contents and can mistake a nonempty literal for zero length. No runtime evidence validates either path.
-5. Replay all unchanged new source regressions and the independent probe, then enable the real Go witness. Run the related Go decoding, domains, packages, and initializer cohorts. Add real module/meta-runner JSON/SARIF coverage with exact sites, totals, selection/suppression, cache invalidation, and prior-finding retention on incomplete results.
-6. After a complete validated implementation, regenerate canonical checksum pins and follow the repository's version/release rules. Run prescribed broad checks through DSR. Do not weaken detectors, budgets, partial-result policy, test assertions, or release gates.
+No candidate test has run. No candidate native Go witness, public JSON/SARIF run, package-cache run, independent 18-case replay, adjacent Go suite, or integrity gate has passed.
 
-Only checkpoint artifacts should be activated while this work remains incomplete. Production analyzer, test discovery, checksum pins, version mirrors, and broad bead status must not be changed by applying this partial candidate.
+## Resume and remaining gaps
+
+1. Restore the candidate against the stated base and inspect the diff.
+2. Execute the unchanged ten-method regression gate and the added source methods through DSR. Fix failures before making completion claims.
+3. Execute the retained native Go witness, the unchanged independent 18-case corpus, package-cache mutation test, and public module/runner JSON/SARIF cases through DSR. Check exact locations, totals, exit codes, suppression, partial status, selected-file behavior, and cache invalidation.
+4. Run the required adjacent Go and repository integrity gates; update production hashes only after qualification.
+5. Review literal byte-length inference: Go byte escapes such as `"\\xff"` differ from Python UTF-8 encoding; comments after a trailing comma in a byte-slice literal may affect inferred length. These are unvalidated correctness risks, not established passing behavior.
+6. Native read writes in immediate closures are included. General captured buffer index assignment is not newly modeled by the native-read write-summary hook; inspect existing behavior and preserve an explicit unsupported boundary where effects cannot be proven.
+7. Helper-local returned buffers and captured buffer-header replacement remain intentionally unsupported in this bounded candidate.
+
+The candidate is not evidence that sections 15–16 or the Go read-buffer bead are complete.
+
+
+## Additional root recovery review
+
+Root independently replayed all 45 hunks forward and backward against the
+immutable source/test files and recovered the originals exactly. No execution
+result is implied. The original successful-edit snapshot remains separate from
+the final in-memory combination, as described above.
+
+Further static follow-ups to exercise before activation:
+
+- Raw Go strings discard carriage returns; Go hex/octal escapes contribute one
+  byte rather than Python's UTF-8 length of the decoded character. Preserve exact
+  byte extents or keep the proof unknown.
+- Ignore comment-only pieces after a byte-slice literal's trailing comma when
+  counting elements; do not invent an additional destination byte.
+- Record ordinary indexed writes in buffer write effects for immediate closures;
+  unproved delayed writes must remain incomplete. Native-read write hooks alone
+  do not prove arbitrary captured indexed assignment behavior.

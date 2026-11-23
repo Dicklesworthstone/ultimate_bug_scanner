@@ -262,3 +262,33 @@ files and matched the reconstructed source/test blobs exactly. Comparison to the
 lost local files remains unavailable; this is recovery evidence, not an additional
 runtime pass. Keep `1b9j.6.17` in progress until its original independent,
 public, adjacent and canonical integrity/DSR gates are complete.
+
+### Go native destination buffers
+
+The updated `go-read-into-candidate.patch` targets `b27c0dcc`. It adds native
+`io.ReadFull`/`io.ReadAtLeast` and selected `Read` transfer paths, backing-cell
+identity, reslice/alias handling, no-read bounds, clean metadata, helper write
+contracts and escape/closure boundaries. Ten original regression methods are
+preserved and nine source/cache/public methods are added. This final combination
+is unexecuted and unvalidated; it is not ready for production activation.
+
+The fresh DSR baseline discovered ten original methods: nine executed, with 12
+failed assertions and one error; the optional native witness skipped. Log SHA-256
+`37a2e3a74821a882d8b84ccbd05c1112e572d3ed7c56740c69e507962aae0149`.
+No candidate/native/independent/public test completion was observed.
+
+Final combined patch: `636a11e95ac737b93cdf5c13d5090708bd5d215e`.
+The prior successful-edit reconstruction is preserved by
+`4bb8637c6f57bfc07fd4abb749148ab08671c3f1`; the later, originally unapplied
+summary integration is preserved by `d4a93003da5f79b3dbd36a1897b2d1c0783e6d7f`.
+Root independently checked exact forward/reverse replay of the final 45 hunks
+against immutable source/test blobs. This does not establish Python syntax,
+native Go semantics, final disk-byte identity or a passing DSR gate.
+
+Before activation, resolve literal byte-length proof risks (Go hex/octal escapes,
+raw-string CR handling and comments after trailing commas) and ordinary captured
+buffer-index writes. Run the unchanged native/independent corpus and added
+methods, affected Go suites, public reports and canonical integrity checks.
+Returned helper-local buffers and captured buffer-header replacement remain
+intentional incomplete-analysis boundaries. The detailed current checkpoint is
+`test-suite/patches/go-read-into-checkpoint.md`; keep `1b9j.6.18` in progress.

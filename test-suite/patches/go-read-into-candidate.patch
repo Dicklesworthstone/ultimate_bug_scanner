@@ -2,53 +2,52 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
 --- a/modules/helpers/ubs_core/analyzers/taint_go.py
 +++ b/modules/helpers/ubs_core/analyzers/taint_go.py
 @@ -44,7 +44,7 @@
-                     'html/template': 'template', 'text/template': 'template', 'os': 'os',
+                     'html/template': 'template', 'text/template': 'template', 'os': 'os', 'os/exec': 'exec',
                      'fmt': 'fmt', 'strings': 'strings', 'bytes': 'bytes', 'bufio': 'bufio'}
  _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
-+                   'io': {'ReadAll', 'ReadFull', 'ReadAtLeast'}, 'ioutil': {'ReadAll'},
 -                   'io': {'ReadAll'}, 'ioutil': {'ReadAll'},
++                   'io': {'ReadAll', 'ReadFull', 'ReadAtLeast'}, 'ioutil': {'ReadAll'},
                     'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
                     'os': {'Getenv', 'LookupEnv', 'Stdin'},
-                    'fmt': {'Scan', 'Scanln', 'Scanf', 'Fscan', 'Fscanln', 'Fscanf',
-@@ -53,6 +53,7 @@
-                    'bufio': {'NewReader', 'NewReaderSize', 'NewScanner',
+                    'exec': {'Command', 'CommandContext'},
+@@ -55,6 +55,7 @@
                               'ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'}}
  _ENVIRONMENT_OPERATIONS = frozenset({('os', 'Getenv'), ('os', 'LookupEnv')})
+ _COMMAND_OPERATIONS = frozenset({('exec', 'Command'), ('exec', 'CommandContext')})
 +_READ_INTO_OPERATIONS = frozenset({('io', 'ReadFull'), ('io', 'ReadAtLeast')})
  _SCAN_OPERATIONS = frozenset(('fmt', member) for member in _NATIVE_MEMBERS['fmt'])
  _READER_CONSTRUCTORS = {
      ('strings', 'NewReader'): 'strings-reader', ('bytes', 'NewReader'): 'bytes-reader',
-@@ -61,14 +62,15 @@
+@@ -63,7 +64,7 @@
      ('bufio', 'NewScanner'): 'scanner',
  }
  _BUFFER_SPLITTERS = frozenset(('bufio', member) for member in ('ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'))
-+_SOURCE_OPERATIONS = (_ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _READ_INTO_OPERATIONS
-+                      | _READER_CONSTRUCTORS.keys())
--_SOURCE_OPERATIONS = _ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _READER_CONSTRUCTORS.keys()
+-_CALLABLE_OPERATIONS = (_ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _COMMAND_OPERATIONS
++_CALLABLE_OPERATIONS = (_ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _COMMAND_OPERATIONS | _READ_INTO_OPERATIONS
+                         | _READER_CONSTRUCTORS.keys())
  _DECODER_METHODS = frozenset({'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
                                'UseNumber', 'DisallowUnknownFields', 'Buffered'})
- 
- 
- def _source_boundary(operations, action):
-     family = ('formatted input' if operations & _SCAN_OPERATIONS else
-+              'reader' if operations & (_READER_CONSTRUCTORS.keys() | _READ_INTO_OPERATIONS) else 'environment')
+@@ -72,7 +73,7 @@
+ def _callable_boundary(operations, action):
+     family = ('command' if operations & _COMMAND_OPERATIONS else
+               'formatted input' if operations & _SCAN_OPERATIONS else
 -              'reader' if operations & _READER_CONSTRUCTORS.keys() else 'environment')
++              'reader' if operations & (_READER_CONSTRUCTORS.keys() | _READ_INTO_OPERATIONS) else 'environment')
      return AnalysisLimit(f'Go {family} callable {action} is unsupported; analysis is incomplete')
  
  SOURCE_PATTERNS = [
-@@ -334,6 +336,28 @@
-     cell: str
+@@ -338,6 +339,28 @@
  
  
-+@dataclass(frozen=True)
+ @dataclass(frozen=True)
 +class _BufferKey:
 +    cell: str
 +
 +
 +@dataclass(frozen=True)
 +class _BufferInfo:
-+    # A byte slice's length is distinct from its shared backing contents.
-+    # Unknown lengths still permit conservative writes; unknown identities do not.
++    # Slice length belongs to the view, while _ValueInfo.pointers identify
++    # shared backing storage. A fresh string conversion copies its contents.
 +    length: int | None = None
 +    definite: bool = True
 +
@@ -62,10 +61,11 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
 +                       len(present) == len(buffers) and all(buffer.definite for buffer in present))
 +
 +
- @dataclass(frozen=True)
++@dataclass(frozen=True)
  class _DecoderKey:
      cell: str
-@@ -411,6 +435,7 @@
+ 
+@@ -414,6 +437,7 @@
      decoder: _DecoderInfo | None = None
      pointers: frozenset[_Target] = frozenset()
      reader: _ReaderInfo | None = None
@@ -73,17 +73,17 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
  
  
  def _join_value_info(*values):
-@@ -423,7 +448,8 @@
+@@ -426,7 +450,8 @@
      if not all(value.pointers for value in values):
          pointers = frozenset(replace(target, whole=False) for target in pointers)
      return _ValueInfo(_join_native(*(value.native for value in values)), decoder, pointers,
+-                      _join_readers(*(value.reader for value in values)))
 +                      _join_readers(*(value.reader for value in values)),
 +                      _join_buffers(*(value.buffer for value in values)))
--                      _join_readers(*(value.reader for value in values)))
  
  
  def _join_native(*values):
-@@ -497,6 +523,8 @@
+@@ -500,6 +525,8 @@
              result[name] = _join_decoders(*(state.get(name) for state in states))
          elif isinstance(name, _ReaderKey):
              result[name] = _join_readers(*(state.get(name) for state in states))
@@ -92,45 +92,49 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
          elif isinstance(name, _NativeKey):
              result[name] = _join_native(*(state.get(name) for state in states))
          elif isinstance(name, _ScanKindKey):
-@@ -758,7 +786,7 @@
+@@ -766,7 +793,7 @@
          match = re.match(r'[A-Za-z_]\w*\s+(.+)$', part, re.DOTALL)
          if match:
              typename = re.sub(r'\s+', '', match.group(1))
-+            reference = typename.startswith('*') or typename in {'any', 'interface{}', '[]byte', '[]uint8'}
 -            reference = typename.startswith('*') or typename in {'any', 'interface{}'}
++            reference = typename.startswith('*') or typename in {'any', 'interface{}', '[]byte', '[]uint8'}
          elif not re.fullmatch(r'[A-Za-z_]\w*', part):
              reference = False
          if reference:
-@@ -821,6 +849,7 @@
+@@ -834,6 +861,8 @@
      value_returns: tuple[_ValueInfo | None, ...] = ()
      native_writes: dict[tuple[int, tuple[str, ...]], _NativeInfo | None] = field(default_factory=dict)
      reader_scans: frozenset[int] = frozenset()
++    buffer_writes: frozenset[int] = frozenset()
 +    buffer_escapes: frozenset[int] = frozenset()
  
  
  def _join_summaries(summaries: list[_Summary]) -> _Summary:
-@@ -875,7 +904,10 @@
+@@ -888,7 +917,12 @@
              native_writes[index, path] = _join_native(native_writes.get((index, path)), native)
      reader_scans = frozenset(min(index, variadic) if variadic is not None else index
                               for summary in summaries for index in summary.reader_scans)
+-    return _Summary(returns, effects, variadic, writes, tuple(value_returns), native_writes, reader_scans)
++    buffer_writes = frozenset(min(index, variadic) if variadic is not None else index
++                              for summary in summaries for index in summary.buffer_writes)
 +    buffer_escapes = frozenset(min(index, variadic) if variadic is not None else index
 +                               for summary in summaries for index in summary.buffer_escapes)
 +    return _Summary(returns, effects, variadic, writes, tuple(value_returns), native_writes,
-+                    reader_scans, buffer_escapes)
--    return _Summary(returns, effects, variadic, writes, tuple(value_returns), native_writes, reader_scans)
++                    reader_scans, buffer_writes, buffer_escapes)
  
  
  @dataclass
-@@ -906,6 +938,8 @@
+@@ -919,6 +953,9 @@
          self.native_escapes: set[str] = set()
          self.scan_writes: dict[_Target, _Fact] = {}
          self.reader_scans: set[_ReaderOrigin] = set()
 +        self.buffer_escapes: set[_Target] = set()
 +        self.buffer_writes: dict[_Target, _Fact] = {}
++        self.buffer_cell_writes: set[str] = set()
          self.reader_cell_writes: dict[str, _ReaderInfo | None] = {}
          self.decoder_cell_writes: dict[str, _DecoderInfo | None] = {}
          self.decoder_returns: dict[str, _DecoderInfo | None] | None = None
-@@ -1022,6 +1056,78 @@
+@@ -1035,6 +1072,122 @@
          identity = self.native_identity(root, member, offset, scope)
          return _NativeInfo(frozenset({identity})) if identity is not None else _UNKNOWN_NATIVE
  
@@ -148,16 +152,20 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
 +            return None
 +
 +    def buffer_expression(self, expr, offset, state, scope):
-+        """Recognize builtin byte allocations and slices, without a general heap.
++        """Builtin byte slices retain backing identity independently of bindings.
 +
-+        Backing cells are allocation-site identities. Slice copies keep those
-+        cells; string conversions read a value snapshot. Named element types,
-+        fields and escaping local factories need additional type/heap proof.
++        Allocation sites are finite. Ordinary aliases and bounded slices keep
++        their backing cells; unknown conversions never gain native type proof.
++        Named element types and general heap storage remain outside this model.
 +        """
 +        expr, offset = self.unparenthesize(expr, offset)
 +        code = _masked_source(expr)
 +        if expr == 'nil' and 'nil' not in scope.bindings and 'nil' not in self.summaries:
 +            return _ValueInfo(buffer=_BufferInfo(0)), False, False
++        if re.fullmatch(r'[A-Za-z_]\w*', code):
++            buffer = state.get(_BufferKey(scope.bindings.get(expr, expr)))
++            if buffer is not None:
++                return _ValueInfo(pointers=self.pointers(expr, state, scope), buffer=buffer), False, False
 +        sliced = re.fullmatch(r'([A-Za-z_]\w*)\s*\[(.*)\]', code, re.DOTALL)
 +        if sliced:
 +            parts = _parts(sliced.group(2), ':')
@@ -170,7 +178,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
 +                length = max(0, high - low) if high is not None and low is not None else None
 +                return replace(info, buffer=replace(info.buffer, length=length)), False, False
 +        constructed = re.fullmatch(r'make\s*\((.*)\)', expr, re.DOTALL)
-+        length, fresh, zeroed = None, False, False
++        length, fresh, zeroed, definite = None, False, False, True
 +        if constructed and 'make' not in scope.bindings and 'make' not in self.summaries:
 +            pieces = [constructed.group(1)[start:end].strip()
 +                      for start, end in _parts(_masked_source(constructed.group(1)))]
@@ -189,27 +197,67 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
 +                literal = _string_literal(argument.strip())
 +                if literal is not None:
 +                    length, fresh = len(literal.encode('utf-8')), True
-+                elif (re.fullmatch(r'\s*string\s*\(.*\)\s*', argument, re.DOTALL)
-+                      and 'string' not in scope.bindings and 'string' not in self.summaries):
++                else:
 +                    fresh = True
++                    definite = (self.scan_kind(argument, offset + converted.end(), state, scope) == 'text'
++                                or bool(re.fullmatch(r'\s*string\s*\(.*\)\s*', argument, re.DOTALL))
++                                and 'string' not in scope.bindings and 'string' not in self.summaries)
 +        literal = re.fullmatch(r'\[\]\s*(byte|uint8)\s*\{(.*)\}', code, re.DOTALL)
 +        if literal and self.scan_type('[]' + literal.group(1), scope) == 'text':
-+            items = literal.group(2).strip().rstrip(',').strip()
-+            length = (0 if not items else len(_parts(items))) if ':' not in items else None
++            # Count source elements, not masked rune contents: {'x'} is not
++            # empty after the lexer replaces the rune with spaces.
++            items = expr[literal.start(2):literal.end(2)].strip().rstrip(',').strip()
++            masked_items = _masked_source(items)
++            length = (0 if not _masked_source(items, strings=False).strip()
++                      else max(1, len(_parts(masked_items)))) if ':' not in masked_items else None
 +            fresh = True
 +        if fresh:
 +            target = _Target(f'@byte-buffer:{offset}')
-+            return _ValueInfo(pointers=frozenset({target}), buffer=_BufferInfo(length)), True, zeroed
++            return _ValueInfo(pointers=frozenset({target}), buffer=_BufferInfo(length, definite)), True, zeroed
 +        return None, False, False
 +
 +    def escape_buffer(self, info):
 +        if info is not None and info.buffer is not None:
 +            self.buffer_escapes.update(info.pointers)
 +
++    def write_buffer(self, info, payload, state, label):
++        if (info is None or info.buffer is None or not info.buffer.definite or not info.pointers
++                or any(not target.whole or target.path or target.indexed for target in info.pointers)):
++            raise AnalysisLimit('Go reader buffer destination is unsupported; analysis is incomplete')
++        escaped_cells = {target.cell for target in self.buffer_escapes}
++        global_backing = {target.cell for cell in self.global_cells
++                          for target in state.get(_PointerKey(cell), ())}
++        if any(target.cell in escaped_cells | global_backing | self.global_cells for target in info.pointers):
++            raise AnalysisLimit('Go reader buffer escape or package mutation is unsupported; analysis is incomplete')
++        self.write_targets(info.pointers, payload, state, label)
++        for target in info.pointers:
++            self.buffer_writes[target] = _join(self.buffer_writes.get(target, _CLEAN), payload)
++
++    def read_into(self, operation, arguments, values, state, scope, *, payload=None):
++        direct = operation == 'Read'
++        expected = 1 if direct else 3 if operation == 'ReadAtLeast' else 2
++        if len(arguments) != expected or any(expr.rstrip().endswith('...') for expr, _ in arguments):
++            raise AnalysisLimit('Go reader buffer argument shape is unsupported; analysis is incomplete')
++        destination = 0 if direct else 1
++        info = self.value_info(*arguments[destination], state, scope)
++        length = info.buffer.length if info is not None and info.buffer is not None and info.buffer.definite else None
++        minimum = self.integer_literal(arguments[2][0]) if operation == 'ReadAtLeast' else None
++        # ReadAtLeast checks the destination bounds before invoking Reader;
++        # ReadFull delegates with min=len(buf). These no-read paths also hold
++        # for a custom Reader, whose method is never executed.
++        if (not direct and (length == 0 or minimum is not None and (
++                minimum <= 0 or length is not None and minimum > length))):
++            return
++        if direct and length == 0:
++            return
++        if payload is None:
++            payload = self.reader_payload(*arguments[0], values[0], state, scope, require=True)
++        self.write_buffer(info, payload, state, 'reader.' + operation)
++
      def check_source_storage(self, code, offset, state, scope):
          # Scalar native identities and selected helper results are modeled.
          # Composite values are not a callable heap: losing a getter inside a
-@@ -1078,12 +1184,16 @@
+@@ -1091,12 +1244,16 @@
                  if (stored and summary is not None and any(info is not None and info.decoder is not None
                                                             for info in summary.value_returns)):
                      raise AnalysisLimit('Go decoder aggregate storage is unsupported; analysis is incomplete')
@@ -226,34 +274,341 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ub
                  if info is not None and info.reader is not None:
                      raise AnalysisLimit('Go reader aggregate storage is unsupported; analysis is incomplete')
                  if info is not None and info.decoder is not None:
-@@ -1115,7 +1225,8 @@
+@@ -1108,6 +1265,8 @@
+ 
+     def value_info(self, expr, offset, state, scope):
+         expr, offset = self.unparenthesize(expr, offset)
++        if expr == 'nil' and 'nil' not in scope.bindings and 'nil' not in self.summaries:
++            return _ValueInfo(buffer=_BufferInfo(0))
+         closure = self.closure_results.get(offset)
+         if closure is not None:
+             return closure[1][0] if closure[1] else _ValueInfo()
+@@ -1128,7 +1287,8 @@
                                       frozenset({'stdin'}), frozenset({_ReaderOrigin((-1, -1))}))
              elif re.fullmatch(r'(?:r|req|request)\s*\.\s*Body', code):
                  reader = _ReaderInfo(frozenset({_Trace(code, path=(code,))}), frozenset({'request'}))
+-            return _ValueInfo(native, decoder, self.pointers(expr, state, scope), reader)
 +            buffer = state.get(_BufferKey(cell)) if name.group(2) is None else None
 +            return _ValueInfo(native, decoder, self.pointers(expr, state, scope), reader, buffer)
--            return _ValueInfo(native, decoder, self.pointers(expr, state, scope), reader)
          call = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
          if call:
              end = _pairs(code).get(call.end() - 1)
-@@ -1131,7 +1242,8 @@
+@@ -1144,7 +1304,8 @@
              owner = self.value_info(expr[:selection.start()], offset, state, scope)
              if owner is not None and owner.decoder is not None and owner.decoder.methods == {''}:
                  return _ValueInfo(decoder=replace(owner.decoder, methods=frozenset({selection.group(1)})))
+-        return _ValueInfo(pointers=self.pointers(expr, state, scope))
 +        buffer, _fresh, _zeroed = self.buffer_expression(expr, offset, state, scope)
 +        return buffer if buffer is not None else _ValueInfo(pointers=self.pointers(expr, state, scope))
--        return _ValueInfo(pointers=self.pointers(expr, state, scope))
  
      def reader_payload(self, expr, offset, fact, state, scope, *, require=False):
          """Reader handles carry contents separately from ordinary value facts."""
+@@ -1200,6 +1361,9 @@
+                     return ()
+                 raise AnalysisLimit('Go custom scanner split is unsupported; analysis is incomplete')
+         elif 'scanner' not in reader.kinds:
++            if method == 'Read':
++                self.read_into(method, arguments, values, state, scope, payload=reader.source)
++                return (_CLEAN, _CLEAN)
+             if method in {'ReadString', 'ReadBytes', 'ReadSlice', 'Peek', 'ReadByte'}:
+                 return (reader.source, _CLEAN)
+             if method in {'ReadLine', 'ReadRune'}:
+@@ -1389,6 +1553,8 @@
+                 native = info.native if info is not None else None
+                 self.native_writes[key] = _join_native(self.native_writes.get(key), native)
+             if target.path or target.indexed:
++                if info is not None and info.buffer is not None:
++                    self.escape_buffer(info)
+                 if info is not None and info.native is not None and info.native.operations & _CALLABLE_OPERATIONS:
+                     raise _callable_boundary(info.native.operations, 'field/index storage')
+                 if info is not None and info.reader is not None:
+@@ -1421,6 +1587,11 @@
+             self.reader_cell_writes[target.cell] = (
+                 _join_readers(self.reader_cell_writes[target.cell], replacement)
+                 if target.cell in self.reader_cell_writes else replacement)
++            buffer_key = _BufferKey(target.cell)
++            replacement = info.buffer if info is not None else None
++            if replacement is not None or state.get(buffer_key) is not None:
++                self.buffer_cell_writes.add(target.cell)
++            state[buffer_key] = replacement if strong else _join_buffers(state.get(buffer_key), replacement)
+ 
+     def native_call(self, expression, match, state, scope, *, whole=False):
+         """Known result shapes and output-parameter effects, never name-only Decode."""
+@@ -1447,6 +1618,11 @@
+         constructor = bool(operations) and operations <= {('json', 'NewDecoder'), ('xml', 'NewDecoder')}
+         unmarshal = bool(operations) and operations <= {('json', 'Unmarshal'), ('xml', 'Unmarshal')}
+         readall = bool(operations) and operations <= {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
++        readinto = operations & _READ_INTO_OPERATIONS
++        size_builtin = (member is None and root in {'len', 'cap'}
++                        and root not in scope.bindings and root not in self.summaries)
++        string_builtin = (member is None and root == 'string'
++                          and root not in scope.bindings and root not in self.summaries)
+         sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
+         environment = operations & _ENVIRONMENT_OPERATIONS
+         scanning = operations & _SCAN_OPERATIONS
+@@ -1474,7 +1650,8 @@
+                 outer_end = pairs.get(end + chain.end())
+                 if outer_end is None:
+                     return None
+-        if not (constructor or unmarshal or readall or sanitizer or environment or scanning or commands
++        if not (constructor or unmarshal or readall or readinto or size_builtin or string_builtin
++                or sanitizer or environment or scanning or commands
+                 or unbound_command or method
+                 or reader_constructor or reader_method):
+             return None
+@@ -1502,6 +1679,10 @@
+         values, targets = arguments(match.end(), end)
+         raw_arguments = [(expr[match.end() + left:match.end() + right], offset + match.end() + left)
+                          for left, right in _parts(code[match.end():end])]
++        if size_builtin:
++            return finish(end, (_CLEAN,))
++        if string_builtin:
++            return finish(end, (_join(*values),))
+         if unbound_command:
+             # Importless editor fragments retain conventional native names.
+             # An explicit but incomplete import list cannot prove either a
+@@ -1537,6 +1718,7 @@
+         environment = operations & _ENVIRONMENT_OPERATIONS
+         scanning = operations & _SCAN_OPERATIONS
+         commands = operations & _COMMAND_OPERATIONS
++        readinto = operations & _READ_INTO_OPERATIONS
+         if commands:
+             # Constructor identity belongs to its file-local import or saved
+             # callable. A same-spelled custom object does not execute commands.
+@@ -1569,6 +1751,11 @@
+                 raise AnalysisLimit('Go reader constructor argument alternatives are unsupported; analysis is incomplete')
+             payload = (self.reader_payload(*raw_arguments[0], values[0], state, scope, require=True)
+                        if wrapped else values[0])
++            if any(package == 'bytes' and operation in {'NewReader', 'NewBuffer'}
++                   for package, operation in reader_constructor):
++                # bytes readers retain a live backing slice. A later native
++                # write would invalidate their snapshotted payload contract.
++                self.escape_buffer(self.value_info(*raw_arguments[0], state, scope))
+             input_reader = _ReaderInfo(payload, kinds, frozenset({_ReaderOrigin((result_offset, result_offset))}))
+             if not chain:
+                 return finish(end, (_CLEAN,), reader=input_reader)
+@@ -1590,6 +1777,11 @@
+                 raise AnalysisLimit('Go formatted input unknown callable alternative is unsupported; analysis is incomplete')
+             self.scan_input(scanning, raw_arguments, values, targets, state, scope)
+             return finish(end, (_CLEAN, _CLEAN))
++        if readinto:
++            if native.unknown or operations != readinto or len(readinto) != 1:
++                raise AnalysisLimit('Go reader callable alternative is unsupported; analysis is incomplete')
++            self.read_into(next(iter(readinto))[1], raw_arguments, values, state, scope)
++            return finish(end, (_CLEAN, _CLEAN))
+         if environment:
+             if len(values) != 1:
+                 return finish(end, (fallback,))
+@@ -1717,6 +1909,10 @@
+             if re.fullmatch(r'[A-Za-z_]\w*', variable):
+                 infos[index] = _join_value_info(infos[index], self.value_info(expression, origin, state, scope))
+                 arguments[index] = _join(arguments[index], state.get(scope.bindings.get(variable, variable), _CLEAN))
++            info = infos[index]
++            if (info is not None and info.buffer is not None and
++                    {target.cell for target in info.pointers} & {target.cell for target in self.buffer_escapes}):
++                infos[index] = replace(info, buffer=replace(info.buffer, definite=False))
+         summary = self.summaries[name]
+         if summary.variadic is not None:
+             arguments = [*arguments[:summary.variadic], _join(*arguments[summary.variadic:])]
+@@ -1734,8 +1930,15 @@
+             self.effect(call_offset, label, self.instantiate(dependent, arguments, name, infos))
+         for (index, path), fact in summary.writes.items():
+             if index < len(targets):
++                payload = self.instantiate(fact, arguments, name, infos)
++                if index in summary.buffer_writes:
++                    self.write_buffer(infos[index], payload, state, name + '()')
++                    continue
+                 destinations = frozenset(_field_target(target, path) for target in targets[index])
+-                self.write_targets(destinations, self.instantiate(fact, arguments, name, infos), state, name + '()')
++                self.write_targets(destinations, payload, state, name + '()')
++        for index in summary.buffer_escapes:
++            if index < len(infos):
++                self.escape_buffer(infos[index])
+         for (index, path), native in summary.native_writes.items():
+             if index >= len(targets):
+                 continue
+@@ -1762,6 +1965,8 @@
+             if info is None:
+                 result_infos.append(None)
+                 continue
++            if info.buffer is not None and any(target.parameter is None for target in info.pointers):
++                raise AnalysisLimit('Go helper-local buffer result transport is unsupported; analysis is incomplete')
+             decoder = (replace(info.decoder, source=self.instantiate(info.decoder.source, arguments, name, infos))
+                        if info.decoder is not None else None)
+             reader = info.reader
+@@ -1942,6 +2147,8 @@
+                             closure_state[key] = replace(native, definite=False)
+                         elif isinstance(key, _DecoderKey) and native is not None:
+                             closure_state[key] = replace(native, definite=False)
++                        elif isinstance(key, _BufferKey) and native is not None:
++                            closure_state[key] = replace(native, definite=False)
+                 for index, parameter in enumerate(parameters):
+                     if parameter:
+                         key = closure_scope.declare(parameter, offset + match.start())
+@@ -1962,12 +2169,15 @@
+                                 closure_state[_DecoderKey(key)] = info.decoder
+                             if info.reader is not None:
+                                 closure_state[_ReaderKey(key)] = info.reader
++                            if info.buffer is not None:
++                                closure_state[_BufferKey(key)] = info.buffer
+                             closure_state[_PointerKey(key)] = info.pointers
+                             if info.pointers and all(target.parameter is None for target in info.pointers):
+                                 closure_state[key] = _CLEAN
+                 nested = _Analysis(self.source, self.code, self.rule, self.summaries, self.imports,
+                                    self.uncertain_globals, self.global_cells, self.resolve_summary)
+                 nested.native_escapes = set(self.native_escapes)
++                nested.buffer_escapes = set(self.buffer_escapes)
+                 result = code[param_end + 1:opening].strip()
+                 nested.named_returns = (_parameter_names(result[1:-1])
+                                         if result.startswith('(') and result.endswith(')')
+@@ -1992,6 +2202,16 @@
+                 # captured writes cannot be transported by the outer call.
+                 for (sink_offset, label), fact in nested.effects.items():
+                     self.effect(sink_offset, label, fact)
++                captured_buffers = {target: fact for target, fact in nested.buffer_writes.items()
++                                    if target.cell in state}
++                if captured_buffers and not immediate:
++                    raise AnalysisLimit('Go delayed reader buffer writes are unsupported; analysis is incomplete')
++                if any(cell in state for cell in nested.buffer_cell_writes):
++                    raise AnalysisLimit('Go captured buffer replacement is unsupported; analysis is incomplete')
++                self.buffer_escapes.update(nested.buffer_escapes)
++                for target, fact in captured_buffers.items():
++                    self.write_targets((target,), fact, state, 'closure reader')
++                    self.buffer_writes[target] = _join(self.buffer_writes.get(target, _CLEAN), fact)
+                 if immediate:
+                     for cell in nested.native_mutations & enclosing_sources.keys():
+                         replacement = (closure_flow.normal.get(_NativeKey(cell))
+@@ -2118,6 +2338,7 @@
+                                 match.group(2) is None and match.group(1) in self.summaries
+                                 and match.group(1) not in scope.bindings):
+                             info = self.value_info(argument, offset + match.end() + start, state, scope)
++                            self.escape_buffer(info)
+                             if info is not None and ((info.reader is not None and info.reader.kinds != {'request'}) or any(
+                                     state.get(_ReaderKey(target.cell)) is not None for target in info.pointers)):
+                                 raise AnalysisLimit('Go reader opaque-call transport is unsupported; analysis is incomplete')
+@@ -2136,6 +2357,15 @@
+                 continue
+             info = self.value_info(match.group(1) + '.' + match.group(2), offset + match.start(), state, scope)
+             if info.reader is not None:
++                if match.group(3) == 'Read':
++                    end = pairs.get(match.end() - 1)
++                    if end is not None:
++                        arguments = [(expr[match.end() + left:match.end() + right], offset + match.end() + left)
++                                     for left, right in _parts(code[match.end():end])]
++                        values = [self.value(argument, origin, state, scope) for argument, origin in arguments]
++                        self.read_into('Read', arguments, values, state, scope, payload=info.reader.source)
++                        cover(match.start(), end + 1)
++                    continue
+                 if match.group(3) not in {'Close', 'Name', 'Fd', 'Stat'}:
+                     raise AnalysisLimit('Go reader ' + match.group(3) + ' mutation or protocol is unsupported; analysis is incomplete')
+                 end = pairs.get(match.end() - 1)
+@@ -2206,7 +2436,19 @@
+                 facts.append(_field_fact(state, target.cell, target.path + path))
+                 if not target.path:
+                     pending.extend(state.get(_PointerKey(target.cell), ()))
+-        return _join(*facts)
++        fact = _join(*facts)
++        buffer, fresh, zeroed = self.buffer_expression(expr, offset, state, scope)
++        if buffer is not None and buffer.buffer is not None:
++            if fresh:
++                payload = _CLEAN if zeroed else fact
++                for target in buffer.pointers:
++                    # Repeated allocations at a loop site are summarized by
++                    # one cell; never erase an alias to an earlier iteration.
++                    state[target.cell] = _join(state.get(target.cell, _CLEAN), payload)
++                fact = payload
++            if buffer.buffer.definite and buffer.buffer.length == 0:
++                return _CLEAN
++        return fact
+ 
+     def simple(self, start: int, end: int, state, scope, declaration_kind: str = '') -> _Flow:
+         prefix = declaration_kind + ' ' if declaration_kind else ''
+@@ -2317,6 +2559,10 @@
+                 updates[_PointerKey(key)] = pointers
+                 updates[_DecoderKey(key)] = decoder
+                 updates[_ReaderKey(key)] = info.reader if info is not None else None
++                buffer = info.buffer if info is not None else None
++                if buffer is not None or state.get(_BufferKey(key)) is not None:
++                    self.buffer_cell_writes.add(key)
++                updates[_BufferKey(key)] = buffer
+                 updates[_NativeKey(key)] = native
+                 declared_type = re.match(r'\s*(?:var|const)\s+'
+                                          r'[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s+(.+?)\s*=', code, re.DOTALL)
+@@ -2346,6 +2592,9 @@
+                 state[_NativeKey(key)] = _UNKNOWN_NATIVE
+                 typename = code[declaration.end(1):].strip()
+                 state[_ScanKindKey(key)] = self.scan_type(typename, scope)
++                if (re.sub(r'\s+', '', typename) in {'[]byte', '[]uint8'}
++                        and self.scan_type(typename, scope) == 'text'):
++                    state[_BufferKey(key)] = _BufferInfo(0)
+         self.value(self.source[start:end], start, state, scope)
+         return _Flow(state)
+ 
+@@ -2508,11 +2757,11 @@
+             return bottoms[name]
+         signature = tuple((info.native, (info.decoder.definite, info.decoder.methods) if info.decoder is not None else None,
+                            (info.reader.kinds, info.reader.scanned, info.reader.definite, info.reader.methods)
+-                           if info.reader is not None else None)
++                           if info.reader is not None else None, info.buffer)
+                           for info in infos[:parameter_counts[name]])
+-        signature += ((_UNKNOWN_NATIVE, None, None),) * (parameter_counts[name] - len(signature))
+-        if all(native == _UNKNOWN_NATIVE and decoder is None and reader is None
+-               for native, decoder, reader in signature):
++        signature += ((_UNKNOWN_NATIVE, None, None, None),) * (parameter_counts[name] - len(signature))
++        if all(native == _UNKNOWN_NATIVE and decoder is None and reader is None and buffer is None
++               for native, decoder, reader, buffer in signature):
+             return summaries[name]
+         key = (name, signature)
+         dependents[key].add(current)
+@@ -2560,7 +2809,8 @@
+                 if parameter and parameter != '_':
+                     key = scope.declare(parameter, function.start)
+                     state[key] = frozenset({_Trace(parameter, index, (parameter,))})
+-                    native, decoder, reader = signature[index] if signature is not None else (_UNKNOWN_NATIVE, None, None)
++                    native, decoder, reader, buffer = (signature[index] if signature is not None
++                                                       else (_UNKNOWN_NATIVE, None, None, None))
+                     state[_NativeKey(key)] = native
+                     typename = function.parameter_types[index] if index < len(function.parameter_types) else ''
+                     state[_ScanKindKey(key)] = analysis.scan_type(
+@@ -2576,6 +2826,18 @@
+                             frozenset({_ReaderOrigin((function.start, index), index)}), scanned, definite, methods)
+                     if index in function.reference_parameters:
+                         state[_PointerKey(key)] = frozenset({_Target(key, index)})
++                    if (buffer is None and typename in {'[]byte', '[]uint8'}
++                            and analysis.scan_type(typename, scope) == 'text'):
++                        buffer = _BufferInfo()
++                    if buffer is not None:
++                        # A parameter's slice header may be rebound without
++                        # moving the storage observed by a previously saved
++                        # alias. Symbolic backing cells are separate bindings.
++                        backing = f'@byte-buffer-param:{function.start}:{index}'
++                        state[backing] = state[key]
++                        state[key] = _CLEAN
++                        state[_BufferKey(key)] = buffer
++                        state[_PointerKey(key)] = frozenset({_Target(backing, index)})
+             for result in function.results:
+                 if result:
+                     key = scope.declare(result, function.start)
+@@ -2590,7 +2852,11 @@
+             variants.append(_Summary(analysis.returns, analysis.effects, function.variadic,
+                                      analysis.writes, analysis.value_returns, analysis.native_writes,
+                                      frozenset(origin.parameter for origin in analysis.reader_scans
+-                                               if origin.parameter is not None)))
++                                               if origin.parameter is not None),
++                                     frozenset(target.parameter for target in analysis.buffer_writes
++                                               if target.parameter is not None),
++                                     frozenset(target.parameter for target in analysis.buffer_escapes
++                                               if target.parameter is not None)))
+         newly_uncertain = (mutations & global_cells) - uncertain_globals
+         if newly_uncertain:
+             # Package callbacks are mutable cells. A write in any selected
 diff --git a/test-suite/quality/test_taint_go_decoding.py b/test-suite/quality/test_taint_go_decoding.py
 --- a/test-suite/quality/test_taint_go_decoding.py
 +++ b/test-suite/quality/test_taint_go_decoding.py
-@@ -231,6 +231,137 @@
-                                 'fmt.Fprint(w, value) // output\nfmt.Fprint(w, n, err)',
-                                 [('query', 'sql', 'db.Query'), ('command', 'command', 'exec.Command'),
-                                  ('output', 'xss', 'fmt.Fprint')])
-+
+@@ -241,6 +241,205 @@
+                                 'db.Query(value) // query\nfmt.Fprint(w, n, err)',
+                                 [('query', 'sql', 'db.Query')])
+ 
 +    def test_readinto_request_bytes_reach_sinks_but_count_and_error_do_not(self):
 +        for operation, extra in [('ReadFull', ''), ('ReadAtLeast', ', 1')]:
 +            with self.subTest(operation=operation):
@@ -384,6 +739,141 @@ diff --git a/test-suite/quality/test_taint_go_decoding.py b/test-suite/quality/t
 +                          for number, line in enumerate(source.splitlines(), 1)
 +                          if any('// ' + marker in line for marker in ('payload', 'minimum', 'short')))
 +        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings), expected, findings)
++
++    def test_readinto_native_reader_methods_and_clean_results(self):
++        for reader in (
++            'r.Body.Read(buffer)',
++            'os.Stdin.Read(buffer)',
++            'source.Read(buffer)',
++            'read(buffer)',
++        ):
++            with self.subTest(reader=reader):
++                self.check_scan('buffer := make([]byte, 8)\n'
++                                'source := strings.NewReader(r.FormValue("q"))\n'
++                                'read := source.Read\nn, err := ' + reader + '\n'
++                                'db.Query(string(buffer)) // query\n'
++                                'fmt.Fprint(w, n, err, len(buffer), cap(buffer))',
++                                [('query', 'sql', 'db.Query')],
++                                imports='import ("os"; "strings"; "fmt")')
++
++    def test_readinto_nil_and_rune_literal_lengths(self):
++        self.check_scan('var empty []byte\nio.ReadFull(custom, empty)\n'
++                        'db.Query(string(empty))\n'
++                        'one := []byte{\'x\'}\nio.ReadAtLeast(custom, one, 2)\n'
++                        'db.Query(string(one))\n'
++                        'io.ReadFull(r.Body, one)\ndb.Query(string(one)) // query',
++                        [('query', 'sql', 'db.Query')], imports='import "io"')
++
++    def test_readinto_zero_length_views_stay_empty_after_backing_write(self):
++        self.check_scan('empty := make([]byte, 0, 8)\n'
++                        'full := empty[:8]\nsnapshot := string(full)\n'
++                        'io.ReadFull(r.Body, full)\n'
++                        'db.Query(string(full)) // query\n'
++                        'db.Query(string(empty))\ndb.Query(string(full[:0]))\n'
++                        'db.Query(snapshot)\nfmt.Fprint(w, len(full), cap(full))',
++                        [('query', 'sql', 'db.Query')], imports='import ("io"; "fmt")')
++
++    def test_readinto_helper_aliases_survive_parameter_rebinding(self):
++        self.check_scan('buffer := make([]byte, 8)\nrelay(r.Body, buffer)\n'
++                        'db.Query(string(buffer)) // query\n'
++                        'other := make([]byte, 8)\nlocal(r.Body, other)\n'
++                        'db.Query(string(other))', [('query', 'sql', 'db.Query')],
++                        imports='import "io"', helpers='''
++                            func fill(source io.Reader, destination []byte) {
++                                alias := destination
++                                destination = make([]byte, 8)
++                                io.ReadFull(source, alias)
++                            }
++                            func relay(source io.Reader, destination []byte) { fill(source, destination) }
++                            func local(source io.Reader, destination []byte) {
++                                destination = make([]byte, 8)
++                                io.ReadFull(source, destination)
++                            }
++                        ''')
++
++    def test_readinto_returned_parameter_views_keep_backing_identity(self):
++        self.check_scan('buffer := make([]byte, 8)\nalias := tail(buffer)\n'
++                        'io.ReadFull(r.Body, alias)\ndb.Query(string(buffer)) // query',
++                        [('query', 'sql', 'db.Query')], imports='import "io"',
++                        helpers='func tail(buffer []byte) []byte { return buffer[1:] }')
++
++    def test_readinto_immediate_closure_writes_and_unrelated_scalar_assignment(self):
++        for write in (
++            'func() { io.ReadFull(r.Body, buffer) }()',
++            'func(out []byte) { io.ReadFull(r.Body, out) }(buffer)',
++        ):
++            with self.subTest(write=write):
++                self.check_scan('buffer := make([]byte, 8)\nmetadata := 0\n'
++                                'func() { metadata = 1 }()\n' + write + '\n'
++                                'db.Query(string(buffer)) // query\nfmt.Fprint(w, metadata)',
++                                [('query', 'sql', 'db.Query')], imports='import ("io"; "fmt")')
++
+     def test_reader_scan_family_tracks_bodies_and_native_stdin(self):
+         for operation, separator in [('Fscan', ''), ('Fscanln', ''), ('Fscanf', '"%s", ')]:
+             for reader in ('r.Body', 'os.Stdin', 'strings.NewReader(r.FormValue("query"))'):
+@@ -899,6 +1098,27 @@
+ class BufferedReaderCacheTests(packages.PackageTestCase):
+     scan_main = packages.PackageCacheTests.scan_main
  
-     def test_string_scan_family_uses_input_slot_and_keeps_metadata_clean(self):
-         for operation, arguments in [('Sscan', 'input, &value'), ('Sscanln', 'input, &value'),
++    def test_readinto_factory_changes_invalidate_cached_buffer_findings(self):
++        helper = self.source('helper.go', 'package app\nimport ("strings"; "io")\n'
++                             'func open() io.Reader { return strings.NewReader("fixed") }\n')
++        source = ('package app\nimport "io"\nfunc h() {\n'
++                  'buffer := make([]byte, 8)\nio.ReadFull(open(), buffer)\n'
++                  'db.Query(string(buffer))\n}\n')
++        handler = self.source('handler.go', source)
++        (self.root / 'unselected.go').write_text('package app\nfunc other() { db.Query(r.FormValue("q")) }\n')
++        self.assertEqual(self.scan_main()[0], [])
++        warm, stats = self.scan_main()
++        self.assertEqual(warm, [])
++        self.assertEqual(stats['hits'], 2, stats)
++        self.source('helper.go', 'package app\nimport ("os"; "io")\n'
++                    'func open() io.Reader { return os.Stdin }\n')
++        changed, stats = self.scan_main()
++        self.assertEqual([(Path(row['path']).name, row['line'], row['col'], row['rule']) for row in changed],
++                         [('handler.go', 6, 1, 'go.taint.sql')], changed)
++        self.assertEqual(stats['misses'], 2, stats)
++        self.assertEqual(self.scan_main([helper])[0], [])
++        self.assertEqual(self.scan_main([helper, handler])[0], changed)
++
+     def test_reader_factory_changes_invalidate_warm_package_findings(self):
+         helper = self.source('helper.go', 'package app\nimport ("strings"; "io")\n'
+                              'func open() io.Reader { return strings.NewReader("fixed") }\n')
+@@ -929,6 +1149,12 @@
+     def test_public_controls_and_protocol_boundaries(self):
+         self.check_public_cases(4, 8)
+ 
++    def test_readinto_public_payloads_and_no_read_controls(self):
++        self.check_public_cases(8, 12)
++
++    def test_readinto_public_suppression_snapshots_and_retained_partial_findings(self):
++        self.check_public_cases(12, 16)
++
+     def check_public_cases(self, start, end):
+         from test_keep_temp import prevent_child_deletion
+ 
+@@ -950,6 +1176,24 @@
+             ('custom', 'value, err := io.ReadAll(customReader)\ndb.Query(string(value))', False, True),
+             ('mutation', 'reader := bufio.NewReader(os.Stdin)\nreader.Reset(strings.NewReader("fixed"))',
+              False, True),
++            ('readfull', 'buffer := make([]byte, 8)\nalias := buffer\n'
++             'n, err := io.ReadFull(os.Stdin, alias)\ndb.Query(string(buffer)) // query\n'
++             'fmt.Fprint(w, n, err)', True, False),
++            ('readminimum', 'buffer := make([]byte, 8)\n'
++             'io.ReadAtLeast(r.Body, buffer, 1)\ndb.Query(string(buffer)) // query', True, False),
++            ('readmethod', 'buffer := make([]byte, 8)\n'
++             'n, err := r.Body.Read(buffer)\ndb.Query(string(buffer)) // query\n'
++             'fmt.Fprint(w, n, err)', True, False),
++            ('noread', 'buffer := make([]byte, 8)\nio.ReadAtLeast(customReader, buffer, 9)\n'
++             'db.Query(string(buffer))', False, False),
++            ('read-suppressed', 'buffer := make([]byte, 8)\nio.ReadFull(os.Stdin, buffer)\n'
++             'db.Query(string(buffer)) // ubs:ignore[go.taint.sql]', False, False),
++            ('read-partial', 'buffer := make([]byte, 8)\nio.ReadFull(os.Stdin, buffer)\n'
++             'db.Query(string(buffer)) // query\n'
++             'other := make([]byte, 8)\nio.ReadFull(customReader, other)', True, True),
++            ('unknown-buffer', 'buffer := external()\nio.ReadFull(r.Body, buffer)', False, True),
++            ('read-snapshot', 'buffer := make([]byte, 8)\nsnapshot := string(buffer)\n'
++             'io.ReadFull(os.Stdin, buffer)\ndb.Query(snapshot)', False, False),
+         )
+         artifacts = packages.ROOT / 'test-suite' / 'artifacts'
+         artifacts.mkdir(parents=True, exist_ok=True)

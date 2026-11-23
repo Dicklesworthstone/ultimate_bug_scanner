@@ -82,11 +82,11 @@ _STDIN_CSV_PARSERS = frozenset({'csv.reader', 'csv.DictReader'})
 _STDIN_PARSER_CARRIERS = (_STDIN_EAGER_PARSERS | _STDIN_CSV_PARSERS | _STDIN_STREAMS
                           | frozenset(_STDIN_READERS)
                           | {'json', 'tomllib', 'csv', 'sys', 'iter', 'builtins.iter', 'zip', 'builtins.zip',
-                             'enumerate', 'builtins.enumerate'})
+                             'enumerate', 'builtins.enumerate', 'filter', 'builtins.filter'})
 _STDIN_OPAQUE_ARGUMENTS = '@stdin:opaque-arguments'
 _SOURCE_MEMBERS = {'os': frozenset({'getenv', 'getenvb', 'environ', 'environb'}),
                    'sys': frozenset({'argv', 'stdin', '__stdin__'}),
-                   'builtins': frozenset({'iter', 'list', 'tuple', 'next', 'zip', 'enumerate', 'bytearray'}),
+                   'builtins': frozenset({'iter', 'list', 'tuple', 'next', 'zip', 'enumerate', 'filter', 'bytearray'}),
                    'json': frozenset({'load', 'loads', 'JSONDecoder', '_default_decoder'}),
                    'tomllib': frozenset({'load', 'loads'}),
                    **{stream: methods | {'__iter__', 'buffer', 'raw', 'readinto', 'readinto1'}
@@ -613,6 +613,7 @@ class _ZipIterator:
     fallible_at_end: bool = False
     native_kind: str = 'zip'
     exhaustible: bool = True
+    native_streams: tuple[str, ...] = ()
 
 
 def _literal_choices(binding):
@@ -1128,7 +1129,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'filter', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -2048,6 +2049,9 @@ class FunctionSummary:
     stdin_iterator_parameters: frozenset[str] = frozenset()
     # A symbolic zip input must be revisited with its actual native iterator.
     zip_parameters: frozenset[str] = frozenset()
+    # Filter predicates and stream protocols need their own operation-specific
+    # obligation; a generic zip diagnostic cannot identify an unresolved filter.
+    filter_parameters: frozenset[str] = frozenset()
     # A generic prepared-request helper must be revisited with native input
     # identities. Keep that obligation instead of inventing a clean Request.
     http_parameters: frozenset[str] = frozenset()
@@ -2187,6 +2191,7 @@ class _Flow:
         self.buffer_parameters = set()
         self.stdin_iterator_parameters = set()
         self.zip_parameters = set()
+        self.filter_parameters = set()
         self.http_parameters = set()
         self.generator_predicate_parameters = set()
         self.generator_predicate_incomplete = False
@@ -4915,6 +4920,53 @@ class _Flow:
             elements.append((element, incoming, NO_REFERENCES))
         return tuple(elements), len(elements), references, False
 
+    def filter_value(self, node, state, inputs):
+        """Keep stdin items through an exact native None predicate.
+
+        File iteration yields nonempty lines; EOF raises StopIteration.
+        None therefore preserves every line without invoking a callback.
+        Creating the filter acquires the iterator without reading an item.
+        """
+        positions = self.call_positions(node, inputs.arguments, state)
+        if None in inputs.keywords or any(isinstance(expression, (ast.Starred, _ArgumentExpansion))
+                                         for expression, _fact, _binding, _refs in positions):
+            raise AnalysisLimit('native filter argument expansion is unresolved; analysis is incomplete')
+        if len(positions) != 2 or inputs.keywords:
+            self.possible_exception(state)
+            return CLEAN
+        _predicate, _predicate_fact, predicate, _predicate_refs = positions[0]
+        expression, fact, binding, references = positions[1]
+        self.require_value(predicate)
+        self.require_value(binding)
+        choices = _binding_choices(binding)
+        if not choices:
+            return CLEAN
+        known = [value for value in choices if self.stdin_identity(value) in _STDIN_STREAMS]
+        if not known:
+            return None
+        predicates = _binding_choices(predicate)
+        symbolic = {value.parameter for value in (*choices, *predicates)
+                    if isinstance(value, _SymbolicValue)}
+        if symbolic:
+            self.filter_parameters.update(symbolic)
+            return CLEAN
+        if any(value not in known and not (isinstance(value, ast.Constant)
+                and type(value.value) in {int, float, complex, bool, type(None)}) for value in choices):
+            raise AnalysisLimit('native filter input alternatives are unresolved; analysis is incomplete')
+        if not self.stdin_parser_stable(node, members={'filter', '__iter__', '__next__', '__bool__', '__len__'}):
+            raise AnalysisLimit('native filter callable identity is unresolved; analysis is incomplete')
+        if not predicates:
+            return CLEAN
+        if not all(isinstance(value, ast.Constant) and value.value is None for value in predicates):
+            raise AnalysisLimit('native filter predicate callbacks are unmodeled; analysis is incomplete')
+        columns = [self.zip_input(expression, fact, value, references, state) for value in known]
+        payload = join_facts(*(elements[0][1] for elements, _length, _refs, _fallible in columns))
+        element = _join_bindings(*(elements[0][0] for elements, _length, _refs, _fallible in columns))
+        row = _ArgumentVector(((element, payload),))
+        return self.install_zip_iterator(node, state, _ZipIterator(
+            (row,), None, optional=True, repeating=True, fallible=True, fallible_at_end=True,
+            native_kind='filter', native_streams=tuple(sorted({self.stdin_identity(value) for value in known}))))
+
     def enumerate_value(self, node, state, inputs):
         """Expose native stdin rows while keeping the generated index clean.
 
@@ -5050,7 +5102,7 @@ class _Flow:
                 for value in _binding_choices(binding))))
 
     def install_zip_iterator(self, node, state, iterator):
-        """Share native row/cursor ownership across zip and enumerate."""
+        """Share native row/cursor ownership across zip, enumerate and filter."""
         cursor = _CellRef(self.scope, '@zip:cursor', (node,))
         cells = state.cell_state()
         child = self.engine.original_calls.get(node, node)
@@ -5115,7 +5167,8 @@ class _Flow:
             branch.put_cell(iterator.cursor, _CellContents(binding=_ZipCursor(
                 phase.index if iterator.repeating else phase.index + 1)), written=True)
             row = iterator.rows[phase.index]
-            yielded.append((branch, join_facts(*(fact for _value, fact in row.operands)), row))
+            value = row.operands[0][0] if iterator.native_kind == 'filter' else row
+            yielded.append((branch, join_facts(*(fact for _value, fact in row.operands)), value))
         return yielded, _join_states(*exhausted)
 
     def zip_next(self, node, state, iterators, default=None):
@@ -5141,12 +5194,21 @@ class _Flow:
         return join_facts(*facts)
 
     def zip_materialize(self, node, state, iterators):
-        outputs, branches = [], []
+        outputs, branches, scalar_facts = [], [], []
         for iterator in iterators:
             if not iterator.exhaustible:
                 raise AnalysisLimit('native iterator exhaustion is unproved; analysis is incomplete')
             if iterator.repeating:
-                raise AnalysisLimit('native zip unbounded materialization is unresolved; analysis is incomplete')
+                if iterator.native_kind != 'filter':
+                    raise AnalysisLimit('native zip unbounded materialization is unresolved; analysis is incomplete')
+                # Native filtered lines share a source contract without an
+                # invented sequence length. EOF need not be permanent: the
+                # stream can resume after a seek or later input.
+                yielded, exhausted = self.zip_step(state, iterator)
+                outputs.append(None)
+                scalar_facts.extend(fact for _branch, fact, _value in yielded)
+                branches.append(exhausted)
+                continue
             # Validate shared cursor/backing identity before reading its state.
             self.zip_step(state, iterator)
             for phase in _binding_choices(state.cells.contents[iterator.cursor].binding):
@@ -5170,10 +5232,15 @@ class _Flow:
         self.expression_bindings[node] = _join_bindings(*outputs)
         self.expression_references[node] = frozenset({node})
         self.possible_exception(state)
-        return join_facts(*(fact for output in outputs for _row, fact in output.operands))
+        return join_facts(*scalar_facts, *(fact for output in outputs if output is not None
+                                          for _row, fact in output.operands))
 
     def zip_call(self, node, state, target, name, inputs):
         native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
+        if native and name in {'filter', 'builtins.filter'}:
+            if isinstance(target, _BoundCallable) and target.producer_unproved:
+                raise AnalysisLimit('native filter callable producer effects are unresolved; analysis is incomplete')
+            return self.filter_value(node, state, inputs)
         if native and name in {'enumerate', 'builtins.enumerate'}:
             if isinstance(target, _BoundCallable) and target.producer_unproved:
                 raise AnalysisLimit('native enumerate callable producer effects are unresolved; analysis is incomplete')
@@ -5643,10 +5710,12 @@ class _Flow:
             return all((self.stdin_identity(value) in _STDIN_STREAMS
                         or self.stdin_identity(value) in _STDIN_READERS
                         or isinstance(value, str) and value in _STDIN_CSV_PARSERS | {
-                            'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate'}
+                            'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate',
+                            'filter', 'builtins.filter'}
                         or isinstance(value, _BoundCallable) and value.namespace_proven
                         and value.name in _STDIN_CSV_PARSERS | {
-                            'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate'})
+                            'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate',
+                            'filter', 'builtins.filter'})
                        and not (isinstance(value, _BoundCallable) and value.producer_unproved)
                        or isinstance(value, (_CsvReader, _StdinCallableIterator)) and value.format_safe
                        or self.materialized_generator_binding(value, NO_REFERENCES, state)
@@ -5660,7 +5729,7 @@ class _Flow:
                 if expression.id in values:
                     return values[expression.id]
                 contents = self.global_contents(expression.id, state)
-                if (contents.binding is None and expression.id in {'iter', 'zip', 'enumerate', 'builtins'}
+                if (contents.binding is None and expression.id in {'iter', 'zip', 'enumerate', 'filter', 'builtins'}
                         and expression.id not in self.engine.globals.bindings
                         and expression.id not in state.bindings
                         and '@global:' + expression.id not in state.bindings):
@@ -5684,7 +5753,8 @@ class _Flow:
         returned = body[0].value
         if isinstance(returned, ast.Call):
             return (identity(returned.func) in _STDIN_CSV_PARSERS | {
-                        'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate'}
+                        'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate',
+                        'filter', 'builtins.filter'}
                     and all(inert(value) for value in returned.args)
                     and all(keyword.arg is not None and inert(keyword.value) for keyword in returned.keywords))
         return inert(returned)
@@ -5906,6 +5976,34 @@ class _Flow:
             # Native join enforces its element type: text cannot consume a
             # binary stream, and bytes cannot consume a text stream.
             original_bindings = _binding_choices(binding)
+            filters = [value for value in original_bindings
+                       if isinstance(value, _ZipIterator) and value.native_kind == 'filter']
+            if filters:
+                if len(filters) != len(original_bindings):
+                    raise AnalysisLimit('native filter join alternatives are unresolved; analysis is incomplete')
+                if isinstance(target, _BoundCallable) and target.producer_unproved:
+                    raise AnalysisLimit('native filter join receiver producer effects are unresolved; '
+                                        'analysis is incomplete')
+                if keywords or len(positions) != 1:
+                    self.possible_exception(state)
+                    return CLEAN
+                facts, branches = [], []
+                for iterator in filters:
+                    if not iterator.exhaustible or not iterator.native_streams:
+                        raise AnalysisLimit('native filter join exhaustion is unproved; analysis is incomplete')
+                    # Consuming the shared cursor invalidates later resumption
+                    # at a possibly temporary EOF, just as list/tuple do.
+                    _yielded, exhausted = self.zip_step(state, iterator)
+                    branches.append(exhausted)
+                    matching = [stream for stream in iterator.native_streams
+                                if (stream.endswith(('.buffer', '.raw')) if bytes_join
+                                    else stream in {'sys.stdin', 'sys.__stdin__'})]
+                    facts.extend(self.stdin_source(stream) for stream in matching)
+                state.replace(_join_states(*branches))
+                self.possible_exception(state)
+                # An incompatible stream either is empty or raises TypeError;
+                # it cannot create an executable payload or copy the separator.
+                return join_facts(receiver, *facts) if facts else CLEAN
             if (any(isinstance(value, _StdinCallableIterator) for value in original_bindings)
                     and (keywords or len(positions) != 1)):
                 self.possible_exception(state)
@@ -7896,6 +7994,16 @@ class _Flow:
             zipped = self.zip_call(node, state, target, name, inputs)
             if zipped is not None:
                 return zipped
+            if (name.rsplit('.', 1)[-1] == 'join'
+                    and any(isinstance(value, _ZipIterator) and value.native_kind == 'filter'
+                            for expression in node.args
+                            for value in _binding_choices(self.expression_bindings.get(expression)))):
+                # An exact native string/bytes join can consume filtered
+                # stdin. Let that typed contract prove the call before the
+                # ordinary refusal for opaque native-iterator consumers.
+                filtered = self.stdin_call(node, state, target, name, receiver, inputs)
+                if filtered is not None:
+                    return filtered
             if any(isinstance(value, _ZipIterator) or isinstance(value, _BoundCallable)
                    and isinstance(value.receiver_binding, _ZipIterator)
                    for expression in (*node.args, *keyword_nodes.values())
@@ -8163,6 +8271,13 @@ class _Flow:
                     self.http_parameters.update(value.parameter for value in choices)
                 else:
                     raise AnalysisLimit('HTTP helper requires proven native inputs; '
+                                        'analysis is incomplete')
+            for name in summary.filter_parameters:
+                choices = _binding_choices(values.get(name))
+                if choices and all(isinstance(value, _SymbolicValue) for value in choices):
+                    self.filter_parameters.update(value.parameter for value in choices)
+                else:
+                    raise AnalysisLimit('native filter helper requires proven iterator and predicate inputs; '
                                         'analysis is incomplete')
             predicate_incomplete = summary.generator_predicate_incomplete
             for name in summary.generator_predicate_parameters:
@@ -8906,7 +9021,9 @@ class _Flow:
                         else _opaque_qualifier(_qualified(node, state.bindings), receiver_unknown=True))
                 receiver_binding = (base if isinstance(base, (_LiteralString, _GeneratorString, _LiteralJoinInstance,
                                                                _UnprovedProducer, _SymbolicValue))
-                                    or isinstance(base, ast.Constant) and type(base.value) is str else None)
+                                    or isinstance(base, ast.Constant) and (
+                                        type(base.value) is str
+                                        or node.attr == 'join' and type(base.value) is bytes) else None)
                 if not name and (receiver_refs or producer_unproved or receiver_binding is not None or node.attr == 'join'):
                     # A returned object has identity even without a source
                     # spelling (identity(box).append(...)). Keep the method
@@ -10062,6 +10179,7 @@ class _Flow:
             buffer_parameters=frozenset(self.buffer_parameters),
             stdin_iterator_parameters=frozenset(self.stdin_iterator_parameters),
             zip_parameters=frozenset(self.zip_parameters),
+            filter_parameters=frozenset(self.filter_parameters),
             http_parameters=frozenset(self.http_parameters),
             generator_predicate_parameters=frozenset(self.generator_predicate_parameters),
             generator_predicate_incomplete=self.generator_predicate_incomplete,
@@ -11728,17 +11846,20 @@ class _Analysis:
                          self.generator_helper_identity(function) or self.http_factory_callback(function)))
 
     def zip_diagnostics(self):
-        """Uncalled or escaped generic zip inputs never certify completeness."""
-        functions = [function for function in self.functions
-                     if self.summaries.get(function, FunctionSummary()).zip_parameters]
-        if not functions:
-            return ()
-        self.budget.spend(len(self.summaries))
-        qualified = {key[0] for key, value in self.summaries.items()
-                     if isinstance(key, tuple) and not value.zip_parameters and not value.incomplete}
-        reason = 'native zip helper has unresolved iterator inputs; analysis is incomplete'
-        return tuple(self.scope_diagnostic(function, reason) for function in functions
-                     if function not in qualified or not self.generator_helper_identity(function))
+        """Uncalled or escaped native iterator inputs stay incomplete."""
+        diagnostics = []
+        for operation, field in (('zip', 'zip_parameters'), ('filter', 'filter_parameters')):
+            functions = [function for function in self.functions
+                         if getattr(self.summaries.get(function, FunctionSummary()), field)]
+            if not functions:
+                continue
+            self.budget.spend(len(self.summaries))
+            qualified = {key[0] for key, value in self.summaries.items()
+                         if isinstance(key, tuple) and not getattr(value, field) and not value.incomplete}
+            reason = f'native {operation} helper has unresolved iterator inputs; analysis is incomplete'
+            diagnostics.extend(self.scope_diagnostic(function, reason) for function in functions
+                               if function not in qualified or not self.generator_helper_identity(function))
+        return tuple(diagnostics)
 
     def generator_predicate_diagnostics(self):
         """Discharge generic protocols only after native contexts complete."""

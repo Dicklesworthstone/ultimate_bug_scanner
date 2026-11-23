@@ -1354,6 +1354,145 @@ class EagerStdinParserTests(SourceTest):
                          {('eval',2),('eval',6)})
 
 
+class FilteredStdinTests(SourceTest):
+    def test_native_filter_payload_reaches_each_sink_domain(self):
+        for stream, convert in (('sys.stdin', ''), ('sys.__stdin__', ''),
+                                ('sys.stdin.buffer', '.decode()'),
+                                ('sys.stdin.buffer.raw', '.decode()')):
+            for sink, rule in (("eval(value)", 'eval'), ("cursor.execute(value)", 'sql'),
+                               ("os.system(value)", 'command'), ("HttpResponse(value)", 'xss'),
+                               ("requests.get(value)", 'ssrf')):
+                with self.subTest(stream=stream, sink=sink):
+                    findings = self.assert_rules('import sys, os, requests\n'
+                        f'value = next(filter(None, {stream})){convert}\n{sink}\n', rule)
+                    self.assertEqual([finding['line'] for finding in findings], [3])
+                    self.assertIn(stream, findings[0]['message'])
+
+    def test_aliases_native_consumers_and_collections_keep_original_items(self):
+        cases = (
+            'rows = filter(None, sys.stdin)\nvalue = next(rows)',
+            'rows = filter(None, sys.stdin)\nalias = rows\nvalue = next(iter(alias))',
+            'rows = filter(None, sys.stdin)\nadvance = rows.__next__\nvalue = advance()',
+            'rows = filter(None, sys.stdin).__iter__()\nvalue = next(rows)',
+            'for line in filter(None, sys.stdin):\n    value = line',
+            'value = [line for line in filter(None, sys.stdin)][0]',
+            'value = list(filter(None, sys.stdin))[0]',
+            'value = tuple(filter(None, sys.stdin))[0]',
+            'from builtins import filter as select\nvalue = next(select(None, sys.stdin))',
+            'import builtins as native\nvalue = native.next(native.filter(None, sys.stdin))',
+            'select = filter\nfilter = lambda predicate, items: []\nvalue = next(select(None, sys.stdin))',
+            'predicate = None\nvalue = next(filter(predicate, iter(sys.stdin)))',
+            'arguments = (None, sys.stdin)\nvalue = next(filter(*arguments))',
+            'value = next(filter(None, sys.stdin), "SELECT 1")',
+        )
+        for setup in cases:
+            with self.subTest(setup=setup):
+                self.assert_rules('import sys\n' + setup + '\ncursor.execute(value)\n', 'sql')
+
+    def test_lazy_handles_and_strong_overwrites_remain_clean(self):
+        cases = (
+            'rows = filter(None, sys.stdin)\nvalue = "SELECT 1"',
+            'rows = filter(None, sys.stdin)\nadvance = rows.__next__\nvalue = "SELECT 1"',
+            'value = next(filter(None, sys.stdin))\nvalue = "SELECT 1"',
+            'rows = filter(None, sys.stdin)\nrows = ["SELECT 1"]\nvalue = rows[0]',
+            'value = next(filter(None, []), "SELECT 1")',
+            'def filter(predicate, items):\n    return ["SELECT 1"]\nvalue = filter(None, sys.stdin)[0]',
+            'from .builtins import filter\nvalue = next(filter(None, sys.stdin))',
+            'from application.builtins import filter\nvalue = next(filter(None, sys.stdin))',
+        )
+        for setup in cases:
+            with self.subTest(setup=setup):
+                self.assert_rules('import sys\n' + setup + '\ncursor.execute(value)\n')
+
+    def test_pure_filter_factories_keep_native_payload(self):
+        cases = (
+            'def rows(stream):\n    return filter(None, stream)\nvalue = next(rows(sys.stdin))',
+            'def rows():\n    return filter(None, sys.stdin)\nvalue = next(rows())',
+            'def rows(predicate, stream):\n    return filter(predicate, stream)\n'
+            'value = next(rows(None, sys.stdin))',
+            'def stream():\n    return sys.stdin\nvalue = next(filter(None, stream()))',
+        )
+        for setup in cases:
+            with self.subTest(setup=setup):
+                self.assert_rules('import sys\n' + setup + '\ncursor.execute(value)\n', 'sql')
+
+    def test_unknown_predicates_and_iteration_protocols_remain_incomplete(self):
+        for expression in ('filter(predicate, sys.stdin)', 'filter(lambda row: True, sys.stdin)',
+                           'filter(None, sys.stdin if flag else opaque)',
+                           'filter(*arguments)', 'filter(**options)'):
+            with self.subTest(expression=expression), self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter'):
+                self.scan('import sys\nrows = ' + expression + '\n')
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter'):
+            self.scan('import sys\ndef rows(predicate):\n'
+                      '    return filter(predicate, sys.stdin)\n')
+
+    def test_replaced_native_filter_and_opaque_factories_remain_incomplete(self):
+        for mutation in ('builtins.filter = replacement', 'del builtins.filter'):
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(taint_py.AnalysisLimit, 'source member mutation'):
+                self.scan('import sys, builtins\n' + mutation + '\nrows = builtins.filter(None, sys.stdin)\n')
+        for source in (
+                'def rows():\n    owner = Owner()\n    return filter(None, sys.stdin)\nrows()\n',
+                'def stream():\n    owner = Owner()\n    return sys.stdin\nfilter(None, stream())\n'):
+            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'producer'):
+                self.scan('import sys\n' + source)
+
+    def test_shared_cursor_does_not_certify_resumption_after_possible_eof(self):
+        for consume in ('list(rows)', 'tuple(rows)', 'next(rows, "SELECT 1")',
+                        'for row in rows:\n    pass', "''.join(rows)",
+                        "combine = ''.join\ncombine(rows)"):
+            with self.subTest(consume=consume), self.assertRaisesRegex(taint_py.AnalysisLimit, 'cursor'):
+                self.scan('import sys\nrows = filter(None, sys.stdin)\nalias = rows\n'
+                          + consume + '\nsys.stdin.seek(0)\ncursor.execute(next(alias))\n')
+
+    def test_partial_filter_keeps_findings_already_reached(self):
+        engine = taint_py._Analysis(ast.parse(
+            'import sys\ncursor.execute(input())\nrows = filter(predicate, sys.stdin)\n'))
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter') as caught:
+            engine.analyze()
+        self.assertEqual({(kind, line) for kind, line, _column, _label in caught.exception.effects},
+                         {('sql', 2)})
+
+    def test_filter_payload_preserves_parameter_binding_and_context_sanitizers(self):
+        self.assert_rules('import sys, os, shlex, html\nvalue = next(filter(None, sys.stdin))\n'
+                          'cursor.execute("SELECT ?", (value,))\n'
+                          'os.system("echo " + shlex.quote(value))\nHttpResponse(html.escape(value))\n')
+        self.assert_rules('import sys, html\nvalue = next(filter(None, sys.stdin))\n'
+                          'eval(html.escape(value))\n', 'eval')
+
+    def test_native_filter_witnesses_preserve_lines_and_resume_after_eof(self):
+        artifacts = ROOT / 'test-suite/artifacts/python-filter-native'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='witness-', dir=artifacts))
+        stdin_path = scratch / 'stdin.txt'
+        stdin_path.write_bytes(b'\nSELECT supplied\n')
+        for stream, convert in (('sys.stdin', ''), ('sys.stdin.buffer', '.decode()'),
+                                ('sys.stdin.buffer.raw', '.decode()')):
+            source = ('import json, sys\nrows = filter(None, ' + stream + ')\n'
+                      'alias = rows\nfirst = next(alias)\nsecond = next(rows)\n'
+                      'remaining = list(alias)\nsys.stdin.seek(0)\nagain = next(rows)\n'
+                      f'print(json.dumps([first{convert}, second{convert}, remaining, again{convert}]))\n')
+            with self.subTest(stream=stream):
+                with stdin_path.open('rb') as source_file:
+                    result = subprocess.run([sys.executable, '-I', '-B', '-c', source], stdin=source_file,
+                                            capture_output=True, text=True, timeout=15, check=True)
+                self.assertEqual(json.loads(result.stdout), ['\n', 'SELECT supplied\n', [], '\n'])
+
+    def test_native_join_consumes_matching_text_and_binary_filter_payloads(self):
+        for stream, separator in (('sys.stdin', "''"), ('sys.__stdin__', "'\\n'"),
+                                  ('sys.stdin.buffer', "b''"), ('sys.stdin.buffer.raw', "b' '")):
+            for use in (f'value = {separator}.join(rows)',
+                        f'combine = {separator}.join\nvalue = combine(rows)'):
+                with self.subTest(stream=stream, use=use):
+                    self.assert_rules('import sys\nrows = filter(None, ' + stream + ')\n'
+                                      + use + '\neval(value)\n', 'eval')
+
+    def test_incompatible_native_joins_have_no_executable_payload(self):
+        for source in ("''.join(filter(None, sys.stdin.buffer))",
+                       "b''.join(filter(None, sys.stdin))"):
+            with self.subTest(source=source):
+                self.assert_rules('import sys\nvalue = ' + source + '\neval(value)\n')
+
+
 class EnumeratedStdinTests(SourceTest):
     def test_native_payload_reaches_each_sink_domain(self):
         for stream, convert in (('sys.stdin', ''), ('sys.stdin.buffer', '.decode()'),
@@ -2235,6 +2374,63 @@ class RunnerIntegrationTests(unittest.TestCase):
                                            output='json', expected=[(2, 1)], partial=True, cache=True)
                     self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
                                      'An incomplete native zip scan must not enter the completed cache')
+
+    def test_filtered_stdin_module_and_runner_reports_keep_sites_and_selection(self):
+        cases = (
+            ('text-join', 'import sys\nrows = filter(None, sys.stdin)\n'
+             'query = "".join(rows)\ncursor.execute(query)\n', [(4, 1)], False),
+            ('bytes-join', 'import sys\nrows = filter(None, sys.stdin.buffer)\n'
+             'query = b"".join(rows).decode()\ncursor.execute(query)\n', [(4, 1)], False),
+            ('helper', 'import sys\ndef select(stream):\n    return filter(None, stream)\n'
+             'cursor.execute(next(select(sys.stdin)))\n', [(4, 1)], False),
+            ('unused', 'import sys\nrows = filter(None, sys.stdin)\n'
+             'cursor.execute("SELECT 1")\n', [], False),
+            ('partial', 'import sys\ncursor.execute(input())\n'
+             'rows = filter(predicate, sys.stdin)\n', [(2, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/python-filter-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'view.py'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.py').write_text('cursor.execute(input())\n', encoding='utf-8')
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, output=output):
+                        self.zip_public_report(target, project / f'{meta}-{output}', meta=meta,
+                                               output=output, expected=expected, partial=partial,
+                                               partial_label='filter')
+
+    def test_filtered_stdin_cache_invalidation_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/python-filter-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'view.py'
+        prefix = 'import sys\nrows = filter(None, sys.stdin)\nquery = "".join(rows)\n'
+        unsafe = prefix + 'cursor.execute(query)\n'
+        clean = prefix + 'cursor.execute("SELECT 1")\n'
+        suppressed = prefix + 'cursor.execute(query)  # ubs:ignore[python.taint.sql]\n'
+        for index, (source, expected, hits) in enumerate((
+                (unsafe, [(4, 1)], 0), (unsafe, [(4, 1)], 1),
+                (clean, [], 0), (suppressed, [], 0), (unsafe, [(4, 1)], 1))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.zip_public_report(target, scratch / f'cache-{index}', meta=True, output='json',
+                                               expected=expected, cache=True, partial_label='filter')
+                self.assertEqual(report['profile']['cache_hits'], hits, report)
+        entries = set((scratch / 'cache').glob('*/files/**/*.json'))
+        self.assertTrue(entries, 'Completed native filter scans must create reusable cache entries')
+        target.write_text('import sys\ncursor.execute(input())\n'
+                          'rows = filter(predicate, sys.stdin)\n', encoding='utf-8')
+        for index in range(2):
+            with self.subTest(partial=index):
+                self.zip_public_report(target, scratch / f'partial-{index}', meta=True, output='json',
+                                       expected=[(2, 1)], partial=True, cache=True, partial_label='filter')
+                self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
+                                 'An incomplete native filter scan must not enter the completed cache')
 
     def test_enumerated_stdin_module_and_runner_reports_keep_sites_and_selection(self):
         prefix = ('import sys\ndef rows():\n    return enumerate(sys.stdin, start=7)\n'

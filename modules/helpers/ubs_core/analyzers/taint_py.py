@@ -82,11 +82,12 @@ _STDIN_CSV_PARSERS = frozenset({'csv.reader', 'csv.DictReader'})
 _STDIN_PARSER_CARRIERS = (_STDIN_EAGER_PARSERS | _STDIN_CSV_PARSERS | _STDIN_STREAMS
                           | frozenset(_STDIN_READERS)
                           | {'json', 'tomllib', 'csv', 'sys', 'iter', 'builtins.iter', 'zip', 'builtins.zip',
-                             'enumerate', 'builtins.enumerate', 'filter', 'builtins.filter'})
+                             'enumerate', 'builtins.enumerate', 'filter', 'builtins.filter',
+                             'map', 'builtins.map'})
 _STDIN_OPAQUE_ARGUMENTS = '@stdin:opaque-arguments'
 _SOURCE_MEMBERS = {'os': frozenset({'getenv', 'getenvb', 'environ', 'environb'}),
                    'sys': frozenset({'argv', 'stdin', '__stdin__'}),
-                   'builtins': frozenset({'iter', 'list', 'tuple', 'next', 'zip', 'enumerate', 'filter', 'bytearray'}),
+                   'builtins': frozenset({'iter', 'list', 'tuple', 'next', 'zip', 'enumerate', 'filter', 'map', 'len', 'bytearray'}),
                    'json': frozenset({'load', 'loads', 'JSONDecoder', '_default_decoder'}),
                    'tomllib': frozenset({'load', 'loads'}),
                    **{stream: methods | {'__iter__', 'buffer', 'raw', 'readinto', 'readinto1'}
@@ -169,6 +170,9 @@ SANITIZERS = {
     'markupsafe.escape': 'xss', 'bleach.clean': 'xss',
     'shlex.quote': 'command',
 }
+# Only these sanitizer contracts also return an exact native str for a native
+# str input. Third-party escaping helpers may return behavior-bearing subclasses.
+_NATIVE_MAP_SANITIZERS = frozenset({'html.escape', 'shlex.quote'})
 
 KIND_BY_RULE = {f'py.taint.{kind}': kind for kind in ('xss', 'sql', 'command', 'eval', 'ssrf')}
 
@@ -614,6 +618,10 @@ class _ZipIterator:
     native_kind: str = 'zip'
     exhaustible: bool = True
     native_streams: tuple[str, ...] = ()
+    # map captures a callable now and invokes it only while consuming rows.
+    # Its selected body/defaults/cells must survive ordinary name rebinding.
+    mapper: object = None
+    mapper_call: ast.Call | None = None
 
 
 def _literal_choices(binding):
@@ -1113,6 +1121,8 @@ def _analysis_comparison_steps(a, b, evidence):
                 and a.optional == b.optional and a.repeating == b.repeating
                 and a.fallible == b.fallible and a.fallible_at_end == b.fallible_at_end
                 and a.native_kind == b.native_kind and a.exhaustible == b.exhaustible
+                and a.native_streams == b.native_streams and a.mapper_call is b.mapper_call
+                and (yield (a.mapper, b.mapper, evidence))
                 and (yield (a.rows, b.rows, evidence)))
     return a == b
 
@@ -1129,7 +1139,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'filter', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'len', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'filter', 'map', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -2052,6 +2062,7 @@ class FunctionSummary:
     # Filter predicates and stream protocols need their own operation-specific
     # obligation; a generic zip diagnostic cannot identify an unresolved filter.
     filter_parameters: frozenset[str] = frozenset()
+    map_parameters: frozenset[str] = frozenset()
     # A generic prepared-request helper must be revisited with native input
     # identities. Keep that obligation instead of inventing a clean Request.
     http_parameters: frozenset[str] = frozenset()
@@ -2164,6 +2175,9 @@ class _Flow:
         self.generator_returns = {}
         self.generator_return_references = {}
         self.expression_references = {}
+        # Materializing a native map proves the outer list/tuple is native
+        # even when its stream length (and therefore vector shape) is unknown.
+        self.native_map_sequences = set()
         self.mutations = {}
         self.returned_references = set()
         # Return completions may be replaced by finally or discarded while a
@@ -2192,6 +2206,7 @@ class _Flow:
         self.stdin_iterator_parameters = set()
         self.zip_parameters = set()
         self.filter_parameters = set()
+        self.map_parameters = set()
         self.http_parameters = set()
         self.generator_predicate_parameters = set()
         self.generator_predicate_incomplete = False
@@ -3715,7 +3730,7 @@ class _Flow:
                 and self.materialized_generator_binding(self.expression_bindings.get(node),
                     self.expression_references.get(node, NO_REFERENCES), state))
 
-    def materialized_generator_call(self, node, target, state, *, discarded=False):
+    def materialized_generator_call(self, node, target, state, *, discarded=False, native_callback=False):
         """Prove calls cannot hide owned finalizers, including exceptional exits.
 
         A primitive return alone says nothing about released locals/defaults.
@@ -3740,17 +3755,24 @@ class _Flow:
             target = closure.value
         if isinstance(target, _FunctionValue):
             target = target.function
-        if (not isinstance(target, (ast.FunctionDef, ast.Lambda) if discarded else ast.FunctionDef)
+        if (not isinstance(target, (ast.FunctionDef, ast.Lambda) if discarded or native_callback else ast.FunctionDef)
                 or self.engine.owner(target) is not self.engine or target in self.engine.generators
                 or getattr(target, 'decorator_list', ()) or getattr(target, 'returns', None) is not None
-                or not (self.engine.generator_discard_identity(target) if discarded
-                        else self.engine.generator_helper_identity(target))):
+                or not native_callback and not (self.engine.generator_discard_identity(target) if discarded
+                                                else self.engine.generator_helper_identity(target))):
+            return False
+        if native_callback and any(
+                engine.generator_builtin_reflection or engine.generator_namespace_exposed
+                or engine.generator_frame_exposed
+                or engine.generator_attribute_writes & {
+                    '__code__', '__defaults__', '__kwdefaults__', '__closure__', '__class__', '__bases__', '__del__'}
+                for engine in self.engine.generator_peers):
             return False
         signature = target.args
         positional = [*signature.posonlyargs, *signature.args]
         defaults = [*signature.defaults, *(value for value in signature.kw_defaults if value is not None)]
         if (signature.vararg or signature.kwarg
-                or defaults and (not discarded or any(not isinstance(value, ast.Constant)
+                or defaults and (not (discarded or native_callback) or any(not isinstance(value, ast.Constant)
                     or type(value.value) not in {str, bytes, int, float, complex, bool, type(None)} for value in defaults))
                 or any(argument.annotation is not None for argument in (*positional, *signature.kwonlyargs))
                 or len(node.args) > len(positional)):
@@ -3761,7 +3783,7 @@ class _Flow:
             if keyword.arg not in accepted or keyword.arg in arguments:
                 return False
             arguments[keyword.arg] = keyword.value
-        if discarded:
+        if discarded or native_callback:
             for argument, default in zip(positional[len(positional) - len(signature.defaults):], signature.defaults):
                 arguments.setdefault(argument.arg, default)
             for argument, default in zip(signature.kwonlyargs, signature.kw_defaults):
@@ -4404,6 +4426,7 @@ class _Flow:
                 value = replace(value, rows=tuple(self.map_cell_bindings(
                     row, map_ref, memo, map_objects=map_objects) for row in value.rows),
                     cursor=map_ref(value.cursor),
+                    mapper=self.map_cell_bindings(value.mapper, map_ref, memo, map_objects=map_objects),
                     references=map_objects(value.references) if map_objects else value.references)
             elif isinstance(value, (_FunctionValue, _DeferredCall)):
                 self.engine.budget.spend(1 + len(value.values))
@@ -5076,6 +5099,10 @@ class _Flow:
         if symbolic:
             self.zip_parameters.update(symbolic)
             return join_facts(*inputs.arguments)
+        return self.install_zip_iterator(node, state, self.native_iterator_rows(positions, state))
+
+    def native_iterator_rows(self, positions, state):
+        """Shared shortest-input rows for native zip and deferred map calls."""
         columns = [self.zip_input(expression, fact, binding, references, state)
                    for expression, fact, binding, references in positions]
         lengths = [length for _elements, length, _references, _fallible in columns if length is not None]
@@ -5086,7 +5113,7 @@ class _Flow:
             tuple((elements[index if length is not None else 0][0],
                    elements[index if length is not None else 0][1])
                   for elements, length, _references, _fallible in columns)) for index in range(count))
-        return self.install_zip_iterator(node, state, _ZipIterator(
+        return _ZipIterator(
             rows, None, frozenset().union(*(references for _elements, _length, references, _fallible in columns)),
             optional=any(length is None for _elements, length, _references, _fallible in columns),
             repeating=bool(columns) and not lengths,
@@ -5099,7 +5126,162 @@ class _Flow:
             exhaustible=bool(lengths) or all(
                 not isinstance(value, _StdinCallableIterator) or value.eof_terminated
                 for _expression, _fact, binding, _refs in positions
-                for value in _binding_choices(binding))))
+                for value in _binding_choices(binding)))
+
+    def map_value(self, node, state, inputs):
+        """Capture native input/callback identities without running a mapper."""
+        positions = self.call_positions(node, inputs.arguments, state)
+        if (None in inputs.keywords or any(isinstance(expression, (ast.Starred, _ArgumentExpansion))
+                                           for expression, _fact, _binding, _refs in positions)
+                or inputs.keywords and (set(inputs.keywords) != {'strict'}
+                    or not isinstance(inputs.keyword_nodes.get('strict'), ast.Constant)
+                    or inputs.keyword_nodes['strict'].value is not False)):
+            raise AnalysisLimit('native map strictness or argument expansion is unresolved; analysis is incomplete')
+        if len(positions) < 2:
+            self.possible_exception(state)
+            return CLEAN
+        if len(positions) - 1 > _MAX_VECTOR_CONTEXT:
+            raise AnalysisLimit('native map argument count exceeds the bounded model; analysis is incomplete')
+        fresh_lambda = positions[0][0] if isinstance(positions[0][0], ast.Lambda) else None
+        if not self.stdin_parser_stable(node, members={'map', 'str', '__iter__', '__next__'},
+                                        deferred_lambdas=(fresh_lambda,) if fresh_lambda is not None else ()):
+            raise AnalysisLimit('native map callable identity is unresolved; analysis is incomplete')
+        symbolic = set()
+        for _expression, _fact, binding, _references in positions:
+            self.require_value(binding)
+            choices = _binding_choices(binding)
+            if not choices:
+                return CLEAN
+            symbolic.update(value.parameter for value in choices if isinstance(value, _SymbolicValue))
+        if symbolic:
+            self.map_parameters.update(symbolic)
+            return CLEAN
+        mapper_choices = _binding_choices(positions[0][2])
+        if len(mapper_choices) != 1:
+            raise AnalysisLimit('native map callback alternatives are unresolved; analysis is incomplete')
+        mapper = next(iter(mapper_choices))
+        function = mapper.value if isinstance(mapper, _ClosureValue) else mapper
+        function = function.function if isinstance(function, _FunctionValue) else function
+        native_name = (mapper if isinstance(mapper, str) else mapper.name
+                       if isinstance(mapper, _BoundCallable) and mapper.namespace_proven else None)
+        string_methods = {'strip', 'lstrip', 'rstrip', 'lower', 'upper', 'capitalize', 'casefold', 'swapcase', 'title'}
+        native_string = (native_name in {'str', 'builtins.str'}
+                         or native_name in {prefix + method for prefix in ('str.', 'builtins.str.')
+                                            for method in string_methods})
+        if (not native_string and native_name not in _NATIVE_MAP_SANITIZERS
+                and not isinstance(function, (ast.FunctionDef, ast.Lambda))
+                or isinstance(function, (ast.FunctionDef, ast.Lambda)) and function in self.engine.generators
+                or isinstance(mapper, _BoundCallable) and (
+                    mapper.producer_unproved or mapper.references & state.mutated)):
+            raise AnalysisLimit('native map callback identity or protocol is unresolved; analysis is incomplete')
+        try:
+            iterator = self.native_iterator_rows(positions[1:], state)
+        except AnalysisLimit as exc:
+            raise AnalysisLimit('native map input protocol is unresolved: ' + str(exc)) from exc
+        key = (node, 'native-map-callback', len(positions) - 1)
+        call = self.engine.method_calls.get(key)
+        if call is None:
+            site = positions[0][0]
+            call = ast.copy_location(ast.Call(
+                func=ast.copy_location(ast.Name(id='@map:callback', ctx=ast.Load()), site),
+                args=[ast.copy_location(ast.Name(id=f'@map:argument:{index}', ctx=ast.Load()), site)
+                      for index in range(len(positions) - 1)], keywords=[]), site)
+            self.engine.method_calls[key] = call
+            self.engine.original_calls[call] = self.engine.original_calls.get(node, node)
+        return self.install_zip_iterator(node, state, replace(
+            iterator, native_kind='map', mapper=mapper, mapper_call=call))
+
+    def map_step(self, state, iterator, row):
+        """Invoke one captured mapper after its input row has been consumed."""
+        call, mapper = iterator.mapper_call, iterator.mapper
+        self.expression_bindings[call.func] = mapper
+        arguments = []
+        for expression, (binding, fact) in zip(call.args, row.operands):
+            self.expression_bindings[expression] = binding
+            self.expression_facts[expression] = fact
+            self.expression_references[expression] = NO_REFERENCES
+            arguments.append(fact)
+        native = (mapper if isinstance(mapper, str) else mapper.name
+                  if isinstance(mapper, _BoundCallable) and mapper.namespace_proven else None)
+        if native in {'str', 'builtins.str'}:
+            if len(row.operands) != 1 or not self.formatted_string_operand(call.args[0], state):
+                raise AnalysisLimit('native map string conversion protocol is unresolved; analysis is incomplete')
+            self.possible_exception(state)
+            return [(state, arguments[0], _GeneratorString())], None
+        if native is not None and (native.startswith(('str.', 'builtins.str.')) or native in _NATIVE_MAP_SANITIZERS):
+            if len(row.operands) != 1 or not self.native_string_binding(row.operands[0][0]):
+                raise AnalysisLimit('native map string callback input is unresolved; analysis is incomplete')
+            self.possible_exception(state)
+            result = _sanitize(arguments[0], SANITIZERS[native]) if native in SANITIZERS else arguments[0]
+            return [(state, result, _GeneratorString())], None
+        if not self.materialized_generator_call(call, mapper, state, native_callback=True):
+            raise AnalysisLimit('native map callback frame lifetime is unresolved; analysis is incomplete')
+        outer_pending, self.pending = self.pending, []
+        self.expression_bindings.pop(call, None)
+        self.expression_references.pop(call, None)
+        try:
+            fact = self.invoke(call, state, _CallTarget(mapper), _CallInputs(arguments, {}, {}))
+        finally:
+            callback_pending, self.pending = self.pending, outer_pending
+        stopped = []
+        for completion in callback_pending:
+            if completion.kind == 'raise' and completion.exception_type == 'StopIteration':
+                stopped.append(completion.state)
+            else:
+                self.pending.append(completion)
+        yielded = []
+        if state.reachable:
+            binding = self.expression_bindings.get(call)
+            if not all(isinstance(value, (_LiteralString, _GeneratorString))
+                       or isinstance(value, ast.Constant) and type(value.value)
+                       in {str, bytes, int, float, complex, bool, type(None)}
+                       for value in _binding_choices(binding)):
+                raise AnalysisLimit('native map callback result protocol is unresolved; analysis is incomplete')
+            yielded.append((state, fact, binding))
+        return yielded, _join_states(*stopped)
+
+    def map_materialize(self, node, state, iterators, *, element_type=None):
+        """Consume callbacks in order; retain effects and finite output slots."""
+        outputs, branches, facts = [], [], []
+
+        def validate(binding):
+            if element_type is not None and not all(
+                    self.native_string_binding(value) if element_type is str
+                    else isinstance(value, ast.Constant) and type(value.value) is bytes
+                    for value in _binding_choices(binding)):
+                raise AnalysisLimit('native map join element type is unresolved; analysis is incomplete')
+
+        for iterator in iterators:
+            if not iterator.exhaustible:
+                raise AnalysisLimit('native map exhaustion is unproved; analysis is incomplete')
+            if iterator.repeating:
+                def iteration(branch, fact, binding):
+                    validate(binding)
+                    facts.append(fact)
+                    return branch
+                branches.append(self.zip_walk(state, iterator, iteration))
+                outputs.append(None)
+                continue
+            pending = [(state.copy(), ())]
+            while pending:
+                current, values = pending.pop()
+                self.engine.budget.spend(1 + len(values))
+                if len(values) > len(iterator.rows):
+                    raise AnalysisLimit('native map cursor restarted during materialization; analysis is incomplete')
+                yielded, exhausted = self.zip_step(current, iterator)
+                if exhausted is not None:
+                    branches.append(exhausted)
+                    outputs.append(_ArgumentVector(values))
+                for branch, fact, binding in yielded:
+                    validate(binding)
+                    pending.append((branch, (*values, (binding, fact))))
+        state.replace(_join_states(*branches))
+        self.expression_bindings[node] = _join_bindings(*outputs)
+        self.expression_references[node] = frozenset({node})
+        if element_type is None:
+            self.native_map_sequences.add(node)
+        return join_facts(*facts, *(fact for output in outputs if output is not None
+                                   for _binding, fact in output.operands))
 
     def install_zip_iterator(self, node, state, iterator):
         """Share native row/cursor ownership across zip, enumerate and filter."""
@@ -5167,6 +5349,11 @@ class _Flow:
             branch.put_cell(iterator.cursor, _CellContents(binding=_ZipCursor(
                 phase.index if iterator.repeating else phase.index + 1)), written=True)
             row = iterator.rows[phase.index]
+            if iterator.native_kind == 'map':
+                mapped, stopped = self.map_step(branch, iterator, row)
+                yielded.extend(mapped)
+                exhausted.append(stopped)
+                continue
             value = row.operands[0][0] if iterator.native_kind == 'filter' else row
             yielded.append((branch, join_facts(*(fact for _value, fact in row.operands)), value))
         return yielded, _join_states(*exhausted)
@@ -5194,6 +5381,10 @@ class _Flow:
         return join_facts(*facts)
 
     def zip_materialize(self, node, state, iterators):
+        if any(iterator.native_kind == 'map' for iterator in iterators):
+            if not all(iterator.native_kind == 'map' for iterator in iterators):
+                raise AnalysisLimit('native map materialization alternatives are unresolved; analysis is incomplete')
+            return self.map_materialize(node, state, iterators)
         outputs, branches, scalar_facts = [], [], []
         for iterator in iterators:
             if not iterator.exhaustible:
@@ -5237,6 +5428,32 @@ class _Flow:
 
     def zip_call(self, node, state, target, name, inputs):
         native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
+        if native and name in {'map', 'builtins.map'}:
+            if isinstance(target, _BoundCallable) and target.producer_unproved:
+                raise AnalysisLimit('native map callable producer effects are unresolved; analysis is incomplete')
+            return self.map_value(node, state, inputs)
+        if native and name in {'len', 'builtins.len'} and len(node.args) == 1 and not node.keywords:
+            references = self.expression_references.get(node.args[0], NO_REFERENCES)
+            if (references and references <= self.native_map_sequences
+                    and not references & state.mutated
+                    and not (isinstance(target, _BoundCallable) and target.producer_unproved)):
+                if not self.stdin_parser_stable(node, members={'len', '__len__'}):
+                    raise AnalysisLimit('native map sequence length identity is unresolved; analysis is incomplete')
+                # The count is numeric metadata; none of the retained element
+                # text becomes executable content through a native __len__.
+                self.expression_references[node] = NO_REFERENCES
+                self.possible_exception(state)
+                return CLEAN
+        if native and name in {'str', 'builtins.str'} and len(node.args) == 1 and not node.keywords:
+            choices = _binding_choices(self.expression_bindings.get(node.args[0]))
+            if choices and all(isinstance(value, _ZipIterator) and value.native_kind == 'map'
+                               for value in choices):
+                if not self.stdin_parser_stable(node, members={'str', '__str__', '__repr__'}):
+                    raise AnalysisLimit('native map handle formatting identity is unresolved; analysis is incomplete')
+                self.expression_bindings[node] = _GeneratorString()
+                self.expression_references[node] = NO_REFERENCES
+                self.possible_exception(state)
+                return CLEAN
         if native and name in {'filter', 'builtins.filter'}:
             if isinstance(target, _BoundCallable) and target.producer_unproved:
                 raise AnalysisLimit('native filter callable producer effects are unresolved; analysis is incomplete')
@@ -5266,11 +5483,21 @@ class _Flow:
         choices = _binding_choices(positions[0][2]) if positions else ()
         if not any(isinstance(value, _ZipIterator) for value in choices):
             return None
+        deferred_lambdas = []
+        for iterator in choices:
+            if isinstance(iterator, _ZipIterator) and iterator.native_kind == 'map' and not iterator.rows:
+                constructor = self.engine.original_calls.get(iterator.mapper_call)
+                if (isinstance(constructor, ast.Call) and constructor.args
+                        and isinstance(constructor.args[0], ast.Lambda)):
+                    # A captured fresh lambda cannot run before construction,
+                    # and an exact empty shortest input never calls it later.
+                    deferred_lambdas.append(constructor.args[0])
         if (not all(isinstance(value, _ZipIterator) for value in choices)
                 or any(isinstance(expression, (ast.Starred, _ArgumentExpansion))
                        for expression, _fact, _binding, _references in positions)
                 or inputs.keywords or len(positions) > (2 if name.endswith('next') else 1)
-                or not self.stdin_parser_stable(node, members={name.rsplit('.', 1)[-1]})):
+                or not self.stdin_parser_stable(node, members={name.rsplit('.', 1)[-1]},
+                                                deferred_lambdas=tuple(deferred_lambdas))):
             raise AnalysisLimit('native zip consumer identity or arguments are unresolved; analysis is incomplete')
         if name in {'iter', 'builtins.iter'}:
             self.expression_bindings[node] = _join_bindings(*choices)
@@ -5439,7 +5666,7 @@ class _Flow:
             return True
         return bool(calls) and all(self.stdin_parser_after(execution, call, seen | {scope}) for call in calls)
 
-    def stdin_parser_stable(self, node, *, members=None):
+    def stdin_parser_stable(self, node, *, members=None, deferred_lambdas=()):
         """Require the native loader's decoder and module to remain intact."""
         names = (members if members is not None else {
             'load', 'loads', 'JSONDecoder', '_default_decoder', 'read',
@@ -5453,6 +5680,15 @@ class _Flow:
                     or engine is not self.engine and engine.generator_namespace_exposed):
                 return False
             for capability in engine.generator_execution_capabilities:
+                if engine is self.engine and deferred_lambdas:
+                    child = capability
+                    parent = engine.parents.get(child)
+                    while parent is not None and parent not in deferred_lambdas:
+                        child, parent = parent, engine.parents.get(parent)
+                    if parent in deferred_lambdas and child is parent.body:
+                        # Default arguments still run during lambda creation;
+                        # only the owned body's execution is deferred.
+                        continue
                 call = engine.parents.get(capability)
                 spelling = capability.id if isinstance(capability, ast.Name) else capability.attr
                 if (engine is not self.engine or spelling == 'exec'
@@ -5711,11 +5947,11 @@ class _Flow:
                         or self.stdin_identity(value) in _STDIN_READERS
                         or isinstance(value, str) and value in _STDIN_CSV_PARSERS | {
                             'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate',
-                            'filter', 'builtins.filter'}
+                            'filter', 'builtins.filter', 'map', 'builtins.map', 'str', 'builtins.str'}
                         or isinstance(value, _BoundCallable) and value.namespace_proven
                         and value.name in _STDIN_CSV_PARSERS | {
                             'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate',
-                            'filter', 'builtins.filter'})
+                            'filter', 'builtins.filter', 'map', 'builtins.map', 'str', 'builtins.str'})
                        and not (isinstance(value, _BoundCallable) and value.producer_unproved)
                        or isinstance(value, (_CsvReader, _StdinCallableIterator)) and value.format_safe
                        or self.materialized_generator_binding(value, NO_REFERENCES, state)
@@ -5729,7 +5965,7 @@ class _Flow:
                 if expression.id in values:
                     return values[expression.id]
                 contents = self.global_contents(expression.id, state)
-                if (contents.binding is None and expression.id in {'iter', 'zip', 'enumerate', 'filter', 'builtins'}
+                if (contents.binding is None and expression.id in {'iter', 'zip', 'enumerate', 'filter', 'map', 'str', 'builtins'}
                         and expression.id not in self.engine.globals.bindings
                         and expression.id not in state.bindings
                         and '@global:' + expression.id not in state.bindings):
@@ -5754,7 +5990,7 @@ class _Flow:
         if isinstance(returned, ast.Call):
             return (identity(returned.func) in _STDIN_CSV_PARSERS | {
                         'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate',
-                        'filter', 'builtins.filter'}
+                        'filter', 'builtins.filter', 'map', 'builtins.map'}
                     and all(inert(value) for value in returned.args)
                     and all(keyword.arg is not None and inert(keyword.value) for keyword in returned.keywords))
         return inert(returned)
@@ -5976,6 +6212,16 @@ class _Flow:
             # Native join enforces its element type: text cannot consume a
             # binary stream, and bytes cannot consume a text stream.
             original_bindings = _binding_choices(binding)
+            mapped = [value for value in original_bindings
+                      if isinstance(value, _ZipIterator) and value.native_kind == 'map']
+            if mapped:
+                if len(mapped) != len(original_bindings):
+                    raise AnalysisLimit('native map join alternatives are unresolved; analysis is incomplete')
+                if keywords or len(positions) != 1:
+                    self.possible_exception(state)
+                    return CLEAN
+                result = self.map_materialize(node, state, mapped, element_type=bytes if bytes_join else str)
+                return join_facts(receiver, result)
             filters = [value for value in original_bindings
                        if isinstance(value, _ZipIterator) and value.native_kind == 'filter']
             if filters:
@@ -6733,6 +6979,8 @@ class _Flow:
                 choices.append(replace(target, rows=tuple(self.substitute_binding(
                     row, bound, references, node, call_name, values, substitute=substitute, cells=cells)
                     for row in target.rows), cursor=(cells or {}).get(target.cursor, target.cursor),
+                    mapper=self.substitute_binding(target.mapper, bound, references, node, call_name, values,
+                                                   substitute=substitute, cells=cells),
                     references=actual))
             elif isinstance(target, _ArgumentVector):
                 operands = []
@@ -7995,7 +8243,7 @@ class _Flow:
             if zipped is not None:
                 return zipped
             if (name.rsplit('.', 1)[-1] == 'join'
-                    and any(isinstance(value, _ZipIterator) and value.native_kind == 'filter'
+                    and any(isinstance(value, _ZipIterator) and value.native_kind in {'filter', 'map'}
                             for expression in node.args
                             for value in _binding_choices(self.expression_bindings.get(expression)))):
                 # An exact native string/bytes join can consume filtered
@@ -8278,6 +8526,13 @@ class _Flow:
                     self.filter_parameters.update(value.parameter for value in choices)
                 else:
                     raise AnalysisLimit('native filter helper requires proven iterator and predicate inputs; '
+                                        'analysis is incomplete')
+            for name in summary.map_parameters:
+                choices = _binding_choices(values.get(name))
+                if choices and all(isinstance(value, _SymbolicValue) for value in choices):
+                    self.map_parameters.update(value.parameter for value in choices)
+                else:
+                    raise AnalysisLimit('native map helper requires proven iterator and callback inputs; '
                                         'analysis is incomplete')
             predicate_incomplete = summary.generator_predicate_incomplete
             for name in summary.generator_predicate_parameters:
@@ -10180,6 +10435,7 @@ class _Flow:
             stdin_iterator_parameters=frozenset(self.stdin_iterator_parameters),
             zip_parameters=frozenset(self.zip_parameters),
             filter_parameters=frozenset(self.filter_parameters),
+            map_parameters=frozenset(self.map_parameters),
             http_parameters=frozenset(self.http_parameters),
             generator_predicate_parameters=frozenset(self.generator_predicate_parameters),
             generator_predicate_incomplete=self.generator_predicate_incomplete,
@@ -11848,7 +12104,7 @@ class _Analysis:
     def zip_diagnostics(self):
         """Uncalled or escaped native iterator inputs stay incomplete."""
         diagnostics = []
-        for operation, field in (('zip', 'zip_parameters'), ('filter', 'filter_parameters')):
+        for operation, field in (('zip', 'zip_parameters'), ('filter', 'filter_parameters'), ('map', 'map_parameters')):
             functions = [function for function in self.functions
                          if getattr(self.summaries.get(function, FunctionSummary()), field)]
             if not functions:

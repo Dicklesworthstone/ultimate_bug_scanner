@@ -1354,6 +1354,140 @@ class EagerStdinParserTests(SourceTest):
                          {('eval',2),('eval',6)})
 
 
+class MappedStdinTests(SourceTest):
+    def test_native_string_mapping_reaches_all_sink_domains(self):
+        for source in ('sys.stdin', 'sys.__stdin__'):
+            for sink, rule in (('eval(value)', 'eval'), ('os.system(value)', 'command'),
+                               ('cursor.execute(value)', 'sql'), ('HttpResponse(value)', 'xss'),
+                               ('requests.get(value)', 'ssrf')):
+                with self.subTest(source=source, sink=sink):
+                    self.assert_rules('import sys, os, requests\n'
+                                      f'value=next(map(str,{source}))\n{sink}\n', rule)
+
+    def test_mapper_identity_survives_builtin_aliases_and_rebinding(self):
+        for setup, constructor in (('', 'map'), ('import builtins\n', 'builtins.map'),
+                                    ('from builtins import map as transform\n', 'transform'),
+                                    ('transform=map\n', 'transform')):
+            with self.subTest(constructor=constructor):
+                self.assert_rules('import sys\n' + setup
+                                  + f'values={constructor}(str,sys.stdin)\n'
+                                  + 'map=lambda callback,values:[]\neval(next(values))\n', 'eval')
+        self.assert_rules('import sys\nmapper=str\nvalues=map(mapper,sys.stdin)\n'
+                          'mapper=lambda value:"safe"\neval(next(values))\n', 'eval')
+
+    def test_local_callbacks_preserve_returns_and_clean_replacements(self):
+        for callback in ('lambda value:value', 'identity'):
+            with self.subTest(callback=callback):
+                self.assert_rules('import sys\ndef identity(value):\n return value\n'
+                                  f'eval(next(map({callback},sys.stdin)))\n', 'eval')
+        self.assert_rules('import sys\neval(next(map(lambda value:"safe",sys.stdin)))\n')
+        self.assert_rules('eval(next(map(lambda unused:input(),["safe"])))\n', 'eval')
+
+    def test_consumers_preserve_mapped_values(self):
+        for expression in ('next(values)', 'values.__next__()', 'next(iter(values))',
+                           'list(values)[0]', 'tuple(values)[0]'):
+            with self.subTest(expression=expression):
+                self.assert_rules('import sys\nvalues=map(str,sys.stdin)\n'
+                                  f'eval({expression})\n', 'eval')
+        self.assert_rules('import sys\nfor line in map(str,sys.stdin):\n eval(line)\n', 'eval')
+        self.assert_rules('import sys\nvalues=[line for line in map(str,sys.stdin)]\n'
+                          'eval(values[0])\n', 'eval')
+
+    def test_finite_rows_keep_positions_and_shortest_input(self):
+        source = ('values=list(map(lambda value:value,[input(),"safe"]))\n'
+                  'eval(values[0])\neval(values[1])\n')
+        findings = self.assert_rules(source, 'eval')
+        self.assertEqual([(item['line'], item['col']) for item in findings], [(2, 1)])
+        self.assert_rules('import sys\nvalues=map(lambda left,right:right,["safe"],sys.stdin)\n'
+                          'eval(next(values))\n', 'eval')
+        self.assert_rules('values=map(lambda left,right:right,["safe"], ["safe",input()])\n'
+                          'first=next(values)\nsecond=next(values,"safe")\neval(first)\neval(second)\n')
+        # Executing arbitrary Python between consumes can replace builtins.
+        # This existing namespace boundary is separate from shortest-input
+        # provenance, so retain it explicitly rather than trusting a spelling.
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'native zip consumer identity'):
+            self.scan('values=map(lambda left,right:right,["safe"], ["safe",input()])\n'
+                      'eval(next(values))\neval(next(values,"safe"))\n')
+
+    def test_selected_helpers_preserve_consumption_and_factory_identity(self):
+        self.assert_rules('import sys\ndef read(stream):\n return next(map(str,stream))\n'
+                          'eval(read(sys.stdin))\n', 'eval')
+        self.assert_rules('import sys\ndef values(stream):\n return map(str,stream)\n'
+                          'eval(next(values(sys.stdin)))\n', 'eval')
+        self.assert_rules('import sys\ndef constructor():\n return map\n'
+                          'transform=constructor()\neval(next(transform(str,sys.stdin)))\n', 'eval')
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'native map helper'):
+            self.scan('import sys\ndef deferred(callback):\n return next(map(callback,sys.stdin))\n')
+
+    def test_native_string_joins_consume_mapped_payloads(self):
+        self.assert_rules('import sys\neval("".join(map(str,sys.stdin)))\n', 'eval')
+        self.assert_rules('import sys\neval("".join(map(lambda line:"safe",sys.stdin)))\n')
+        self.assert_rules('values=map(lambda value:value,["safe",input()])\n'
+                          'next(values)\neval("".join(values))\n', 'eval')
+
+    def test_callback_effects_are_deferred_until_consumption(self):
+        prefix = ('import sys\nvalue="safe"\ndef remember(line):\n'
+                  ' global value\n value=line\n return "safe"\n'
+                  'values=map(remember,sys.stdin)\n')
+        self.assert_rules(prefix + 'eval(value)\n')
+        self.assert_rules(prefix + 'next(values,"safe")\neval(value)\n', 'eval')
+        self.assert_rules(prefix + 'list(values)\neval(value)\n', 'eval')
+        self.assert_rules('values=map(lambda value:eval(value),[])\nlist(values)\n')
+
+    def test_mapper_sanitizers_keep_their_own_domains(self):
+        self.assert_rules('import sys, html\nvalue=next(map(html.escape,sys.stdin))\n'
+                          'HttpResponse(value)\neval(value)\n', 'eval')
+        self.assert_rules('import sys\nvalue=next(map(str.strip,sys.stdin))\n'
+                          'cursor.execute("SELECT %s",(value,))\ncursor.execute(value)\n', 'sql')
+
+    def test_native_handles_and_literal_inputs_are_clean(self):
+        self.assert_rules('import sys\nvalues=map(str,sys.stdin)\neval(str(values))\n')
+        self.assert_rules('eval(next(map(str,["safe"])))\n')
+        self.assert_rules('import sys\nvalues=list(map(str,sys.stdin))\neval(str(len(values)))\n')
+        self.assert_rules('import sys\nvalues=tuple(map(str,sys.stdin))\n'
+                          'def len(values):\n return input()\neval(len(values))\n', 'eval')
+        self.assert_rules('import sys\nvalue="safe"\ndef remember(line):\n'
+                          ' global value\n value=line\n return "safe"\n'
+                          'values=list(map(remember,sys.stdin))\ncount=len(values)\neval(value)\n', 'eval')
+        self.assert_rules('import sys\ndef map(callback,values):\n return ["safe"]\n'
+                          'eval(next(map(str,sys.stdin)))\n')
+
+    def test_unknown_protocols_remain_explicit(self):
+        for operation in ('map(unknown,sys.stdin)', 'map(str,unknown)',
+                          'map(str,sys.stdin,strict=True)', 'map(str,*unknown)',
+                          'map(str,sys.stdin,**options)', 'map(markupsafe.escape,sys.stdin)'):
+            with self.subTest(operation=operation), self.assertRaisesRegex(
+                    taint_py.AnalysisLimit, 'native map'):
+                self.scan('import sys\neval(next(' + operation + '))\n')
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'native (map|zip).*mutation'):
+            self.scan('items=["safe"]\nvalues=map(str,items)\nitems[0]=input()\n'
+                      'eval(next(values))\n')
+
+    def test_native_mapping_witnesses_match_deferred_order(self):
+        source = '''
+import builtins, json, sys
+events=[]
+def remember(value):
+    events.append(value)
+    return value.strip()
+items=map(remember,sys.stdin)
+assert events == []
+first=next(items)
+assert events == ["first\\n"]
+rest=list(items)
+assert events == ["first\\n","second\\n"]
+assert first == "first" and rest == ["second"]
+assert list(map(lambda left,right:right,[0],["safe","unused"])) == ["safe"]
+assert list(map(lambda value: value.upper(),[])) == []
+print(json.dumps({"first":first,"rest":rest,"events":events}))
+'''
+        result = subprocess.run([sys.executable, '-c', source], input='first\nsecond\n',
+                                text=True, capture_output=True, timeout=20, check=False)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(json.loads(result.stdout),
+                         {'first': 'first', 'rest': ['second'], 'events': ['first\n', 'second\n']})
+
+
 class FilteredStdinTests(SourceTest):
     def test_native_filter_payload_reaches_each_sink_domain(self):
         for stream, convert in (('sys.stdin', ''), ('sys.__stdin__', ''),
@@ -2374,6 +2508,60 @@ class RunnerIntegrationTests(unittest.TestCase):
                                            output='json', expected=[(2, 1)], partial=True, cache=True)
                     self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
                                      'An incomplete native zip scan must not enter the completed cache')
+
+    def test_mapped_stdin_module_and_runner_reports_keep_sites_and_selection(self):
+        cases = (
+            ('unsafe', 'import sys\nrows=map(str,sys.stdin)\n'
+             'cursor.execute(next(rows))\n', [(3, 1)], False),
+            ('clean-replacement', 'import sys\nrows=map(lambda line:"SELECT 1",sys.stdin)\n'
+             'cursor.execute(next(rows))\n', [], False),
+            ('partial', 'import sys\ncursor.execute(input())\n'
+             'rows=map(unknown,sys.stdin)\n', [(2, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/python-map-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'view.py'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.py').write_text('cursor.execute(input())\n', encoding='utf-8')
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, output=output):
+                        self.zip_public_report(target, project / f'{meta}-{output}', meta=meta,
+                                               output=output, expected=expected, partial=partial,
+                                               partial_label='map')
+
+    def test_mapped_stdin_cache_edits_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/python-map-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'view.py'
+        prefix = 'import sys\nrows=map(str,sys.stdin)\n'
+        unsafe = prefix + 'cursor.execute(next(rows))\n'
+        clean = 'import sys\nrows=map(lambda line:"SELECT 1",sys.stdin)\ncursor.execute(next(rows))\n'
+        suppressed = prefix + 'cursor.execute(next(rows))  # ubs:ignore[python.taint.sql]\n'
+        for index, (source, expected, hits) in enumerate((
+                (unsafe, [(3, 1)], 0), (unsafe, [(3, 1)], 1),
+                (clean, [], 0), (suppressed, [], 0))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.zip_public_report(target, scratch / f'cache-{index}', meta=True,
+                                               output='json', expected=expected, cache=True,
+                                               partial_label='map')
+                self.assertEqual(report['profile']['cache_hits'], hits, report)
+        entries = set((scratch / 'cache').glob('*/files/**/*.json'))
+        self.assertTrue(entries, 'Completed native map scans must create reusable cache entries')
+        target.write_text('import sys\ncursor.execute(input())\nrows=map(unknown,sys.stdin)\n',
+                          encoding='utf-8')
+        for index in range(2):
+            with self.subTest(partial=index):
+                self.zip_public_report(target, scratch / f'partial-{index}', meta=True, output='json',
+                                       expected=[(2, 1)], partial=True, cache=True, partial_label='map')
+                self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
+                                 'An incomplete native map scan must not enter the completed cache')
 
     def test_filtered_stdin_module_and_runner_reports_keep_sites_and_selection(self):
         cases = (

@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.126-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.127-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -2182,6 +2182,32 @@ overrides keep their selected identities and Python argument evaluation order.
 Unknown external configuration remains unproved and does not create a
 missing-timeout warning. This check does not prove whole-program deadlines or
 cancellation behavior.
+
+### Python native map pipelines
+
+Python taint analysis follows native `map` pipelines over standard input and
+bounded literal sequences. Supported scalar mappers include `str`, selected
+string methods, `html.escape`, `shlex.quote`, and bounded local functions and
+lambdas. `next`, saved `__next__` methods, loops, comprehensions, `list`/`tuple`
+materialization and native string joins consume their mapped values:
+
+```python
+import sys
+
+query = next(map(str.strip, sys.stdin))
+cursor.execute(query)  # python.taint.sql
+```
+
+Creating a map keeps its callback deferred. Consumption preserves returned
+text, supported callback writes, finite output positions and the shortest
+input's bound. Constant replacements, unused handles and proven native
+sequence length metadata remain clean; escaping sanitizers retain only their
+own security domain.
+
+Unproved callbacks, custom iteration or result-object protocols, third-party
+sanitizers returning string subclasses, `strict=True` and reflected native
+identities report incomplete analysis while retaining findings already reached.
+These boundaries do not certify unsupported pipelines as clean.
 
 ### Python subprocess taint
 

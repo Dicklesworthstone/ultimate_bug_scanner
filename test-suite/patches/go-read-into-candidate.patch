@@ -1,0 +1,389 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_go.py b/modules/helpers/ubs_core/analyzers/taint_go.py
+--- a/modules/helpers/ubs_core/analyzers/taint_go.py
++++ b/modules/helpers/ubs_core/analyzers/taint_go.py
+@@ -44,7 +44,7 @@
+                     'html/template': 'template', 'text/template': 'template', 'os': 'os',
+                     'fmt': 'fmt', 'strings': 'strings', 'bytes': 'bytes', 'bufio': 'bufio'}
+ _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
++                   'io': {'ReadAll', 'ReadFull', 'ReadAtLeast'}, 'ioutil': {'ReadAll'},
+-                   'io': {'ReadAll'}, 'ioutil': {'ReadAll'},
+                    'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
+                    'os': {'Getenv', 'LookupEnv', 'Stdin'},
+                    'fmt': {'Scan', 'Scanln', 'Scanf', 'Fscan', 'Fscanln', 'Fscanf',
+@@ -53,6 +53,7 @@
+                    'bufio': {'NewReader', 'NewReaderSize', 'NewScanner',
+                              'ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'}}
+ _ENVIRONMENT_OPERATIONS = frozenset({('os', 'Getenv'), ('os', 'LookupEnv')})
++_READ_INTO_OPERATIONS = frozenset({('io', 'ReadFull'), ('io', 'ReadAtLeast')})
+ _SCAN_OPERATIONS = frozenset(('fmt', member) for member in _NATIVE_MEMBERS['fmt'])
+ _READER_CONSTRUCTORS = {
+     ('strings', 'NewReader'): 'strings-reader', ('bytes', 'NewReader'): 'bytes-reader',
+@@ -61,14 +62,15 @@
+     ('bufio', 'NewScanner'): 'scanner',
+ }
+ _BUFFER_SPLITTERS = frozenset(('bufio', member) for member in ('ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'))
++_SOURCE_OPERATIONS = (_ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _READ_INTO_OPERATIONS
++                      | _READER_CONSTRUCTORS.keys())
+-_SOURCE_OPERATIONS = _ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _READER_CONSTRUCTORS.keys()
+ _DECODER_METHODS = frozenset({'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
+                               'UseNumber', 'DisallowUnknownFields', 'Buffered'})
+ 
+ 
+ def _source_boundary(operations, action):
+     family = ('formatted input' if operations & _SCAN_OPERATIONS else
++              'reader' if operations & (_READER_CONSTRUCTORS.keys() | _READ_INTO_OPERATIONS) else 'environment')
+-              'reader' if operations & _READER_CONSTRUCTORS.keys() else 'environment')
+     return AnalysisLimit(f'Go {family} callable {action} is unsupported; analysis is incomplete')
+ 
+ SOURCE_PATTERNS = [
+@@ -334,6 +336,28 @@
+     cell: str
+ 
+ 
++@dataclass(frozen=True)
++class _BufferKey:
++    cell: str
++
++
++@dataclass(frozen=True)
++class _BufferInfo:
++    # A byte slice's length is distinct from its shared backing contents.
++    # Unknown lengths still permit conservative writes; unknown identities do not.
++    length: int | None = None
++    definite: bool = True
++
++
++def _join_buffers(*buffers):
++    present = [buffer for buffer in buffers if buffer is not None]
++    if not present:
++        return None
++    lengths = {buffer.length for buffer in present}
++    return _BufferInfo(next(iter(lengths)) if len(lengths) == 1 else None,
++                       len(present) == len(buffers) and all(buffer.definite for buffer in present))
++
++
+ @dataclass(frozen=True)
+ class _DecoderKey:
+     cell: str
+@@ -411,6 +435,7 @@
+     decoder: _DecoderInfo | None = None
+     pointers: frozenset[_Target] = frozenset()
+     reader: _ReaderInfo | None = None
++    buffer: _BufferInfo | None = None
+ 
+ 
+ def _join_value_info(*values):
+@@ -423,7 +448,8 @@
+     if not all(value.pointers for value in values):
+         pointers = frozenset(replace(target, whole=False) for target in pointers)
+     return _ValueInfo(_join_native(*(value.native for value in values)), decoder, pointers,
++                      _join_readers(*(value.reader for value in values)),
++                      _join_buffers(*(value.buffer for value in values)))
+-                      _join_readers(*(value.reader for value in values)))
+ 
+ 
+ def _join_native(*values):
+@@ -497,6 +523,8 @@
+             result[name] = _join_decoders(*(state.get(name) for state in states))
+         elif isinstance(name, _ReaderKey):
+             result[name] = _join_readers(*(state.get(name) for state in states))
++        elif isinstance(name, _BufferKey):
++            result[name] = _join_buffers(*(state.get(name) for state in states))
+         elif isinstance(name, _NativeKey):
+             result[name] = _join_native(*(state.get(name) for state in states))
+         elif isinstance(name, _ScanKindKey):
+@@ -758,7 +786,7 @@
+         match = re.match(r'[A-Za-z_]\w*\s+(.+)$', part, re.DOTALL)
+         if match:
+             typename = re.sub(r'\s+', '', match.group(1))
++            reference = typename.startswith('*') or typename in {'any', 'interface{}', '[]byte', '[]uint8'}
+-            reference = typename.startswith('*') or typename in {'any', 'interface{}'}
+         elif not re.fullmatch(r'[A-Za-z_]\w*', part):
+             reference = False
+         if reference:
+@@ -821,6 +849,7 @@
+     value_returns: tuple[_ValueInfo | None, ...] = ()
+     native_writes: dict[tuple[int, tuple[str, ...]], _NativeInfo | None] = field(default_factory=dict)
+     reader_scans: frozenset[int] = frozenset()
++    buffer_escapes: frozenset[int] = frozenset()
+ 
+ 
+ def _join_summaries(summaries: list[_Summary]) -> _Summary:
+@@ -875,7 +904,10 @@
+             native_writes[index, path] = _join_native(native_writes.get((index, path)), native)
+     reader_scans = frozenset(min(index, variadic) if variadic is not None else index
+                              for summary in summaries for index in summary.reader_scans)
++    buffer_escapes = frozenset(min(index, variadic) if variadic is not None else index
++                               for summary in summaries for index in summary.buffer_escapes)
++    return _Summary(returns, effects, variadic, writes, tuple(value_returns), native_writes,
++                    reader_scans, buffer_escapes)
+-    return _Summary(returns, effects, variadic, writes, tuple(value_returns), native_writes, reader_scans)
+ 
+ 
+ @dataclass
+@@ -906,6 +938,8 @@
+         self.native_escapes: set[str] = set()
+         self.scan_writes: dict[_Target, _Fact] = {}
+         self.reader_scans: set[_ReaderOrigin] = set()
++        self.buffer_escapes: set[_Target] = set()
++        self.buffer_writes: dict[_Target, _Fact] = {}
+         self.reader_cell_writes: dict[str, _ReaderInfo | None] = {}
+         self.decoder_cell_writes: dict[str, _DecoderInfo | None] = {}
+         self.decoder_returns: dict[str, _DecoderInfo | None] | None = None
+@@ -1022,6 +1056,78 @@
+         identity = self.native_identity(root, member, offset, scope)
+         return _NativeInfo(frozenset({identity})) if identity is not None else _UNKNOWN_NATIVE
+ 
++    @staticmethod
++    def integer_literal(expr):
++        expr, _ = _Analysis.unparenthesize(expr)
++        if not re.fullmatch(r'[+-]?(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|[0-9][0-9_]*)', expr):
++            return None
++        number = expr.replace('_', '')
++        unsigned = number.lstrip('+-')
++        base = 8 if len(unsigned) > 1 and unsigned[0] == '0' and unsigned[1].isdigit() else 0
++        try:
++            return int(number, base or (10 if unsigned.isdigit() else 0))
++        except ValueError:
++            return None
++
++    def buffer_expression(self, expr, offset, state, scope):
++        """Recognize builtin byte allocations and slices, without a general heap.
++
++        Backing cells are allocation-site identities. Slice copies keep those
++        cells; string conversions read a value snapshot. Named element types,
++        fields and escaping local factories need additional type/heap proof.
++        """
++        expr, offset = self.unparenthesize(expr, offset)
++        code = _masked_source(expr)
++        if expr == 'nil' and 'nil' not in scope.bindings and 'nil' not in self.summaries:
++            return _ValueInfo(buffer=_BufferInfo(0)), False, False
++        sliced = re.fullmatch(r'([A-Za-z_]\w*)\s*\[(.*)\]', code, re.DOTALL)
++        if sliced:
++            parts = _parts(sliced.group(2), ':')
++            info = self.value_info(sliced.group(1), offset, state, scope)
++            if len(parts) in {2, 3} and info is not None and info.buffer is not None:
++                low_text = sliced.group(2)[slice(*parts[0])].strip()
++                high_text = sliced.group(2)[slice(*parts[1])].strip()
++                low = self.integer_literal(low_text) if low_text else 0
++                high = self.integer_literal(high_text) if high_text else info.buffer.length
++                length = max(0, high - low) if high is not None and low is not None else None
++                return replace(info, buffer=replace(info.buffer, length=length)), False, False
++        constructed = re.fullmatch(r'make\s*\((.*)\)', expr, re.DOTALL)
++        length, fresh, zeroed = None, False, False
++        if constructed and 'make' not in scope.bindings and 'make' not in self.summaries:
++            pieces = [constructed.group(1)[start:end].strip()
++                      for start, end in _parts(_masked_source(constructed.group(1)))]
++            if (len(pieces) in {2, 3} and re.sub(r'\s+', '', pieces[0]) in {'[]byte', '[]uint8'}
++                    and self.scan_type(pieces[0], scope) == 'text'):
++                length = self.integer_literal(pieces[1])
++                fresh, zeroed = True, True
++        converted = re.match(r'\[\]\s*(byte|uint8)\s*\(', code)
++        if converted and self.scan_type('[]' + converted.group(1), scope) == 'text':
++            closing = _pairs(code).get(converted.end() - 1)
++            if closing == len(code) - 1:
++                argument = expr[converted.end():closing]
++                info = self.value_info(argument, offset + converted.end(), state, scope)
++                if info is not None and info.buffer is not None:
++                    return replace(info, native=_UNKNOWN_NATIVE), False, False
++                literal = _string_literal(argument.strip())
++                if literal is not None:
++                    length, fresh = len(literal.encode('utf-8')), True
++                elif (re.fullmatch(r'\s*string\s*\(.*\)\s*', argument, re.DOTALL)
++                      and 'string' not in scope.bindings and 'string' not in self.summaries):
++                    fresh = True
++        literal = re.fullmatch(r'\[\]\s*(byte|uint8)\s*\{(.*)\}', code, re.DOTALL)
++        if literal and self.scan_type('[]' + literal.group(1), scope) == 'text':
++            items = literal.group(2).strip().rstrip(',').strip()
++            length = (0 if not items else len(_parts(items))) if ':' not in items else None
++            fresh = True
++        if fresh:
++            target = _Target(f'@byte-buffer:{offset}')
++            return _ValueInfo(pointers=frozenset({target}), buffer=_BufferInfo(length)), True, zeroed
++        return None, False, False
++
++    def escape_buffer(self, info):
++        if info is not None and info.buffer is not None:
++            self.buffer_escapes.update(info.pointers)
++
+     def check_source_storage(self, code, offset, state, scope):
+         # Scalar native identities and selected helper results are modeled.
+         # Composite values are not a callable heap: losing a getter inside a
+@@ -1078,12 +1184,16 @@
+                 if (stored and summary is not None and any(info is not None and info.decoder is not None
+                                                            for info in summary.value_returns)):
+                     raise AnalysisLimit('Go decoder aggregate storage is unsupported; analysis is incomplete')
++                if stored and summary is not None:
++                    for info in summary.value_returns:
++                        self.escape_buffer(info)
+                 if (native is not None and native.operations & {('json', 'NewDecoder'), ('xml', 'NewDecoder')}
+                         and (stored or re.match(r'\s*\.\s*[A-Za-z_]\w*\s*[,}]', tail))):
+                     raise AnalysisLimit('Go decoder aggregate storage is unsupported; analysis is incomplete')
+             else:
+                 natives = (self.native_callable(root, member, offset + match.start(), state, scope),)
+                 info = self.value_info(match.group(), offset + match.start(), state, scope)
++                self.escape_buffer(info)
+                 if info is not None and info.reader is not None:
+                     raise AnalysisLimit('Go reader aggregate storage is unsupported; analysis is incomplete')
+                 if info is not None and info.decoder is not None:
+@@ -1115,7 +1225,8 @@
+                                      frozenset({'stdin'}), frozenset({_ReaderOrigin((-1, -1))}))
+             elif re.fullmatch(r'(?:r|req|request)\s*\.\s*Body', code):
+                 reader = _ReaderInfo(frozenset({_Trace(code, path=(code,))}), frozenset({'request'}))
++            buffer = state.get(_BufferKey(cell)) if name.group(2) is None else None
++            return _ValueInfo(native, decoder, self.pointers(expr, state, scope), reader, buffer)
+-            return _ValueInfo(native, decoder, self.pointers(expr, state, scope), reader)
+         call = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
+         if call:
+             end = _pairs(code).get(call.end() - 1)
+@@ -1131,7 +1242,8 @@
+             owner = self.value_info(expr[:selection.start()], offset, state, scope)
+             if owner is not None and owner.decoder is not None and owner.decoder.methods == {''}:
+                 return _ValueInfo(decoder=replace(owner.decoder, methods=frozenset({selection.group(1)})))
++        buffer, _fresh, _zeroed = self.buffer_expression(expr, offset, state, scope)
++        return buffer if buffer is not None else _ValueInfo(pointers=self.pointers(expr, state, scope))
+-        return _ValueInfo(pointers=self.pointers(expr, state, scope))
+ 
+     def reader_payload(self, expr, offset, fact, state, scope, *, require=False):
+         """Reader handles carry contents separately from ordinary value facts."""
+diff --git a/test-suite/quality/test_taint_go_decoding.py b/test-suite/quality/test_taint_go_decoding.py
+--- a/test-suite/quality/test_taint_go_decoding.py
++++ b/test-suite/quality/test_taint_go_decoding.py
+@@ -231,6 +231,137 @@
+                                 'fmt.Fprint(w, value) // output\nfmt.Fprint(w, n, err)',
+                                 [('query', 'sql', 'db.Query'), ('command', 'command', 'exec.Command'),
+                                  ('output', 'xss', 'fmt.Fprint')])
++
++    def test_readinto_request_bytes_reach_sinks_but_count_and_error_do_not(self):
++        for operation, extra in [('ReadFull', ''), ('ReadAtLeast', ', 1')]:
++            with self.subTest(operation=operation):
++                self.check_scan('buffer := make([]byte, 32)\n'
++                                'n, err := io.' + operation + '(r.Body, buffer' + extra + ')\n'
++                                'db.Query(string(buffer)) // query\n'
++                                'exec.Command("sh", "-c", string(buffer)) // command\n'
++                                'fmt.Fprint(w, string(buffer)) // output\n'
++                                'fmt.Fprint(w, n, err)',
++                                [('query', 'sql', 'db.Query'), ('command', 'command', 'exec.Command'),
++                                 ('output', 'xss', 'fmt.Fprint')], imports='import ("io"; "fmt"; "os/exec")')
++
++    def test_readinto_native_aliases_and_selected_reader_factory_keep_identity(self):
++        self.check_scan('buffer := make([]uint8, 8)\n'
++                        'read := stream.ReadFull\nsaved := read\n'
++                        'source := factory()\nsaved(source, buffer)\n'
++                        'db.Query(string(buffer)) // query', [('query', 'sql', 'db.Query')],
++                        imports='import (stream "io"; environment "os")',
++                        helpers='func factory() stream.Reader { return environment.Stdin }')
++
++    def test_readinto_buffer_aliases_observe_backing_storage_and_rebinding(self):
++        self.check_scan('buffer := make([]byte, 8)\nalias := buffer\n'
++                        'snapshot := string(buffer)\nbuffer = make([]byte, 8)\n'
++                        'io.ReadFull(r.Body, alias[1:])\n'
++                        'db.Query(string(alias)) // alias\n'
++                        'db.Query(string(buffer))\ndb.Query(snapshot)',
++                        [('alias', 'sql', 'db.Query')], imports='import "io"')
++
++    def test_readinto_zero_length_and_impossible_minimum_do_not_read(self):
++        operations = (
++            'io.ReadFull(custom, buffer[:0])',
++            'io.ReadFull(custom, nil)',
++            'io.ReadAtLeast(custom, buffer, 0)',
++            'io.ReadAtLeast(custom, buffer, -1)',
++            'io.ReadAtLeast(custom, buffer, 9)',
++            'io.ReadAtLeast(custom, make([]byte, 0), count)',
++        )
++        for operation in operations:
++            with self.subTest(operation=operation):
++                self.check_scan('buffer := make([]byte, 8)\nn, err := ' + operation + '\n'
++                                'db.Query(string(buffer))\nfmt.Fprint(w, n, err)',
++                                imports='import ("io"; "fmt")')
++
++    def test_readinto_reslicing_empty_capacity_may_read(self):
++        self.check_scan('buffer := make([]byte, 0, 8)\nalias := buffer[:8]\n'
++                        'io.ReadFull(r.Body, alias)\ndb.Query(string(alias)) // query',
++                        [('query', 'sql', 'db.Query')], imports='import "io"')
++
++    def test_readinto_fixed_bytes_weak_writes_and_sanitizer_domains(self):
++        self.check_scan('fixed := make([]byte, 8)\nio.ReadFull(strings.NewReader("fixed"), fixed)\n'
++                        'db.Query(string(fixed))\nbuffer := make([]byte, 8)\n'
++                        'io.ReadFull(r.Body, buffer)\n'
++                        'io.ReadFull(strings.NewReader("x"), buffer)\n'
++                        'db.Query(string(buffer)) // preserved\n'
++                        'db.Query("SELECT $1", string(buffer))\n'
++                        'safe := html.EscapeString(string(buffer))\nfmt.Fprint(w, safe)\n'
++                        'db.Query(safe) // domain',
++                        [('preserved', 'sql', 'db.Query'), ('domain', 'sql', 'db.Query')],
++                        imports='import ("io"; "strings"; "html"; "fmt")')
++
++    def test_readinto_selected_helper_writes_a_slice_parameter(self):
++        self.check_scan('buffer := make([]byte, 8)\nread(r.Body, buffer)\n'
++                        'db.Query(string(buffer)) // query\n'
++                        'empty := make([]byte, 0)\nread(r.Body, empty)\ndb.Query(string(empty))',
++                        [('query', 'sql', 'db.Query')], imports='import "io"',
++                        helpers='func read(source io.Reader, destination []byte) { io.ReadFull(source, destination) }')
++
++    def test_readinto_import_decoys_and_lexical_shadows_do_not_borrow_io(self):
++        for imports, helpers, call in (
++            ('import io "example.org/io"', '', 'io.ReadFull(r.Body, buffer)'),
++            ('import "io"', 'func h2() { io := custom; buffer := make([]byte, 8); '
++             'io.ReadFull(r.Body, buffer); db.Query(string(buffer)) }', ''),
++            ('import . "io"', 'func ReadFull(_ interface{}, _ []byte) {}', 'ReadFull(r.Body, buffer)'),
++        ):
++            with self.subTest(imports=imports, call=call):
++                self.check_scan('buffer := make([]byte, 8)\n' + call + '\ndb.Query(string(buffer))',
++                                imports=imports, helpers=helpers)
++
++    def test_readinto_unknown_protocols_and_untracked_destinations_are_incomplete(self):
++        from ubs_core.taint_flow import AnalysisLimit
++
++        for body in (
++            'buffer := make([]byte, 8)\nio.ReadFull(custom, buffer)',
++            'buffer := external()\nio.ReadFull(r.Body, buffer)',
++            'buffer := make([]byte, 8)\nread := io.ReadFull\nif choice { read = custom }\nread(r.Body, buffer)',
++            'buffer := make([]byte, 8)\nexternal(buffer)\nio.ReadFull(r.Body, buffer)',
++            'buffer := make([]byte, 8)\naliases := [][]byte{buffer}\nio.ReadFull(r.Body, buffer)',
++            'buffer := make([]byte, 8)\nreader := bytes.NewReader(buffer)\nio.ReadFull(r.Body, buffer)',
++            'buffer := make([]byte, 8)\ndefer func() { io.ReadFull(r.Body, buffer) }()',
++        ):
++            with self.subTest(body=body), self.assertRaisesRegex(AnalysisLimit, 'reader|buffer'):
++                self.check_scan(body, imports='import ("io"; "bytes")')
++
++    @unittest.skipUnless(os.environ.get('UBS_GO_READINTO_NATIVE') == '1',
++                         'set UBS_GO_READINTO_NATIVE=1 for real Go read-into witnesses')
++    def test_readinto_native_witness_matches_payload_alias_and_no_read_semantics(self):
++        source = textwrap.dedent('''
++            package main
++            import ("encoding/json"; "io"; "os"; "strings"; "fmt")
++            type Recorder struct { Queries []string }
++            func (db *Recorder) Query(query string) { db.Queries = append(db.Queries, query) }
++            func main() {
++                db := &Recorder{}
++                buffer := make([]byte, 4)
++                alias := buffer
++                snapshot := string(buffer)
++                n, err := io.ReadFull(os.Stdin, buffer)
++                db.Query(string(alias)) // payload
++                db.Query(snapshot)
++                db.Query(fmt.Sprint(n, ":", err))
++                empty := buffer[:0]
++                io.ReadFull(os.Stdin, empty)
++                fixed := []byte("fixed")
++                io.ReadAtLeast(os.Stdin, fixed, 6)
++                io.ReadAtLeast(os.Stdin, fixed, -1)
++                db.Query(string(fixed))
++                io.ReadAtLeast(strings.NewReader(os.Getenv("UBS_GO_BUFFERED_INPUT")), buffer, 1)
++                db.Query(string(alias)) // minimum
++                io.ReadFull(strings.NewReader("x"), buffer)
++                db.Query(string(alias)) // short
++                if err := json.NewEncoder(os.Stdout).Encode(db.Queries); err != nil { panic(err) }
++            }
++        ''').lstrip('\n')
++        BufferedReaderFlowTests.run_native_reader(
++            self, source, ['<std', '\0' * 4, '4:<nil>', 'fixed', '<sup', 'xsup'])
++        findings = self.scan()
++        expected = sorted((number, line.index('db.Query') + 1, 'go.taint.sql')
++                          for number, line in enumerate(source.splitlines(), 1)
++                          if any('// ' + marker in line for marker in ('payload', 'minimum', 'short')))
++        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings), expected, findings)
+ 
+     def test_string_scan_family_uses_input_slot_and_keeps_metadata_clean(self):
+         for operation, arguments in [('Sscan', 'input, &value'), ('Sscanln', 'input, &value'),

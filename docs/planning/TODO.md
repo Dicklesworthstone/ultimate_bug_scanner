@@ -624,3 +624,7 @@ This is preserved source work, not an activated scanner repair or release claim.
   archived candidate reduces 54 maintained baseline assertion failures to one
   diagnostic-label failure across ten methods. Native join consumption,
   independent candidate replay, public reports and prescribed gates are pending.
+- [ ] `1b9j.6.18`: complete Go native read-into-buffer transport. The archived
+  patch contains failing regression witnesses and a partial capability scaffold;
+  native transfer, alias/backing writes and helper integration are unfinished.
+  No candidate runtime qualification is claimed.

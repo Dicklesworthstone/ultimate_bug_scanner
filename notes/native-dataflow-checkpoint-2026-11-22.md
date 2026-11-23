@@ -141,3 +141,49 @@ The stdin-provenance, D6 and release-self-scan umbrella goals remain open.
 Reconstruction was checked by exact forward/reverse application in tool memory.
 Original full runtime logs were not recovered; the saved receipt fields are not
 a replacement for them or for rerunning the final tree.
+
+## Go: io.ReadFull and io.ReadAtLeast destination writes
+
+Bead: `ultimate_bug_scanner-1b9j.6.18`.
+
+The unchanged analyzer can report no findings and complete analysis for:
+
+```go
+buffer := make([]byte, 128)
+io.ReadFull(r.Body, buffer)
+db.Query(string(buffer))
+```
+
+The intended shared model must carry Reader contents into byte-slice backing
+storage, preserve aliases and partial writes, and separate payloads from counts
+and errors. Proven zero-length and invalid-minimum no-read operations must keep
+their actual behavior.
+
+Preserved material:
+
+- `test-suite/patches/go-read-into-candidate.patch`: exact partial edits.
+- `test-suite/patches/go-read-into-checkpoint.md`: detailed reconstruction,
+  observed evidence and implementation instructions.
+- `test-suite/patches/go-read-into-independent.py`: unchanged 18-case independent
+  source probe.
+
+The maintained baseline ran nine methods: 12 failed assertions and one error.
+DSR log SHA-256:
+`f23d9d734eb3212892f8ce96b821bb2caa21ab64a83dab30b5846717ae9778f6`.
+The separate independent baseline produced 10 exact, one partial and seven
+incorrect complete results; log SHA-256:
+`7ac1fd7e2c99abc572bb1d720455498b3667651a683afae5dc82665553af1fb6`.
+
+This candidate is **unfinished implementation**, not just pending qualification.
+The native read-into transfer, destination backing-cell writes and helper-summary
+integration still need implementation. The added scaffold has two identified
+issues (nil recognition order and masked rune-literal lengths) recorded in the
+detailed checkpoint. No candidate syntax or runtime test completed. The opt-in
+real Go witness was written but not executed.
+
+Finish those contracts, replay unchanged source and native witnesses, then run
+real reports and existing affected suites through DSR. Refresh pins/version only
+after functional completion and run prescribed gates. Keep the broader Go input,
+D6 and release goals open. All 25 recorded manual hunks were checked against the
+immutable base and the recovery patch replayed both ways in tool memory; this
+does not establish that the unfinished candidate executes correctly.

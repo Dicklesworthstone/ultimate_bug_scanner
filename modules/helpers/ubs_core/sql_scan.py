@@ -422,7 +422,10 @@ def reject_sql_interpolation(tokens: list[Token], source: str) -> None:
                 continue
             following = source[token.end:token.end + 1]
             if following and (following.isalnum() or following in "'_\"{" or ord(following) >= 128):
-                raise Incomplete(f"line {token.line}: psql SQL interpolation requires external variable context")
+                # The statement loop prefixes the statement's first line;
+                # name the variable's own line only when it differs.
+                where = "" if token.line == tokens[0].line else f" at line {token.line}"
+                raise Incomplete(f"psql SQL interpolation{where} requires external variable context")
         index += 1
 
 

@@ -215,21 +215,21 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [bash]='effa5ba3bc33be4ac478160fcbd4085a1bf639d46c9989b21540b97b1ff2462a'
-  [cpp]='dbfec255a145efddc85f75bf9fe3534050c3a9b19d1d59692e9d270d320e815a'
-  [csharp]='b8e6bdc39b64e899f36450cd30f1b6715fcd6ad975174f620d39da11e2147b48'
-  [elixir]='6c161b835803e404f2ffb064d782197af3045537bb824a6c88ca985f49841659'
-  [golang]='6e5b04fc547779e193b2a7788b3c24851c4c2bcd8c58bb1f7b440709e8514252'
-  [hcl]='24de00b38c563d01aefcbafefbc85ed4c5f2031b83d9aed36c2def225306e9c6'
-  [java]='882b24ed930c5f57cef6d8cb2cc336d3e424a640453472032ea7bdb3ab0a4c2f'
-  [js]='4a54affe8cede1f024f033176ada2fa187b3ea31dfa0edd0fcf83c4af9a194a5'
-  [kotlin]='9c5d7d8bcb7c7fff6eeff133e1178f72e55120c4fbe9322f3369a4f4dca967b3'
-  [php]='5d47fd64d9bbc8534ecad672d8e44e720a4cead98359a6b357a2a7630cf7a96a'
-  [python]='765e7778c9768cb89797359a0ba98d8335558983a46ddbc89c1c84dc54e4c8a4'
-  [ruby]='93a0a3872539df613deb37a58ca1842f8859adf82a6ba9ca2d69fd849befca0d'
-  [rust]='e156d1ba9731baa2339e6dd953e89b3b015e6dfd3b9ed534c84deb329611ef12'
-  [sql]='391a446c6e17e974f2ae7af06c94f6a1ebd9ab0af7b34f74862c3005cfb09823'
-  [swift]='cad31b3db9079195196a4f1ba61b0a5f8e887f5f0cb91b053f802e51478e378b'
+  [bash]='b4b2f83210b0e1d58cd69c1d343da027bcb3482ce8e6c7c63cc3f2858c86063b'
+  [cpp]='190dcf36818014a8fc1692e16b188e689cfa61f30787ac87ae9ef583a4799f2f'
+  [csharp]='9e49c00b469e4faf35aa02d1a94c053b3bd07693fd12fe1e3f1c74b71fc5312f'
+  [elixir]='a0e3aacff04d7620c6bebe27976f32f57765c3faf07db44a7fc22ea470ae43ca'
+  [golang]='b70ae80eb9a294ed4778e625024150a2eb9cab1d5bef026aa5ce9d3327e06d6a'
+  [hcl]='2894b432f4b11ad64ce80628df19c83b642b2516648a4897160644a74b54b5cc'
+  [java]='46fd9ab6b0941d88f5cb7a45db30283f5f0ecd50db62787b886c0848e75865df'
+  [js]='49ce02a57fceaf240e400c5c30ee3c7d88ad12a0dbfbabdd5088c315b70df71b'
+  [kotlin]='fc351fa2dbdc95553ffca204463f382448d5b8e3a296ece40100b81b85a045ff'
+  [php]='e6bccffb2377e3153cf47efa3b9721f08fe82e92713e618705fb0fafa1b39576'
+  [python]='47bfe2313dbaa018f20da2f7eee2600ee753e637aec38872411ad4f5beba45bc'
+  [ruby]='1982d571bf96f01b1e6cdacfca6763bbafa3fa556a785e5e96aea35a05e786da'
+  [rust]='b234a9d2c26637b4f69a14a5497c88f44d5a61273d747d2b87951df38ba911ca'
+  [sql]='cad2633ba84216e9b9fda40af67adf912380db4a059df7b839e8bbf9cdc01418'
+  [swift]='aff7f55c0fc5815027c7fb2217dafe3a4ef16907dbea4705c8bcd3fb37f3da72'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -583,7 +583,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/scheduler.py']='ce86f556229c0875eb4ea11ef5958a7cd24768ffcce3b39d480a938d1c4879b7'
   ['helpers/ubs_core/selftest.py']='6ca3dd5e5534edc0b8a10e9aac1f80834f0d79b661c50c28bd00b33eb85bff08'
   ['helpers/ubs_core/shards.py']='cdc6ecab42bd962e65bb1ac1dc5e3f20b87c4d68632617286a2991274c0c98f7'
-  ['helpers/ubs_core/sql_scan.py']='73ccf0288fb616d110b84c2ccf7a445b29a1ac7954c8e4c850eda98a36994200'
+  ['helpers/ubs_core/sql_scan.py']='e1a52124fa7aa9b2c56b012906d6f175224c1624464bde5e9391ab5167d28de0'
   ['helpers/ubs_core/suppression.py']='1e41ad9342ada75f8371c89fa516b8bf70abbdf0b68f8eed968306ec6bf6fcb4'
   ['helpers/ubs_core/swift_ast.py']='53b2d380aeca310005241d1c43756dbf00d730163c2abbba4f8b1dbfadf799d3'
   ['helpers/ubs_core/swift_detectors/__init__.py']='e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
@@ -605,7 +605,7 @@ declare -A HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
   ['helpers/ubs_core/swift_scan.py']='7543f49117b6549a56771e737c8d57a828c238af50a660faf27b65a1227bfd5f'
   ['helpers/ubs_core/taint_flow.py']='b50925e0f4bf7263f41650a1274c208b5e2c2a994d7cdfd518fb26b3dd5251cf'
-  ['lib/ubs-common.sh']='59678add185a65684dfd468150b6383bf80c19786d65727114cf4ed3cdca28aa'
+  ['lib/ubs-common.sh']='8a35d668a796756696d60cd11ef9fb6c9ab9639fd2d9c26ecdaa87803f233457'
 )
 
 # contract.json as shipped by earlier releases (sha256 -> first tag), kept out

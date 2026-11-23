@@ -1525,6 +1525,10 @@ class SQLNativeTests(EvidenceTest):
         self.assertEqual(errors, ["line 2: unsupported PostgreSQL statement 'load'",
                                   "line 3: non-PostgreSQL dialect syntax",
                                   "line 4: unsupported SQL or psql command"])
+        records, errors = analyzer.analyze_source("SELECT :'v';\nSELECT 1\nFROM :t;\n", "diagnostics.sql")
+        self.assertEqual(records, [], errors)
+        self.assertEqual(errors, ["line 1: psql SQL interpolation requires external variable context",
+                                  "line 2: psql SQL interpolation at line 3 requires external variable context"])
 
     def test_role_changes_do_not_reuse_another_owners_schema_defaults(self):
         analyzer = importlib.import_module("ubs_core.sql_scan")

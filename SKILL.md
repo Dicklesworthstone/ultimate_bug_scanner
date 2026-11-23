@@ -320,6 +320,7 @@ ubs sessions --entries 1    # View latest install session
 | Error | Fix |
 |-------|-----|
 | "Environment error" (exit 2) | `ubs doctor --fix` |
+| `Partial: [ANALYSIS_INCOMPLETE]` (exit 2) | An analyzer hit a coverage limit, not a tooling problem; `ubs doctor --fix` cannot help. Read the reason (text output or `failed_modules[].message` in JSON); `UBS_ALLOW_PARTIAL=1` accepts the partial result |
 | "ast-grep not found" | `brew install ast-grep` or `cargo install ast-grep` |
 | Too many false positives | Use `--skip=N` or `// ubs:ignore` |
 | Slow scans | Scope to files: `ubs <file>` not `ubs .` |

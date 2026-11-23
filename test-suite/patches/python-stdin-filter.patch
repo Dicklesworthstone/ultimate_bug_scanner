@@ -1,0 +1,330 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -80,13 +80,13 @@
+ _STDIN_EAGER_PARSERS = frozenset({'json.load', 'tomllib.load'})
+ _STDIN_CSV_PARSERS = frozenset({'csv.reader', 'csv.DictReader'})
+ _STDIN_PARSER_CARRIERS = (_STDIN_EAGER_PARSERS | _STDIN_CSV_PARSERS | _STDIN_STREAMS
+                           | frozenset(_STDIN_READERS)
+                           | {'json', 'tomllib', 'csv', 'sys', 'iter', 'builtins.iter', 'zip', 'builtins.zip',
+-                             'enumerate', 'builtins.enumerate'})
++                             'enumerate', 'builtins.enumerate', 'filter', 'builtins.filter'})
+ _STDIN_OPAQUE_ARGUMENTS = '@stdin:opaque-arguments'
+ _SOURCE_MEMBERS = {'os': frozenset({'getenv', 'getenvb', 'environ', 'environb'}),
+                    'sys': frozenset({'argv', 'stdin', '__stdin__'}),
+-                   'builtins': frozenset({'iter', 'list', 'tuple', 'next', 'zip', 'enumerate', 'bytearray'}),
++                   'builtins': frozenset({'iter', 'list', 'tuple', 'next', 'zip', 'enumerate', 'filter', 'bytearray'}),
+                    'json': frozenset({'load', 'loads', 'JSONDecoder', '_default_decoder'}),
+                    'tomllib': frozenset({'load', 'loads'}),
+                    **{stream: methods | {'__iter__', 'buffer', 'raw', 'readinto', 'readinto1'}
+@@ -1096,8 +1096,8 @@
+ 
+ # Preserve the existing conventional unimported names, but never restore one
+ # after a local assignment/parameter has explicitly shadowed it.
+ _IMPLICIT_IDENTITIES = frozenset({
+-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
++    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'filter', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
+     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
+     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
+     'render_template', 'render_template_string', 'HttpResponse', 'Response',
+@@ -4882,7 +4882,61 @@
+             elements.append((element, incoming, NO_REFERENCES))
+         return tuple(elements), len(elements), references, False
+ 
+-    def enumerate_value(self, node, state, inputs):
++    def filter_value(self, node, state, inputs):
++        """Keep stdin items through an exact native None predicate.
++
++        Native text/binary file iteration yields nonempty lines; EOF raises
++        StopIteration instead of yielding an empty line. None therefore
++        preserves every yielded item without invoking a callback. Creation
++        acquires the iterator but does not read its first item. The shared
++        cursor model retains aliases and refuses uncertain post-EOF reuse.
++        """
++        positions = self.call_positions(node, inputs.arguments, state)
++        if None in inputs.keywords or any(isinstance(expression, (ast.Starred, _ArgumentExpansion))
++                                         for expression, _fact, _binding, _refs in positions):
++            raise AnalysisLimit('native filter argument expansion is unresolved; analysis is incomplete')
++        if len(positions) != 2 or inputs.keywords:
++            self.possible_exception(state)
++            return CLEAN  # filter takes exactly two positional arguments.
++        _predicate, _predicate_fact, predicate, _predicate_refs = positions[0]
++        expression, fact, binding, references = positions[1]
++        self.require_value(predicate)
++        self.require_value(binding)
++        choices = _binding_choices(binding)
++        if not choices:
++            return CLEAN
++        known = [value for value in choices if self.stdin_identity(value) in _STDIN_STREAMS]
++        if not known:
++            # Demand selected helper inputs without changing ordinary
++            # aggregate transfer for application iterables and shadows.
++            return None
++        predicates = _binding_choices(predicate)
++        symbolic = {value.parameter for value in (*choices, *predicates)
++                    if isinstance(value, _SymbolicValue)}
++        if symbolic:
++            self.zip_parameters.update(symbolic)
++            return CLEAN
++        if any(value not in known and not (isinstance(value, ast.Constant)
++                and type(value.value) in {int, float, complex, bool, type(None)}) for value in choices):
++            raise AnalysisLimit('native filter input alternatives are unresolved; analysis is incomplete')
++        if not self.stdin_parser_stable(node, members={'filter', '__iter__', '__next__', '__bool__', '__len__'}):
++            raise AnalysisLimit('native filter callable identity is unresolved; analysis is incomplete')
++        if not predicates:
++            return CLEAN
++        if not all(isinstance(value, ast.Constant) and value.value is None for value in predicates):
++            # A predicate returns selection truth, never the selected item.
++            # Unknown callbacks can also mutate reachable SQL or program
++            # state; do not replace their execution with an eager taint join.
++            raise AnalysisLimit('native filter predicate callbacks are unmodeled; analysis is incomplete')
++        columns = [self.zip_input(expression, fact, value, references, state) for value in known]
++        payload = join_facts(*(elements[0][1] for elements, _length, _refs, _fallible in columns))
++        element = _join_bindings(*(elements[0][0] for elements, _length, _refs, _fallible in columns))
++        row = _ArgumentVector(((element, payload),))
++        return self.install_zip_iterator(node, state, _ZipIterator(
++            (row,), None, optional=True, repeating=True, fallible=True, fallible_at_end=True,
++            native_kind='filter'))
++
++    def enumerate_value(self, node, state, inputs):
+         """Expose native stdin rows while keeping the generated index clean.
+ 
+         Reuse the shared row/cursor engine, including its exhaustion and
+@@ -5016,8 +5070,8 @@
+                 for _expression, _fact, binding, _refs in positions
+                 for value in _binding_choices(binding))))
+ 
+     def install_zip_iterator(self, node, state, iterator):
+-        """Share native row/cursor ownership across zip and enumerate."""
++        """Share native row/cursor ownership across zip, enumerate and filter."""
+         cursor = _CellRef(self.scope, '@zip:cursor', (node,))
+         cells = state.cell_state()
+         child = self.engine.original_calls.get(node, node)
+@@ -5079,10 +5133,11 @@
+             if phase.index < 0 or phase.index >= len(iterator.rows):
+                 continue
+             branch = state.copy()
+             branch.put_cell(iterator.cursor, _CellContents(binding=_ZipCursor(
+                 phase.index if iterator.repeating else phase.index + 1)), written=True)
+             row = iterator.rows[phase.index]
+-            yielded.append((branch, join_facts(*(fact for _value, fact in row.operands)), row))
++            value = row.operands[0][0] if iterator.native_kind == 'filter' else row
++            yielded.append((branch, join_facts(*(fact for _value, fact in row.operands)), value))
+         return yielded, _join_states(*exhausted)
+ 
+     def zip_next(self, node, state, iterators, default=None):
+@@ -5107,13 +5162,23 @@
+         self.expression_references[node] = refs
+         return join_facts(*facts)
+ 
+     def zip_materialize(self, node, state, iterators):
+-        outputs, branches = [], []
++        outputs, branches, scalar_facts = [], [], []
+         for iterator in iterators:
+             if not iterator.exhaustible:
+                 raise AnalysisLimit('native iterator exhaustion is unproved; analysis is incomplete')
+             if iterator.repeating:
+-                raise AnalysisLimit('native zip unbounded materialization is unresolved; analysis is incomplete')
++                if iterator.native_kind != 'filter':
++                    raise AnalysisLimit('native zip unbounded materialization is unresolved; analysis is incomplete')
++                # Every native filtered line has the same source contract.
++                # Aggregate contents do not need an invented length or row
++                # index. Exhaustion still leaves a potentially resumable
++                # stream cursor, so later use cannot borrow a clean EOF.
++                yielded, exhausted = self.zip_step(state, iterator)
++                outputs.append(None)
++                scalar_facts.extend(fact for _branch, fact, _value in yielded)
++                branches.append(exhausted)
++                continue
+             # Validate shared cursor/backing identity before reading its state.
+             self.zip_step(state, iterator)
+             for phase in _binding_choices(state.cells.contents[iterator.cursor].binding):
+@@ -5137,11 +5202,16 @@
+         self.expression_bindings[node] = _join_bindings(*outputs)
+         self.expression_references[node] = frozenset({node})
+         self.possible_exception(state)
+-        return join_facts(*(fact for output in outputs for _row, fact in output.operands))
++        return join_facts(*scalar_facts, *(fact for output in outputs if output is not None
++                                          for _row, fact in output.operands))
+ 
+     def zip_call(self, node, state, target, name, inputs):
+         native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
++        if native and name in {'filter', 'builtins.filter'}:
++            if isinstance(target, _BoundCallable) and target.producer_unproved:
++                raise AnalysisLimit('native filter callable producer effects are unresolved; analysis is incomplete')
++            return self.filter_value(node, state, inputs)
+         if native and name in {'enumerate', 'builtins.enumerate'}:
+             if isinstance(target, _BoundCallable) and target.producer_unproved:
+                 raise AnalysisLimit('native enumerate callable producer effects are unresolved; analysis is incomplete')
+             return self.enumerate_value(node, state, inputs)
+@@ -5609,11 +5679,13 @@
+         def native(binding):
+             return all((self.stdin_identity(value) in _STDIN_STREAMS
+                         or self.stdin_identity(value) in _STDIN_READERS
+                         or isinstance(value, str) and value in _STDIN_CSV_PARSERS | {
+-                            'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate'}
++                            'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate',
++                            'filter', 'builtins.filter'}
+                         or isinstance(value, _BoundCallable) and value.namespace_proven
+                         and value.name in _STDIN_CSV_PARSERS | {
+-                            'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate'})
++                            'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate',
++                            'filter', 'builtins.filter'})
+                        and not (isinstance(value, _BoundCallable) and value.producer_unproved)
+                        or isinstance(value, (_CsvReader, _StdinCallableIterator)) and value.format_safe
+                        or self.materialized_generator_binding(value, NO_REFERENCES, state)
+@@ -5627,7 +5699,7 @@
+                 if expression.id in values:
+                     return values[expression.id]
+                 contents = self.global_contents(expression.id, state)
+-                if (contents.binding is None and expression.id in {'iter', 'zip', 'enumerate', 'builtins'}
++                if (contents.binding is None and expression.id in {'iter', 'zip', 'enumerate', 'filter', 'builtins'}
+                         and expression.id not in self.engine.globals.bindings
+                         and expression.id not in state.bindings
+                         and '@global:' + expression.id not in state.bindings):
+@@ -5650,8 +5722,9 @@
+             return False
+         returned = body[0].value
+         if isinstance(returned, ast.Call):
+             return (identity(returned.func) in _STDIN_CSV_PARSERS | {
+-                        'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate'}
++                        'iter', 'builtins.iter', 'zip', 'builtins.zip', 'enumerate', 'builtins.enumerate',
++                        'filter', 'builtins.filter'}
+                     and all(inert(value) for value in returned.args)
+                     and all(keyword.arg is not None and inert(keyword.value) for keyword in returned.keywords))
+         return inert(returned)
+diff --git a/test-suite/quality/test_taint_python_dataflow.py b/test-suite/quality/test_taint_python_dataflow.py
+--- a/test-suite/quality/test_taint_python_dataflow.py
++++ b/test-suite/quality/test_taint_python_dataflow.py
+@@ -1354,7 +1354,130 @@
+                          {('eval',2),('eval',6)})
+ 
+ 
+-class EnumeratedStdinTests(SourceTest):
++class FilteredStdinTests(SourceTest):
++    def test_native_filter_payload_reaches_each_sink_domain(self):
++        for stream, convert in (('sys.stdin', ''), ('sys.__stdin__', ''),
++                                ('sys.stdin.buffer', '.decode()'),
++                                ('sys.stdin.buffer.raw', '.decode()')):
++            for sink, rule in (("eval(value)", 'eval'), ("cursor.execute(value)", 'sql'),
++                               ("os.system(value)", 'command'), ("HttpResponse(value)", 'xss'),
++                               ("requests.get(value)", 'ssrf')):
++                with self.subTest(stream=stream, sink=sink):
++                    findings = self.assert_rules('import sys, os, requests\n'
++                        f'value = next(filter(None, {stream})){convert}\n{sink}\n', rule)
++                    self.assertEqual([finding['line'] for finding in findings], [3])
++                    self.assertIn(stream, findings[0]['message'])
++
++    def test_aliases_native_consumers_and_collections_keep_original_items(self):
++        cases = (
++            'rows = filter(None, sys.stdin)\nvalue = next(rows)',
++            'rows = filter(None, sys.stdin)\nalias = rows\nvalue = next(iter(alias))',
++            'rows = filter(None, sys.stdin)\nadvance = rows.__next__\nvalue = advance()',
++            'rows = filter(None, sys.stdin).__iter__()\nvalue = next(rows)',
++            'for line in filter(None, sys.stdin):\n    value = line',
++            'value = [line for line in filter(None, sys.stdin)][0]',
++            'value = list(filter(None, sys.stdin))[0]',
++            'value = tuple(filter(None, sys.stdin))[0]',
++            'from builtins import filter as select\nvalue = next(select(None, sys.stdin))',
++            'import builtins as native\nvalue = native.next(native.filter(None, sys.stdin))',
++            'select = filter\nfilter = lambda predicate, items: []\nvalue = next(select(None, sys.stdin))',
++            'predicate = None\nvalue = next(filter(predicate, iter(sys.stdin)))',
++            'arguments = (None, sys.stdin)\nvalue = next(filter(*arguments))',
++            'value = next(filter(None, sys.stdin), "SELECT 1")',
++        )
++        for setup in cases:
++            with self.subTest(setup=setup):
++                self.assert_rules('import sys\n' + setup + '\ncursor.execute(value)\n', 'sql')
++
++    def test_lazy_handles_and_strong_overwrites_remain_clean(self):
++        cases = (
++            'rows = filter(None, sys.stdin)\nvalue = "SELECT 1"',
++            'rows = filter(None, sys.stdin)\nadvance = rows.__next__\nvalue = "SELECT 1"',
++            'value = next(filter(None, sys.stdin))\nvalue = "SELECT 1"',
++            'rows = filter(None, sys.stdin)\nrows = ["SELECT 1"]\nvalue = rows[0]',
++            'value = next(filter(None, []), "SELECT 1")',
++            'def filter(predicate, items):\n    return ["SELECT 1"]\nvalue = filter(None, sys.stdin)[0]',
++            'from .builtins import filter\nvalue = next(filter(None, sys.stdin))',
++            'from application.builtins import filter\nvalue = next(filter(None, sys.stdin))',
++        )
++        for setup in cases:
++            with self.subTest(setup=setup):
++                self.assert_rules('import sys\n' + setup + '\ncursor.execute(value)\n')
++
++    def test_pure_filter_factories_keep_native_payload(self):
++        cases = (
++            'def rows(stream):\n    return filter(None, stream)\nvalue = next(rows(sys.stdin))',
++            'def rows():\n    return filter(None, sys.stdin)\nvalue = next(rows())',
++            'def rows(predicate, stream):\n    return filter(predicate, stream)\n'
++            'value = next(rows(None, sys.stdin))',
++            'def stream():\n    return sys.stdin\nvalue = next(filter(None, stream()))',
++        )
++        for setup in cases:
++            with self.subTest(setup=setup):
++                self.assert_rules('import sys\n' + setup + '\ncursor.execute(value)\n', 'sql')
++
++    def test_unknown_predicates_and_iteration_protocols_remain_incomplete(self):
++        for expression in ('filter(predicate, sys.stdin)', 'filter(lambda row: True, sys.stdin)',
++                           'filter(None, sys.stdin if flag else opaque)',
++                           'filter(*arguments)', 'filter(**options)'):
++            with self.subTest(expression=expression), self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter'):
++                self.scan('import sys\nrows = ' + expression + '\n')
++        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter'):
++            self.scan('import sys\ndef rows(predicate):\n'
++                      '    return filter(predicate, sys.stdin)\n')
++
++    def test_replaced_native_filter_and_opaque_factories_remain_incomplete(self):
++        for mutation in ('builtins.filter = replacement', 'del builtins.filter'):
++            with self.subTest(mutation=mutation), self.assertRaisesRegex(taint_py.AnalysisLimit, 'source member mutation'):
++                self.scan('import sys, builtins\n' + mutation + '\nrows = builtins.filter(None, sys.stdin)\n')
++        for source in (
++                'def rows():\n    owner = Owner()\n    return filter(None, sys.stdin)\nrows()\n',
++                'def stream():\n    owner = Owner()\n    return sys.stdin\nfilter(None, stream())\n'):
++            with self.subTest(source=source), self.assertRaisesRegex(taint_py.AnalysisLimit, 'producer'):
++                self.scan('import sys\n' + source)
++
++    def test_shared_cursor_does_not_certify_resumption_after_possible_eof(self):
++        for consume in ('list(rows)', 'tuple(rows)', 'next(rows, "SELECT 1")',
++                        'for row in rows:\n    pass'):
++            with self.subTest(consume=consume), self.assertRaisesRegex(taint_py.AnalysisLimit, 'cursor'):
++                self.scan('import sys\nrows = filter(None, sys.stdin)\nalias = rows\n'
++                          + consume + '\nsys.stdin.seek(0)\ncursor.execute(next(alias))\n')
++
++    def test_partial_filter_keeps_findings_already_reached(self):
++        engine = taint_py._Analysis(ast.parse(
++            'import sys\ncursor.execute(input())\nrows = filter(predicate, sys.stdin)\n'))
++        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter') as caught:
++            engine.analyze()
++        self.assertEqual({(kind, line) for kind, line, _column, _label in caught.exception.effects},
++                         {('sql', 2)})
++
++    def test_filter_payload_preserves_parameter_binding_and_context_sanitizers(self):
++        self.assert_rules('import sys, os, shlex, html\nvalue = next(filter(None, sys.stdin))\n'
++                          'cursor.execute("SELECT ?", (value,))\n'
++                          'os.system("echo " + shlex.quote(value))\nHttpResponse(html.escape(value))\n')
++        self.assert_rules('import sys, html\nvalue = next(filter(None, sys.stdin))\n'
++                          'eval(html.escape(value))\n', 'eval')
++
++    def test_native_filter_witnesses_preserve_lines_and_resume_after_eof(self):
++        artifacts = ROOT / 'test-suite/artifacts/python-filter-native'
++        artifacts.mkdir(parents=True, exist_ok=True)
++        scratch = Path(tempfile.mkdtemp(prefix='witness-', dir=artifacts))
++        stdin_path = scratch / 'stdin.txt'
++        stdin_path.write_bytes(b'\nSELECT supplied\n')
++        for stream, convert in (('sys.stdin', ''), ('sys.stdin.buffer', '.decode()'),
++                                ('sys.stdin.buffer.raw', '.decode()')):
++            source = ('import json, sys\nrows = filter(None, ' + stream + ')\n'
++                      'alias = rows\nfirst = next(alias)\nsecond = next(rows)\n'
++                      'remaining = list(alias)\nsys.stdin.seek(0)\nagain = next(rows)\n'
++                      f'print(json.dumps([first{convert}, second{convert}, remaining, again{convert}]))\n')
++            with self.subTest(stream=stream):
++                with stdin_path.open('rb') as source_file:
++                    result = subprocess.run([sys.executable, '-I', '-B', '-c', source], stdin=source_file,
++                                            capture_output=True, text=True, timeout=15, check=True)
++                self.assertEqual(json.loads(result.stdout), ['\n', 'SELECT supplied\n', [], '\n'])
++
++
++class EnumeratedStdinTests(SourceTest):
+     def test_native_payload_reaches_each_sink_domain(self):
+         for stream, convert in (('sys.stdin', ''), ('sys.stdin.buffer', '.decode()'),
+                                 ('sys.stdin.buffer.raw', '.decode()')):

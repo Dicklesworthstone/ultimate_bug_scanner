@@ -620,3 +620,7 @@ This is preserved source work, not an activated scanner repair or release claim.
   passes all 14 new maintained methods (41 baseline assertion failures), but
   mixed mapper alternatives, independent candidate replay, public reports and
   adjacent/full gates remain pending.
+- [ ] `1b9j.6.17`: finish Python `filter(None, stdin)` provenance. The exact
+  archived candidate reduces 54 maintained baseline assertion failures to one
+  diagnostic-label failure across ten methods. Native join consumption,
+  independent candidate replay, public reports and prescribed gates are pending.

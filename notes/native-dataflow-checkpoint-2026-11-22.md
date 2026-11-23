@@ -85,3 +85,59 @@ this checks reconstruction and is not a rerun of Python or Node.
    gates; retain existing failures without weakening budgets or expectations.
 
 The parent D6 and release self-scan beads remain open.
+
+## Python: lazy filter(None, stdin) contents
+
+Bead: `ultimate_bug_scanner-1b9j.6.17`.
+
+The unchanged analyzer certifies the following source flow complete with no
+finding:
+
+```python
+import sys
+eval(next(filter(None, sys.stdin)))
+```
+
+The candidate reuses native iterator ownership and consumption tracking for
+text, buffered and raw stdin. It preserves clean lazy handles separately from
+consumed content, native callable aliases, supported helper factories, loops,
+comprehensions, next and list/tuple consumers. Unknown predicates/protocols and
+uncertain resumption remain explicit boundaries.
+
+Preserved material:
+
+- `test-suite/patches/python-stdin-filter.patch`: exact tested source and ten
+  maintained regression methods, including the outstanding failed assertion.
+- `test-suite/patches/python-stdin-filter-receipts.json`: original recorded DSR
+  receipt fields, source blob identities and recovery limits.
+- `test-suite/patches/python-stdin-filter-independent.py`: unchanged 17-case
+  independently authored exploratory corpus with native Python witnesses.
+
+Executed evidence:
+
+- Maintained baseline: ten methods, 54 failing assertions.
+  Log SHA-256:
+  `fd61157adf49aebb846141d8db9693f179260a55f151bc49e6499fd3cc54edc3`.
+- Candidate: ten methods, one diagnostic-label assertion failure; aggregate
+  result remains failed. The uncalled symbolic-predicate helper correctly
+  reports incomplete analysis, but its message names a native zip helper rather
+  than filter. The other behavior, source, clean-control, retained-finding and
+  native text/buffer/raw witness assertions pass.
+  Log SHA-256:
+  `0e5c02995662370b8f2795db3ac53a5c9d8d9079022fe4e3667ba1555fcb2610`.
+- Independent baseline: 5 exact results and 12 incorrect complete results
+  across 17 cases; all native outcomes match the predeclared labels.
+  Log SHA-256:
+  `e58c45fcc159226d75daa449ba02ac19d5d2207331c4d54bed4037367acbfe92`.
+  No candidate replay is claimed.
+
+Before activation, fix the filter diagnostic, implement native text/bytes join
+consumption (currently explicitly incomplete), replay the unchanged independent
+corpus and run the public/report/cache, adjacent and prescribed gates. Preserve
+the original assertion; do not widen it merely to turn this receipt green.
+Canonical pins and version have not been regenerated for this inactive patch.
+The stdin-provenance, D6 and release-self-scan umbrella goals remain open.
+
+Reconstruction was checked by exact forward/reverse application in tool memory.
+Original full runtime logs were not recovered; the saved receipt fields are not
+a replacement for them or for rerunning the final tree.

@@ -100,7 +100,12 @@ def lock_free_read_json(target_path: Path) -> Any | None:
 
 
 def get_clean_git_blobs(project_dir: Path) -> dict[str, str] | None:
-    """Return normal tracked blobs from a clean requested subtree, if any."""
+    """Return clean tracked blobs only where Git preserves worktree bytes.
+
+    A clean Git status proves equality after check-in conversion, not equality
+    of the source bytes the scanner reads. Filters, encoding, keyword and EOL
+    conversion therefore use the ordinary content-hash path instead.
+    """
     try:
         cur = project_dir.resolve()
         is_git = False
@@ -143,6 +148,50 @@ def get_clean_git_blobs(project_dir: Path) -> dict[str, str] | None:
                 and parts[3] == b"0"
             ):
                 blobs[os.fsdecode(path_bytes)] = parts[2].decode("ascii")
+        if not blobs:
+            return None
+
+        # Ask Git for effective attributes, including inherited directories,
+        # info/attributes, global attributes and macros. Query --all: a named
+        # filter can literally be called "unset" or "unspecified", so those
+        # values from a named-attribute query cannot prove absence. Explicit
+        # negative attributes conservatively take the content-hash path too.
+        attributes = {b"filter", b"text", b"eol", b"ident", b"working-tree-encoding", b"crlf"}
+        attrs_res = subprocess.run(
+            ["git", "-C", str(project_dir), "check-attr", "--all", "-z", "--stdin"],
+            input=b"".join(os.fsencode(path) + b"\0" for path in blobs),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+        if attrs_res.returncode or attrs_res.stdout and not attrs_res.stdout.endswith(b"\0"):
+            return None
+        fields = attrs_res.stdout.split(b"\0")[:-1] if attrs_res.stdout else []
+        if len(fields) % 3:
+            return None
+        converted = set()
+        for offset in range(0, len(fields), 3):
+            path = os.fsdecode(fields[offset])
+            if path not in blobs:
+                return None
+            if fields[offset + 1] in attributes:
+                converted.add(path)
+
+        # With no per-path text attribute, core.autocrlf still normalizes
+        # worktree contents, including its input-only mode. Content hashing
+        # preserves cache reuse without trusting that normalized equivalence.
+        autocrlf_res = subprocess.run(
+            ["git", "-C", str(project_dir), "config", "--get", "core.autocrlf"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+        )
+        if autocrlf_res.returncode not in (0, 1):
+            return None
+        if autocrlf_res.returncode == 0 and autocrlf_res.stdout.strip().lower() not in (
+                b"false", b"no", b"off", b"0"):
+            return None
+        blobs = {path: blob for path, blob in blobs.items() if path not in converted}
         if not blobs:
             return None
 

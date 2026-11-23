@@ -1479,6 +1479,198 @@ class IncrementalCacheTests(unittest.TestCase):
         self._run_with_logging(case_id, _test)
 
 
+class GitWorktreeConversionTests(unittest.TestCase):
+    """Git-clean filtered sources still need their actual scanned-byte identity."""
+
+    def setUp(self) -> None:
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(exist_ok=True)
+        self.work = Path(tempfile.mkdtemp(prefix="cache-git-conversion-", dir=artifacts))
+        self.project = self.work / "project"
+        self.project.mkdir()
+        self.cache_env = patch.dict(os.environ, {
+            ENV_CACHE_DIR: str(self.work / "cache"), ENV_NO_CACHE: "0",
+            "UBS_KEEP_TEMP": "1", "PYTHONDONTWRITEBYTECODE": "1",
+        })
+        self.cache_env.start()
+        self.addCleanup(self.cache_env.stop)
+        self.git("init", "-q")
+        self.git("config", "core.autocrlf", "false")
+        self.run_number = 0
+
+    def git(self, *args: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(self.project), *args], capture_output=True,
+            text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, f"{args}: {result.stderr}")
+        return result.stdout
+
+    def commit(self) -> None:
+        self.git("add", "--", ".")
+        self.git("-c", "user.name=UBS Test", "-c", "user.email=test@example.invalid",
+                 "commit", "-q", "-m", "conversion fixture")
+
+    def configure_filter(self, source: Path, driver: str = "ubs-cache") -> None:
+        # This real Git clean filter removes marked source lines. Changing
+        # those lines changes scanner input without changing Git's index or
+        # clean status; the cached answer must not inherit Git's equivalence.
+        (self.project / ".gitattributes").write_text(
+            f"*.py filter={driver}\n", encoding="utf-8")
+        self.git("config", f"filter.{driver}.clean", "sed '/UBS_FILTERED/d'")
+        source.write_text("import pickle\nvalue = b'payload'\n# UBS_FILTERED\n", encoding="utf-8")
+        self.commit()
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def cache(self) -> ScanCache:
+        return ScanCache("python", self.project, rulepack_hash="git-conversion-probe")
+
+    def stage_equivalent_bytes(self, source: Path) -> None:
+        relative = source.relative_to(self.project).as_posix()
+        before = self.git("rev-parse", ":" + relative)
+        # Refresh Git's index stat information too. Some Git versions first
+        # report a size-only modification before content equivalence is
+        # refreshed. The staged blob must remain IDENTICAL throughout.
+        self.git("add", "--", relative)
+        self.assertEqual(self.git("rev-parse", ":" + relative), before)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def assert_changed_bytes_miss(self, source: Path, replacement: bytes) -> None:
+        first = self.cache()
+        first.store_scanned_files([source], {str(source): []})
+        self.assertEqual(self.cache().partition_files([source]), ({source: []}, []))
+        source.write_bytes(replacement)
+        self.stage_equivalent_bytes(source)
+        self.assertEqual(self.cache().partition_files([source]), ({}, [source]))
+
+    def test_clean_filter_cannot_replay_clean_findings_after_source_edit(self) -> None:
+        source = self.project / "source.py"
+        self.configure_filter(source)
+        self.assert_changed_bytes_miss(
+            source, b"import pickle\nvalue = b'payload'\npickle.loads(value)  # UBS_FILTERED\n")
+
+    def test_filtered_file_is_not_trusted_as_a_dependency_on_directory_hits(self) -> None:
+        dependency = self.project / "dependency.py"
+        self.configure_filter(dependency)
+        source = self.project / "caller.txt"
+        source.write_text("caller\n", encoding="utf-8")
+        self.commit()
+        cache = self.cache()
+        dependency_hash = cache._get_file_hash(dependency, get_clean_git_blobs(self.project))
+        cache.store_scanned_files([source], {str(source): []},
+                                 {str(source): {str(dependency): dependency_hash}})
+        warm = self.cache()
+        self.assertEqual(warm.partition_files([source]), ({source: []}, []))
+        self.assertEqual(warm.stats["merkle_dir_hits"], 1)
+        dependency.write_text("import pickle\nvalue = b'payload'\npickle.loads(value)  # UBS_FILTERED\n",
+                              encoding="utf-8")
+        self.stage_equivalent_bytes(dependency)
+        self.assertEqual(self.cache().partition_files([source]), ({}, [source]))
+
+    def test_filtered_edit_during_analysis_is_not_admitted_to_cache(self) -> None:
+        source = self.project / "source.py"
+        self.configure_filter(source)
+        cache = self.cache()
+        self.assertEqual(cache.partition_files([source]), ({}, [source]))
+        source.write_text("import pickle\nvalue = b'payload'\npickle.loads(value)  # UBS_FILTERED\n",
+                          encoding="utf-8")
+        self.stage_equivalent_bytes(source)
+        cache.store_scanned_files([source], {str(source): []})
+        self.assertEqual(self.cache().partition_files([source]), ({}, [source]))
+
+    def test_explicit_text_conversion_hashes_crlf_bytes(self) -> None:
+        source = self.project / "source.py"
+        (self.project / ".gitattributes").write_text("*.py text\n", encoding="utf-8")
+        source.write_bytes(b"value = 1\n")
+        self.commit()
+        self.assert_changed_bytes_miss(source, b"value = 1\r\n")
+
+    def test_implicit_autocrlf_conversion_hashes_crlf_bytes(self) -> None:
+        source = self.project / "source.py"
+        self.git("config", "core.autocrlf", "input")
+        source.write_bytes(b"value = 1\n")
+        self.commit()
+        self.assert_changed_bytes_miss(source, b"value = 1\r\n")
+
+    def test_ident_conversion_hashes_actual_keyword_bytes(self) -> None:
+        source = self.project / "source.py"
+        (self.project / ".gitattributes").write_text("*.py ident\n", encoding="utf-8")
+        source.write_bytes(b"# $Id: first $\nvalue = 1\n")
+        self.commit()
+        self.assert_changed_bytes_miss(source, b"# $Id: changed $\nvalue = 1\n")
+
+    def test_conversion_exclusion_preserves_unfiltered_blob_fast_path(self) -> None:
+        source = self.project / "source.py"
+        self.configure_filter(source)
+        identity = self.project / "ordinary.txt"
+        identity.write_text("ordinary\n", encoding="utf-8")
+        self.commit()
+        blobs = get_clean_git_blobs(self.project)
+        self.assertIsInstance(blobs, dict)
+        self.assertNotIn("source.py", blobs)
+        self.assertEqual(blobs["ordinary.txt"], self.git("hash-object", "--no-filters", "--", str(identity)).strip())
+
+    def test_reserved_filter_driver_names_do_not_mean_disabled_attributes(self) -> None:
+        for driver in ("unset", "unspecified"):
+            with self.subTest(driver=driver):
+                source = self.project / "source.py"
+                self.configure_filter(source, driver)
+                # check-attr's value spelling is ambiguous unless --all is
+                # used to prove the attribute was actually assigned.
+                self.assertIn(f"source.py: filter: {driver}",
+                              self.git("check-attr", "--all", "--", "source.py"))
+                self.assert_changed_bytes_miss(
+                    source, b"import pickle\nvalue = b'payload'\npickle.loads(value)  # UBS_FILTERED\n")
+
+    def native_scan(self, source: Path, *, no_cache: bool = False) -> tuple[int, dict, list[dict]]:
+        self.run_number += 1
+        output = self.work / f"scan-{self.run_number}"
+        output.mkdir()
+        env = {**os.environ, "PYTHONPATH": str(HELPERS_DIR), "UBS_NO_AUTO_UPDATE": "1",
+               "ENABLE_UV_TOOLS": "0", "UBS_NO_CACHE": str(int(no_cache)),
+               "UBS_CACHE_FILE": str(output / "cache.json"),
+               "UBS_PREFILTER_FILE": str(output / "prefilter.json")}
+        process = subprocess.run(
+            [sys.executable, "-B", "-m", "ubs_core.py_scan", "--project-dir", str(self.project),
+             "--sink", str(output / "findings.jsonl"), "--json-out", str(output / "summary.json"),
+             "--text-out", str(output / "report.txt"), "--jobs", "1"],
+            input=os.fsencode(source) + b"\0", capture_output=True, env=env,
+            cwd=self.work, timeout=180,
+        )
+        (output / "stdout.log").write_bytes(process.stdout)
+        (output / "stderr.log").write_bytes(process.stderr)
+        self.assertIn(process.returncode, (0, 1), process.stdout + process.stderr)
+        summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+        findings = [json.loads(line) for line in (output / "findings.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(summary["status"], "ok")
+        return process.returncode, summary, findings
+
+    def test_real_native_scan_rechecks_filtered_source_and_matches_uncached_findings(self) -> None:
+        source = self.project / "source.py"
+        self.configure_filter(source)
+        initial = self.native_scan(source)
+        warm = self.native_scan(source)
+        self.assertEqual(initial[0], 0)
+        self.assertEqual(initial[2], warm[2])
+        self.assertEqual(warm[1]["extras"]["profile"]["cache_hits"], 1)
+        source.write_text("import pickle\nvalue = b'payload'\npickle.loads(value)  # UBS_FILTERED\n",
+                          encoding="utf-8")
+        self.stage_equivalent_bytes(source)
+        changed = self.native_scan(source)
+        uncached = self.native_scan(source, no_cache=True)
+        positive = [(row["rule"], row["severity"], row["line"])
+                    for row in uncached[2] if row["rule"] == "py.security.pickle-usage"]
+        self.assertEqual(positive, [("py.security.pickle-usage", "critical", 3)])
+        self.assertEqual(changed[0], 1)
+        self.assertEqual(changed[2], uncached[2])
+        self.assertEqual(changed[1]["extras"]["profile"]["cache_hits"], 0)
+        self.assertEqual(changed[1]["extras"]["profile"]["cache_misses"], 1)
+        replay = self.native_scan(source)
+        self.assertEqual(replay[0], 1)
+        self.assertEqual(replay[2], uncached[2])
+        self.assertEqual(replay[1]["extras"]["profile"]["cache_hits"], 1)
+
+
 class PythonPatternCountExportTests(unittest.TestCase):
     """GH #191: unthresholded pattern facts are independent of report samples."""
 

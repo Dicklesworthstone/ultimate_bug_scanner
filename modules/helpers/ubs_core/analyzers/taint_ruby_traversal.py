@@ -82,8 +82,10 @@ API_CONSTANTS = frozenset(tuple(name.split('::')) for name in (
     'Net', 'Net::HTTP', 'Addressable', 'Addressable::URI', 'Rack', 'Rack::Request',
     'ActionDispatch', 'ActionDispatch::Request',
     'Faraday', 'HTTParty', 'RestClient', 'Excon', 'HTTP', 'Typhoeus', 'Curl',
-    'ActiveRecord', 'ActiveRecord::Base', 'Arel', 'CGI', 'ERB', 'ERB::Util', 'Rack::Utils',
+    'ActiveRecord', 'ActiveRecord::Base', 'Arel', 'CGI', 'ERB', 'ERB::Util', 'Rack::Utils', 'ARGV', 'ENV',
 ))
+NATIVE_INPUT_CONSTANTS = {('ARGV',): 'native-argv', ('ENV',): 'native-environment'}
+NATIVE_INPUT_SHAPES = frozenset(NATIVE_INPUT_CONSTANTS.values()) | {'native-argv-copy'}
 REQUEST_BINDINGS = {
     'request': 'request', 'req': 'request', 'rack_request': 'request',
     'params': 'request-params', 'env': 'environment', 'cookies': 'request-params',
@@ -1373,7 +1375,8 @@ class RubyEngine:
     def elements(self, value):
         return frozenset(replace(trace, kind='object') if trace.kind == 'member' else trace
                          for trace in value if trace.kind not in {'object', 'process-vector'}
-                         and not (trace.kind == 'shape' and trace.key[0] in {'literal-list', 'mapped-list'}))
+                         and not (trace.kind == 'shape' and trace.key[0] in {
+                             'literal-list', 'mapped-list', 'native-argv-copy'}))
 
     def literal_value(self, tokens, shared=False):
         """Attach allocation identities without changing literal proof facts."""
@@ -2148,6 +2151,113 @@ class RubyEngine:
                 self.mutations[index] = join(self.mutations.get(index, CLEAN), changed)
         return changed
 
+    def native_array_override(self, method):
+        """Do not borrow an Array contract through a visible override/alias."""
+        names, pending = {method}, [method]
+        while pending:
+            self.budget.spend()
+            for alias in self.parser.aliases.get((('Array',), False, pending.pop()), ()):
+                if alias not in names:
+                    names.add(alias)
+                    pending.append(alias)
+        return any(function.owner == ('Array',) and not function.singleton and function.name in names
+                   for function in self.parser.functions.values())
+
+    def native_input_call(self, name, receiver, arguments, token):
+        """Read contents only from a proved Ruby process input receiver.
+
+        ARGV and ENV are handles until a native operation reads their values.
+        This keeps size, identity and membership metadata separate from input
+        bytes, while aliases and selected helper summaries retain the handle.
+        Writes and unknown protocols cannot certify the resulting store clean.
+        """
+        kinds = {trace.key[0] for trace in receiver if trace.kind == 'shape'} & NATIVE_INPUT_SHAPES
+        if not kinds:
+            return None
+        method = name.rsplit('.', 1)[-1]
+        arrays = kinds <= {'native-argv', 'native-argv-copy'}
+        environment = kinds == {'native-environment'}
+        valid = not any(trace.kind == 'keyword' for argument in arguments for trace in argument)
+        count = len(arguments)
+        if arrays and self.native_array_override(method):
+            self.unresolved_calls.add(
+                f'{self.path}:{self.step(token.start, "call", name).line}: '
+                'Ruby input array method is overridden; analysis is incomplete')
+            valid = False
+        selected_owner = ('ARGV',) if 'native-argv' in kinds else ('ENV',)
+        if ((arrays or environment) and 'native-argv-copy' not in kinds
+                and self.candidates('::' + selected_owner[0] + '.' + method, None)):
+            self.unresolved_calls.add(
+                f'{self.path}:{self.step(token.start, "call", name).line}: '
+                'Ruby process input override arguments could not bind; analysis is incomplete')
+            valid = False
+        selectors = arguments[:1] if method in {'[]', 'slice', 'at', 'fetch'} else arguments
+        if method in {'[]', 'slice', 'at', 'fetch', 'values_at', 'fetch_values', 'first', 'last', 'shift', 'pop'}:
+            expected = {'number'} if arrays else {'literal', 'header-string'}
+            if any(trace.kind == 'constant' and trace.key[0] not in expected
+                   for selector in selectors for trace in selector):
+                valid = False
+
+        def contents():
+            return (self.elements(receiver) if kinds == {'native-argv-copy'}
+                    else self.source(token.start, name + ' process input'))
+
+        def values(empty=False):
+            value = self.collection(CLEAN if empty else contents(), token.start)
+            return join(value, shape('native-argv-copy', token.start))
+
+        if valid and (arrays or environment):
+            if not arguments and method in {'size', 'length', 'empty?', 'object_id', '__id__',
+                                            'class', 'frozen?'}:
+                return self.fresh(CLEAN, 'input-metadata', token.start)
+            if method in {'respond_to?', 'is_a?', 'kind_of?', 'instance_of?', 'equal?'} and count == 1:
+                return self.fresh(CLEAN, 'input-metadata', token.start)
+            if method in {'itself', 'freeze'} and not arguments:
+                return receiver
+            if method in {'send', 'public_send', '__send__'} and arguments:
+                if self.dispatch_target(arguments[0]) is not None or tainted(arguments[0]):
+                    return None
+            if arrays:
+                if method in {'each', 'map', 'collect', 'to_a', 'to_ary'} and not arguments:
+                    return receiver
+                if method == 'dup' and not arguments:
+                    return values()
+                if method == 'clone' and not arguments:
+                    return self.fresh(receiver, 'input-array-copy', token.start, shallow=True)
+                if method in {'join', 'inspect', 'to_s'} and count <= (1 if method == 'join' else 0):
+                    return self.fresh(join(contents(), *arguments), 'string', token.start)
+                if method == 'count' and not arguments:
+                    return self.fresh(CLEAN, 'input-metadata', token.start)
+                if method == 'values_at':
+                    return values(empty=not arguments)
+                if ((method in {'[]', 'slice', 'fetch'} and 1 <= count <= 2)
+                        or (method == 'at' and count == 1)
+                        or (method in {'first', 'last', 'shift', 'pop'} and count <= 1)):
+                    sequence = (method in {'[]', 'slice'} and count == 2
+                                or method in {'first', 'last', 'shift', 'pop'} and count == 1)
+                    if sequence and arguments[-1] == constant('0', 'number'):
+                        return values(empty=True)
+                    return values() if sequence else contents()
+            if environment:
+                if method == 'to_s' and not arguments:
+                    return self.fresh(constant('ENV'), 'string', token.start)
+                if method in {'key?', 'has_key?', 'include?', 'member?', 'value?', 'has_value?'} and count == 1:
+                    return self.fresh(CLEAN, 'input-metadata', token.start)
+                if method in REQUEST_MAP_ITERATORS | {'map', 'collect'} and not arguments:
+                    return receiver
+                if method == '[]' and count == 1 or method == 'fetch' and 1 <= count <= 2:
+                    return contents()
+                if method in {'values', 'keys'} and not arguments:
+                    return values()
+                if method == 'values_at':
+                    return values(empty=not arguments)
+                if method == 'inspect' and not arguments:
+                    return contents()
+        self.unresolved_calls.add(
+            f'{self.path}:{self.step(token.start, "call", name).line}: '
+            f'Ruby process input operation {method} needs a supported value/mutation contract; analysis is incomplete')
+        return self.fresh(join(receiver, *arguments), 'unknown', token.start)
+
     def request_call(self, name, receiver, arguments, token, state):
         """Expose request content only through a selected framework receiver.
 
@@ -2282,6 +2392,8 @@ class RubyEngine:
 
     def call(self, name, receiver, arguments, token, state):
         self.budget.spend()
+        if '.' not in name and self.function.singleton and self.function.owner in NATIVE_INPUT_CONSTANTS:
+            receiver = state.get('self', receiver)
         original_name = name
         name = self.constant_call(name)
         unresolved_definition = original_name.rsplit('.', 1)[-1] in self.unresolved_definition_methods
@@ -2296,6 +2408,13 @@ class RubyEngine:
         constant_receiver = ('.' in original_name and re.fullmatch(
             r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', original_name.rsplit('.', 1)[0]))
         candidates = self.candidates('::' + name if constant_receiver else name, len(arguments))
+        if not constant_receiver:
+            # A local alias still calls singleton methods on the original
+            # process input object. A duplicated Array does not inherit them.
+            for owner, kind in NATIVE_INPUT_CONSTANTS.items():
+                if has_shape(receiver, kind):
+                    candidates.extend(self.candidates('::' + owner[0] + '.' + name.rsplit('.', 1)[-1],
+                                                      len(arguments)))
         models = {trace.key[1] for trace in receiver
                   if trace.kind == 'shape' and trace.key[0] == 'active-record-model'}
         framework_models = set()
@@ -2354,6 +2473,18 @@ class RubyEngine:
             if any(tainted(argument) for argument in arguments):
                 raise ValueError('Ruby selected helper arguments could not bind; analysis is incomplete')
         method = name.rsplit('.', 1)[-1]
+        resolved_arguments = []
+        for argument in arguments:
+            input_kinds = {trace.key[0] for trace in argument if trace.kind == 'shape'} & NATIVE_INPUT_SHAPES
+            if input_kinds and name == 'File.join' and input_kinds <= {'native-argv', 'native-argv-copy'}:
+                argument = (self.elements(argument) if input_kinds == {'native-argv-copy'}
+                            else self.source(token.start, 'File.join process argument array'))
+            elif input_kinds:
+                self.unresolved_calls.add(
+                    f'{self.path}:{self.step(token.start, "call", name).line}: '
+                    'Ruby process input handle passed to an unresolved reader; analysis is incomplete')
+            resolved_arguments.append(argument)
+        arguments = resolved_arguments
         value = join(receiver, *arguments)
         self.pending_raises = join(self.pending_raises, self.exception_value(value, '*'))
         process_result = self.process_call(name, arguments, token, state)
@@ -2373,6 +2504,9 @@ class RubyEngine:
         sql_result = self.active_record_call(name, receiver, arguments, token, state)
         if sql_result is not None:
             return sql_result
+        input_result = self.native_input_call(name, receiver, arguments, token)
+        if input_result is not None:
+            return input_result
         request_result = self.request_call(name, receiver, arguments, token, state)
         if request_result is not None:
             return request_result
@@ -2658,6 +2792,16 @@ class RubyEngine:
                     cursor += 2
                 constant_receiver = (name.removeprefix('::')[0].isupper() and cursor < len(tokens)
                                      and tokens[cursor].value in {'.', '&.'})
+                if re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name):
+                    native_owner = self.constant_owner(name, self.function.owner, self.function.lexical_owners)
+                    bound_kinds = {trace.key[0] for trace in state.get(name, CLEAN) if trace.kind == 'object'}
+                    bound_value = bool(bound_kinds and bound_kinds <= {'array', 'string'})
+                    if (native_owner in NATIVE_INPUT_CONSTANTS and native_owner in self.constant_definitions
+                            and (self.constant_value_owner(native_owner) is None and not bound_value
+                                 or self.constant_positions.get(native_owner, -1) > token.start)):
+                        self.unresolved_calls.add(
+                            f'{self.path}:{self.step(token.start, "source", name).line}: '
+                            'Ruby process input constant rebinding needs ordered value analysis; analysis is incomplete')
                 atom = state.get(name, CLEAN if constant_receiver
                                  else shape('unresolved-value', token.start))
                 if name not in state and re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name):
@@ -2667,6 +2811,15 @@ class RubyEngine:
                         atom = state.get('::' + '::'.join(selected), CLEAN)
                     elif owner in self.sql_models:
                         atom = shape('active-record-model', owner)
+                    else:
+                        identity = self.constant_identity(owner)
+                        if identity in NATIVE_INPUT_CONSTANTS and identity not in self.constant_definitions:
+                            kind = NATIVE_INPUT_CONSTANTS[identity]
+                            atom = self.fresh(shape(kind, token.start), kind, 0)
+                        elif owner in NATIVE_INPUT_CONSTANTS:
+                            self.unresolved_calls.add(
+                                f'{self.path}:{self.step(token.start, "source", name).line}: '
+                                'Ruby process input constant is rebound without a resolved value; analysis is incomplete')
                 if cursor < len(tokens) and tokens[cursor].value == '(':
                     end = closing_token(tokens, cursor)
                     arguments = self.call_arguments(tokens[cursor + 1:end], state, depth + 1)
@@ -2678,7 +2831,9 @@ class RubyEngine:
                     cursor = len(tokens)
                 elif name not in state and (self.candidates(name, 0) or (
                         name in {'connection', 'lease_connection', 'retrieve_connection', 'connection_pool'}
-                        and has_shape(state.get('self', CLEAN), 'active-record-model'))):
+                        and has_shape(state.get('self', CLEAN), 'active-record-model')) or (
+                        re.fullmatch(r'[a-z_]\w*[!?]?', name) and any(
+                            has_shape(state.get('self', CLEAN), kind) for kind in NATIVE_INPUT_SHAPES))):
                     atom = self.call(name, CLEAN, [], token, state)
             else:
                 cursor += 1
@@ -3002,13 +3157,21 @@ class RubyEngine:
                         value = retag(join(state.get(name, CLEAN), value), remove=VALUE_TAGS)
                     if (name.startswith(('@', '$')) or name[0].isupper()) and tainted(value):
                         raise ValueError('Request-derived Ruby instance/global state needs heap analysis; analysis is incomplete')
+                    if name.startswith(('@', '$')) and any(has_shape(value, kind) for kind in NATIVE_INPUT_SHAPES):
+                        self.unresolved_calls.add(
+                            f'{self.path}:{self.step(lhs[0].start, "assign", name).line}: '
+                            'Ruby process input handle escapes into instance/global state; analysis is incomplete')
                     state[name] = advance(value, self.step(lhs[0].start, 'assign', name))
                 else:
+                    opening = next((i for i, token in enumerate(lhs) if token.value == '['
+                                    and closing_token(lhs, i) == len(lhs) - 1), None)
+                    receiver = self.expression(lhs[:opening], state) if opening is not None else CLEAN
+                    if any(has_shape(receiver, kind) for kind in NATIVE_INPUT_SHAPES):
+                        self.unresolved_calls.add(
+                            f'{self.path}:{self.step(lhs[0].start, "assign", token_text(lhs)).line}: '
+                            'Ruby process input element mutation needs store analysis; analysis is incomplete')
                     if self.policy in {'header', 'redirect'}:
-                        opening = next((i for i, token in enumerate(lhs) if token.value == '['
-                                        and closing_token(lhs, i) == len(lhs) - 1), None)
                         if opening is not None:
-                            receiver = self.expression(lhs[:opening], state)
                             key = self.expression(lhs[opening + 1:-1], state)
                             if has_shape(receiver, 'response-headers') or has_shape(receiver, 'response'):
                                 self.response_field(key, value, lhs[0], 'response header assignment')
@@ -3143,7 +3306,11 @@ class RubyEngine:
             slot, method = extra
             value = self.expression(tokens, state)
             instances = {trace.key[0] for trace in value if trace.kind == 'instance'}
-            if self.candidates(token_text(tokens) + '.' + method, 0) or any(
+            input_override = any(
+                has_shape(value, native_kind) and self.candidates('::' + owner[0] + '.' + method, None)
+                for owner, native_kind in NATIVE_INPUT_CONSTANTS.items())
+            array_override = (has_shape(value, 'native-argv') or has_shape(value, 'native-argv-copy')) and self.native_array_override(method)
+            if input_override or array_override or self.candidates(token_text(tokens) + '.' + method, 0) or any(
                     not function.scope and not function.singleton and function.name == method
                     and function.owner in instances for function in self.parser.functions.values()):
                 raise ValueError('Overridden Ruby block methods need callback dispatch analysis; analysis is incomplete')
@@ -3164,19 +3331,25 @@ class RubyEngine:
             slot, parameters, locals_, method = extra
             value = state.get(slot + ':receiver', CLEAN)
             body_line = method == 'each' and has_shape(value, 'request-body')
+            input_element = method in {'each', 'map', 'collect'} and has_shape(value, 'native-argv')
             map_entry = (method in REQUEST_MAP_ITERATORS | {'map', 'collect'}
-                         and any(has_shape(value, kind) for kind in REQUEST_MAP_SHAPES))
+                         and any(has_shape(value, kind) for kind in REQUEST_MAP_SHAPES | {'native-environment'}))
             if '_2' in parameters and not (map_entry and method not in {'each_key', 'each_value'}):
                 raise ValueError('Ruby higher numbered block parameters need arity binding; analysis is incomplete')
-            arity = 1 if method == 'with_connection' or body_line else None
+            arity = 1 if method == 'with_connection' or body_line or input_element else None
             if body_line:
                 offset = min(trace.key[1] for trace in value
                              if trace.kind == 'shape' and trace.key[0] == 'request-body')
                 value = self.source(offset, 'request body each yielded string')
+            elif input_element:
+                offset = min(trace.key[1] for trace in value
+                             if trace.kind == 'shape' and trace.key[0] == 'native-argv')
+                value = self.source(offset, 'ARGV ' + method + ' yielded argument')
             elif map_entry:
                 offset = min(trace.key[1] for trace in value
-                             if trace.kind == 'shape' and trace.key[0] in REQUEST_MAP_SHAPES)
-                value = self.source(offset, 'request map ' + method + ' yielded entry')
+                             if trace.kind == 'shape' and trace.key[0] in REQUEST_MAP_SHAPES | {'native-environment'})
+                label = 'ENV' if has_shape(value, 'native-environment') else 'request map'
+                value = self.source(offset, label + ' ' + method + ' yielded entry')
                 arity = 1 if method in {'each_key', 'each_value'} else 2
                 if arity == 2 and len(parameters) == 1:
                     # Hash#each gives one formal the [key, value] pair; Ruby
@@ -3252,6 +3425,10 @@ class RubyEngine:
                             state[name] = shape(kind, function.key)
                 if function.owner in self.sql_models and (function.singleton or function.scope):
                     state['self'] = shape('active-record-model', function.owner)
+                if (function.singleton and function.owner in NATIVE_INPUT_CONSTANTS
+                        and function.owner not in self.constant_definitions):
+                    native_kind = NATIVE_INPUT_CONSTANTS[function.owner]
+                    state['self'] = self.fresh(shape(native_kind, function.key), native_kind, 0)
                 for (owner, name), fact in self.constants.items():
                     self.budget.spend()
                     selected = self.constant_value_owner((*owner, name)) if fact else None
@@ -3287,8 +3464,8 @@ class RubyEngine:
 
 
 def flow_findings_from_text(path, text, policy):
-    # Skip files with no request vocabulary before parsing unrelated Ruby DSLs.
-    if not re.search(r'\b(?:params|request|req|rack_request|env|cookies|Rack::Request|ActionDispatch::Request|original_filename|filename)\b', text):
+    # Skip source-free files before parsing unrelated Ruby DSLs.
+    if not re.search(r'\b(?:params|request|req|rack_request|env|cookies|ARGV|ENV|Rack::Request|ActionDispatch::Request|original_filename|filename)\b', text):
         return
     engine = RubyEngine(path, text, policy)
     lines = text.splitlines()

@@ -27,6 +27,7 @@ HELPERS = ROOT / 'modules/helpers'
 sys.path.insert(0, str(HELPERS))
 from ubs_core.analyzers import taint_ruby_traversal, taint_ruby_url
 from ubs_core.registry import RunContext
+from test_keep_temp import prevent_child_deletion
 
 URL = 'ruby.taint.outbound_url'
 PATH = 'ruby.taint.path_traversal'
@@ -2662,6 +2663,175 @@ PROCESS_BOUNDARIES = (
 )
 
 
+NATIVE_INPUT_CASES = (
+    Case('native_argv_index_path', PATH, 'File.read(ARGV[0])', (1,)),
+    Case('native_argv_fetch_url', URL, 'Net::HTTP.get(URI.parse(ARGV.fetch(0)))', (1,)),
+    Case('native_argv_first_eval', EVAL, 'eval(ARGV.first)', (1,)),
+    Case('native_argv_last_command', SHELL_COMMAND, 'system(ARGV.last)', (1,)),
+    Case('native_argv_at_executable', EXECUTABLE, "spawn(ARGV.at(0), '--version')", (1,)),
+    Case('native_argv_slice_path', PATH, 'File.read(ARGV[0, 2].first)', (1,)),
+    Case('native_argv_values_at_path', PATH, 'File.read(ARGV.values_at(0, 1).last)', (1,)),
+    Case('native_argv_join_command', SHELL_COMMAND, "system(ARGV.join(' '))", (1,)),
+    Case('native_argv_shift_path', PATH, 'File.read(ARGV.shift)', (1,)),
+    Case('native_argv_pop_path', PATH, 'File.read(ARGV.pop)', (1,)),
+    Case('native_argv_alias_helper', PATH, '''
+        def choose(arguments)
+          arguments.fetch(0)
+        end
+        arguments = ARGV
+        File.read(choose(arguments))''', (5,)),
+    Case('native_argv_helper_return', PATH, '''
+        def arguments
+          ARGV
+        end
+        File.read(arguments.first)''', (4,)),
+    Case('native_argv_constant_alias', PATH, 'Inputs = ARGV\nFile.read(Inputs.first)', (2,)),
+    Case('native_argv_each', PATH, '''
+        ARGV.each do |path|
+          File.read(path)
+        end''', (2,)),
+    Case('native_argv_map', URL, '''
+        links = ARGV.map do |argument|
+          URI.parse(argument)
+        end
+        links.each do |link|
+          Net::HTTP.get(link)
+        end''', (5,)),
+    Case('native_argv_copy', PATH, 'arguments = ARGV.dup\nFile.read(arguments.first)', (2,)),
+    Case('native_argv_copy_scalar', PATH, 'File.read(ARGV.dup.first.strip)', (1,)),
+    Case('native_argv_file_join', PATH, "File.read(File.join('/srv', ARGV))", (1,)),
+    Case('native_env_index_path', PATH, "File.read(ENV['INPUT'])", (1,)),
+    Case('native_env_fetch_url', URL, "Net::HTTP.get(URI.parse(ENV.fetch('TARGET', 'https://fixed.example/')))", (1,)),
+    Case('native_env_eval', EVAL, "eval(ENV['CODE'])", (1,)),
+    Case('native_env_shell_code', SHELL_ARGV, "system('sh', '-c', ENV['CODE'])", (1,)),
+    Case('native_env_sql', SQL, "ActiveRecord::Base.connection.execute(ENV['QUERY'])", (1,)),
+    Case('native_env_values_at', PATH, "File.read(ENV.values_at('FIRST', 'SECOND').first)", (1,)),
+    Case('native_env_values', PATH, 'File.read(ENV.values.first)', (1,)),
+    Case('native_env_keys', PATH, 'File.read(ENV.keys.first)', (1,)),
+    Case('native_env_inspect', SHELL_COMMAND, 'system(ENV.inspect)', (1,)),
+    Case('native_env_dynamic_bound_read', PATH, "File.read(ENV.public_send(:fetch, 'INPUT'))", (1,)),
+    Case('native_env_value_scalar', PATH, 'File.read(ENV.values.first.strip)', (1,)),
+    Case('native_env_alias_helper', PATH, '''
+        def choose(settings)
+          settings.fetch('INPUT')
+        end
+        settings = ENV
+        File.read(choose(settings))''', (5,)),
+    Case('native_env_singleton_reader', PATH, '''
+        def ENV.input
+          self['INPUT']
+        end
+        File.read(ENV.input)''', (4,)),
+    Case('native_env_implicit_singleton_reader', PATH, '''
+        def ENV.input
+          fetch('INPUT')
+        end
+        settings = ENV
+        File.read(settings.input)''', (5,)),
+    Case('native_argv_implicit_singleton_reader', PATH, '''
+        def ARGV.input
+          first
+        end
+        File.read(ARGV.input)''', (4,)),
+    Case('native_env_constant_alias', PATH, "Settings = ENV\nFile.read(Settings['INPUT'])", (2,)),
+    Case('native_env_root_scope', PATH, '''
+        module Application
+          ENV = { 'INPUT' => 'fixed.txt' }
+          def self.run
+            File.read(::ENV['INPUT'])
+          end
+        end''', (4,)),
+    Case('native_env_each_value', PATH, '''
+        ENV.each_value do |path|
+          File.read(path)
+        end''', (2,)),
+    Case('native_env_each_pair', PATH, '''
+        ENV.each_pair do |key, path|
+          File.read(path)
+        end''', (2,)),
+    Case('native_env_each_single_formal', PATH, '''
+        ENV.each do |entry|
+          File.read(entry.last)
+        end''', (2,)),
+    Case('native_argv_local_overwrite', PATH, "path = ARGV.first\npath = 'fixed.txt'\nFile.read(path)", ()),
+    Case('native_env_local_overwrite', PATH, "settings = ENV\nsettings = { 'INPUT' => 'fixed.txt' }\nFile.read(settings['INPUT'])", ()),
+    Case('native_argv_constant_shadow', PATH, "ARGV = ['fixed.txt']\nFile.read(ARGV.first)", ()),
+    Case('native_env_constant_shadow', PATH, "ENV = { 'INPUT' => 'fixed.txt' }\nFile.read(ENV['INPUT'])", ()),
+    Case('native_env_lexical_shadow', PATH, '''
+        module Application
+          ENV = { 'INPUT' => 'fixed.txt' }
+          def self.run
+            File.read(ENV['INPUT'])
+          end
+        end''', ()),
+    Case('native_argv_size_metadata', PATH, 'File.read(ARGV.length.to_s)', ()),
+    Case('native_env_size_metadata', PATH, 'File.read(ENV.size.to_s)', ()),
+    Case('native_env_identity_metadata', PATH, 'File.read(ENV.to_s)', ()),
+    Case('native_env_membership_metadata', PATH, "File.read(ENV.key?('INPUT').to_s)", ()),
+    Case('native_argv_copy_size', PATH, 'File.read(ARGV.dup.size.to_s)', ()),
+    Case('native_argv_zero_length_slice', PATH, 'File.read(ARGV[0, 0].join)', ()),
+    Case('native_argv_empty_selection', PATH, 'File.read(ARGV.values_at.join)', ()),
+    Case('native_env_empty_selection', PATH, 'File.read(ENV.values_at.join)', ()),
+    Case('native_argv_fixed_helper', PATH, '''
+        def choose(arguments)
+          'fixed.txt'
+        end
+        File.read(choose(ARGV))''', ()),
+    Case('native_env_selected_override', PATH, '''
+        def ENV.fetch(name)
+          'fixed.txt'
+        end
+        File.read(ENV.fetch('INPUT'))''', ()),
+    Case('native_env_alias_selected_override', PATH, '''
+        def ENV.fetch(name)
+          'fixed.txt'
+        end
+        settings = ENV
+        File.read(settings.fetch('INPUT'))''', ()),
+    Case('native_argv_singleton_metadata', PATH, '''
+        def ARGV.count_label
+          length.to_s
+        end
+        File.read(ARGV.count_label)''', ()),
+    Case('native_argv_sql_integer', SQL, 'ActiveRecord::Base.connection.execute("SELECT * FROM entries WHERE id = #{ARGV.first.to_i}")', ()),
+    Case('native_env_process_data', SHELL_COMMAND, "system('printf', '%s', ENV['VALUE'])", ()),
+    Case('native_argv_guarded_url', URL, '''
+        uri = URI.parse(ARGV.first)
+        if uri.scheme == 'https' && ['api.example.com'].include?(uri.host)
+          Net::HTTP.get(uri)
+        end''', ()),
+)
+
+NATIVE_INPUT_BOUNDARIES = (
+    ('argv_unknown_protocol', 'File.read(ARGV.custom_first)'),
+    ('env_unknown_protocol', "File.read(ENV.lookup('INPUT'))"),
+    ('argv_element_write', "ARGV[0] = 'fixed.txt'\nFile.read(ARGV.first)"),
+    ('env_element_write', "ENV['INPUT'] = 'fixed.txt'\nFile.read(ENV['INPUT'])"),
+    ('argv_replace', "ARGV.replace(['fixed.txt'])\nFile.read(ARGV.first)"),
+    ('env_clear', "ENV.clear\nFile.read(ENV['INPUT'])"),
+    ('env_delete', "ENV.delete('INPUT')\nFile.read(ENV['INPUT'])"),
+    ('env_unverified_fetch_values', "File.read(ENV.fetch_values('INPUT').first)"),
+    ('argv_global_escape', '$arguments = ARGV\nFile.read($arguments.first)'),
+    ('env_instance_escape', "@settings = ENV\nFile.read(@settings['INPUT'])"),
+    ('argv_wrong_read_arity', 'File.read(ARGV.fetch)'),
+    ('env_wrong_read_arity', 'File.read(ENV.fetch)'),
+    ('argv_unknown_reader', 'File.read(choose_input(ARGV))'),
+    ('env_unknown_reader', 'File.read(choose_input(ENV))'),
+    ('argv_unknown_rebind', 'ARGV = arguments_from_config()\nFile.read(ARGV.first)'),
+    ('env_unknown_rebind', "ENV = settings_from_config()\nFile.read(ENV['INPUT'])"),
+    ('argv_alias_before_rebind', "Inputs = ARGV\nARGV = ['fixed.txt']\nFile.read(Inputs.first)"),
+    ('env_alias_before_rebind', "Settings = ENV\nENV = { 'INPUT' => 'fixed.txt' }\nFile.read(Settings['INPUT'])"),
+    ('env_arity_override', "def ENV.fetch\n  'fixed.txt'\nend\nFile.read(ENV.fetch('INPUT'))"),
+    ('argv_array_override', "class Array\n  def first\n    external_input()\n  end\nend\nFile.read(ARGV.first)"),
+    ('argv_array_metadata_override', "class Array\n  def length\n    external_input()\n  end\nend\nFile.read(ARGV.length.to_s)"),
+    ('argv_array_metadata_alias', "class Array\n  def replacement\n    external_input()\n  end\n  alias length replacement\nend\nFile.read(ARGV.length.to_s)"),
+    ('env_alias_block_override', "def ENV.each\n  yield 'unused', external_input()\nend\nsettings = ENV\nsettings.each do |key, value|\n  File.read(value)\nend"),
+    ('argv_invalid_selector', "File.read(ARGV.fetch('INPUT'))"),
+    ('env_invalid_selector', 'File.read(ENV.fetch(:INPUT))'),
+    ('env_unsupported_snapshot', "File.read(ENV.to_h['INPUT'])"),
+)
+
+
 class LoggedCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2722,7 +2892,8 @@ class RubyRequestSourceTests(LoggedCase):
                'UBS_KEEP_TEMP': '1', 'UBS_CACHE_DIR': str(self.artifact / 'cache')}
         started = time.monotonic()
         result = subprocess.run(command, input=str(target) + '\0', cwd=target.parent,
-                                env=env, text=True, capture_output=True, timeout=120)
+                                env=env, text=True, capture_output=True, timeout=120,
+                                preexec_fn=prevent_child_deletion)
         (directory / 'stdout.log').write_text(result.stdout)
         (directory / 'stderr.log').write_text(result.stderr)
         (directory / 'source.rb').write_text(target.read_text())
@@ -2960,6 +3131,106 @@ class RubyRequestSourceTests(LoggedCase):
         result, payload, _env = self.native_scan(directory / 'category-disabled', target, skip='6')
         self.assertEqual((result.returncode, payload['status'], payload['critical']),
                          (0, 'ok', 0), (payload, result.stderr))
+
+
+class RubyNativeInputTests(LoggedCase):
+    native_scan = RubyRequestSourceTests.native_scan
+
+    def test_native_input_value_and_binding_cases(self):
+        for case in NATIVE_INPUT_CASES:
+            with self.subTest(case=case.name):
+                _target, records = self.observe(case)
+                self.assertEqual(sorted((row['rule'], row['line']) for row in records),
+                                 [(case.rule, line) for line in case.lines], case.source)
+
+    def test_native_input_unsupported_protocols_are_incomplete(self):
+        for name, source in NATIVE_INPUT_BOUNDARIES:
+            with self.subTest(case=name):
+                with self.assertRaisesRegex(ValueError, 'incomplete'):
+                    self.observe(Case('native_boundary_' + name, PATH, source, ()))
+
+    def test_native_input_redirect_and_header_policies(self):
+        cases = (
+            ('redirect', 'redirect_to ARGV.first', 'ruby.redirect.open', (1,)),
+            ('redirect', "redirect_to ENV.fetch('TARGET')", 'ruby.redirect.open', (1,)),
+            ('header', "response.set_header('X-Value', ENV.fetch('VALUE'))", 'ruby.header-injection.response', (1,)),
+            ('header', "response.set_header('X-Value', ARGV.first)", 'ruby.header-injection.response', (1,)),
+            ('redirect', 'redirect_to ENV.to_s', 'ruby.redirect.open', ()),
+            ('header', "response.set_header('X-Value', ARGV.size.to_s)", 'ruby.header-injection.response', ()),
+        )
+        for index, (policy, source, rule, expected) in enumerate(cases):
+            with self.subTest(policy=policy, source=source):
+                directory = self.artifact / ('native-policy-' + str(index))
+                directory.mkdir()
+                target = directory / 'input.rb'
+                target.write_text(source + '\n')
+                rows = list(taint_ruby_traversal.flow_findings(target, policy))
+                (directory / 'findings.json').write_text(json.dumps(rows, indent=2) + '\n')
+                self.assertEqual([(row[0], row[1]) for row in rows], [(rule, line) for line in expected])
+
+    def test_native_input_scanner_json_sarif_and_file_selection(self):
+        names = {'native_argv_index_path', 'native_argv_fetch_url', 'native_argv_first_eval',
+                 'native_env_sql', 'native_env_shell_code', 'native_env_alias_helper',
+                 'native_argv_map', 'native_env_each_pair', 'native_env_constant_shadow',
+                 'native_argv_size_metadata', 'native_env_alias_selected_override'}
+        for case in NATIVE_INPUT_CASES:
+            if case.name not in names:
+                continue
+            with self.subTest(case=case.name):
+                directory = self.artifact / ('scanner-' + case.name)
+                directory.mkdir()
+                target = directory / 'selected source.rb'
+                target.write_text(case.source)
+                (directory / 'unselected.rb').write_text('eval(ARGV.first)\n')
+                result, payload, env = self.native_scan(directory / 'json', target)
+                self.assertEqual((result.returncode, payload['status'], payload['files'], payload['critical']),
+                                 (int(bool(case.lines)), 'ok', 1, len(case.lines)), (payload, result.stderr))
+                rows = [row for row in payload['findings'] if row['severity'] == 'critical']
+                self.assertEqual([(row['rule'], row['line']) for row in rows],
+                                 [(case.rule, line) for line in case.lines], payload)
+                converted = subprocess.run(
+                    [sys.executable, '-m', 'ubs_core', 'findings-sarif', '--combined',
+                     str(directory / 'json/result.json')], cwd=target.parent, env=env,
+                    text=True, capture_output=True, timeout=60, preexec_fn=prevent_child_deletion)
+                (directory / 'result.sarif').write_text(converted.stdout)
+                (directory / 'sarif.stderr.log').write_text(converted.stderr)
+                self.assertEqual(converted.returncode, 0, converted.stderr)
+                sarif = json.loads(converted.stdout)
+                rows = [row for run in sarif['runs'] for row in run.get('results', [])
+                        if row.get('level') == 'error']
+                self.assertEqual([(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'])
+                                  for row in rows], [(case.rule, line) for line in case.lines], sarif)
+
+    def test_native_input_scanner_cache_suppression_and_partial(self):
+        directory = self.artifact / 'scanner-native-policy'
+        directory.mkdir()
+        target = directory / 'selected.rb'
+        unsafe = "command = ENV.fetch('COMMAND')\nsystem(command)\n"
+        safe = "command = ENV.fetch('COMMAND')\nsystem('printf', '%s', command)\n"
+        for attempt, (source, count, hits) in enumerate(((unsafe, 1, 0), (unsafe, 1, 1),
+                                                       (safe, 0, 0), (safe, 0, 1))):
+            target.write_text(source)
+            result, payload, _env = self.native_scan(directory / str(attempt), target)
+            self.assertEqual((result.returncode, payload['status'], payload['critical']),
+                             (int(bool(count)), 'ok', count), (payload, result.stderr))
+            self.assertEqual(payload['extras']['profile']['cache_hits'], hits, payload)
+        for label, source, skip, count in (
+                ('suppressed', 'system(ARGV.first) # ubs:ignore[ruby.security.shell-single-string]\n', '', 0),
+                ('unrelated', 'system(ARGV.first) # ubs:ignore[ruby.security.eval-family]\n', '', 1),
+                ('disabled', unsafe, '6', 0)):
+            with self.subTest(case=label):
+                target.write_text(source)
+                result, payload, _env = self.native_scan(directory / label, target, skip=skip)
+                self.assertEqual((result.returncode, payload['status'], payload['critical']),
+                                 (int(bool(count)), 'ok', count), (payload, result.stderr))
+        target.write_text("system(ARGV.first)\nENV.clear\n")
+        for attempt in range(2):
+            result, payload, _env = self.native_scan(directory / ('partial-' + str(attempt)), target)
+            self.assertEqual((result.returncode, payload['status'], payload['critical'], payload['module_error']),
+                             (2, 'partial', 1, 'ANALYZER_ERROR'), (payload, result.stderr))
+            self.assertEqual(payload['extras']['profile']['cache_hits'], 0, payload)
+            self.assertEqual([(row['rule'], row['line']) for row in payload['findings'] if row['severity'] == 'critical'],
+                             [(SHELL_COMMAND, 1)], payload)
 
 
 class RubySemanticTests(LoggedCase):

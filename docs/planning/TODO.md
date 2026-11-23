@@ -722,7 +722,7 @@ Beads remain in progress because their broader qualification is unfinished.
 | --- | --- | --- |
 | Cache | Frozen baseline: 9 methods, 10 failures. Final: all 9 pass, plus 2 preserved filename/index-flag controls. | Both module and runner SARIF pass cold clean, filtered edit and warm positive reuse. |
 | JavaScript | All 19 feature methods pass. Unchanged 18-case corpus: 15 exact, 3 explicit partial, 0 incorrect-complete; all 18 Node witnesses match. | All 27 module/runner JSON/SARIF, selection, suppression, cache/edit and partial-nonreuse calls pass, zero skips. |
-| Python | All 12 focused and 22 selected adjacent methods pass. Unchanged 17-case corpus: 16 exact, 1 unsupported-predicate partial, 0 incorrect-complete; all 17 CPython witnesses match. | The 27-call gate launched; completion was unobserved after workspace loss. |
+| Python | All 12 focused and 22 selected adjacent methods pass. Unchanged 17-case corpus: 16 exact, 1 unsupported-predicate partial, 0 incorrect-complete; all 17 CPython witnesses match. | Original launch interrupted; both public methods subsequently passed without skips on unchanged main 7ab3a66, including report/site selection, suppression, cache invalidation and partial nonreuse. |
 | Go | 23 source methods and 1 package-cache regression pass; unchanged independent corpus is 18/18 exact. Seven opaque header-escape failures were reproduced and then fixed. | All 32 module/runner JSON/SARIF calls pass with original assertions and 45-second child deadlines. |
 
 The real Go compiler witness remains skipped. The other two skips in the
@@ -760,8 +760,11 @@ against the unavailable 5.5.121/5.5.122 working files. The independent report
 is Git blob `e27c7b757688ac377aa723a9d9eea54362b668b1`, SHA256
 `9f9317f3fae63d9286cc0b5452f1aa52d49f38f83bce402c8b8fbd3df0bcefa6`.
 
-- [ ] Recover or rerun the two Python public methods; do not count the
-  interrupted 27-call launch as a pass. Its following self-scan did not launch.
+- [x] Rerun both Python public methods on unchanged main `7ab3a66`: both
+  passed with no skips, original child deadlines and identical before/after
+  source hashes. Both integrity verifiers also passed. Fresh DSR log SHA256:
+  `67e1829fd47dbf2aa88a3a79dae83531f0d49453e2a242db2e82a294fb71f0d7`.
+  The earlier interrupted launch remains unobserved; its self-scan did not launch.
 - [ ] Complete strict changed-source scans. Cache self-scan was explicitly
   partial (exit 2, 0 critical, 13 warnings, 252 info). JS self-scan submission
   had no observed launch/result. The combined eight-file scan launched but
@@ -782,3 +785,52 @@ is Git blob `e27c7b757688ac377aa723a9d9eea54362b668b1`, SHA256
 
 No assertions, deadlines, suppressions or acceptance criteria were weakened.
 No broad D6, whole-repository or release closure is claimed.
+
+## 18. November 23 continuation: shell boundaries and native process inputs
+
+### Bash heredoc recognition (`ultimate_bug_scanner-b43a`)
+
+- [x] Preserve native findings after quoted heredoc-looking text in nested
+  command substitutions and backticks; distinguish arithmetic shifts and
+  case-arm syntax from actual redirections. Reuse the same boundary for
+  trap-restoration analysis while retaining genuine heredoc data exclusion.
+  Published directly on main in `3f3d170aa903e4a0e3233b189e8750ca90a93d9e`
+  (5.5.123).
+- [x] Reproduce 15 missed unsafe native subcases and all eight unsafe public
+  JSON/SARIF sites on the unchanged baseline. Final source gate passes all
+  42 methods with no skips; all 16 new module/runner public calls pass.
+- [ ] Broad qualification remains open. The complete 54-method Bash run
+  reports one existing Elixir retention assertion, one trap-test timeout
+  and one optional ShellCheck skip. Later fixed-budget repeats and the
+  git-diff static gate timed out; those attempts remain recorded failures.
+  The successful feature calls do not convert the aggregate into a pass.
+
+### Ruby command-line and environment sources (`ultimate_bug_scanner-mj1j.6`)
+
+- [x] Add native ARGV/ENV receiver identity, selected content reads, aliases,
+  helpers and iteration to the existing shared security policies. Keep
+  metadata, fixed values, lexical shadows and overridden methods distinct;
+  unsupported operations and mutable-store uncertainty remain incomplete.
+- [x] Fixed baseline: 32 unsafe misses among 48 content controls and ten
+  incorrectly complete unsupported cases. Final corpus: 58 value controls,
+  26 partial boundaries and six redirect/header controls. Ruby source cohort on the combined Bash/Ruby
+  delivery: 425 tests, two existing host-Ruby skips, no failures.
+- [x] Pass the five scanner/cache/suppression/partial methods and eight real
+  module/meta-runner JSON/SARIF observations on isolated 5.5.124, with the
+  exact published Bash source and regenerated nested integrity pins.
+- [x] Independently execute 39 value/binding observations in actual CRuby
+  3.4.1 WASI with real CLI arguments and a controlled environment. The first
+  run caught an unavailable ENV.fetch_values assumption; preserve that
+  failed source/log, remove the unverified contract, and require incomplete
+  scanner output for the identical unsupported program. The corrected
+  native witness passes; this does not replace the two host-Ruby skips.
+- [ ] General mutable stores, stream sources and broader Ruby/whole-repository
+  acceptance remain open. No broad Bead or release closure is claimed.
+
+Final Ruby log SHA256 receipts:
+
+- Source cohort: `3d5d1308983468db6a3c755607230734d8de2c1217027cfb196b477635eca64b`.
+- Scanner/cache methods: `392c2c0d423480e2896a65abfbe6a2f4cb9d5005a2a81829234f91974438f96b`.
+- Public module/runner: `1c27168d94d14c3a62469ce50c220769cc46e38ca6901a8c316cabe34d669103`.
+- Native CRuby witness: `80aa058b7805ec69a5e0bd531fa34c33b89d36419b420219c59eb2bf823a406c`.
+- Integrity: `beea5e178ee0a626079527c7dea78aa105dd3a1d3754f1650937dd288ce9f6c3`.

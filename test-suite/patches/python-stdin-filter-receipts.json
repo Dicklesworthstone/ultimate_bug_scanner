@@ -1,62 +1,130 @@
 {
   "status": "unactivated_checkpoint",
-  "recovery": "Exact applied edits and DSR receipt values recovered from tool history after the executor disconnected. Full log files were not recovered into this artifact; their paths and SHA256 hashes below identify the original workspace logs.",
-  "base_ref": "d6c529ee",
-  "patch_blob": "a3362feea0c168c217cf0afe6e0fdc50d991bda2",
-  "source_blobs": [
-    {
-      "path": "modules/helpers/ubs_core/analyzers/taint_py.py",
-      "base": "6f04f1d653b381567fb88bb5a62ec7ca529a0dca",
-      "candidate": "4d5acda21e163a0b0552b159f1324422f5071df4"
+  "latest_base_ref": "b27c0dcc126a4181ca0766a69ed91cffb9ed305e",
+  "latest_patch_blob": "6dc3814e689dc61aef86ceb874b3888c9f3ce5e0",
+  "latest_checkpoint": {
+    "kind": "python-filter-candidate-recovery",
+    "base_commit": "b27c0dcc126a4181ca0766a69ed91cffb9ed305e",
+    "files": [
+      {
+        "path": "modules/helpers/ubs_core/analyzers/taint_py.py",
+        "base_blob": "398af4751e7c213f5607d23393d6da08ffb24ec4",
+        "candidate_blob": "407278c2ad00577666272667e13b82da27c6666f"
+      },
+      {
+        "path": "test-suite/quality/test_taint_python_dataflow.py",
+        "base_blob": "ed9560c6752f2ac9131ffa35701103ec96dbaf4f",
+        "candidate_blob": "103e986d6dcd3e2f0706fe7963bf3c752c802a64"
+      }
+    ],
+    "reconstruction": "Reconstructed in tool memory by exact unique-context application of archived python-stdin-filter.patch followed by manual edits recorded in this session. Includes operation-specific filter obligations, native text/bytes joins and their maintained tests. No local-byte hash comparison has yet completed after the executor outage. Public test insertion failed before reading its target; public tests are NOT included.",
+    "observed_candidate_test": {
+      "command": "UBS_KEEP_TEMP=1 python3 -m unittest quality.test_taint_python_dataflow.FilteredStdinTests",
+      "status": "passed",
+      "executed": true,
+      "passed": true,
+      "exit_code": 0,
+      "cwd": "/tmp/ubs-session-fa0589d603b3/ultimate_bug_scanner/test-suite",
+      "duration_ms": 2963,
+      "timeout_seconds": 240,
+      "log_path": "/tmp/ubs-session-fa0589d603b3/ultimate_bug_scanner/test-suite/artifacts/session-2026-11-23/py-filter-candidate-joins.Wr7iQYmK/check.log",
+      "log_sha256": "066770cf77c8666ae4d49617f2093164584fb2cac785c55384d6a84a14738d8d",
+      "test_tail": "............\n----------------------------------------------------------------------\nRan 12 tests in 0.542s\n\nOK\n\n# exit_code: 0\n"
     },
-    {
-      "path": "test-suite/quality/test_taint_python_dataflow.py",
-      "base": "ed9560c6752f2ac9131ffa35701103ec96dbaf4f",
-      "candidate": "6ef6d387ad02cbabc20be5bdb47c0c0c1a04c8be"
-    }
-  ],
-  "baseline": {
-    "command": "UBS_KEEP_TEMP=1 PYTHONPATH=test-suite/quality python -m unittest -v test_taint_python_dataflow.FilteredStdinTests",
-    "status": "failed",
-    "executed": true,
-    "passed": false,
-    "exit_code": 1,
-    "cwd": "/workspace/scratch/4722fa52f353/ultimate_bug_scanner",
-    "duration_ms": 1498,
-    "timeout_seconds": 180,
-    "output_preview": "                                       ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AnalysisLimit not raised\n\n======================================================================\nFAIL: test_unknown_predicates_and_iteration_protocols_remain_incomplete (test_taint_python_dataflow.FilteredStdinTests.test_unknown_predicates_and_iteration_protocols_remain_incomplete)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/scratch/4722fa52f353/ultimate_bug_scanner/test-suite/quality/test_taint_python_dataflow.py\", line 1425, in test_unknown_predicates_and_iteration_protocols_remain_incomplete\n    with self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter'):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AnalysisLimit not raised\n\n----------------------------------------------------------------------\nRan 10 tests in 0.442s\n\nFAILED (failures=54)\n\n# exit_code: 1\n",
-    "log_path": "/workspace/scratch/4722fa52f353/ultimate_bug_scanner/test-suite/artifacts/session-python-filter-baseline-70M7LDMG/check.log",
-    "log_sha256": "fd61157adf49aebb846141d8db9693f179260a55f151bc49e6499fd3cc54edc3"
-  },
-  "candidate": {
-    "command": "UBS_KEEP_TEMP=1 PYTHONPATH=test-suite/quality python -m unittest -v test_taint_python_dataflow.FilteredStdinTests",
-    "status": "failed",
-    "executed": true,
-    "passed": false,
-    "exit_code": 1,
-    "cwd": "/workspace/scratch/4722fa52f353/ultimate_bug_scanner",
-    "duration_ms": 2722,
-    "timeout_seconds": 180,
-    "output_preview": "tion_protocols_remain_incomplete)\n----------------------------------------------------------------------\nubs_core.taint_flow.AnalysisLimit: Python taint analysis is incomplete in 1 zip scope(s): native zip helper has unresolved iterator inputs; analysis is incomplete\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"/workspace/scratch/4722fa52f353/ultimate_bug_scanner/test-suite/quality/test_taint_python_dataflow.py\", line 1425, in test_unknown_predicates_and_iteration_protocols_remain_incomplete\n    with self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter'):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: \"filter\" does not match \"Python taint analysis is incomplete in 1 zip scope(s): native zip helper has unresolved iterator inputs; analysis is incomplete\"\n\n----------------------------------------------------------------------\nRan 10 tests in 1.385s\n\nFAILED (failures=1)\n\n# exit_code: 1\n",
-    "log_path": "/workspace/scratch/4722fa52f353/ultimate_bug_scanner/test-suite/artifacts/session-python-filter-candidate-0gJXrHig/check.log",
-    "log_sha256": "0e5c02995662370b8f2795db3ac53a5c9d8d9079022fe4e3667ba1555fcb2610"
-  },
-  "interpretation": {
-    "baseline": "Ten maintained methods; 54 failing assertions. The independent native text/buffer/raw EOF witness method passes.",
-    "candidate": "Ten maintained methods; one failing diagnostic-label assertion. The other behavior, clean-control, source provenance, refusal, retained-finding and native-witness assertions pass. The aggregate candidate receipt remains failed.",
+    "prior_failed_candidate": {
+      "artifact": "py-filter-candidate.f98b2PDD",
+      "log_sha256": "10bf8227ce01739b682b8c938ecc72a968277a0f2362c284efec40f7d0e2a100",
+      "reason": "Seven errors on binary-join cases; fixed captured bytes.join receiver identity. The ten original methods already passed."
+    },
+    "baseline": {
+      "artifact": "py-filter-baseline.JzzKyTMW",
+      "observed_log_tail": "Ran 12 tests in 85.705s\nFAILED (failures=66, errors=2)",
+      "receipt_complete": false,
+      "reason": "Executor interrupted receipt serialization; raw unittest completion was recovered."
+    },
     "remaining": [
-      "Use an actionable filter diagnostic for an uncalled helper with symbolic predicate; current shared obligation says native zip helper while the maintained assertion requires filter.",
-      "Native str/bytes join consumption of filtered iterators is not implemented; the existing unresolved-consumer gate reports partial.",
-      "Replay the unchanged independently authored corpus on the candidate.",
-      "Run real module and meta-runner JSON/SARIF, selection/cache/retained-findings checks.",
-      "Regenerate and verify canonical integrity pins, run relevant existing suites, shell lint and prescribed self-scan/full-suite gates before activation.",
-      "Do not close stdin-provenance, D6 or release-self-scan umbrella beads."
+      "Compare reconstructed bytes against surviving local files",
+      "Replay unchanged independent 17-case corpus",
+      "Add and run public JSON/SARIF selection, suppression, cache and partial-nonreuse methods",
+      "Run affected source/callable/iterator suites",
+      "Refresh canonical integrity/version and root-run repository gates before publication"
     ]
   },
-  "replay_verification": {
-    "method": "Manual applied hunks recovered verbatim; unique exact old-text matches against fetched base blobs; generated conventional unified diff applied and reversed by a separate JavaScript parser.",
+  "public_test_draft": {
+    "blob": "0534ea179a042417cc824c95f491e6817ef0e113",
+    "status": "unexecuted",
+    "methods": 2,
+    "planned_scanner_calls": 27,
+    "included_in_latest_patch": true,
+    "covered_by_observed_12_method_pass": false
+  },
+  "root_recovery_verification": {
     "forward_matches_candidate": true,
     "reverse_matches_base": true,
-    "note": "This establishes recovery consistency, not Python runtime or release qualification."
+    "separate_source_and_full_test_blobs_match": true,
+    "local_post_outage_byte_comparison": false,
+    "note": "Exact unified-diff replay in tool memory; does not establish runtime or release qualification."
+  },
+  "previous_checkpoint": {
+    "status": "unactivated_checkpoint",
+    "recovery": "Exact applied edits and DSR receipt values recovered from tool history after the executor disconnected. Full log files were not recovered into this artifact; their paths and SHA256 hashes below identify the original workspace logs.",
+    "base_ref": "d6c529ee",
+    "patch_blob": "a3362feea0c168c217cf0afe6e0fdc50d991bda2",
+    "source_blobs": [
+      {
+        "path": "modules/helpers/ubs_core/analyzers/taint_py.py",
+        "base": "6f04f1d653b381567fb88bb5a62ec7ca529a0dca",
+        "candidate": "4d5acda21e163a0b0552b159f1324422f5071df4"
+      },
+      {
+        "path": "test-suite/quality/test_taint_python_dataflow.py",
+        "base": "ed9560c6752f2ac9131ffa35701103ec96dbaf4f",
+        "candidate": "6ef6d387ad02cbabc20be5bdb47c0c0c1a04c8be"
+      }
+    ],
+    "baseline": {
+      "command": "UBS_KEEP_TEMP=1 PYTHONPATH=test-suite/quality python -m unittest -v test_taint_python_dataflow.FilteredStdinTests",
+      "status": "failed",
+      "executed": true,
+      "passed": false,
+      "exit_code": 1,
+      "cwd": "/workspace/scratch/4722fa52f353/ultimate_bug_scanner",
+      "duration_ms": 1498,
+      "timeout_seconds": 180,
+      "output_preview": "                                       ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AnalysisLimit not raised\n\n======================================================================\nFAIL: test_unknown_predicates_and_iteration_protocols_remain_incomplete (test_taint_python_dataflow.FilteredStdinTests.test_unknown_predicates_and_iteration_protocols_remain_incomplete)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/workspace/scratch/4722fa52f353/ultimate_bug_scanner/test-suite/quality/test_taint_python_dataflow.py\", line 1425, in test_unknown_predicates_and_iteration_protocols_remain_incomplete\n    with self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter'):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: AnalysisLimit not raised\n\n----------------------------------------------------------------------\nRan 10 tests in 0.442s\n\nFAILED (failures=54)\n\n# exit_code: 1\n",
+      "log_path": "/workspace/scratch/4722fa52f353/ultimate_bug_scanner/test-suite/artifacts/session-python-filter-baseline-70M7LDMG/check.log",
+      "log_sha256": "fd61157adf49aebb846141d8db9693f179260a55f151bc49e6499fd3cc54edc3"
+    },
+    "candidate": {
+      "command": "UBS_KEEP_TEMP=1 PYTHONPATH=test-suite/quality python -m unittest -v test_taint_python_dataflow.FilteredStdinTests",
+      "status": "failed",
+      "executed": true,
+      "passed": false,
+      "exit_code": 1,
+      "cwd": "/workspace/scratch/4722fa52f353/ultimate_bug_scanner",
+      "duration_ms": 2722,
+      "timeout_seconds": 180,
+      "output_preview": "tion_protocols_remain_incomplete)\n----------------------------------------------------------------------\nubs_core.taint_flow.AnalysisLimit: Python taint analysis is incomplete in 1 zip scope(s): native zip helper has unresolved iterator inputs; analysis is incomplete\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"/workspace/scratch/4722fa52f353/ultimate_bug_scanner/test-suite/quality/test_taint_python_dataflow.py\", line 1425, in test_unknown_predicates_and_iteration_protocols_remain_incomplete\n    with self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter'):\n         ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: \"filter\" does not match \"Python taint analysis is incomplete in 1 zip scope(s): native zip helper has unresolved iterator inputs; analysis is incomplete\"\n\n----------------------------------------------------------------------\nRan 10 tests in 1.385s\n\nFAILED (failures=1)\n\n# exit_code: 1\n",
+      "log_path": "/workspace/scratch/4722fa52f353/ultimate_bug_scanner/test-suite/artifacts/session-python-filter-candidate-0gJXrHig/check.log",
+      "log_sha256": "0e5c02995662370b8f2795db3ac53a5c9d8d9079022fe4e3667ba1555fcb2610"
+    },
+    "interpretation": {
+      "baseline": "Ten maintained methods; 54 failing assertions. The independent native text/buffer/raw EOF witness method passes.",
+      "candidate": "Ten maintained methods; one failing diagnostic-label assertion. The other behavior, clean-control, source provenance, refusal, retained-finding and native-witness assertions pass. The aggregate candidate receipt remains failed.",
+      "remaining": [
+        "Use an actionable filter diagnostic for an uncalled helper with symbolic predicate; current shared obligation says native zip helper while the maintained assertion requires filter.",
+        "Native str/bytes join consumption of filtered iterators is not implemented; the existing unresolved-consumer gate reports partial.",
+        "Replay the unchanged independently authored corpus on the candidate.",
+        "Run real module and meta-runner JSON/SARIF, selection/cache/retained-findings checks.",
+        "Regenerate and verify canonical integrity pins, run relevant existing suites, shell lint and prescribed self-scan/full-suite gates before activation.",
+        "Do not close stdin-provenance, D6 or release-self-scan umbrella beads."
+      ]
+    },
+    "replay_verification": {
+      "method": "Manual applied hunks recovered verbatim; unique exact old-text matches against fetched base blobs; generated conventional unified diff applied and reversed by a separate JavaScript parser.",
+      "forward_matches_candidate": true,
+      "reverse_matches_base": true,
+      "note": "This establishes recovery consistency, not Python runtime or release qualification."
+    }
   }
 }

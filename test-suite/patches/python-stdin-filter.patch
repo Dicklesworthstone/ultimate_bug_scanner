@@ -1,9 +1,7 @@
 diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
 --- a/modules/helpers/ubs_core/analyzers/taint_py.py
 +++ b/modules/helpers/ubs_core/analyzers/taint_py.py
-@@ -80,13 +80,13 @@
- _STDIN_EAGER_PARSERS = frozenset({'json.load', 'tomllib.load'})
- _STDIN_CSV_PARSERS = frozenset({'csv.reader', 'csv.DictReader'})
+@@ -82,11 +82,11 @@
  _STDIN_PARSER_CARRIERS = (_STDIN_EAGER_PARSERS | _STDIN_CSV_PARSERS | _STDIN_STREAMS
                            | frozenset(_STDIN_READERS)
                            | {'json', 'tomllib', 'csv', 'sys', 'iter', 'builtins.iter', 'zip', 'builtins.zip',
@@ -17,8 +15,26 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
                     'json': frozenset({'load', 'loads', 'JSONDecoder', '_default_decoder'}),
                     'tomllib': frozenset({'load', 'loads'}),
                     **{stream: methods | {'__iter__', 'buffer', 'raw', 'readinto', 'readinto1'}
-@@ -1096,8 +1096,8 @@
+@@ -613,6 +613,10 @@
+     fallible_at_end: bool = False
+     native_kind: str = 'zip'
+     exhaustible: bool = True
++    # Scalar native adapters preserve item types separately from their data.
++    # A binary line must not become a guessed empty bytes literal merely to
++    # prove bytes.join's element contract.
++    element_kinds: frozenset[str] = frozenset()
  
+ 
+ def _literal_choices(binding):
+@@ -1112,6 +1116,7 @@
+                 and a.optional == b.optional and a.repeating == b.repeating
+                 and a.fallible == b.fallible and a.fallible_at_end == b.fallible_at_end
+                 and a.native_kind == b.native_kind and a.exhaustible == b.exhaustible
++                and a.element_kinds == b.element_kinds
+                 and (yield (a.rows, b.rows, evidence)))
+     return a == b
+ 
+@@ -1128,7 +1133,7 @@
  # Preserve the existing conventional unimported names, but never restore one
  # after a local assignment/parameter has explicitly shadowed it.
  _IMPLICIT_IDENTITIES = frozenset({
@@ -27,11 +43,28 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
      'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
      'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
      'render_template', 'render_template_string', 'HttpResponse', 'Response',
-@@ -4882,7 +4882,61 @@
+@@ -2048,6 +2053,9 @@
+     stdin_iterator_parameters: frozenset[str] = frozenset()
+     # A symbolic zip input must be revisited with its actual native iterator.
+     zip_parameters: frozenset[str] = frozenset()
++    # filter's predicate obligation is distinct from zip's iterator inputs,
++    # including in generic-helper diagnostics and selected-call propagation.
++    filter_parameters: frozenset[str] = frozenset()
+     # A generic prepared-request helper must be revisited with native input
+     # identities. Keep that obligation instead of inventing a clean Request.
+     http_parameters: frozenset[str] = frozenset()
+@@ -2187,6 +2195,7 @@
+         self.buffer_parameters = set()
+         self.stdin_iterator_parameters = set()
+         self.zip_parameters = set()
++        self.filter_parameters = set()
+         self.http_parameters = set()
+         self.generator_predicate_parameters = set()
+         self.generator_predicate_incomplete = False
+@@ -4915,6 +4924,62 @@
              elements.append((element, incoming, NO_REFERENCES))
          return tuple(elements), len(elements), references, False
  
--    def enumerate_value(self, node, state, inputs):
 +    def filter_value(self, node, state, inputs):
 +        """Keep stdin items through an exact native None predicate.
 +
@@ -64,7 +97,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
 +        symbolic = {value.parameter for value in (*choices, *predicates)
 +                    if isinstance(value, _SymbolicValue)}
 +        if symbolic:
-+            self.zip_parameters.update(symbolic)
++            self.filter_parameters.update(symbolic)
 +            return CLEAN
 +        if any(value not in known and not (isinstance(value, ast.Constant)
 +                and type(value.value) in {int, float, complex, bool, type(None)}) for value in choices):
@@ -84,14 +117,14 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
 +        row = _ArgumentVector(((element, payload),))
 +        return self.install_zip_iterator(node, state, _ZipIterator(
 +            (row,), None, optional=True, repeating=True, fallible=True, fallible_at_end=True,
-+            native_kind='filter'))
++            native_kind='filter', element_kinds=frozenset(
++                'bytes' if self.stdin_identity(value).endswith(('.buffer', '.raw')) else 'text'
++                for value in known)))
 +
-+    def enumerate_value(self, node, state, inputs):
+     def enumerate_value(self, node, state, inputs):
          """Expose native stdin rows while keeping the generated index clean.
  
-         Reuse the shared row/cursor engine, including its exhaustion and
-@@ -5016,8 +5070,8 @@
-                 for _expression, _fact, binding, _refs in positions
+@@ -5050,7 +5115,7 @@
                  for value in _binding_choices(binding))))
  
      def install_zip_iterator(self, node, state, iterator):
@@ -100,10 +133,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
          cursor = _CellRef(self.scope, '@zip:cursor', (node,))
          cells = state.cell_state()
          child = self.engine.original_calls.get(node, node)
-@@ -5079,10 +5133,11 @@
-             if phase.index < 0 or phase.index >= len(iterator.rows):
-                 continue
-             branch = state.copy()
+@@ -5115,7 +5180,8 @@
              branch.put_cell(iterator.cursor, _CellContents(binding=_ZipCursor(
                  phase.index if iterator.repeating else phase.index + 1)), written=True)
              row = iterator.rows[phase.index]
@@ -113,8 +143,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
          return yielded, _join_states(*exhausted)
  
      def zip_next(self, node, state, iterators, default=None):
-@@ -5107,13 +5162,23 @@
-         self.expression_references[node] = refs
+@@ -5141,12 +5207,22 @@
          return join_facts(*facts)
  
      def zip_materialize(self, node, state, iterators):
@@ -139,7 +168,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
              # Validate shared cursor/backing identity before reading its state.
              self.zip_step(state, iterator)
              for phase in _binding_choices(state.cells.contents[iterator.cursor].binding):
-@@ -5137,11 +5202,16 @@
+@@ -5170,10 +5246,62 @@
          self.expression_bindings[node] = _join_bindings(*outputs)
          self.expression_references[node] = frozenset({node})
          self.possible_exception(state)
@@ -147,6 +176,53 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
 +        return join_facts(*scalar_facts, *(fact for output in outputs if output is not None
 +                                          for _row, fact in output.operands))
  
++    def filter_join(self, node, state, target, name, inputs):
++        """Consume native filtered lines with the actual text/bytes join API.
++
++        Join materializes its input before enforcing element types. Even a
++        type mismatch therefore advances the shared cursor; an empty stream
++        can still return a clean empty result. Preserve these effects rather
++        than equating the inert filter handle with its consumed contents.
++        """
++        if not (isinstance(target, _BoundCallable) and name.rsplit('.', 1)[-1] == 'join'):
++            return None
++        receiver = target.receiver_binding
++        text_join = self.native_string_binding(receiver)
++        bytes_join = bool(_binding_choices(receiver)) and all(
++            isinstance(value, ast.Constant) and type(value.value) is bytes
++            for value in _binding_choices(receiver))
++        if not (text_join or bytes_join):
++            return None
++        positions = self.call_positions(node, inputs.arguments, state)
++        choices = _binding_choices(positions[0][2]) if positions else ()
++        if not any(isinstance(value, _ZipIterator) for value in choices):
++            return None
++        if (target.producer_unproved or target.references & state.mutated
++                or any(isinstance(expression, (ast.Starred, _ArgumentExpansion))
++                       for expression, _fact, _binding, _refs in positions)
++                or None in inputs.keywords
++                or not self.stdin_parser_stable(node, members={'join', '__iter__', '__next__', '__length_hint__'})):
++            raise AnalysisLimit('native filter join receiver or arguments are unresolved; analysis is incomplete')
++        if len(positions) != 1 or inputs.keywords:
++            self.possible_exception(state)
++            return CLEAN
++        if not all(isinstance(value, _ZipIterator) and value.native_kind == 'filter'
++                   and value.element_kinds and value.exhaustible for value in choices):
++            raise AnalysisLimit('native filter join input alternatives are unresolved; analysis is incomplete')
++        branches, facts = [], []
++        for iterator in choices:
++            yielded, exhausted = self.zip_step(state, iterator)
++            branches.append(exhausted)
++            if ('text' if text_join else 'bytes') in iterator.element_kinds:
++                facts.extend(fact for _branch, fact, _value in yielded)
++                if yielded:
++                    facts.append(target.receiver)
++        state.replace(_join_states(*branches))
++        self.expression_bindings[node] = _GeneratorString() if text_join else None
++        self.expression_references[node] = NO_REFERENCES
++        self.possible_exception(state)
++        return join_facts(*facts)
++
      def zip_call(self, node, state, target, name, inputs):
          native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
 +        if native and name in {'filter', 'builtins.filter'}:
@@ -156,9 +232,17 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
          if native and name in {'enumerate', 'builtins.enumerate'}:
              if isinstance(target, _BoundCallable) and target.producer_unproved:
                  raise AnalysisLimit('native enumerate callable producer effects are unresolved; analysis is incomplete')
-             return self.enumerate_value(node, state, inputs)
-@@ -5609,11 +5679,13 @@
-         def native(binding):
+@@ -5192,6 +5320,9 @@
+                 return CLEAN
+             if name == '@zip.__next__':
+                 return self.zip_next(node, state, (iterator,))
++        joined = self.filter_join(node, state, target, name, inputs)
++        if joined is not None:
++            return joined
+         if not node.args or not native or name not in {
+                 'iter', 'next', 'list', 'tuple', 'builtins.iter', 'builtins.next', 'builtins.list', 'builtins.tuple'}:
+             return None
+@@ -5643,10 +5774,12 @@
              return all((self.stdin_identity(value) in _STDIN_STREAMS
                          or self.stdin_identity(value) in _STDIN_READERS
                          or isinstance(value, str) and value in _STDIN_CSV_PARSERS | {
@@ -173,7 +257,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
                         and not (isinstance(value, _BoundCallable) and value.producer_unproved)
                         or isinstance(value, (_CsvReader, _StdinCallableIterator)) and value.format_safe
                         or self.materialized_generator_binding(value, NO_REFERENCES, state)
-@@ -5627,7 +5699,7 @@
+@@ -5660,7 +5793,7 @@
                  if expression.id in values:
                      return values[expression.id]
                  contents = self.global_contents(expression.id, state)
@@ -182,8 +266,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
                          and expression.id not in self.engine.globals.bindings
                          and expression.id not in state.bindings
                          and '@global:' + expression.id not in state.bindings):
-@@ -5650,8 +5722,9 @@
-             return False
+@@ -5684,7 +5817,8 @@
          returned = body[0].value
          if isinstance(returned, ast.Call):
              return (identity(returned.func) in _STDIN_CSV_PARSERS | {
@@ -193,14 +276,77 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ub
                      and all(inert(value) for value in returned.args)
                      and all(keyword.arg is not None and inert(keyword.value) for keyword in returned.keywords))
          return inert(returned)
+@@ -8157,6 +8291,13 @@
+                     self.zip_parameters.update(value.parameter for value in choices)
+                 else:
+                     raise AnalysisLimit('native zip helper requires proven iterator inputs; analysis is incomplete')
++            for name in summary.filter_parameters:
++                choices = _binding_choices(values.get(name))
++                if choices and all(isinstance(value, _SymbolicValue) for value in choices):
++                    self.filter_parameters.update(value.parameter for value in choices)
++                else:
++                    raise AnalysisLimit('native filter helper requires proven predicate and iterator inputs; '
++                                        'analysis is incomplete')
+             for name in summary.http_parameters:
+                 choices = _binding_choices(values.get(name))
+                 if choices and all(isinstance(value, _SymbolicValue) for value in choices):
+@@ -8906,7 +9047,8 @@
+                         else _opaque_qualifier(_qualified(node, state.bindings), receiver_unknown=True))
+                 receiver_binding = (base if isinstance(base, (_LiteralString, _GeneratorString, _LiteralJoinInstance,
+                                                                _UnprovedProducer, _SymbolicValue))
+-                                    or isinstance(base, ast.Constant) and type(base.value) is str else None)
++                                    or isinstance(base, ast.Constant) and (type(base.value) is str
++                                        or node.attr == 'join' and type(base.value) is bytes) else None)
+                 if not name and (receiver_refs or producer_unproved or receiver_binding is not None or node.attr == 'join'):
+                     # A returned object has identity even without a source
+                     # spelling (identity(box).append(...)). Keep the method
+@@ -10062,6 +10204,7 @@
+             buffer_parameters=frozenset(self.buffer_parameters),
+             stdin_iterator_parameters=frozenset(self.stdin_iterator_parameters),
+             zip_parameters=frozenset(self.zip_parameters),
++            filter_parameters=frozenset(self.filter_parameters),
+             http_parameters=frozenset(self.http_parameters),
+             generator_predicate_parameters=frozenset(self.generator_predicate_parameters),
+             generator_predicate_incomplete=self.generator_predicate_incomplete,
+@@ -11728,17 +11871,20 @@
+                          self.generator_helper_identity(function) or self.http_factory_callback(function)))
+ 
+     def zip_diagnostics(self):
+-        """Uncalled or escaped generic zip inputs never certify completeness."""
+-        functions = [function for function in self.functions
+-                     if self.summaries.get(function, FunctionSummary()).zip_parameters]
+-        if not functions:
+-            return ()
+-        self.budget.spend(len(self.summaries))
+-        qualified = {key[0] for key, value in self.summaries.items()
+-                     if isinstance(key, tuple) and not value.zip_parameters and not value.incomplete}
+-        reason = 'native zip helper has unresolved iterator inputs; analysis is incomplete'
+-        return tuple(self.scope_diagnostic(function, reason) for function in functions
+-                     if function not in qualified or not self.generator_helper_identity(function))
++        """Uncalled or escaped native iterator helpers retain their obligations."""
++        diagnostics = []
++        for operation, field in (('zip', 'zip_parameters'), ('filter', 'filter_parameters')):
++            functions = [function for function in self.functions
++                         if getattr(self.summaries.get(function, FunctionSummary()), field)]
++            if not functions:
++                continue
++            self.budget.spend(len(self.summaries))
++            qualified = {key[0] for key, value in self.summaries.items()
++                         if isinstance(key, tuple) and not getattr(value, field) and not value.incomplete}
++            reason = f'native {operation} helper has unresolved iterator inputs; analysis is incomplete'
++            diagnostics.extend(self.scope_diagnostic(function, reason) for function in functions
++                               if function not in qualified or not self.generator_helper_identity(function))
++        return tuple(diagnostics)
+ 
+     def generator_predicate_diagnostics(self):
+         """Discharge generic protocols only after native contexts complete."""
 diff --git a/test-suite/quality/test_taint_python_dataflow.py b/test-suite/quality/test_taint_python_dataflow.py
 --- a/test-suite/quality/test_taint_python_dataflow.py
 +++ b/test-suite/quality/test_taint_python_dataflow.py
-@@ -1354,7 +1354,130 @@
+@@ -1354,6 +1354,148 @@
                           {('eval',2),('eval',6)})
  
  
--class EnumeratedStdinTests(SourceTest):
 +class FilteredStdinTests(SourceTest):
 +    def test_native_filter_payload_reaches_each_sink_domain(self):
 +        for stream, convert in (('sys.stdin', ''), ('sys.__stdin__', ''),
@@ -323,8 +469,90 @@ diff --git a/test-suite/quality/test_taint_python_dataflow.py b/test-suite/quali
 +                                            capture_output=True, text=True, timeout=15, check=True)
 +                self.assertEqual(json.loads(result.stdout), ['\n', 'SELECT supplied\n', [], '\n'])
 +
++    def test_native_joins_consume_filtered_text_and_binary_contents(self):
++        for stream, separator in (('sys.stdin', '""'), ('sys.__stdin__', '"|"'),
++                                  ('sys.stdin.buffer', 'b""'), ('sys.stdin.buffer.raw', 'b"|"')):
++            for setup, expression in (
++                    ('', f'{separator}.join(rows)'),
++                    (f'joiner = {separator}.join\n', 'joiner(rows)'),
++                    ('def select(source):\n    return filter(None, source)\n'
++                     f'rows = select({stream})\n', f'{separator}.join(rows)')):
++                with self.subTest(stream=stream, setup=setup):
++                    self.assert_rules('import sys\n'
++                        f'rows = filter(None, {stream})\n' + setup + f'eval({expression})\n', 'eval')
 +
-+class EnumeratedStdinTests(SourceTest):
++    def test_native_join_rejects_wrong_element_types_without_inventing_payloads(self):
++        for stream, separator in (('sys.stdin', 'b""'), ('sys.stdin.buffer', '""'),
++                                  ('sys.stdin.buffer.raw', '""')):
++            with self.subTest(stream=stream):
++                self.assert_rules('import sys\n'
++                    f'rows = filter(None, {stream})\neval({separator}.join(rows))\n')
++
++
+ class EnumeratedStdinTests(SourceTest):
      def test_native_payload_reaches_each_sink_domain(self):
          for stream, convert in (('sys.stdin', ''), ('sys.stdin.buffer', '.decode()'),
-                                 ('sys.stdin.buffer.raw', '.decode()')):
+@@ -2171,6 +2313,63 @@
+         self.assertEqual(sites, expected, report)
+         return report
+ 
++    def test_filtered_stdin_module_and_runner_reports_keep_sites_and_selection(self):
++        cases = (
++            ('text-join', 'import sys\nrows = filter(None, sys.stdin)\n'
++             'query = "".join(rows)\ncursor.execute(query)\n', [(4, 1)], False),
++            ('bytes-join', 'import sys\nrows = filter(None, sys.stdin.buffer)\n'
++             'query = b"".join(rows).decode()\ncursor.execute(query)\n', [(4, 1)], False),
++            ('helper', 'import sys\ndef select(stream):\n    return filter(None, stream)\n'
++             'cursor.execute(next(select(sys.stdin)))\n', [(4, 1)], False),
++            ('unused', 'import sys\nrows = filter(None, sys.stdin)\n'
++             'cursor.execute("SELECT 1")\n', [], False),
++            ('partial', 'import sys\ncursor.execute(input())\n'
++             'rows = filter(predicate, sys.stdin)\n', [(2, 1)], True),
++        )
++        artifacts = ROOT / 'test-suite/artifacts/python-filter-public'
++        artifacts.mkdir(parents=True, exist_ok=True)
++        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
++        for name, source, expected, partial in cases:
++            project = scratch / name
++            project.mkdir()
++            target = project / 'view.py'
++            target.write_text(source, encoding='utf-8')
++            (project / 'unselected.py').write_text('cursor.execute(input())\n', encoding='utf-8')
++            for meta in (False, True):
++                for output in ('json', 'sarif'):
++                    with self.subTest(case=name, meta=meta, output=output):
++                        self.zip_public_report(target, project / f'{meta}-{output}', meta=meta,
++                                               output=output, expected=expected, partial=partial,
++                                               partial_label='filter')
++
++    def test_filtered_stdin_cache_invalidation_suppression_and_partial_nonreuse(self):
++        artifacts = ROOT / 'test-suite/artifacts/python-filter-public'
++        artifacts.mkdir(parents=True, exist_ok=True)
++        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
++        target = scratch / 'view.py'
++        prefix = 'import sys\nrows = filter(None, sys.stdin)\nquery = "".join(rows)\n'
++        unsafe = prefix + 'cursor.execute(query)\n'
++        clean = prefix + 'cursor.execute("SELECT 1")\n'
++        suppressed = prefix + 'cursor.execute(query)  # ubs:ignore[python.taint.sql]\n'
++        for index, (source, expected, hits) in enumerate((
++                (unsafe, [(4, 1)], 0), (unsafe, [(4, 1)], 1),
++                (clean, [], 0), (suppressed, [], 0), (unsafe, [(4, 1)], 1))):
++            with self.subTest(index=index):
++                target.write_text(source, encoding='utf-8')
++                report = self.zip_public_report(target, scratch / f'cache-{index}', meta=True, output='json',
++                                               expected=expected, cache=True)
++                self.assertEqual(report['profile']['cache_hits'], hits, report)
++        entries = set((scratch / 'cache').glob('*/files/**/*.json'))
++        self.assertTrue(entries, 'Completed native filter scans must create reusable cache entries')
++        target.write_text('import sys\ncursor.execute(input())\n'
++                          'rows = filter(predicate, sys.stdin)\n', encoding='utf-8')
++        for index in range(2):
++            with self.subTest(partial_attempt=index):
++                self.zip_public_report(target, scratch / f'partial-{index}', meta=True, output='json',
++                                       expected=[(2, 1)], partial=True, cache=True, partial_label='filter')
++                self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
++                                 'An incomplete native filter scan must not enter the completed cache')
++
+     def test_zip_module_and_runner_json_sarif_keep_sites_status_and_selection(self):
+         prefix = 'import sys\nfor label, query in zip(["SELECT 1"], sys.stdin):\n'
+         cases = (

@@ -622,10 +622,12 @@ This is preserved source work, not an activated scanner repair or release claim.
   The final patch replays exactly in both directions; its runtime, independent,
   public and adjacent/full checks remain unexecuted after executor loss. The
   earlier 14-method pass applies only to the older archived candidate.
-- [ ] `1b9j.6.17`: finish Python `filter(None, stdin)` provenance. The exact
-  archived candidate reduces 54 maintained baseline assertion failures to one
-  diagnostic-label failure across ten methods. Native join consumption,
-  independent candidate replay, public reports and prescribed gates are pending.
+- [ ] `1b9j.6.17`: qualify Python `filter(None, stdin)` and native text/bytes
+  join consumption. The November 23 implementation fixes the exact diagnostic
+  and passed all 12 maintained/native methods through DSR. The updated patch
+  adds two unexecuted public methods. Independent replay, adjacent suites,
+  public reports and canonical integrity/full gates remain pending; no
+  production activation is claimed.
 - [ ] `1b9j.6.18`: complete Go native read-into-buffer transport. The archived
   patch contains failing regression witnesses and a partial capability scaffold;
   native transfer, alias/backing writes and helper integration are unfinished.

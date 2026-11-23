@@ -225,3 +225,40 @@ runtime pass, accuracy result, activation or release qualification is claimed.
 Before activation, run the maintained and independent cases, the new public
 methods and affected heap/callback/SQL cohorts, then regenerate canonical pins
 and complete the original Bead's DSR gates. Keep `1b9j.6.16` in progress.
+
+### Python native filter and join consumption
+
+The updated `python-stdin-filter.patch` now targets `b27c0dcc` and includes
+native text/bytes join consumption, typed scalar iterator contents and distinct
+filter-helper obligations. The exact original diagnostic assertion is preserved
+and now passes. The candidate's bound bytes-join receiver proof was corrected
+after seven initial errors in the newly added binary-join cases.
+
+A genuine DSR check of the authored candidate completed successfully: all 12
+maintained/native methods passed (the original ten plus two join methods).
+Receipt `py-filter-candidate-joins.Wr7iQYmK` recorded exit 0, 2,963 ms and
+log SHA-256 `066770cf77c8666ae4d49617f2093164584fb2cac785c55384d6a84a14738d8d`.
+The fresh unchanged-source baseline's raw unittest output recorded 66 failed
+subcase assertions and two errors across those 12 methods; executor loss
+interrupted its receipt serialization. The earlier failed candidate receipt
+is preserved in `python-stdin-filter-receipts.json` alongside the passing fields.
+
+The final combined patch additionally contains two unexecuted public methods
+specifying 20 module/runner JSON/SARIF calls and seven cache/edit/suppression/
+partial-nonreuse calls. Those additions are not covered by the 12-method pass.
+The unchanged 17-case independent corpus and adjacent suites have not completed.
+Static independent review found no concrete false-clean blocker in the native
+filter/join paths; it supplied mixed text/binary helper-context and cursor-reuse
+witnesses for the still-pending runtime qualification. Nested filters, arbitrary
+predicates, opaque join receivers and uncertain resumption remain explicit
+incomplete-analysis boundaries.
+
+Recovery patch: `6dc3814e689dc61aef86ceb874b3888c9f3ce5e0`.
+Source associated with the observed pass: `407278c2ad00577666272667e13b82da27c6666f`.
+Maintained-only test snapshot: `103e986d6dcd3e2f0706fe7963bf3c752c802a64`;
+complete test draft: `0534ea179a042417cc824c95f491e6817ef0e113`.
+Root independently replayed the patch forward/backward against immutable base
+files and matched the reconstructed source/test blobs exactly. Comparison to the
+lost local files remains unavailable; this is recovery evidence, not an additional
+runtime pass. Keep `1b9j.6.17` in progress until its original independent,
+public, adjacent and canonical integrity/DSR gates are complete.

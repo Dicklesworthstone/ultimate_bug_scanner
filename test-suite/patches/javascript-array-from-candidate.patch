@@ -1,0 +1,504 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -45,6 +45,7 @@
+ _METHOD_LOOKUP_CONTRACT = ('method-lookup-contract',)
+ _HEAP_METADATA = {_ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT}
+ _OPAQUE_CALLABLE = ('builtin', 'opaque-callable')
++_ARRAY_FROM = ('builtin', 'Array.from')
+ 
+ 
+ def _collapsed(ref):
+@@ -1575,6 +1576,14 @@
+         selected = []
+         for ref in _refs(fact):
+             slots = state.heap.get(ref, {})
++            if (ref == ('builtin', 'Array') and key == 'from'
++                    and not any(name in slots for name in (
++                        'from', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__'))):
++                # Capture the original function, not a spelling that could be
++                # rebound before an alias, helper or later argument calls it.
++                state.heap.setdefault(_ARRAY_FROM, {})
++                selected.append(_Fact(refs=(_ARRAY_FROM,)))
++                continue
+             if self.rule == 'js.taint.sql':
+                 if _sql_object_ref(ref) or _sql_name_ref(ref):
+                     self.incomplete.add('Drizzle SQL object property access requires unsupported wrapper semantics')
+@@ -1954,7 +1963,9 @@
+                 value = self.property(fact, key, state)
+                 if not _refs(fact) or frozenset(fact):
+                     value = _join(value, selected)
+-                absent = (bool(_refs(fact)) and not frozenset(fact) and key is not None
++                # Builtin properties can have a proven native value without
++                # an own slot in the modeled heap (for example Array.from).
++                absent = (bool(_refs(fact)) and not frozenset(fact) and not _refs(value) and key is not None
+                           and all(key not in state.heap.get(parent, {}) and None not in state.heap.get(parent, {})
+                                   for parent in _refs(fact)))
+                 self.bind_pattern(begin, right, value, state, position, absent, binding, target_reference)
+@@ -2923,16 +2934,19 @@
+             # Unlike the other visitors, find calls the predicate for absent
+             # slots too: an optional object can therefore supply undefined.
+             scalar = (undefined or not _refs(value) or bool(frozenset(value))
+-                      or (method in {'find', 'findIndex', 'findLast', 'findLastIndex'}
++                      or (method in {'from', 'find', 'findIndex', 'findLast', 'findLastIndex'}
+                           and getattr(value, 'absent', False)))
+             actual.append((value, scalar))
+             if scalar and not undefined:
+                 missing.add(index)
+                 if index < len(callee.params) and callee.params[index][2] is not None:
+                     self.incomplete.add(f'Array.{method} {label} default requires a known undefined or present value')
+-        actual.extend([(frozenset(), False), (receiver, False)])
+-        prepared = (actual, None, missing,
+-                    {len(values): 'present', len(values) + 1: 'present'})
++        actual.append((frozenset(), False))
++        kinds = {len(values): 'present'}
++        if method != 'from':
++            actual.append((receiver, False))
++            kinds[len(values) + 1] = 'present'
++        prepared = (actual, None, missing, kinds)
+         bound = self.bind(callee, prepared, state, location, receiver=this_arg)
+         returned, effects, normal, thrown, exceptional, incomplete = self.engine.heap_call(
+             callee, self.rule, location, bound, state)
+@@ -3166,11 +3180,41 @@
+                     for index in range(next(iter(sizes)))], True
+         return [_join(*(item for items in variants for item in items))], False
+ 
+-    def array_iteration(self, receiver, method, arguments, prepared, state, location, callback=None):
++    def array_from(self, arguments, prepared, state, location, callback):
++        """Copy native array iterators through the shared callback transfer.
++
++        Array-like objects, custom iterators and constructor receivers need
++        separate protocol proofs. A known array uses its iterator's live
++        length and yields undefined for holes; source species is irrelevant.
++        """
++        actual, uncertain, missing, kinds = prepared
++        if uncertain is not None:
++            self.escape_callbacks((value for value, _missing in actual), state)
++            self.incomplete.add('Array.from requires known argument positions')
++            return self.materialize(_join(*(value for value, _missing in actual)), state)
++        if ((len(actual) > 1 and kinds.get(1) in {'null', 'noniterable'})
++                or not actual or kinds.get(0) in {'null', 'undefined'}
++                or re.match(r'new\s+', self.engine.text[location:])):
++            self.throws.append((frozenset(), state.copy()))
++            raise _NoNormalCompletion
++        receiver = actual[0][0]
++        refs = _refs(receiver)
++        if (not refs or frozenset(receiver) or getattr(receiver, 'absent', False)
++                or getattr(receiver, 'scalar_alternative', False)
++                or any(ref not in state.array_lengths for ref in refs)):
++            self.escape_callbacks((value for value, _missing in actual[1:]), state)
++            self.incomplete.add('Array.from requires a proven native array iterator; array-like and custom iterable inputs are unsupported')
++            return self.materialize(receiver, state)
++        mapper = (actual[1:], None, {index - 1 for index in missing if index > 0},
++                  {index - 1: kind for index, kind in kinds.items() if index > 0})
++        return self.array_iteration(receiver, 'from', arguments[1:], mapper, state, location, callback)
++
++    def array_iteration(self, receiver, method, arguments, prepared, state, location, callback=None):
+         """Execute native callbacks over live finite array slots.
+ 
+-        The source length is captured once, while elements are read immediately
+-        before each callback. Methods that skip holes visit only present slots;
++        Array.from reads the iterator's live length; other methods capture it
++        once. Elements are read immediately before each callback.
++        Methods that skip holes visit only present slots;
+         Find variants visit every index, charged against the shared work budget.
+         Callback writes, throws and borrowed object identities use the same
+         bounded heap summaries as ordinary local calls. Map preserves source
+@@ -3184,7 +3228,9 @@
+         order; index variants return clean indices. Missing and deleted slots
+         still execute their predicates in either direction.
+         """
+-        actual, uncertain, _missing, _kinds = prepared
++        actual, uncertain, _missing, kinds = prepared
++        collecting = method == 'from'
++        mapping = not collecting or bool(actual and kinds.get(0) != 'undefined')
+         callee = (_function_target(actual[0][0]) or callback) if actual else None
+         reducing = method in {'reduce', 'reduceRight'}
+         searching = method in {'find', 'findIndex', 'findLast', 'findLastIndex'}
+@@ -3192,15 +3238,15 @@
+         testing = method in {'some', 'every'} or searching
+         filtering = method == 'filter'
+         reverse = method in {'reduceRight', 'findLast', 'findLastIndex'}
+-        produces_array = method in {'map', 'flatMap', 'filter'}
++        produces_array = method in {'from', 'map', 'flatMap', 'filter'}
+         result = (self.scope, location, 'array-' + method)
+         returned = (_Fact(refs=(result,)) if produces_array else
+                     actual[1][0] if reducing and len(actual) > 1 else frozenset())
+         previous = state.heap.get(result) if produces_array else None
+         previous_length = state.array_lengths.get(result) if produces_array else None
+         refs = _refs(receiver)
+-        if (uncertain is not None or callee is None or callee.generator or callee.asynchronous
+-                or self.escaped_callable(callee)):
++        if (uncertain is not None or (mapping and (
++                callee is None or callee.generator or callee.asynchronous or self.escaped_callable(callee)))):
+             if callee is not None:
+                 self.engine.escaped_callbacks.add(callee)
+             self.incomplete.add(f'Array.{method} requires a selected synchronous callback')
+@@ -3208,10 +3254,12 @@
+                 state.heap[result] = dict(previous or {})
+                 state.array_lengths[result] = None
+             return returned
+-        if any(not self.array_mutation_contract(ref, state, species=produces_array)
++        if any(not self.array_mutation_contract(ref, state, species=produces_array and not collecting)
+                or state.array_lengths[ref] is None or None in state.heap[ref] for ref in refs):
+-            self.engine.escaped_callbacks.add(callee)
+-            requirement = 'finite ordinary arrays and native array species' if produces_array else 'finite ordinary arrays'
++            if callee is not None:
++                self.engine.escaped_callbacks.add(callee)
++            requirement = ('finite ordinary arrays and native array species'
++                           if produces_array and not collecting else 'finite ordinary arrays')
+             self.incomplete.add(f'Array.{method} requires {requirement}')
+             if produces_array:
+                 state.heap[result] = dict(previous or {})
+@@ -3220,14 +3268,14 @@
+         this_arg = actual[1][0] if not reducing and len(actual) > 1 else frozenset()
+         result_kind = self.flatmap_result_kind(callee) if method == 'flatMap' else None
+         predicate_truth = self.predicate_result_truth(callee) if testing or filtering else None
+-        if (not callee.arrow and not _refs(this_arg)
++        if (mapping and not callee.arrow and not _refs(this_arg)
+                 and re.search(r'\bthis\b', callee.code[callee.body_start:callee.body_end])):
+             self.incomplete.add(f'Array.{method} callback requires a known this receiver')
+             if produces_array:
+                 state.heap[result] = dict(previous or {})
+                 state.array_lengths[result] = None
+             return returned
+-        if callee.name and not callee.declaration and not callee.arrow:
++        if mapping and callee.name and not callee.declaration and not callee.arrow:
+             # The general binding model does not create a function
+             # expression's private immutable self-name environment. A
+             # callback that exposes that name can outlive this invocation;
+@@ -3238,8 +3286,9 @@
+                        callee.code[callee.body_start:callee.body_end])):
+                 self.incomplete.add(f'Array.{method} named callback self-reference requires unsupported lexical binding semantics')
+                 self.engine.escaped_callbacks.add(callee)
+-        self.engine.dependents[(callee, self.rule)][self.scope] = None
+-        if (arguments and callee.parent is self.scope
++        if mapping:
++            self.engine.dependents[(callee, self.rule)][self.scope] = None
++        if (mapping and arguments and callee.parent is self.scope
+                 and arguments[0][0] <= callee.start < callee.end <= arguments[0][1]):
+             # A literal callback is not an independent entrypoint. In
+             # particular an empty/sparse array cannot execute its sink body.
+@@ -3260,7 +3309,7 @@
+             accumulator = actual[1][0] if initialized else frozenset()
+             seed_state = branch.copy() if uninitialized else None
+             stopped = None
+-            while 0 <= cursor < limit:
++            while collecting or 0 <= cursor < limit:
+                 source = branch.heap[ref]
+                 self.engine.budget.spend(1 + len(source))
+                 if not self.array_mutation_contract(ref, branch) or None in source:
+@@ -3272,7 +3321,9 @@
+                     self.incomplete.add(f'Array.{method} callback changed the source to an unknown length')
+                     size = None
+                     break
+-                if searching:
++                if collecting and cursor >= length:
++                    break
++                if collecting or searching:
+                     # FindViaPredicate uses Get without HasProperty. Even a
+                     # hole, or an index removed by an earlier callback, is a
+                     # definite visit within the original length snapshot.
+@@ -3285,7 +3336,7 @@
+                         break
+                     index = max(positions) if reverse else min(positions)
+                 value = self.property(selected, str(index), branch)
+-                definite = searching or (ref not in branch.weak_refs and not getattr(value, 'absent', False))
++                definite = collecting or searching or (ref not in branch.weak_refs and not getattr(value, 'absent', False))
+                 next_cursor = index - 1 if reverse else index + 1
+                 if reducing and not initialized:
+                     # Without an initial value, the first present element is
+@@ -3305,8 +3356,8 @@
+                     mapped = self.array_callback(callee, value, selected, this_arg, branch,
+                                                  (location, method + '-index', index), method,
+                                                  accumulator if reducing else None,
+-                                                 element_undefined=searching and (
+-                                                     index >= length or str(index) not in source))
++                                                 element_undefined=(collecting or searching) and (
++                                                     index >= length or str(index) not in source)) if mapping else value
+                 except _NoNormalCompletion:
+                     if bypass is None:
+                         branch = None
+@@ -3346,8 +3397,10 @@
+                         branch = _join_states(branch, bypass)
+                     if reducing:
+                         accumulator = _join(mapped, retained, seed)
+-                    elif method == 'map':
++                    elif collecting or method == 'map':
+                         slots[str(index)] = _Fact(mapped, _refs(mapped), absent=not definite)
++                        if collecting:
++                            size = next_cursor
+                     elif filtering and predicate_truth is not False:
+                         # The predicate chooses the original value; its return
+                         # fact is never the output element. Unknown choices and
+@@ -3376,6 +3429,12 @@
+                             size = None
+                 uninitialized = uninitialized and not definite
+                 cursor = next_cursor
++                if collecting:
++                    remaining = branch.array_lengths[ref]
++                    if remaining is not None and remaining - cursor > self.engine.budget.remaining:
++                        self.incomplete.add('Array.from remaining index visits exceed the taint work limit')
++                        size = None
++                        break
+             if testing:
+                 if value_search and branch is not None:
+                     # A completed nonmatching path returns undefined. Keep it
+@@ -3463,8 +3522,13 @@
+         """Capture GetValue(callee) before arguments can replace a method."""
+         receiver_name, dot, method = name.rpartition('.')
+         if not dot:
++            target = self.reference(name, state)
++            if _ARRAY_FROM in _refs(target):
++                proven = (_refs(target) == {_ARRAY_FROM} and not frozenset(target)
++                          and not getattr(target, 'absent', False)
++                          and not getattr(target, 'scalar_alternative', False))
++                return 'array-from' if proven else 'array-from-unknown', target, 'from'
+             if self.rule == 'js.taint.sql':
+-                target = self.reference(name, state)
+                 if not frozenset(target) and len(_refs(target)) == 1:
+                     ref = next(iter(_refs(target)))
+                     if _sql_builtin_ref(ref) and ref[1].split('.')[-1] in _SQL_FACTORIES:
+@@ -3479,6 +3543,22 @@
+         for key in parts[1:]:
+             receiver = self.property(receiver, key, state)
+         refs = _refs(receiver)
++        if _ARRAY_FROM in refs:
++            # Borrowed constructor invocation and bound receiver semantics
++            # need a separate proof; the captured native must not vanish.
++            return 'array-from-unknown', receiver, method
++        target = self.property(receiver, method, state)
++        if _ARRAY_FROM in _refs(target):
++            ordinary = (refs == {('builtin', 'Array')} or bool(refs) and all(
++                _function_scope(ref) is None and ref[0] != 'builtin'
++                and not any(key in state.heap.get(ref, {}) for key in (
++                    _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')) for ref in refs))
++            proven = (ordinary and not frozenset(receiver)
++                      and not getattr(receiver, 'scalar_alternative', False)
++                      and _refs(target) == {_ARRAY_FROM} and not frozenset(target)
++                      and not getattr(target, 'absent', False)
++                      and not getattr(target, 'scalar_alternative', False))
++            return 'array-from' if proven else 'array-from-unknown', target, 'from'
+         if self.rule == 'js.taint.sql' and refs:
+             if refs == {('builtin', 'drizzle.sql')} and not frozenset(receiver):
+                 slots = state.heap.get(('builtin', 'drizzle.sql'), {})
+@@ -3512,6 +3592,12 @@
+         kind, receiver, method = native
+         actual, uncertain, _missing, _kinds = prepared
+         values = [value for value, _missing in actual]
++        if kind == 'array-from':
++            return self.array_from(arguments, prepared, state, location, callback)
++        if kind == 'array-from-unknown':
++            self.escape_callbacks(values, state)
++            self.incomplete.add('Array.from requires a proven native callable and ordinary constructor receiver')
++            return self.materialize(_join(*values), state)
+         if kind == 'array' and method == 'fill':
+             return self.array_fill(receiver, arguments, prepared, state)
+         if kind == 'array' and method == 'copyWithin':
+@@ -3871,6 +3957,9 @@
+             self.incomplete.add(f'Array.{key} requires a known native or selected callable')
+         if callable_value and report:
+             self.incomplete.add('Own method requires an unambiguous callable and ordinary property semantics')
++        if (report and key == 'from' and ('builtin', 'Array') in _refs(receiver)
++                and self.native_target(name, state) is None):
++            self.incomplete.add('Array.from requires a known native or selected callable')
+         return None, receiver
+ 
+     def callable(self, start, end, state):
+@@ -4522,6 +4611,8 @@
+                             'sort', 'toSorted', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
+                             'find', 'findIndex', 'findLast', 'findLastIndex'}
+                         and arguments else None)
++            if native is not None and native[0] == 'array-from' and len(arguments) > 1:
++                callback = self.callable(*arguments[1], state)
+             if arguments and callback is None:
+                 unmodeled = self.callable(*arguments[0], state)
+                 if (unmodeled is not None and unmodeled.parent is self.scope
+@@ -5224,7 +5315,7 @@
+         self.flatmap_result_kinds = {}
+         self.predicate_result_truths = {}
+         self.has_array_callbacks = any(name in self.text for name in (
+-            'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
++            'from', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
+             'find', 'findIndex', 'findLast', 'findLastIndex', 'sort', 'toSorted'))
+         self.widened_calls, self.exact_calls, self.recursive = {}, defaultdict(list), set()
+         self.current_task = None
+diff --git a/test-suite/quality/test_taint_js_heap.py b/test-suite/quality/test_taint_js_heap.py
+--- a/test-suite/quality/test_taint_js_heap.py
++++ b/test-suite/quality/test_taint_js_heap.py
+@@ -4235,7 +4235,174 @@
+             'items.flatMap((value, index, source) => { source.length = unknown; return [value]; });',
+             'xss', reason='flatMap.*length')
+ 
+-    def assert_fill_partial(self, source, *rules, reason='Array.fill'):
++    def test_array_from_mapper_returns_and_sanitizer_domains(self):
++        source = ('const out = Array.from([1], value => req.query.html); '
++                  'res.send(out[0]); res.send(out.length);')
++        self.scan(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input', 1])
++        self.scan('const out = Array.from([req.query.html], value => "safe"); '
++                  'res.send(out[0]); eval(out[0]); db.query(out[0]); shell.exec(out[0]);')
++        self.scan('const out = Array.from([req.query.html], value => DOMPurify.sanitize(value)); '
++                  'res.send(out[0]); eval(out[0]); db.query(out[0]); shell.exec(out[0]);',
++                  'eval', 'sql', 'command')
++
++    def test_array_from_callback_effects_and_borrowed_objects(self):
++        source = ('let saved = "safe"; const box = {html: "safe"}; '
++                  'const out = Array.from([box], value => { value.html = req.query.html; '
++                  'saved = req.query.html; return value; }); '
++                  'res.send(box.html); res.send(out[0].html); res.send(saved);')
++        self.scan(source, 'xss', 'xss', 'xss')
++        self.assert_runtime_sends(source, ['review-input', 'review-input', 'review-input'])
++        self.scan('const box = {html: req.query.html}; '
++                  'Array.from([box], value => { value.html = "safe"; return 0; }); res.send(box.html);')
++        self.scan('Array.from([req.query.html], value => { res.send(value); return "safe"; });', 'xss')
++
++    def test_array_from_plain_copy_is_fresh_and_shallow(self):
++        source = ('const box = {html: "safe"}; const items = [req.query.html, box]; '
++                  'const out = Array.from(items); items[0] = "safe"; out[1].html = req.query.html; '
++                  'res.send(out[0]); res.send(items[0]); res.send(box.html); res.send(out.length);')
++        self.scan(source, 'xss', 'xss')
++        self.assert_runtime_sends(source, ['review-input', 'safe', 'review-input', 2])
++        self.scan('const items = [req.query.html, "safe"]; '
++                  'const out = Array.from(items); out[0] = "safe"; '
++                  'res.send(items[0]); res.send(out[0]); res.send(out[1]); res.send(out[2]);', 'xss')
++
++    def test_array_from_visits_holes_and_creates_dense_elements(self):
++        source = ('const out = Array.from([,], (value = req.query.html) => value); '
++                  'res.send(out[0]); res.send(out.length);')
++        self.scan(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input', 1])
++        source = ('const items = Array.from([,]); let saved = "safe"; '
++                  'items.map(value => { saved = req.query.html; return value; }); res.send(saved);')
++        self.scan(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input'])
++        self.scan('let saved = "safe"; Array.from([], value => { '
++                  'saved = req.query.html; res.send(req.query.html); return value; }); res.send(saved);')
++
++    def test_array_from_uses_live_array_length_and_element_values(self):
++        cases = (
++            ('const items = ["safe"]; const out = Array.from(items, value => { '
++             'items[1] = req.query.html; return value; }); '
++             'res.send(out[0]); res.send(out[1]); res.send(out.length);',
++             ('xss',), ['safe', 'review-input', 2]),
++            ('const items = ["safe", req.query.html]; const out = Array.from(items, value => { '
++             'items.length = 1; return value; }); res.send(out[1]); res.send(out.length);',
++             (), [None, 1]),
++            ('const items = [req.query.html, req.query.html]; const out = Array.from(items, value => { '
++             'items[1] = "safe"; return value; }); res.send(out[0]); res.send(out[1]);',
++             ('xss',), ['review-input', 'safe']),
++        )
++        for source, rules, expected in cases:
++            with self.subTest(source=source):
++                self.scan(source, *rules)
++                self.assert_runtime_sends(source, expected)
++
++    def test_array_from_mapper_receives_two_arguments_and_this(self):
++        source = ('const out = Array.from(["safe"], function(value, index, missing = req.query.html) { '
++                  'return {value, index, missing, html: this.html}; }, {html: req.query.html}); '
++                  'res.send(out[0].value); res.send(out[0].index); '
++                  'res.send(out[0].missing); res.send(out[0].html);')
++        self.scan(source, 'xss', 'xss')
++        self.assert_runtime_sends(source, ['safe', 0, 'review-input', 'review-input'])
++        self.scan('const out = Array.from([req.query.html], value => "safe", {html: req.query.html}); '
++                  'res.send(out[0]);')
++
++    def test_array_from_native_aliases_and_optional_mapper(self):
++        for setup, call in (
++                ('const Native = Array;', 'Native.from'),
++                ('const copy = Array.from;', 'copy'),
++                ('const {from: copy} = Array;', 'copy'),
++                ('const operations = {copy: Array.from};', 'operations.copy'),
++                ('function factory() { return Array.from; } const copy = factory();', 'copy')):
++            for extra in ('', ', undefined', ', void 0'):
++                with self.subTest(setup=setup, extra=extra):
++                    self.scan(setup + f'const out = {call}([req.query.html, "safe"]{extra}); '
++                              'res.send(out[0]); res.send(out[1]); res.send(out.length);', 'xss')
++        self.scan('const copy = Array.from; Array.from = external; '
++                  'const out = copy([1], value => req.query.html); res.send(out[0]);', 'xss')
++
++    def test_array_from_captures_callee_and_mapper_before_later_arguments(self):
++        source = ('const items = ["safe"]; let map = value => value; '
++                  'const out = Array.from(items, map, (map = () => "safe", items[0] = req.query.html)); '
++                  'res.send(out[0]);')
++        self.scan(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input'])
++        self.scan('const out = Array.from([1], value => req.query.html, Array.from = external); '
++                  'res.send(out[0]);', 'xss')
++
++    def test_array_from_selected_helpers_keep_context_and_module_locations(self):
++        source = ('function map(value) { return {html: value}; } '
++                  'function copy(items, mapper) { return Array.from(items, mapper); } '
++                  'const dirty = copy([req.query.html], map); const clean = copy(["safe"], map); '
++                  'res.send(dirty[0].html); res.send(clean[0].html);')
++        self.scan(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input', 'safe'])
++        artifacts = ROOT / 'test-suite/artifacts/javascript-array-from'
++        artifacts.mkdir(parents=True, exist_ok=True)
++        scratch = Path(tempfile.mkdtemp(prefix='modules-', dir=artifacts))
++        helper, entry = scratch / 'copy.mjs', scratch / 'handler.mjs'
++        helper.write_text('export function copy(items) { return Array.from(items, value => ({html: value})); }\n',
++                          encoding='utf-8')
++        entry.write_text('import {copy} from "./copy.mjs";\nconst out = copy([req.query.html]);\n'
++                         'res.send(out[0].html);\n', encoding='utf-8')
++        findings = list(taint.run(RunContext(lang='javascript', files=[entry, helper])))
++        self.assertEqual([(f['rule'], f['path'], f['line']) for f in findings],
++                         [('javascript.taint.xss', str(entry), 3)])
++
++    def test_array_from_shadowed_or_replaced_functions_use_selected_bodies(self):
++        for setup in ('const Array = {from(items, mapper) { return ["safe"]; }};',
++                      'Array.from = function(items, mapper) { return ["safe"]; };'):
++            with self.subTest(setup=setup):
++                self.scan(setup + 'const out = Array.from([req.query.html], value => req.query.html); '
++                          'res.send(out[0]);')
++        self.scan('const Array = {from(items, mapper) { return [req.query.html]; }}; '
++                  'const out = Array.from(["safe"], value => "safe"); res.send(out[0]);', 'xss')
++        self.scan('function copy(Array) { return Array.from([req.query.html]); } '
++                  'res.send(copy({from() { return ["safe"]; }})[0]);')
++
++    def test_array_from_exceptions_keep_effects_and_skip_later_work(self):
++        source = ('let saved = "safe"; try { Array.from([req.query.html], value => { '
++                  'saved = value; throw "stop"; }); saved = "safe"; '
++                  '} catch (error) { res.send(saved); }')
++        self.scan(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input'])
++        source = ('try { Array.from([req.query.html], value => { throw value; }); '
++                  'res.send(req.query.html); } catch (error) { res.send(error); }')
++        self.scan(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input'])
++
++    def test_array_from_unknown_inputs_and_mapper_protocols_stay_partial(self):
++        for expression in ('opaque', '{0: req.query.html, length: 1}',
++                           'new Set([req.query.html])', 'flag ? [req.query.html] : "safe"'):
++            with self.subTest(expression=expression):
++                self.assert_fill_partial('res.send(req.query.html); '
++                    f'const out = Array.from({expression}, value => "safe");', 'xss', reason='Array.from')
++        for callback in ('external', 'async value => value', 'function*(value) { yield value; }'):
++            with self.subTest(callback=callback):
++                self.assert_fill_partial('res.send(req.query.html); '
++                    f'const out = Array.from(["safe"], {callback});', 'xss', reason='Array.from')
++        self.assert_fill_partial('res.send(req.query.html); const items = ["safe"]; '
++            'Array.from(items, value => { items.length = unknown; return value; });',
++            'xss', reason='Array.from.*length')
++
++    def test_array_from_custom_iteration_and_factory_protocols_stay_partial(self):
++        for setup in ('items[Symbol.iterator] = external;',
++                      'Array.prototype[Symbol.iterator] = external;',
++                      'Object.defineProperty(items, "0", {get() { return req.query.html; }});',
++                      'external(items);'):
++            with self.subTest(setup=setup):
++                self.assert_fill_partial('res.send(req.query.html); const items = ["safe"]; '
++                    + setup + ' Array.from(items, value => "safe");', 'xss', reason='Array.from')
++        for call in ('Array.from.call(external, ["safe"]);',
++                     'Array.from = external; Array.from(["safe"]);'):
++            with self.subTest(call=call):
++                self.assert_fill_partial('res.send(req.query.html); ' + call, 'xss', reason='Array.from')
++
++    def test_array_from_sparse_traversal_respects_work_limit(self):
++        self.assert_fill_partial('res.send(req.query.html); const items = []; items.length = 4294967294; '
++            'Array.from(items, value => "safe");', 'xss', reason='Array.from.*work limit')
++
++    def assert_fill_partial(self, source, *rules, reason='Array.fill'):
+         with tempfile.TemporaryDirectory(prefix='ubs-fill-partial-') as scratch:
+             path = Path(scratch) / 'handler.js'
+             path.write_text(source + '\n', encoding='utf-8')

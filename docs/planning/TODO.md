@@ -607,3 +607,16 @@ three implementation tracks remain separate meaningful commits on main.
   there is no completed whole-suite result. Attempt log SHA256
   `4b6de775aaf47cd99735c812e325797839b35fd35067d80d612725010800e9d2`.
   No fixture expectations, tests or gates were weakened.
+
+## 15. November 22: native dataflow work interrupted by executor loss
+
+At `d6c529ee`, independent probes reproduced silent native dataflow misses.
+The execution workspace became unavailable before full validation and publication.
+Recoverable implementations and unchanged probes are preserved as **unactivated**
+patches; see [the checkpoint](../../notes/native-dataflow-checkpoint-2026-11-22.md).
+This is preserved source work, not an activated scanner repair or release claim.
+
+- [ ] `1b9j.6.16`: finish native JavaScript `Array.from`. The archived candidate
+  passes all 14 new maintained methods (41 baseline assertion failures), but
+  mixed mapper alternatives, independent candidate replay, public reports and
+  adjacent/full gates remain pending.

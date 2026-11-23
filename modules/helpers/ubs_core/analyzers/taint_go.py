@@ -6,7 +6,7 @@ loops and package call summaries to convergence. Sanitizers are specific to the
 interpreter receiving a value. This is a conservative source analyzer, not a
 Go type checker; arbitrary imported-package calls and dynamically invoked
 closures are not resolved. File-local imports identify standard JSON/XML,
-reader, environment and HTML escape operations, including captured function aliases.
+reader, environment, command and HTML escape operations, including captured function aliases.
 Bound JSON/XML decoder methods preserve the selected receiver and result shape.
 Selected package helpers transport callable and decoder identities through
 parameters and result slots, with a finite context worklist independent of
@@ -41,18 +41,20 @@ FIELD_PATH_LIMIT = 8
 
 _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
                     'io': 'io', 'io/ioutil': 'ioutil', 'html': 'html',
-                    'html/template': 'template', 'text/template': 'template', 'os': 'os',
+                    'html/template': 'template', 'text/template': 'template', 'os': 'os', 'os/exec': 'exec',
                     'fmt': 'fmt', 'strings': 'strings', 'bytes': 'bytes', 'bufio': 'bufio'}
 _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
                    'io': {'ReadAll'}, 'ioutil': {'ReadAll'},
                    'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
                    'os': {'Getenv', 'LookupEnv', 'Stdin'},
+                   'exec': {'Command', 'CommandContext'},
                    'fmt': {'Scan', 'Scanln', 'Scanf', 'Fscan', 'Fscanln', 'Fscanf',
                            'Sscan', 'Sscanln', 'Sscanf'},
                    'strings': {'NewReader'}, 'bytes': {'NewReader', 'NewBuffer', 'NewBufferString'},
                    'bufio': {'NewReader', 'NewReaderSize', 'NewScanner',
                              'ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'}}
 _ENVIRONMENT_OPERATIONS = frozenset({('os', 'Getenv'), ('os', 'LookupEnv')})
+_COMMAND_OPERATIONS = frozenset({('exec', 'Command'), ('exec', 'CommandContext')})
 _SCAN_OPERATIONS = frozenset(('fmt', member) for member in _NATIVE_MEMBERS['fmt'])
 _READER_CONSTRUCTORS = {
     ('strings', 'NewReader'): 'strings-reader', ('bytes', 'NewReader'): 'bytes-reader',
@@ -61,13 +63,15 @@ _READER_CONSTRUCTORS = {
     ('bufio', 'NewScanner'): 'scanner',
 }
 _BUFFER_SPLITTERS = frozenset(('bufio', member) for member in ('ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'))
-_SOURCE_OPERATIONS = _ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _READER_CONSTRUCTORS.keys()
+_CALLABLE_OPERATIONS = (_ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _COMMAND_OPERATIONS
+                        | _READER_CONSTRUCTORS.keys())
 _DECODER_METHODS = frozenset({'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
                               'UseNumber', 'DisallowUnknownFields', 'Buffered'})
 
 
-def _source_boundary(operations, action):
-    family = ('formatted input' if operations & _SCAN_OPERATIONS else
+def _callable_boundary(operations, action):
+    family = ('command' if operations & _COMMAND_OPERATIONS else
+              'formatted input' if operations & _SCAN_OPERATIONS else
               'reader' if operations & _READER_CONSTRUCTORS.keys() else 'environment')
     return AnalysisLimit(f'Go {family} callable {action} is unsupported; analysis is incomplete')
 
@@ -90,7 +94,6 @@ SINKS = [
     (re.compile(r"\btemplate\.[A-Za-z_][\w]*\.Execute\s*\("), 'go.taint.xss', 'template.Execute'),
     (re.compile(r"\b[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?\.(?:Exec|ExecContext|Query|QueryContext|QueryRow|QueryRowContext|Raw|NamedQuery|NamedQueryContext|NamedExec|NamedExecContext|Select|SelectContext|Where|Or|Not|Having|Order)\s*\("), 'go.taint.sql', 'SQL query'),
     (re.compile(r"\b(?:db|tx|conn|pool|repo|store|database|queries|sqlxDB)\.Get(?:Context)?\s*\("), 'go.taint.sql', 'SQL query'),
-    (re.compile(r"(?<![\w.])exec\.Command(?:Context)?\s*\("), 'go.taint.command', 'exec.Command'),
 ]
 
 ASSIGN_PATTERNS = [
@@ -663,6 +666,10 @@ class _ImportContexts:
         index = bisect_right(self.starts, offset) - 1
         return self.files[index].resolve(root, member) if index >= 0 else None
 
+    def has_name(self, root: str, offset: int) -> bool:
+        index = bisect_right(self.starts, offset) - 1
+        return index >= 0 and root in self.files[index].names
+
 
 def _file_imports(source: str, code: str, parser: _Parser) -> _FileImports:
     """Read only actual import declarations, before the file's other code.
@@ -729,6 +736,7 @@ class _Function:
     variadic: int | None = None
     reference_parameters: frozenset[int] = frozenset()
     parameter_types: tuple[str, ...] = ()
+    receiver: str = ''
 
 
 def _parameter_names(code: str) -> tuple[str, ...]:
@@ -798,8 +806,13 @@ def _functions(code: str, parser: _Parser) -> list[_Function]:
         # Methods remain separately scoped, but cannot be resolved from an
         # unqualified helper call without receiver type information.
         name = match.group('closure')
+        receiver = ''
         if name is None:
-            name = match.group('name') if not code[match.start() + 4:match.start('name')].strip() else f'@method:{match.start()}'
+            receiver_text = code[match.start() + 4:match.start('name')].strip()
+            name = match.group('name') if not receiver_text else f'@method:{match.start()}'
+            if receiver_text.startswith('(') and receiver_text.endswith(')'):
+                receiver_names = _parameter_names(receiver_text[1:-1])
+                receiver = receiver_names[0] if receiver_names else ''
         if name == 'init':
             name = f'@init:{match.start()}'
         parameters = _parameter_names(code[match.end():param_end])
@@ -807,7 +820,7 @@ def _functions(code: str, parser: _Parser) -> list[_Function]:
                                    parser.block(opening + 1, end - 1),
                                    len(parameters) - 1 if '...' in code[match.end():param_end] else None,
                                    _reference_parameters(code[match.end():param_end]),
-                                   _parameter_types(code[match.end():param_end])))
+                                   _parameter_types(code[match.end():param_end]), receiver))
         covered = end
     return functions
 
@@ -1088,10 +1101,10 @@ class _Analysis:
                     raise AnalysisLimit('Go reader aggregate storage is unsupported; analysis is incomplete')
                 if info is not None and info.decoder is not None:
                     raise AnalysisLimit('Go decoder aggregate storage is unsupported; analysis is incomplete')
-            operations = frozenset().union(*(native.operations & _SOURCE_OPERATIONS
+            operations = frozenset().union(*(native.operations & _CALLABLE_OPERATIONS
                                              for native in natives if native is not None))
             if operations:
-                raise _source_boundary(operations, 'aggregate storage')
+                raise _callable_boundary(operations, 'aggregate storage')
 
     def value_info(self, expr, offset, state, scope):
         expr, offset = self.unparenthesize(expr, offset)
@@ -1376,8 +1389,8 @@ class _Analysis:
                 native = info.native if info is not None else None
                 self.native_writes[key] = _join_native(self.native_writes.get(key), native)
             if target.path or target.indexed:
-                if info is not None and info.native is not None and info.native.operations & _SOURCE_OPERATIONS:
-                    raise _source_boundary(info.native.operations, 'field/index storage')
+                if info is not None and info.native is not None and info.native.operations & _CALLABLE_OPERATIONS:
+                    raise _callable_boundary(info.native.operations, 'field/index storage')
                 if info is not None and info.reader is not None:
                     raise AnalysisLimit('Go reader field/index storage is unsupported; analysis is incomplete')
                 if info is not None and info.decoder is not None:
@@ -1437,6 +1450,10 @@ class _Analysis:
         sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
         environment = operations & _ENVIRONMENT_OPERATIONS
         scanning = operations & _SCAN_OPERATIONS
+        commands = operations & _COMMAND_OPERATIONS
+        unbound_command = (not commands and root == 'exec' and member in _NATIVE_MEMBERS['exec']
+                           and root not in scope.bindings and root not in self.summaries
+                           and not self.imports.has_name(root, result_offset))
         reader_constructor = operations & _READER_CONSTRUCTORS.keys()
         method = member if receiver is not None and receiver.methods == {''} and member in _DECODER_METHODS else None
         if bound_decoder:
@@ -1457,7 +1474,8 @@ class _Analysis:
                 outer_end = pairs.get(end + chain.end())
                 if outer_end is None:
                     return None
-        if not (constructor or unmarshal or readall or sanitizer or environment or scanning or method
+        if not (constructor or unmarshal or readall or sanitizer or environment or scanning or commands
+                or unbound_command or method
                 or reader_constructor or reader_method):
             return None
         if whole and code[outer_end + 1:].strip():
@@ -1484,6 +1502,12 @@ class _Analysis:
         values, targets = arguments(match.end(), end)
         raw_arguments = [(expr[match.end() + left:match.end() + right], offset + match.end() + left)
                          for left, right in _parts(code[match.end():end])]
+        if unbound_command:
+            # Importless editor fragments retain conventional native names.
+            # An explicit but incomplete import list cannot prove either a
+            # standard constructor or a safe custom binding. Keep that
+            # coverage boundary visible after retaining argument effects.
+            raise AnalysisLimit('Go command namespace has no imported or local binding; analysis is incomplete')
         if native is not None:
             # Argument effects can invalidate a captured callable. Ordinary
             # reads and calls need not have one total evaluation order in Go,
@@ -1512,6 +1536,28 @@ class _Analysis:
         operations = native.operations if native is not None else frozenset()
         environment = operations & _ENVIRONMENT_OPERATIONS
         scanning = operations & _SCAN_OPERATIONS
+        commands = operations & _COMMAND_OPERATIONS
+        if commands:
+            # Constructor identity belongs to its file-local import or saved
+            # callable. A same-spelled custom object does not execute commands.
+            # A fixed executable takes data arguments unless they select an
+            # interpreter's program/script slot; context is never that slot.
+            if self.rule == 'go.taint.command':
+                selected = []
+                for _package, operation in commands:
+                    first = int(operation == 'CommandContext')
+                    operands = [argument for argument, _origin in raw_arguments[first:]]
+                    selected.extend(values[first + index] for index in _command_arguments(operands))
+                self.effect(result_offset, 'exec.Command', _join(*selected))
+            if native.unknown or operations != commands:
+                # The native alternative is a real possible sink, but an
+                # unresolved replacement can have different operand effects.
+                # Preserve the reached finding without certifying its return
+                # contract or resuming the caller with incomplete knowledge.
+                raise _callable_boundary(commands, 'alternative')
+            # Cmd retains its supplied operands. Do not launder those contents
+            # when the constructed object later flows to another interpreter.
+            return finish(end, (fallback,))
         if reader_constructor:
             if native.unknown or operations != reader_constructor:
                 raise AnalysisLimit('Go reader constructor alternative is unsupported; analysis is incomplete')
@@ -1696,8 +1742,8 @@ class _Analysis:
             for actual in targets[index]:
                 target = _field_target(actual, path)
                 if target.path or target.indexed:
-                    if native is not None and native.operations & _SOURCE_OPERATIONS:
-                        raise _source_boundary(native.operations, 'field/index storage')
+                    if native is not None and native.operations & _CALLABLE_OPERATIONS:
+                        raise _callable_boundary(native.operations, 'field/index storage')
                     continue
                 # Output-parameter summaries are may-writes: another branch or
                 # aliased parameter can leave the old callable in place. Keep
@@ -1853,8 +1899,8 @@ class _Analysis:
                             continue
                         name = enclosing.group(1)
                         native = self.native_callable(name, None, offset + enclosing.start(1), state, scope)
-                        if native is not None and native.operations & _SOURCE_OPERATIONS:
-                            enclosing_sources[scope.bindings.get(name, name)] = native.operations & _SOURCE_OPERATIONS
+                        if native is not None and native.operations & _CALLABLE_OPERATIONS:
+                            enclosing_sources[scope.bindings.get(name, name)] = native.operations & _CALLABLE_OPERATIONS
                         decoder = state.get(_DecoderKey(scope.bindings.get(name, name)))
                         if decoder is not None and decoder.methods != {''}:
                             # The function value may be read before its
@@ -1956,11 +2002,12 @@ class _Analysis:
                             # Closure bodies precede outer calls in this
                             # evaluator. A replacement cannot erase the old
                             # callee; assigning the same getter preserves it.
-                            raise _source_boundary(enclosing_sources[cell], 'replacement during argument evaluation')
+                            raise _callable_boundary(enclosing_sources[cell], 'replacement during argument evaluation')
                 # Invocation timing and captured writes are not described by
                 # return facts. A possible writer invalidates the old proof.
                 for cell in nested.native_mutations:
                     if _NativeKey(cell) in state:
+                        was_escaped = cell in self.native_escapes
                         self.invalidate_native_targets((_Target(cell),), state)
                         if immediate:
                             native = (closure_flow.normal.get(_NativeKey(cell))
@@ -1968,6 +2015,12 @@ class _Analysis:
                                       else nested.native_cell_writes.get(cell))
                             state[_NativeKey(cell)] = (native if closure_flow.normal is not None
                                                        else _join_native(state.get(_NativeKey(cell)), native))
+                            if (closure_flow.normal is not None and not was_escaped
+                                    and cell not in nested.native_escapes):
+                                # A completed lexical assignment is not an
+                                # address escape. Existing or newly escaped
+                                # pointers still keep the cell uncertain.
+                                self.native_escapes.discard(cell)
                             self.native_cell_writes[cell] = _join_native(
                                 self.native_cell_writes.get(cell), native)
                         if cell in nested.reader_cell_writes:
@@ -2035,10 +2088,10 @@ class _Analysis:
                         if any(info is not None and info.decoder is not None for info in nested.value_returns):
                             raise AnalysisLimit('Go decoder closure-result transport is unsupported; analysis is incomplete')
                         source_operations = frozenset().union(*(
-                            info.native.operations & _SOURCE_OPERATIONS for info in nested.value_returns
+                            info.native.operations & _CALLABLE_OPERATIONS for info in nested.value_returns
                             if info is not None and info.native is not None))
                         if source_operations:
-                            raise _source_boundary(source_operations, 'closure-result transport')
+                            raise _callable_boundary(source_operations, 'closure-result transport')
                     facts.extend(nested.returns)
                 if invoked:
                     close = pairs[invocation]
@@ -2095,8 +2148,18 @@ class _Analysis:
             if (end is None or masked[match.start()].isspace() or name not in self.summaries
                     or name in scope.bindings):
                 continue
+            call_offset = offset + match.start()
             facts.extend(self.call(name, expr[match.end():end], offset + match.end(),
-                                   offset + match.start(), state, scope))
+                                   call_offset, state, scope))
+            if re.match(r'\s*\(', code[end + 1:]):
+                # A computed invocation needs a separate argument/callee
+                # evaluation step. Do not silently discard a known returned
+                # command constructor while only evaluating its factory.
+                commands = frozenset().union(*(info.native.operations & _COMMAND_OPERATIONS
+                                                for info in self.call_results.get(call_offset, ())
+                                                if info is not None and info.native is not None))
+                if commands:
+                    raise _callable_boundary(commands, 'computed invocation')
             cover(match.start(), end + 1)
         remaining = ''.join(masked)
         for regex, rule, label in SINKS:
@@ -2121,11 +2184,6 @@ class _Analysis:
                     arguments = arguments[index:index + 1]
                 elif label == 'fmt.Fprintf' or label == 'template.Execute':
                     arguments = arguments[1:]
-                elif rule == 'go.taint.command':
-                    if 'CommandContext' in match.group():
-                        arguments = arguments[1:]
-                    raw_arguments = [expr[arg_start + start:arg_start + stop] for start, stop in arguments]
-                    arguments = [arguments[index] for index in _command_arguments(raw_arguments)]
                 fact = _join(*(self.value(expr[arg_start + start:arg_start + stop],
                                           offset + arg_start + start, state, scope)
                                for start, stop in arguments))
@@ -2494,6 +2552,10 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
             analysis = _Analysis(source, code, rule, summaries, imports, uncertain_globals,
                                  global_cells, resolve_summary)
             state, scope = dict(global_state), globals_scope.child()
+            if function.receiver and function.receiver != '_':
+                key = scope.declare(function.receiver, function.start)
+                state[key] = _CLEAN
+                state[_NativeKey(key)] = _UNKNOWN_NATIVE
             for index, parameter in enumerate(function.parameters):
                 if parameter and parameter != '_':
                     key = scope.declare(parameter, function.start)
@@ -2554,7 +2616,7 @@ def _source_hits(source, code, functions, global_nodes, imports):
     hits = {}
     errors = []
     components = []
-    for rule in dict.fromkeys(rule for _regex, rule, _label in SINKS):
+    for rule in (*dict.fromkeys(rule for _regex, rule, _label in SINKS), 'go.taint.command'):
         try:
             summaries, globals_effects = _summaries(source, code, functions, _Parser(code), rule, imports,
                                                    global_nodes=global_nodes)

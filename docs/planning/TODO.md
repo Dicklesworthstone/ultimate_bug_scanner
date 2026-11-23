@@ -629,16 +629,18 @@ This is preserved source work, not an activated scanner repair or release claim.
   native transfer, alias/backing writes and helper integration are unfinished.
   No candidate runtime qualification is claimed.
 
-## 16. Native copy and HTTP destination semantics
+## 16. Native copy, HTTP destinations and command constructors
 
 - [x] `1b9j.6.19`: implement native JavaScript `Array.slice` range selection,
   sparse slots, fresh outer arrays and shared element identities (`69f8f7af`).
-  All 13 new source/native methods pass. The unchanged independent 28-case
-  corpus has 25 exact results, three explicitly incomplete results and no
-  incorrect complete results (baseline: 11 exact, 17 incorrect complete).
-- [ ] Complete the final 15-method JS public/cache replay after the original
-  ENOSPC failure. Dynamic bounds, custom species and property protocols
-  remain explicitly incomplete; broad D6 qualification remains open.
+  The unchanged independent 28-case corpus has 25 exact results, three
+  explicitly incomplete results and no incorrect complete results
+  (baseline: 11 exact, 17 incorrect complete).
+- [x] Finish the final JS public/cache replay on the published slice tree:
+  genuine DSR passes all 15 methods without skips, including 17 real public
+  scanner calls. Source/config snapshots match. Receipt SHA256
+  `8112261df6689263b7997edbf0705d509e257f6f393113b720b66bedbb5013e0`.
+  The earlier ENOSPC failure remains retained.
 - [x] `1b9j.6.20`: implement native `urllib3.request` and `PoolManager` URL
   provenance across aliases, saved methods and selected helper summaries.
   Keep request metadata separate and reject mutable/custom dispatch proofs.
@@ -647,9 +649,33 @@ This is preserved source work, not an activated scanner repair or release claim.
   Ten intercepted native requests independently confirm argument positions
   and eager send behavior. Direct-import registry/reflection escapes are
   covered by regressions after independent review exposed initial misses.
-- [ ] Preserve the failed broader integration receipt: the strict changed
-  Python helper self-scan is partial (0 critical, 66 warnings), and the full
-  ShellCheck process was killed with exit 137. Its receipt remains failed 3/5
+- [x] `1b9j.6.21`: identify native Go `os/exec` constructors through imports,
+  saved functions, helper summaries, pointers and supported captures. Keep
+  contexts and ordinary arguments distinct from executable/program operands.
+  Genuine DSR passes 81 of 84 focused methods (three opt-in skips), the
+  separate compiled witness and all 24 public module/runner JSON/SARIF calls.
+  Source/native receipt SHA256
+  `0027280d2dc589105c246c4d5ac5f3a648022afcdb60893051ae19602f283ed8`;
+  final public receipt SHA256
+  `af101643c158d486db69433af592ab1001bc24aeccd05094b2d1dac61b0e0729`.
+- [x] Preserve and explain the Go public harness correction. The initial
+  16-pass/8-failure run exposed the separate name-based informational
+  `go.exec-command-without-context` advisory on two custom-binding controls.
+  Eight unchanged-baseline public reports prove identical advisory records.
+  The final harness asserts those exact records plus zero security findings;
+  source fixtures, coordinates, completion/exit assertions and deadlines
+  stay unchanged. No suppression or filtering was introduced.
+- [ ] Broader qualification remains open. The strict changed-Python-helper
+  self-scan is partial (0 critical, 66 warnings); its integration receipt
+  remains failed 3/5
   (`035659a23da88c784333611efe3ab72561ab302ab70d786611b885b31cbfee6e`).
-  Repeat ShellCheck on the final combined tree; full HTTP/dataflow,
-  whole-repository and release qualification remain open.
+  The final combined runtime passes both integrity verifiers and diff checks,
+  but the full ShellCheck process again exits 137. The changed-Go-helper
+  self-scan is partial (1 critical, 0 warnings). Its sole critical metadata
+  comparison is unchanged, and the raw baseline scan reproduces that finding
+  and incomplete status (exit 2; receipt SHA256
+  `b054fed4b9d1f9fb39f1398c6eea1f774770f89b7e4819cc8f7694d3aae86898`).
+  Final runtime receipt remains failed 3/5:
+  `8dd56b328b033f8653fdcc47bc91a6288c998ec28ad7fdcaa2abb1a852d14765`.
+  Full language cohorts, whole-repository and release qualification remain
+  open; unsupported native protocols continue to report incomplete analysis.

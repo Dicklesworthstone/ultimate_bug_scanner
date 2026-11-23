@@ -206,7 +206,7 @@ class NativeScanningFlowTests(packages.PackageTestCase):
         self.sources = {}
         print(f'[{self.id()}] RUN', flush=True)
 
-    def check_scan(self, body, expected=(), *, imports='import ("fmt"; "strings"; "html")', helpers=''):
+    def check_scan(self, body, expected=(), *, imports='import ("fmt"; "strings"; "html"; "os/exec")', helpers=''):
         self.source('handler.go', 'package app\n' + imports + '\n' + textwrap.dedent(helpers)
                     + '\nfunc h() {\n' + textwrap.dedent(body) + '\n}\n')
         findings = self.scan()
@@ -1107,7 +1107,7 @@ class NativeScanningModuleTests(unittest.TestCase):
 
 class OrdinaryDestinationWriteTests(packages.PackageTestCase):
     def check_writes(self, body, sites, helpers=''):
-        self.source('handler.go', 'package app\nimport ("html"; "encoding/json"; "strings")\n'
+        self.source('handler.go', 'package app\nimport ("html"; "encoding/json"; "strings"; "os/exec")\n'
                     'func h() {\n' + textwrap.dedent(body) + '\n}\n')
         self.source('helpers.go', 'package app\ntype Payload struct { SQL string; HTML string }\n'
                     + textwrap.dedent(helpers))
@@ -2010,7 +2010,7 @@ class HigherOrderNativeFlowTests(packages.PackageTestCase):
             with self.subTest(module=module):
                 self.source('handler.go', '''
                     package app
-                    import safe "''' + module + '''"
+                    import (safe "''' + module + '''"; "os/exec")
                     func apply(escape func(string) string, value string) string { return escape(value) }
                     func raw(value string) string { return value }
                     func h() {
@@ -2162,7 +2162,7 @@ class HigherOrderNativeFlowTests(packages.PackageTestCase):
             with self.subTest(codec=codec):
                 self.source('handler.go', '''
                     package app
-                    import codec "''' + codec + '''"
+                    import (codec "''' + codec + '''"; "os/exec")
                     func h() {
                         var p, fixed Payload
                         err := ((codec.Unmarshal))([]byte(r.FormValue("body")), &p)
@@ -2246,7 +2246,7 @@ class HigherOrderNativeFlowTests(packages.PackageTestCase):
     def test_parenthesized_sanitizers_keep_identity_and_argument_effects(self):
         self.source('handler.go', '''
             package app
-            import "html"
+            import ("html"; "os/exec")
             func raw(value string) string { return value }
             func emit(value string) string { fmt.Fprint(w, value); return value }
             func h() {
@@ -2323,7 +2323,7 @@ class BoundDecoderMethodTests(packages.PackageTestCase):
             with self.subTest(codec=codec):
                 self.source('handler.go', '''
                     package app
-                    import codec "''' + codec + '''"
+                    import (codec "''' + codec + '''"; "os/exec")
                     func h() {
                         decoder := codec.NewDecoder(r.Body)
                         decode := decoder.Decode
@@ -2489,7 +2489,7 @@ class BoundDecoderMethodTests(packages.PackageTestCase):
     def test_bound_safe_queries_and_html_sanitizers_remain_domain_specific(self):
         self.source('handler.go', '''
             package app
-            import (. "encoding/json"; "html"; "strings")
+            import (. "encoding/json"; "html"; "strings"; "os/exec")
             func h() {
                 decoder := NewDecoder(r.Body)
                 decode := decoder.Decode

@@ -542,6 +542,384 @@ class GoTaintDomainTests(unittest.TestCase):
         '''), ["go.taint.xss"])
 
 
+class GoCommandIdentityTests(packages.PackageTestCase):
+    """Resolve command constructors by their native binding, including aliases."""
+
+    def check_command(self, body, expected=(), *, imports='import ("os"; "os/exec")', helpers='', partial=None):
+        source = 'package app\n' + imports + '\n' + textwrap.dedent(helpers) + '\nfunc h() {\n'
+        source += textwrap.dedent(body) + '\n}\n'
+        path = self.source('handler.go', source)
+        if partial is None:
+            findings = self.scan()
+        else:
+            from ubs_core.taint_flow import AnalysisLimit
+
+            findings = []
+            with self.assertRaisesRegex(AnalysisLimit, partial):
+                findings.extend(taint_go.run(RunContext(lang='go', files=list(self.sources.values()))))
+        (self.root / 'findings.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+        sites = []
+        for marker, rule, sink in expected:
+            lines = [(number, line) for number, line in enumerate(path.read_text().splitlines(), 1)
+                     if '// ' + marker in line]
+            self.assertEqual(len(lines), 1, (marker, source))
+            number, line = lines[0]
+            sites.append((number, line.index(sink) + 1, 'go.taint.' + rule))
+        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings),
+                         sorted(sites), (source, findings))
+        return findings
+
+    def test_native_aliases_preserve_executable_and_shell_program_sites(self):
+        for name in ('exec', 'process', 'json'):
+            with self.subTest(name=name):
+                self.check_command(
+                    name + '.Command(os.Getenv("PROGRAM"), "fixed") // executable\n'
+                    + name + '.Command("sh", "-c", os.Getenv("SCRIPT")) // script\n'
+                    + name + '.CommandContext(ctx, os.Getenv("PROGRAM")) // context',
+                    [('executable', 'command', name + '.Command'),
+                     ('script', 'command', name + '.Command'),
+                     ('context', 'command', name + '.CommandContext')],
+                    imports='import ("os"; ' + name + ' "os/exec")')
+
+    def test_dot_and_escaped_imports_preserve_native_authority(self):
+        self.check_command('Command(os.Getenv("PROGRAM")) // direct\n'
+                           'CommandContext(ctx, "sh", "-c", os.Getenv("SCRIPT")) // context',
+                           [('direct', 'command', 'Command'), ('context', 'command', 'CommandContext')],
+                           imports='import ("os"; . "os/exec")')
+        for path in ('`os/exec`', '"os/\\x65xec"'):
+            with self.subTest(path=path):
+                self.check_command('process.Command(os.Getenv("PROGRAM")) // executable',
+                                   [('executable', 'command', 'process.Command')],
+                                   imports='import ("os"; process ' + path + ')')
+
+    def test_same_spelled_nonstdlib_imports_are_not_command_sinks(self):
+        for package in ('example.test/exec', 'example.test/os/exec', 'example.test/settings'):
+            with self.subTest(package=package):
+                self.check_command('exec.Command(os.Getenv("PROGRAM"))\n'
+                                   'exec.CommandContext(ctx, "sh", "-c", os.Getenv("SCRIPT"))',
+                                   imports='import ("os"; exec "' + package + '")')
+
+    def test_local_parameter_and_type_shadows_do_not_borrow_exec_authority(self):
+        self.check_command('exec := settings\nexec.Command(os.Getenv("PROGRAM"))')
+        self.check_command('', helpers='func read(exec Settings) { exec.Command(os.Getenv("PROGRAM")) }')
+        self.check_command('', helpers='func (exec Settings) read() { exec.Command(os.Getenv("PROGRAM")) }')
+        self.check_command('type exec struct{}\nexec.Command(os.Getenv("PROGRAM"))')
+        self.check_command('Command := constant\nCommand(os.Getenv("PROGRAM"))',
+                           imports='import ("os"; . "os/exec")',
+                           helpers='func constant(name string, args ...string) *Cmd { return nil }')
+
+    def test_missing_command_import_is_incomplete_and_ambiguous_dots_do_not_gain_authority(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        with self.assertRaisesRegex(AnalysisLimit, 'command namespace.*incomplete'):
+            self.check_command('exec.Command(os.Getenv("PROGRAM"))', imports='import "os"')
+        self.check_command('Command(os.Getenv("PROGRAM"))',
+                           imports='import ("os"; . "os/exec"; . "example.test/exec")')
+
+    def test_importless_editor_fragments_keep_conventional_constructor_support(self):
+        self.check_command('exec.Command(r.FormValue("program")) // direct\n'
+                           'saved := exec.Command\nsaved("sh", "-c", r.FormValue("script")) // saved',
+                           [('direct', 'command', 'exec.Command'), ('saved', 'command', 'saved')], imports='')
+
+    def test_saved_native_constructor_copies_survive_rebinding(self):
+        self.check_command('build := exec.Command\nsaved := build\nbuild = constant\n'
+                           'saved(os.Getenv("PROGRAM")) // saved\n'
+                           'build(os.Getenv("PROGRAM"))\n'
+                           'fmt.Fprint(w, saved, build, exec.Command)',
+                           [('saved', 'command', 'saved')],
+                           helpers='func constant(name string, args ...string) *exec.Cmd { return nil }')
+
+    def test_saved_context_constructor_ignores_context_contents_and_plain_argv(self):
+        self.check_command('build := exec.CommandContext\n'
+                           'build(ctx, "sh", "-c", os.Getenv("SCRIPT")) // script\n'
+                           'build(ctx, "printf", "%s", os.Getenv("DATA"))\n'
+                           'build(taintedContext(r.FormValue("context")), "printf", "fixed")',
+                           [('script', 'command', 'build')])
+
+    def test_native_constructor_branches_keep_possible_sinks(self):
+        self.check_command('build := exec.Command\nif choice { build = constant }\n'
+                           'build(os.Getenv("PROGRAM")) // possible',
+                           [('possible', 'command', 'build')],
+                           helpers='func constant(name string, args ...string) *exec.Cmd { return nil }',
+                           partial='command callable alternative')
+
+    def test_selected_helpers_transport_native_constructors_and_argument_facts(self):
+        self.check_command('build := keep(exec.Command)\n'
+                           'build(os.Getenv("PROGRAM")) // returned\n'
+                           'invoke(build, os.Getenv("SCRIPT")) // passed\n'
+                           'invoke(build, "echo fixed")\n'
+                           'literalData(build, os.Getenv("DATA"))',
+                           [('returned', 'command', 'build'), ('passed', 'command', 'invoke')], helpers='''
+            func keep(build func(string, ...string) *exec.Cmd) func(string, ...string) *exec.Cmd {
+                return build
+            }
+            func invoke(build func(string, ...string) *exec.Cmd, value string) {
+                build("sh", "-c", value)
+            }
+            func literalData(build func(string, ...string) *exec.Cmd, value string) {
+                build("printf", "%s", value)
+            }
+        ''')
+
+    def test_returned_constructor_computed_invocation_is_explicitly_incomplete(self):
+        self.check_command('db.Query(os.Getenv("QUERY")) // earlier\n'
+                           'constructor()("sh", "-c", os.Getenv("SCRIPT"))',
+                           [('earlier', 'sql', 'db.Query')],
+                           helpers='func constructor() func(string, ...string) *exec.Cmd { return exec.Command }',
+                           partial='command callable computed invocation')
+
+    def test_immediate_closure_installs_constructor_and_later_replacement_is_clean(self):
+        self.check_command('build := constant\nfunc() { build = exec.Command }()\n'
+                           'build(os.Getenv("PROGRAM")) // installed\n'
+                           'func() { build = constant }()\nbuild(os.Getenv("PROGRAM"))',
+                           [('installed', 'command', 'build')],
+                           helpers='func constant(name string, args ...string) *exec.Cmd { return nil }')
+
+    def test_immediate_closure_rebinding_preserves_saved_constructor_copy(self):
+        self.check_command('build := exec.Command\nsaved := build\n'
+                           'func() { build = constant }()\n'
+                           'saved(os.Getenv("PROGRAM")) // saved\nbuild(os.Getenv("PROGRAM"))',
+                           [('saved', 'command', 'saved')],
+                           helpers='func constant(name string, args ...string) *exec.Cmd { return nil }')
+
+    def test_immediate_assignment_does_not_restore_an_escaped_constructor_cell(self):
+        self.check_command('build := exec.Command\nforeign(&build)\n'
+                           'func() { build = exec.Command }()\n'
+                           'build(os.Getenv("PROGRAM")) // possible',
+                           [('possible', 'command', 'build')], partial='command callable alternative')
+
+    def test_argument_closure_replacement_cannot_erase_the_selected_constructor(self):
+        self.check_command('db.Query(os.Getenv("QUERY")) // earlier\n'
+                           'build := exec.Command\n'
+                           'build(func() string { build = constant; return os.Getenv("PROGRAM") }())',
+                           [('earlier', 'sql', 'db.Query')],
+                           helpers='func constant(name string, args ...string) *exec.Cmd { return nil }',
+                           partial='command callable replacement during argument evaluation')
+
+    def test_missing_command_import_keeps_prior_and_argument_findings(self):
+        self.check_command('db.Query(os.Getenv("QUERY")) // earlier\n'
+                           'exec.Command(render(os.Getenv("HTML"))) // argument',
+                           [('earlier', 'sql', 'db.Query'), ('argument', 'xss', 'render')],
+                           imports='import "os"',
+                           helpers='func render(value string) string { fmt.Fprint(w, value); return value }',
+                           partial='command namespace.*incomplete')
+
+    def test_constructor_factory_and_pointer_installation_keep_native_identity(self):
+        self.check_command('build := constructor()\n'
+                           'build(os.Getenv("FIRST")) // factory\n'
+                           'build = constant\ninstall(&build)\n'
+                           'build(os.Getenv("SECOND")) // installed',
+                           [('factory', 'command', 'build'), ('installed', 'command', 'build')], helpers='''
+            func constructor() func(string, ...string) *exec.Cmd { return exec.Command }
+            func constant(name string, args ...string) *exec.Cmd { return nil }
+            func install(build *func(string, ...string) *exec.Cmd) { *build = exec.Command }
+        ''', partial='command callable alternative')
+
+    def test_immediate_closure_constructor_argument_keeps_its_own_binding(self):
+        self.check_command('func(build func(string, ...string) *exec.Cmd, value string) {\n'
+                           'build("sh", "-c", value) // callback\n'
+                           'fmt.Fprint(w, build)\n'
+                           '}(exec.Command, os.Getenv("SCRIPT"))',
+                           [('callback', 'command', 'build')])
+
+    def test_parenthesized_callees_and_result_chains_keep_command_effects(self):
+        self.check_command('build := exec.Command\n'
+                           '((exec.Command))(os.Getenv("PROGRAM")) // native\n'
+                           '((build))("sh", "-c", os.Getenv("SCRIPT")).Run() // saved',
+                           [('native', 'command', 'exec.Command'), ('saved', 'command', 'build')])
+
+    def test_native_constructor_argv_is_data_until_it_selects_code(self):
+        self.check_command(r'''
+            value := os.Getenv("INPUT")
+            exec.Command("printf", "%s", value)
+            exec.Command("sh", "-c", "printf '%s' \"$1\"", "--", value)
+            exec.Command("python3", "fixed.py", value)
+            exec.Command("sh", "-lc", value) // shell
+            exec.Command("python3", "-c", value) // python
+            exec.Command("node", "--eval", value) // node
+            exec.CommandContext(ctx, "sh", "-c", value) // context
+        ''', [('shell', 'command', 'exec.Command'), ('python', 'command', 'exec.Command'),
+              ('node', 'command', 'exec.Command'), ('context', 'command', 'exec.CommandContext')])
+
+    def test_command_argument_effects_and_other_security_domains_are_preserved(self):
+        self.check_command('build := exec.Command\n'
+                           'build("printf", "%s", render(os.Getenv("HTML"))) // rendered\n'
+                           'build("sh", "-c", html.EscapeString(os.Getenv("SCRIPT"))) // command\n'
+                           'fmt.Fprint(w, html.EscapeString(os.Getenv("HTML")))',
+                           [('rendered', 'xss', 'render'), ('command', 'command', 'build')],
+                           imports='import ("os"; "os/exec"; "html"; "fmt")',
+                           helpers='func render(value string) string { fmt.Fprint(w, value); return value }')
+
+    def test_native_constructor_handles_do_not_execute_inside_literals(self):
+        self.check_command('// exec.Command(os.Getenv("PROGRAM"))\n'
+                           'fmt.Fprint(w, `exec.Command(os.Getenv("PROGRAM"))`)\n'
+                           'build := exec.Command\nfmt.Fprint(w, build)')
+
+    def test_import_authority_is_attached_to_each_selected_file(self):
+        self.source('first.go', '''
+            package app
+            import process "os/exec"
+            func invoke(value string) { process.Command("sh", "-c", value) }
+        ''')
+        self.source('second.go', '''
+            package app
+            import ("os"; process "example.test/settings")
+            func h() {
+                process.Command(os.Getenv("PROGRAM"))
+                invoke(os.Getenv("SCRIPT"))
+            }
+        ''')
+        self.assert_hits([('second.go', 5, 'go.taint.command')])
+        self.assertEqual(self.scan([self.sources['second.go']]), [])
+
+    def test_constructor_aggregate_storage_refuses_lost_sink_identity(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        with self.assertRaisesRegex(AnalysisLimit, 'command callable.*storage'):
+            self.check_command('builders := []func(string, ...string) *exec.Cmd{exec.Command}\n'
+                               'builders[0](os.Getenv("PROGRAM"))')
+
+    @unittest.skipUnless(os.environ.get('UBS_TAINT_NATIVE_GO') == '1',
+                         'set UBS_TAINT_NATIVE_GO=1 to compile command-constructor witnesses')
+    def test_compiled_command_aliases_match_native_executable_and_argument_slots(self):
+        from test_keep_temp import prevent_child_deletion
+
+        source = textwrap.dedent('''\
+            package main
+            import (
+                "context"
+                "encoding/json"
+                "os"
+                process "os/exec"
+            )
+            func constructor() func(string, ...string) *process.Cmd { return process.Command }
+            func main() {
+                value := os.Getenv("UBS_GO_COMMAND_INPUT")
+                build := constructor()
+                first := build("/bin/sh", "-c", value) // shell
+                saved := process.CommandContext
+                second := saved(context.Background(), value, "fixed") // executable
+                plain := build("/bin/printf", "%s", value)
+                observed := [][]string{first.Args, second.Args, plain.Args}
+                if err := json.NewEncoder(os.Stdout).Encode(observed); err != nil { panic(err) }
+            }
+        ''')
+        path, executable = self.source('main.go', source), self.root / 'witness'
+        environment = dict(os.environ, GOWORK='off', GO111MODULE='off', GOTOOLCHAIN='local',
+                           UBS_GO_COMMAND_INPUT='external-program')
+        build = subprocess.run(['go', 'build', '-work', '-o', str(executable), str(path)],
+                               cwd=self.root, text=True, capture_output=True, timeout=180,
+                               env=environment, preexec_fn=prevent_child_deletion)
+        (self.root / 'build.stdout.log').write_text(build.stdout)
+        (self.root / 'build.stderr.log').write_text(build.stderr)
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        native = subprocess.run([str(executable)], cwd=self.root, text=True, capture_output=True,
+                                timeout=30, env=environment, preexec_fn=prevent_child_deletion)
+        (self.root / 'runtime.stdout.log').write_text(native.stdout)
+        (self.root / 'runtime.stderr.log').write_text(native.stderr)
+        self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+        self.assertEqual(json.loads(native.stdout), [
+            ['/bin/sh', '-c', 'external-program'], ['external-program', 'fixed'],
+            ['/bin/printf', '%s', 'external-program']])
+        expected = [(number, line.index(sink) + 1, 'go.taint.command')
+                    for number, line in enumerate(source.splitlines(), 1)
+                    for marker, sink in [('shell', 'build'), ('executable', 'saved')]
+                    if '// ' + marker in line]
+        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in self.scan()), expected)
+
+    @unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1',
+                         'set UBS_TAINT_E2E=1 for native command module and runner reports')
+    def test_command_bindings_in_real_json_and_sarif_reports(self):
+        from test_keep_temp import prevent_child_deletion
+
+        cases = (
+            ('native', 'import ("os"; process "os/exec")',
+             'process.Command(os.Getenv("PROGRAM")) // expect-command\n'
+             'build := process.CommandContext\n'
+             'build(ctx, "sh", "-c", os.Getenv("SCRIPT")) // expect-command', False),
+            ('data', 'import ("os"; process "os/exec")',
+             'build := process.Command\nbuild("printf", "%s", os.Getenv("DATA"))', False),
+            ('lookalike', 'import ("os"; exec "example.test/exec")',
+             'exec.Command(os.Getenv("PROGRAM"))', False),
+            ('shadow', 'import ("os"; "os/exec")',
+             'exec := settings\nexec.Command(os.Getenv("PROGRAM"))', False),
+            ('suppressed', 'import ("os"; process "os/exec")',
+             'process.Command(os.Getenv("PROGRAM")) // ubs:ignore[go.taint.command]', False),
+            ('partial', 'import ("os"; process "os/exec")',
+             'process.Command(os.Getenv("FIRST")) // expect-command\n'
+             'build := process.Command\nif choice { build = foreign }\n'
+             'build(os.Getenv("SECOND")) // expect-command', True),
+        )
+        skipped = ','.join(str(category) for category in range(1, 23) if category != 9)
+        advisory_rule = 'go.exec-command-without-context'
+        for name, imports, body, partial in cases:
+            folder = self.root / name
+            folder.mkdir()
+            source = 'package app\n' + imports + '\nfunc h() {\n' + body + '\n}\n'
+            path = folder / 'handler.go'
+            path.write_text(source)
+            (folder / 'unselected.go').write_text('package app\nfunc ignored() { db.Query(r.FormValue("q")) }\n')
+            expected = [(number, line.index('process.Command' if 'process.Command(' in line else 'build(') + 1,
+                         'go.taint.command')
+                        for number, line in enumerate(source.splitlines(), 1) if '// expect-command' in line]
+            # The unchanged scanner's separate timeout advisory is name-based.
+            # Assert its exact record; the taint rule must still be absent for
+            # custom imports and shadowed bindings, with no critical/warning.
+            advisories = [(number, line.index('exec.Command') + 1, advisory_rule)
+                          for number, line in enumerate(source.splitlines(), 1)
+                          if name in ('lookalike', 'shadow') and 'exec.Command(' in line]
+            self.assertEqual(len(advisories), int(name in ('lookalike', 'shadow')))
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, format=output):
+                        command = [str(ROOT / ('ubs' if meta else 'modules/ubs-golang.sh')),
+                                   str(path), '--ci', '--no-color', '--format=' + output, '--skip=' + skipped]
+                        if meta:
+                            command.append('--only=golang')
+                        result = subprocess.run(command, cwd=folder, capture_output=True, text=True,
+                                                timeout=45, preexec_fn=prevent_child_deletion,
+                                                env=dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1',
+                                                         UBS_NO_CACHE='1', UBS_CACHE_DIR=str(folder / 'cache')))
+                        prefix = folder / f'{meta}-{output}'
+                        prefix.with_suffix('.stdout.log').write_text(result.stdout)
+                        prefix.with_suffix('.stderr.log').write_text(result.stderr)
+                        self.assertEqual(result.returncode, 2 if partial else 1 if expected else 0,
+                                         (command, result.stdout, result.stderr))
+                        report = json.loads(result.stdout)
+                        if output == 'json':
+                            self.assertEqual(report['status'], 'partial' if partial else 'ok', report)
+                            totals = report['totals'] if meta else report
+                            self.assertEqual([totals[key] for key in ('files', 'critical', 'warning', 'info')],
+                                             [1, len(expected), 0, len(advisories)], report)
+                            actual = [(row['line'], row['col'], row['rule_id' if meta else 'rule'])
+                                      for row in report['findings']]
+                            for row in report['findings']:
+                                self.assertEqual(Path(row['file' if meta else 'path']).name, path.name, row)
+                                rule_id = row['rule_id' if meta else 'rule']
+                                self.assertEqual(row['severity'], 'info' if rule_id == advisory_rule else 'critical', row)
+                        else:
+                            self.assertEqual(report['version'], '2.1.0', report)
+                            actual = []
+                            for run in report['runs']:
+                                for row in run.get('results', []):
+                                    location = row['locations'][0]['physicalLocation']
+                                    region = location['region']
+                                    self.assertEqual(Path(location['artifactLocation']['uri']).name, path.name, row)
+                                    self.assertEqual(row['level'], 'note' if row['ruleId'] == advisory_rule else 'error', row)
+                                    actual.append((region['startLine'], region['startColumn'], row['ruleId']))
+                            if partial:
+                                self.assertTrue(any(not invocation['executionSuccessful']
+                                                    and invocation.get('exitCode') == 2
+                                                    for run in report['runs']
+                                                    for invocation in run.get('invocations', [])), report)
+                            else:
+                                self.assertTrue(all(invocation['executionSuccessful']
+                                                    for run in report['runs']
+                                                    for invocation in run.get('invocations', [])), report)
+                        self.assertEqual(sorted(actual), sorted(expected + advisories), report)
+                        print('GO_COMMAND_PUBLIC_PASS', name, 'runner' if meta else 'module', output, flush=True)
+
+
 class GoEnvironmentSourceTests(unittest.TestCase):
     """Environment values are sources; function identities and presence are not.
 
@@ -585,7 +963,7 @@ class GoEnvironmentSourceTests(unittest.TestCase):
     def test_direct_and_aliased_getenv_reach_every_security_domain(self):
         for name in ('os', 'environment'):
             with self.subTest(name=name):
-                self.check_source('import ' + name + ' "os"',
+                self.check_source('import (' + name + ' "os"; "os/exec")',
                                   'value := ' + name + '.Getenv("UBS_INPUT")\n'
                                   'db.Query(value) // query\n'
                                   'fmt.Fprint(w, value) // output\n'
@@ -677,7 +1055,7 @@ class GoEnvironmentSourceTests(unittest.TestCase):
                           'db.Query(Getenv("UBS_INPUT"))\nfmt.Fprint(w, value, present)')
 
     def test_overwrites_and_real_sink_specific_controls_stay_clean(self):
-        self.check_source('import (environment "os"; "html")',
+        self.check_source('import (environment "os"; "html"; "os/exec")',
                           'value := environment.Getenv("UBS_INPUT")\n'
                           'db.Query("SELECT $1", value)\n'
                           'exec.Command("printf", "%s", value)\n'
@@ -941,7 +1319,7 @@ class GoEnvironmentSourceTests(unittest.TestCase):
                           'func constant(key string) string { return "SELECT 1" }')
 
     def test_immediate_closure_result_escaper_keeps_security_domains(self):
-        self.check_source('import "html"',
+        self.check_source('import ("html"; "os/exec")',
                           'escape, ready := func() (func(string) string, bool) {\n'
                           'return html.EscapeString, true\n}()\n'
                           'value := escape(r.FormValue("value"))\n'
@@ -1273,7 +1651,7 @@ class GoSanitizerImportTests(packages.PackageTestCase):
                            'fmt.Fprint(w, ' + expression + ')', 'xss')
 
     def test_escape_remains_specific_to_xss(self):
-        self.check('import safe "html"', 'value := safe.EscapeString(r.FormValue("q"))\n'
+        self.check('import (safe "html"; "os/exec")', 'value := safe.EscapeString(r.FormValue("q"))\n'
                    'fmt.Fprint(w, value)\ndb.Query(value)\nexec.Command("sh", "-c", value)', 'sql', 'command')
 
     def test_argument_sink_effects_and_unsafe_siblings_are_retained(self):
@@ -1339,7 +1717,7 @@ class SavedNativeValueOracleTests(packages.PackageTestCase):
         for package, member in (('html', 'EscapeString'), ('html/template', 'HTMLEscapeString'),
                                 ('text/template', 'HTMLEscapeString')):
             with self.subTest(package=package):
-                self.check_source('import safe "' + package + '"',
+                self.check_source('import (safe "' + package + '"; "os/exec")',
                                   'escape := safe.' + member + '\n'
                                   'alias := escape\nvalue := alias(r.FormValue("q"))\n'
                                   'fmt.Fprint(w, value) // escaped output\n'
@@ -1464,7 +1842,7 @@ class SavedNativeValueOracleTests(packages.PackageTestCase):
                                 ('text/template', 'HTMLEscapeString')):
             for scheduling in ('', 'defer ', 'go '):
                 with self.subTest(package=package, scheduling=scheduling):
-                    self.check_source('import safe "' + package + '"',
+                    self.check_source('import (safe "' + package + '"; "os/exec")',
                                       scheduling + 'func(escape func(string) string, value string) {\n'
                                       'fmt.Fprint(w, escape(value))\n'
                                       'db.Query(escape(value)) // sql-site\n'
@@ -1522,13 +1900,13 @@ class GoSanitizerRunnerTests(unittest.TestCase):
              'fmt.Fprint(w, html.EscapeString(r.FormValue("q")))', {'xss'}),
             ('template-lookalike', 'import template "example.test/custom"', '',
              'fmt.Fprint(w, template.HTMLEscapeString(r.FormValue("q")))', {'xss'}),
-            ('html-domains', 'import safe "html"', '',
+            ('html-domains', 'import (safe "html"; "os/exec")', '',
              'value := safe.EscapeString(r.FormValue("q")); fmt.Fprint(w, value); '
              'db.Query(value); exec.Command("sh", "-c", value)', {'sql', 'command'}),
             ('argument-effect', 'import safe "html"',
              'func render(value string) string { fmt.Fprint(w, value); return value }',
              '_ = safe.EscapeString(render(r.FormValue("q")))', {'xss'}),
-            ('saved-escape-domains', 'import "html"', '',
+            ('saved-escape-domains', 'import ("html"; "os/exec")', '',
              'escape := html.EscapeString; value := escape(r.FormValue("q")); '
              'fmt.Fprint(w, value); db.Query(value); exec.Command("sh", "-c", value)', {'sql', 'command'}),
             ('saved-escape-choice', 'import ("html"; "text/template")', '',

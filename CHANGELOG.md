@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Resolve native Go `os/exec.Command` and `CommandContext` through file-local
+  imports, aliases, captured constructors and selected helper summaries.
+  Executable and interpreter-program operands retain command provenance;
+  ordinary arguments, context values and same-spelled custom methods stay
+  separate. Unresolved callable alternatives, aggregate storage and computed
+  invocations retain explicit incomplete analysis with reached findings.
+
 - Trace native Python `urllib3.request` and `PoolManager` destinations through
   saved methods, constructors, helpers and selected cross-file calls. Distinguish
   URL operands from method/body/header metadata and preserve eager request

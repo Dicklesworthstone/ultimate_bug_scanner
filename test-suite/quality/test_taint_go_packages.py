@@ -301,7 +301,7 @@ class PartialPackageFlowTests(PackageTestCase):
     def test_reached_sinks_survive_in_every_domain_without_resuming_failed_body(self):
         self.source('handler.go', '''
             package app
-            import "bufio"
+            import ("bufio"; "os/exec")
             func h() {
                 db.Query(r.FormValue("q")) // sql
                 fmt.Fprint(w, r.FormValue("html")) // html

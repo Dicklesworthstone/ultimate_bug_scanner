@@ -232,6 +232,286 @@ class NativeScanningFlowTests(packages.PackageTestCase):
                                 [('query', 'sql', 'db.Query'), ('command', 'command', 'exec.Command'),
                                  ('output', 'xss', 'fmt.Fprint')])
 
+    def test_readinto_native_operations_write_payload_not_result_metadata(self):
+        for operation, extra in (('ReadFull', ''), ('ReadAtLeast', ', 1')):
+            with self.subTest(operation=operation):
+                self.check_scan('buffer := make([]byte, 32)\n'
+                                'n, err := io.' + operation + '(r.Body, buffer' + extra + ')\n'
+                                'db.Query(string(buffer)) // query\n'
+                                'exec.Command("sh", "-c", string(buffer)) // command\n'
+                                'fmt.Fprint(w, string(buffer)) // output\n'
+                                'fmt.Fprint(w, n, err)',
+                                [('query', 'sql', 'db.Query'), ('command', 'command', 'exec.Command'),
+                                 ('output', 'xss', 'fmt.Fprint')], imports='import ("io"; "fmt"; "os/exec")')
+
+    def test_readinto_native_aliases_and_selected_reader_factory_keep_identity(self):
+        self.check_scan('buffer := make([]uint8, 8)\n'
+                        'read := stream.ReadFull\nsaved := read\n'
+                        'source := factory()\nsaved(source, buffer)\n'
+                        'db.Query(string(buffer)) // query', [('query', 'sql', 'db.Query')],
+                        imports='import (stream "io"; environment "os")',
+                        helpers='func factory() stream.Reader { return environment.Stdin }')
+
+    def test_readinto_buffer_aliases_observe_backing_storage_and_rebinding(self):
+        self.check_scan('buffer := make([]byte, 8)\nalias := buffer\n'
+                        'snapshot := string(buffer)\nbuffer = make([]byte, 8)\n'
+                        'io.ReadFull(r.Body, alias[1:])\n'
+                        'db.Query(string(alias)) // alias\n'
+                        'db.Query(string(buffer))\ndb.Query(snapshot)',
+                        [('alias', 'sql', 'db.Query')], imports='import "io"')
+
+    def test_readinto_zero_length_and_impossible_minimum_do_not_read(self):
+        operations = (
+            'io.ReadFull(custom, buffer[:0])',
+            'io.ReadFull(custom, nil)',
+            'io.ReadAtLeast(custom, buffer, 0)',
+            'io.ReadAtLeast(custom, buffer, -1)',
+            'io.ReadAtLeast(custom, buffer, 9)',
+            'io.ReadAtLeast(custom, make([]byte, 0), count)',
+        )
+        for operation in operations:
+            with self.subTest(operation=operation):
+                self.check_scan('buffer := make([]byte, 8)\nn, err := ' + operation + '\n'
+                                'db.Query(string(buffer))\nfmt.Fprint(w, n, err)',
+                                imports='import ("io"; "fmt")')
+
+    def test_readinto_reslicing_empty_capacity_may_read(self):
+        self.check_scan('buffer := make([]byte, 0, 8)\nalias := buffer[:8]\n'
+                        'io.ReadFull(r.Body, alias)\ndb.Query(string(alias)) // query',
+                        [('query', 'sql', 'db.Query')], imports='import "io"')
+
+    def test_readinto_fixed_bytes_weak_writes_and_sanitizer_domains(self):
+        self.check_scan('fixed := make([]byte, 8)\nio.ReadFull(strings.NewReader("fixed"), fixed)\n'
+                        'db.Query(string(fixed))\nbuffer := make([]byte, 8)\n'
+                        'io.ReadFull(r.Body, buffer)\n'
+                        'io.ReadFull(strings.NewReader("x"), buffer)\n'
+                        'db.Query(string(buffer)) // preserved\n'
+                        'db.Query("SELECT $1", string(buffer))\n'
+                        'safe := html.EscapeString(string(buffer))\nfmt.Fprint(w, safe)\n'
+                        'db.Query(safe) // domain',
+                        [('preserved', 'sql', 'db.Query'), ('domain', 'sql', 'db.Query')],
+                        imports='import ("io"; "strings"; "html"; "fmt")')
+
+    def test_readinto_selected_helper_writes_a_slice_parameter(self):
+        self.check_scan('buffer := make([]byte, 8)\nread(r.Body, buffer)\n'
+                        'db.Query(string(buffer)) // query\n'
+                        'empty := make([]byte, 0)\nread(r.Body, empty)\ndb.Query(string(empty))',
+                        [('query', 'sql', 'db.Query')], imports='import "io"',
+                        helpers='func read(source io.Reader, destination []byte) { io.ReadFull(source, destination) }')
+
+    def test_readinto_import_decoys_and_lexical_shadows_do_not_borrow_io(self):
+        for imports, helpers, call in (
+            ('import io "example.org/io"', '', 'io.ReadFull(r.Body, buffer)'),
+            ('import "io"', 'func h2() { io := custom; buffer := make([]byte, 8); '
+             'io.ReadFull(r.Body, buffer); db.Query(string(buffer)) }', ''),
+            ('import . "io"', 'func ReadFull(_ interface{}, _ []byte) {}', 'ReadFull(r.Body, buffer)'),
+        ):
+            with self.subTest(imports=imports, call=call):
+                self.check_scan('buffer := make([]byte, 8)\n' + call + '\ndb.Query(string(buffer))',
+                                imports=imports, helpers=helpers)
+
+    def test_readinto_unknown_protocols_and_untracked_destinations_are_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for body in (
+            'buffer := make([]byte, 8)\nio.ReadFull(custom, buffer)',
+            'buffer := external()\nio.ReadFull(r.Body, buffer)',
+            'buffer := make([]byte, 8)\nread := io.ReadFull\nif choice { read = custom }\nread(r.Body, buffer)',
+            'buffer := make([]byte, 8)\nexternal(buffer)\nio.ReadFull(r.Body, buffer)',
+            'buffer := make([]byte, 8)\naliases := [][]byte{buffer}\nio.ReadFull(r.Body, buffer)',
+            'buffer := make([]byte, 8)\nreader := bytes.NewReader(buffer)\nio.ReadFull(r.Body, buffer)',
+            'buffer := make([]byte, 8)\ndefer func() { io.ReadFull(r.Body, buffer) }()',
+        ):
+            with self.subTest(body=body), self.assertRaisesRegex(AnalysisLimit, 'reader|buffer'):
+                self.check_scan(body, imports='import ("io"; "bytes")')
+
+    @unittest.skipUnless(os.environ.get('UBS_GO_READINTO_NATIVE') == '1',
+                         'set UBS_GO_READINTO_NATIVE=1 for real Go read-into witnesses')
+    def test_readinto_native_witness_matches_payload_alias_and_no_read_semantics(self):
+        source = textwrap.dedent('''
+            package main
+            import ("encoding/json"; "io"; "os"; "strings"; "fmt")
+            type Recorder struct { Queries []string }
+            func (db *Recorder) Query(query string) { db.Queries = append(db.Queries, query) }
+            func main() {
+                db := &Recorder{}
+                buffer := make([]byte, 4)
+                alias := buffer
+                snapshot := string(buffer)
+                n, err := io.ReadFull(os.Stdin, buffer)
+                db.Query(string(alias)) // payload
+                db.Query(snapshot)
+                db.Query(fmt.Sprint(n, ":", err))
+                empty := buffer[:0]
+                io.ReadFull(os.Stdin, empty)
+                fixed := []byte("fixed")
+                io.ReadAtLeast(os.Stdin, fixed, 6)
+                io.ReadAtLeast(os.Stdin, fixed, -1)
+                db.Query(string(fixed))
+                io.ReadAtLeast(strings.NewReader(os.Getenv("UBS_GO_BUFFERED_INPUT")), buffer, 1)
+                db.Query(string(alias)) // minimum
+                io.ReadFull(strings.NewReader("x"), buffer)
+                db.Query(string(alias)) // short
+                if err := json.NewEncoder(os.Stdout).Encode(db.Queries); err != nil { panic(err) }
+            }
+        ''').lstrip('\n')
+        BufferedReaderFlowTests.run_native_reader(
+            self, source, ['<std', '\0' * 4, '4:<nil>', 'fixed', '<sup', 'xsup'])
+        findings = self.scan()
+        expected = sorted((number, line.index('db.Query') + 1, 'go.taint.sql')
+                          for number, line in enumerate(source.splitlines(), 1)
+                          if any('// ' + marker in line for marker in ('payload', 'minimum', 'short')))
+        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings), expected, findings)
+
+    def test_readinto_empty_alias_and_size_metadata_have_no_payload(self):
+        self.check_scan('buffer := make([]byte, 0, 8)\nalias := buffer[:8]\n'
+                        'io.ReadFull(r.Body, alias)\ndb.Query(string(buffer))\n'
+                        'db.Query(fmt.Sprint(len(alias), cap(alias)))\n'
+                        'db.Query(string(alias)) // query', [('query', 'sql', 'db.Query')],
+                        imports='import ("io"; "fmt")')
+
+    def test_readinto_nil_slices_and_rune_literals_keep_real_lengths(self):
+        self.check_scan('var empty []byte\nio.ReadFull(custom, empty)\n'
+                        'buffer := []byte{\'x\'}\nio.ReadFull(r.Body, buffer)\n'
+                        'db.Query(string(buffer)) // query', [('query', 'sql', 'db.Query')],
+                        imports='import "io"')
+
+    def test_readinto_string_snapshots_and_copied_byte_allocations_stay_independent(self):
+        self.check_scan('buffer := []byte("fixed")\nsnapshot := string(buffer)\n'
+                        'copy := []byte(string(buffer))\nio.ReadFull(r.Body, buffer)\n'
+                        'db.Query(snapshot)\ndb.Query(string(copy))\n'
+                        'db.Query(string(buffer)) // query', [('query', 'sql', 'db.Query')],
+                        imports='import "io"')
+
+    def test_readinto_immediate_closure_writes_the_selected_backing_array(self):
+        self.check_scan('buffer := make([]byte, 8)\n'
+                        'func(destination []byte) { io.ReadFull(r.Body, destination) }(buffer)\n'
+                        'db.Query(string(buffer)) // query', [('query', 'sql', 'db.Query')],
+                        imports='import "io"')
+
+    def test_readinto_selected_helper_returns_the_original_slice_alias(self):
+        self.check_scan('buffer := make([]byte, 8)\nalias := identity(buffer)\n'
+                        'io.ReadFull(r.Body, alias)\ndb.Query(string(buffer)) // query',
+                        [('query', 'sql', 'db.Query')], imports='import "io"',
+                        helpers='func identity(value []byte) []byte { return value }')
+
+    def test_readinto_helper_destinations_and_mutable_globals_refuse_unknown_backing(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for body, helpers in (
+            ('buffer := external()\nread(r.Body, buffer)',
+             'func read(source io.Reader, value []byte) { io.ReadFull(source, value) }'),
+            ('buffer := factory()\nio.ReadFull(r.Body, buffer)',
+             'func factory() []byte { return make([]byte, 8) }'),
+            ('alias := buffer\nio.ReadFull(r.Body, alias)', 'var buffer = make([]byte, 8)'),
+            ('io.ReadFull(r.Body, buffer)', 'var buffer = make([]byte, 0)\n'
+             'func change() { buffer = make([]byte, 8) }'),
+        ):
+            with self.subTest(body=body), self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+                self.check_scan(body, imports='import "io"', helpers=helpers)
+
+    def test_readinto_backing_capability_is_not_a_decoder_output_pointer(self):
+        self.check_scan('var changed []byte\njson.NewDecoder(r.Body).Decode(&changed)\n'
+                        'db.Query(string(changed)) // decoded\n'
+                        'untouched := make([]byte, 8)\njson.NewDecoder(r.Body).Decode(untouched)\n'
+                        'db.Query(string(untouched))\njson.Unmarshal([]byte(r.FormValue("body")), untouched)\n'
+                        'db.Query(string(untouched))', [('decoded', 'sql', 'db.Query')],
+                        imports='import "encoding/json"')
+
+    def test_readinto_borrowed_reader_consumes_stable_backing_contents(self):
+        self.check_scan('buffer := make([]byte, 8)\nio.ReadFull(r.Body, buffer)\n'
+                        'reader := bytes.NewReader(buffer)\ncontents, err := io.ReadAll(reader)\n'
+                        'db.Query(string(contents)) // query\ndb.Query(fmt.Sprint(err))',
+                        [('query', 'sql', 'db.Query')], imports='import ("io"; "bytes"; "fmt")')
+
+    def test_readinto_opaque_mutation_refuses_native_buffer_and_reader_snapshots(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for body in (
+            'io.ReadFull(strings.NewReader("fixed"), buffer)\nexternal.Mutate(buffer)',
+            'reader := bytes.NewReader(buffer)\nexternal.Mutate(buffer)\n'
+            'contents, _ := io.ReadAll(reader)\ndb.Query(string(contents))',
+            'external.Mutate(buffer)\nreader := bytes.NewReader(buffer)',
+        ):
+            with self.subTest(body=body):
+                source = 'package app\nimport ("io"; "bytes"; "strings")\nfunc h() {\n' + (
+                    'db.Query(r.FormValue("before"))\nbuffer := make([]byte, 8)\n' + body + '\n}\n')
+                self.source('handler.go', source)
+                findings = []
+                with self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+                    for finding in packages.taint_go.run(packages.RunContext(lang='go', files=list(self.sources.values()))):
+                        findings.append(finding)
+                self.assertEqual([(finding['line'], finding['rule']) for finding in findings],
+                                 [(4, 'go.taint.sql')], findings)
+
+    def test_readinto_reader_snapshots_refuse_indexed_and_decoder_mutation(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for mutation, helpers, boundary in (
+            ('buffer[0] = os.Getenv("Q")[0]', '', 'buffer'),
+            ('change(buffer)', 'func change(value []byte) { value[0] = os.Getenv("Q")[0] }', 'buffer'),
+            ('json.Unmarshal([]byte(r.FormValue("json")), &buffer)', '', 'buffer'),
+            ('json.NewDecoder(r.Body).Decode(&buffer)', '', 'buffer'),
+            ('fmt.Sscan(r.FormValue("text"), &buffer)', '', 'formatted input'),
+        ):
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(AnalysisLimit, boundary):
+                self.check_scan('buffer := make([]byte, 8)\nreader := bytes.NewReader(buffer)\n' +
+                                mutation + '\ncontents, _ := io.ReadAll(reader)\n'
+                                'db.Query(string(contents))',
+                                imports='import ("io"; "bytes"; "os"; "fmt"; "encoding/json")',
+                                helpers=helpers)
+
+    def test_readinto_reader_borrow_refuses_fresh_helper_backing_without_identity(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        with self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+            self.check_scan('buffer := fresh()\nreader := bytes.NewReader(buffer)\n'
+                            'buffer[0] = os.Getenv("Q")[0]\ncontents, _ := io.ReadAll(reader)\n'
+                            'db.Query(string(contents))', imports='import ("io"; "bytes"; "os")',
+                            helpers='func fresh() []byte { return make([]byte, 8) }')
+
+    def test_readinto_reader_borrow_keeps_rebinding_and_empty_backing_independent(self):
+        self.check_scan('buffer := []byte("fixed")\nreader := bytes.NewReader(buffer)\n'
+                        'buffer = []byte(r.FormValue("later"))\n'
+                        'contents, _ := io.ReadAll(reader)\ndb.Query(string(contents))\n'
+                        'db.Query(string(buffer)) // query\n'
+                        'empty := bytes.NewReader(nil)\nnone, _ := io.ReadAll(empty)\n'
+                        'db.Query(string(none))', [('query', 'sql', 'db.Query')],
+                        imports='import ("io"; "bytes")')
+
+    def test_readinto_opaque_slice_header_escape_invalidates_native_backing_proofs(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for body, helpers in (
+            ('buffer := make([]byte, 8)\nio.ReadFull(strings.NewReader("fixed"), buffer)\n'
+             'external.Mutate(&buffer)\ndb.Query(string(buffer))', ''),
+            ('buffer := make([]byte, 8)\nreader := bytes.NewReader(buffer)\n'
+             'external.Mutate(&buffer)\ncontents, _ := io.ReadAll(reader)\ndb.Query(string(contents))', ''),
+            ('buffer := make([]byte, 8)\naddress := &buffer\nreader := bytes.NewReader(buffer)\n'
+             'external.Mutate(address)\ncontents, _ := io.ReadAll(reader)\ndb.Query(string(contents))', ''),
+            ('var buffer []byte\nexternal.Mutate(&buffer)\nio.ReadFull(r.Body, buffer)\n'
+             'db.Query(string(buffer))', ''),
+            ('buffer := make([]byte, 8)\nio.ReadFull(strings.NewReader("fixed"), buffer)\n'
+             'mutate(&buffer)\ndb.Query(string(buffer))',
+             'func mutate(value *[]byte) { external.Mutate(value) }'),
+            ('var buffer []byte\nmutate(&buffer)\nio.ReadFull(r.Body, buffer)\ndb.Query(string(buffer))',
+             'func mutate(value *[]byte) { external.Mutate(value) }'),
+            ('buffer := make([]byte, 8)\nreader := bytes.NewReader(buffer)\n'
+             'mutate(buffer)\ncontents, _ := io.ReadAll(reader)\ndb.Query(string(contents))',
+             'func mutate(value []byte) { external.Mutate(&value) }'),
+        ):
+            with self.subTest(body=body), self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+                self.check_scan(body, imports='import ("io"; "bytes"; "strings")', helpers=helpers)
+
+    def test_readinto_opaque_value_transport_preserves_empty_slice_header_length(self):
+        for call, helpers in (
+            ('external.Mutate(buffer)', ''),
+            ('mutate(buffer)', 'func mutate(value []byte) { external.Mutate(value) }'),
+        ):
+            with self.subTest(call=call):
+                self.check_scan('var buffer []byte\n' + call + '\nio.ReadFull(customReader, buffer)\n'
+                                'db.Query(string(buffer))', imports='import "io"', helpers=helpers)
+
     def test_string_scan_family_uses_input_slot_and_keeps_metadata_clean(self):
         for operation, arguments in [('Sscan', 'input, &value'), ('Sscanln', 'input, &value'),
                                      ('Sscanf', 'input, "%s", &value')]:
@@ -899,6 +1179,27 @@ func h() {
 class BufferedReaderCacheTests(packages.PackageTestCase):
     scan_main = packages.PackageCacheTests.scan_main
 
+    def test_readinto_reader_factory_edit_invalidates_warm_selected_package(self):
+        helper = self.source('helper.go', 'package app\nimport ("strings"; "io")\n'
+                             'func open() io.Reader { return strings.NewReader("fixed") }\n')
+        handler = self.source('handler.go', 'package app\nimport "io"\nfunc h() {\n'
+                              'buffer := make([]byte, 8)\nio.ReadFull(open(), buffer)\n'
+                              'db.Query(string(buffer))\n}\n')
+        (self.root / 'unselected.go').write_text('package app\nimport "os"\n'
+                                              'func unselected() { db.Query(os.Getenv("SQL")) }\n')
+        self.assertEqual(self.scan_main()[0], [])
+        warm, stats = self.scan_main()
+        self.assertEqual(warm, [])
+        self.assertEqual(stats['hits'], 2, stats)
+        self.source('helper.go', 'package app\nimport ("os"; "io")\n'
+                    'func open() io.Reader { return os.Stdin }\n')
+        changed, stats = self.scan_main()
+        self.assertEqual([(Path(row['path']).name, row['line'], row['col'], row['rule']) for row in changed],
+                         [('handler.go', 6, 1, 'go.taint.sql')], changed)
+        self.assertEqual(stats['misses'], 2, stats)
+        self.assertEqual(self.scan_main([helper])[0], [])
+        self.assertEqual(self.scan_main([helper, handler])[0], changed)
+
     def test_reader_factory_changes_invalidate_warm_package_findings(self):
         helper = self.source('helper.go', 'package app\nimport ("strings"; "io")\n'
                              'func open() io.Reader { return strings.NewReader("fixed") }\n')
@@ -929,6 +1230,12 @@ class BufferedReaderModuleTests(unittest.TestCase):
     def test_public_controls_and_protocol_boundaries(self):
         self.check_public_cases(4, 8)
 
+    def test_public_readinto_unsafe_and_metadata_reports(self):
+        self.check_public_cases(8, 12)
+
+    def test_public_readinto_controls_suppression_and_partial_findings(self):
+        self.check_public_cases(12, 16)
+
     def check_public_cases(self, start, end):
         from test_keep_temp import prevent_child_deletion
 
@@ -950,6 +1257,24 @@ class BufferedReaderModuleTests(unittest.TestCase):
             ('custom', 'value, err := io.ReadAll(customReader)\ndb.Query(string(value))', False, True),
             ('mutation', 'reader := bufio.NewReader(os.Stdin)\nreader.Reset(strings.NewReader("fixed"))',
              False, True),
+            ('readinto-full', 'buffer := make([]byte, 64)\nio.ReadFull(os.Stdin, buffer)\n'
+             'db.Query(string(buffer)) // query', True, False),
+            ('readinto-saved', 'buffer := make([]byte, 64)\nalias := buffer[:]\nread := io.ReadAtLeast\n'
+             'read(r.Body, alias, 1)\ndb.Query(string(buffer)) // query', True, False),
+            ('readinto-metadata', 'buffer := make([]byte, 64)\nn, err := io.ReadFull(r.Body, buffer)\n'
+             'fmt.Fprint(w, n, err, len(buffer), cap(buffer))', False, False),
+            ('readinto-bound', 'buffer := make([]byte, 64)\nio.ReadFull(r.Body, buffer)\n'
+             'db.Query("SELECT $1", string(buffer))', False, False),
+            ('readinto-fixed', 'buffer := []byte("fixed")\n'
+             'io.ReadFull(strings.NewReader("constant"), buffer)\ndb.Query(string(buffer))', False, False),
+            ('readinto-suppressed', 'buffer := make([]byte, 64)\nio.ReadFull(os.Stdin, buffer)\n'
+             'db.Query(string(buffer)) // ubs:ignore[go.taint.sql]', False, False),
+            ('readinto-no-read', 'empty := make([]byte, 0)\nio.ReadFull(customReader, empty)\n'
+             'buffer := make([]byte, 2)\nio.ReadAtLeast(customReader, buffer, 3)\n'
+             'io.ReadAtLeast(customReader, buffer, 0)\ndb.Query(string(empty))\n'
+             'db.Query(string(buffer))', False, False),
+            ('readinto-partial', 'db.Query(r.FormValue("prior")) // query\n'
+             'buffer := make([]byte, 64)\nio.ReadFull(customReader, buffer)', True, True),
         )
         artifacts = packages.ROOT / 'test-suite' / 'artifacts'
         artifacts.mkdir(parents=True, exist_ok=True)

@@ -44,7 +44,7 @@ _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
                     'html/template': 'template', 'text/template': 'template', 'os': 'os', 'os/exec': 'exec',
                     'fmt': 'fmt', 'strings': 'strings', 'bytes': 'bytes', 'bufio': 'bufio'}
 _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
-                   'io': {'ReadAll'}, 'ioutil': {'ReadAll'},
+                   'io': {'ReadAll', 'ReadFull', 'ReadAtLeast'}, 'ioutil': {'ReadAll'},
                    'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
                    'os': {'Getenv', 'LookupEnv', 'Stdin'},
                    'exec': {'Command', 'CommandContext'},
@@ -55,6 +55,7 @@ _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'U
                              'ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'}}
 _ENVIRONMENT_OPERATIONS = frozenset({('os', 'Getenv'), ('os', 'LookupEnv')})
 _COMMAND_OPERATIONS = frozenset({('exec', 'Command'), ('exec', 'CommandContext')})
+_READ_INTO_OPERATIONS = frozenset({('io', 'ReadFull'), ('io', 'ReadAtLeast')})
 _SCAN_OPERATIONS = frozenset(('fmt', member) for member in _NATIVE_MEMBERS['fmt'])
 _READER_CONSTRUCTORS = {
     ('strings', 'NewReader'): 'strings-reader', ('bytes', 'NewReader'): 'bytes-reader',
@@ -63,7 +64,7 @@ _READER_CONSTRUCTORS = {
     ('bufio', 'NewScanner'): 'scanner',
 }
 _BUFFER_SPLITTERS = frozenset(('bufio', member) for member in ('ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'))
-_CALLABLE_OPERATIONS = (_ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _COMMAND_OPERATIONS
+_CALLABLE_OPERATIONS = (_ENVIRONMENT_OPERATIONS | _SCAN_OPERATIONS | _COMMAND_OPERATIONS | _READ_INTO_OPERATIONS
                         | _READER_CONSTRUCTORS.keys())
 _DECODER_METHODS = frozenset({'Decode', 'DecodeElement', 'Token', 'RawToken', 'More', 'InputOffset',
                               'UseNumber', 'DisallowUnknownFields', 'Buffered'})
@@ -72,7 +73,7 @@ _DECODER_METHODS = frozenset({'Decode', 'DecodeElement', 'Token', 'RawToken', 'M
 def _callable_boundary(operations, action):
     family = ('command' if operations & _COMMAND_OPERATIONS else
               'formatted input' if operations & _SCAN_OPERATIONS else
-              'reader' if operations & _READER_CONSTRUCTORS.keys() else 'environment')
+              'reader' if operations & (_READER_CONSTRUCTORS.keys() | _READ_INTO_OPERATIONS) else 'environment')
     return AnalysisLimit(f'Go {family} callable {action} is unsupported; analysis is incomplete')
 
 SOURCE_PATTERNS = [
@@ -338,6 +339,27 @@ class _ScanKindKey:
 
 
 @dataclass(frozen=True)
+class _BufferKey:
+    cell: str
+
+
+@dataclass(frozen=True)
+class _BufferInfo:
+    # Slice length belongs to the header; contents belong to its backing cells.
+    length: int | None = None
+    definite: bool = True
+
+
+def _join_buffers(*buffers):
+    present = [buffer for buffer in buffers if buffer is not None]
+    if not present:
+        return None
+    lengths = {buffer.length for buffer in present}
+    return _BufferInfo(next(iter(lengths)) if len(lengths) == 1 else None,
+                       len(present) == len(buffers) and all(buffer.definite for buffer in present))
+
+
+@dataclass(frozen=True)
 class _DecoderKey:
     cell: str
 
@@ -414,6 +436,7 @@ class _ValueInfo:
     decoder: _DecoderInfo | None = None
     pointers: frozenset[_Target] = frozenset()
     reader: _ReaderInfo | None = None
+    buffer: _BufferInfo | None = None
 
 
 def _join_value_info(*values):
@@ -426,7 +449,8 @@ def _join_value_info(*values):
     if not all(value.pointers for value in values):
         pointers = frozenset(replace(target, whole=False) for target in pointers)
     return _ValueInfo(_join_native(*(value.native for value in values)), decoder, pointers,
-                      _join_readers(*(value.reader for value in values)))
+                      _join_readers(*(value.reader for value in values)),
+                      _join_buffers(*(value.buffer for value in values)))
 
 
 def _join_native(*values):
@@ -500,6 +524,8 @@ def _join_states(*states):
             result[name] = _join_decoders(*(state.get(name) for state in states))
         elif isinstance(name, _ReaderKey):
             result[name] = _join_readers(*(state.get(name) for state in states))
+        elif isinstance(name, _BufferKey):
+            result[name] = _join_buffers(*(state.get(name) for state in states))
         elif isinstance(name, _NativeKey):
             result[name] = _join_native(*(state.get(name) for state in states))
         elif isinstance(name, _ScanKindKey):
@@ -766,7 +792,7 @@ def _reference_parameters(code: str) -> frozenset[int]:
         match = re.match(r'[A-Za-z_]\w*\s+(.+)$', part, re.DOTALL)
         if match:
             typename = re.sub(r'\s+', '', match.group(1))
-            reference = typename.startswith('*') or typename in {'any', 'interface{}'}
+            reference = typename.startswith('*') or typename in {'any', 'interface{}', '[]byte', '[]uint8'}
         elif not re.fullmatch(r'[A-Za-z_]\w*', part):
             reference = False
         if reference:
@@ -834,6 +860,9 @@ class _Summary:
     value_returns: tuple[_ValueInfo | None, ...] = ()
     native_writes: dict[tuple[int, tuple[str, ...]], _NativeInfo | None] = field(default_factory=dict)
     reader_scans: frozenset[int] = frozenset()
+    buffer_escapes: frozenset[int] = frozenset()
+    buffer_writes: frozenset[int] = frozenset()
+    buffer_borrows: frozenset[int] = frozenset()
 
 
 def _join_summaries(summaries: list[_Summary]) -> _Summary:
@@ -888,7 +917,14 @@ def _join_summaries(summaries: list[_Summary]) -> _Summary:
             native_writes[index, path] = _join_native(native_writes.get((index, path)), native)
     reader_scans = frozenset(min(index, variadic) if variadic is not None else index
                              for summary in summaries for index in summary.reader_scans)
-    return _Summary(returns, effects, variadic, writes, tuple(value_returns), native_writes, reader_scans)
+    buffer_escapes = frozenset(min(index, variadic) if variadic is not None else index
+                               for summary in summaries for index in summary.buffer_escapes)
+    buffer_writes = frozenset(min(index, variadic) if variadic is not None else index
+                              for summary in summaries for index in summary.buffer_writes)
+    buffer_borrows = frozenset(min(index, variadic) if variadic is not None else index
+                               for summary in summaries for index in summary.buffer_borrows)
+    return _Summary(returns, effects, variadic, writes, tuple(value_returns), native_writes,
+                    reader_scans, buffer_escapes, buffer_writes, buffer_borrows)
 
 
 @dataclass
@@ -919,6 +955,11 @@ class _Analysis:
         self.native_escapes: set[str] = set()
         self.scan_writes: dict[_Target, _Fact] = {}
         self.reader_scans: set[_ReaderOrigin] = set()
+        self.buffer_escapes: set[_Target] = set()
+        self.buffer_borrows: set[_Target] = set()
+        self.buffer_invalidated = False
+        self.buffer_writes: dict[_Target, _Fact] = {}
+        self.buffer_cell_writes: dict[str, _BufferInfo | None] = {}
         self.reader_cell_writes: dict[str, _ReaderInfo | None] = {}
         self.decoder_cell_writes: dict[str, _DecoderInfo | None] = {}
         self.decoder_returns: dict[str, _DecoderInfo | None] | None = None
@@ -1035,6 +1076,130 @@ class _Analysis:
         identity = self.native_identity(root, member, offset, scope)
         return _NativeInfo(frozenset({identity})) if identity is not None else _UNKNOWN_NATIVE
 
+    @staticmethod
+    def integer_literal(expr):
+        expr, _ = _Analysis.unparenthesize(expr)
+        if not re.fullmatch(r'[+-]?(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|[0-9][0-9_]*)', expr):
+            return None
+        number = expr.replace('_', '')
+        unsigned = number.lstrip('+-')
+        base = 8 if len(unsigned) > 1 and unsigned[0] == '0' and unsigned[1].isdigit() else 0
+        try:
+            return int(number, base or (10 if unsigned.isdigit() else 0))
+        except ValueError:
+            return None
+
+    def buffer_expression(self, expr, offset, state, scope):
+        """Describe selected builtin slices without inventing an object heap.
+
+        Allocation-site backing cells are shared by slice aliases; conversions
+        to string read their current contents. Unknown lengths permit weak
+        writes, while uncertain backing identity cannot authorize a write.
+        """
+        expr, offset = self.unparenthesize(expr, offset)
+        code = _masked_source(expr)
+        if expr == 'nil' and 'nil' not in scope.bindings and 'nil' not in self.summaries:
+            return _ValueInfo(buffer=_BufferInfo(0)), False, False
+        if re.fullmatch(r'[A-Za-z_]\w*', expr):
+            info = self.value_info(expr, offset, state, scope)
+            return (info if info is not None and info.buffer is not None else None), False, False
+        sliced = re.fullmatch(r'([A-Za-z_]\w*)\s*\[(.*)\]', code, re.DOTALL)
+        if sliced:
+            parts = _parts(sliced.group(2), ':')
+            info = self.value_info(sliced.group(1), offset, state, scope)
+            if len(parts) in {2, 3} and info is not None and info.buffer is not None:
+                low_text = sliced.group(2)[slice(*parts[0])].strip()
+                high_text = sliced.group(2)[slice(*parts[1])].strip()
+                low = self.integer_literal(low_text) if low_text else 0
+                high = self.integer_literal(high_text) if high_text else info.buffer.length
+                length = high - low if high is not None and low is not None and high >= low >= 0 else None
+                return replace(info, buffer=replace(info.buffer, length=length)), False, False
+        constructed = re.fullmatch(r'make\s*\((.*)\)', expr, re.DOTALL)
+        length, fresh, zeroed = None, False, False
+        if constructed and 'make' not in scope.bindings and 'make' not in self.summaries:
+            pieces = [constructed.group(1)[start:end].strip()
+                      for start, end in _parts(_masked_source(constructed.group(1)))]
+            if (len(pieces) in {2, 3} and re.sub(r'\s+', '', pieces[0]) in {'[]byte', '[]uint8'}
+                    and self.scan_type(pieces[0], scope) == 'text'):
+                length = self.integer_literal(pieces[1])
+                fresh, zeroed = True, True
+        converted = re.match(r'\[\]\s*(byte|uint8)\s*\(', code)
+        if converted and self.scan_type('[]' + converted.group(1), scope) == 'text':
+            closing = _pairs(code).get(converted.end() - 1)
+            if closing == len(code) - 1:
+                argument = expr[converted.end():closing]
+                info = self.value_info(argument, offset + converted.end(), state, scope)
+                if info is not None and info.buffer is not None:
+                    return replace(info, native=_UNKNOWN_NATIVE), False, False
+                literal = _string_literal(argument.strip())
+                if literal is not None:
+                    length, fresh = len(literal.encode('utf-8')), True
+                elif (re.fullmatch(r'\s*string\s*\(.*\)\s*', argument, re.DOTALL)
+                      and 'string' not in scope.bindings and 'string' not in self.summaries):
+                    fresh = True
+        literal = re.fullmatch(r'\[\]\s*(byte|uint8)\s*\{(.*)\}', code, re.DOTALL)
+        if literal and self.scan_type('[]' + literal.group(1), scope) == 'text':
+            # The lexer preserves a token for rune literals; an empty-looking
+            # masked rune must not prove a zero-length destination.
+            items = literal.group(2).strip().rstrip(',').strip()
+            length = (0 if not items else len(_parts(items))) if ':' not in items else None
+            fresh = True
+        if fresh:
+            target = _Target(f'@byte-buffer:{offset}')
+            return _ValueInfo(pointers=frozenset({target}), buffer=_BufferInfo(length)), True, zeroed
+        return None, False, False
+
+    def escape_buffer(self, info, *, borrow=False, state=None):
+        if info is not None and info.buffer is None and state is not None and not borrow:
+            # An opaque callee receiving &slice can replace the header and
+            # mutate its old array. Follow known address aliases before their
+            # native identity is invalidated; unknown parameter addresses are
+            # retained as summary escapes and resolved at the selected caller.
+            pending, seen = list(info.pointers), set()
+            while pending:
+                target = pending.pop()
+                if target.cell in seen:
+                    continue
+                seen.add(target.cell)
+                if target.parameter is not None:
+                    self.buffer_escapes.add(target)
+                pointers = state.get(_PointerKey(target.cell), frozenset())
+                buffer = state.get(_BufferKey(target.cell))
+                if buffer is not None:
+                    self.escape_buffer(_ValueInfo(pointers=pointers, buffer=buffer))
+                    replacement = replace(buffer, definite=False)
+                    state[_BufferKey(target.cell)] = replacement
+                    self.buffer_cell_writes[target.cell] = replacement
+                pending.extend(pointers)
+        if info is not None and info.buffer is not None:
+            cells = {target.cell for target in info.pointers}
+            if borrow:
+                if info.buffer.length != 0 and (not info.buffer.definite or not info.pointers
+                        or any(not target.whole or target.path or target.indexed for target in info.pointers)):
+                    raise AnalysisLimit('Go reader buffer backing identity is unsupported; analysis is incomplete')
+                self.buffer_borrows.update(info.pointers)
+                self.buffer_invalidated |= bool(cells & {target.cell for target in self.buffer_escapes})
+            else:
+                self.buffer_escapes.update(info.pointers)
+                self.buffer_invalidated |= bool(cells & {
+                    target.cell for target in (*self.buffer_borrows, *self.buffer_writes)})
+
+    def invalidate_borrowed_buffer(self, target):
+        # A bytes.Reader/Buffer keeps the array, not a copy of its contents.
+        # Until reader payloads can follow live backing cells, any subsequent
+        # content write must refuse that old constructor snapshot.
+        self.buffer_invalidated |= any(borrowed.cell == target.cell for borrowed in self.buffer_borrows)
+
+    def check_buffer_write(self, info, state):
+        global_backing = {target.cell for cell in self.global_cells
+                          for target in state.get(_PointerKey(cell), ())}
+        escaped = {target.cell for target in self.buffer_escapes | self.buffer_borrows}
+        if (info is None or info.buffer is None or not info.buffer.definite or not info.pointers
+                or any(not target.whole or target.path or target.indexed
+                       or target.cell in self.global_cells or target.cell in global_backing
+                       or target.cell in escaped for target in info.pointers)):
+            raise AnalysisLimit('Go reader destination buffer identity or escape is unsupported; analysis is incomplete')
+
     def check_source_storage(self, code, offset, state, scope):
         # Scalar native identities and selected helper results are modeled.
         # Composite values are not a callable heap: losing a getter inside a
@@ -1091,12 +1256,16 @@ class _Analysis:
                 if (stored and summary is not None and any(info is not None and info.decoder is not None
                                                            for info in summary.value_returns)):
                     raise AnalysisLimit('Go decoder aggregate storage is unsupported; analysis is incomplete')
+                if stored and summary is not None:
+                    for info in summary.value_returns:
+                        self.escape_buffer(info, state=state)
                 if (native is not None and native.operations & {('json', 'NewDecoder'), ('xml', 'NewDecoder')}
                         and (stored or re.match(r'\s*\.\s*[A-Za-z_]\w*\s*[,}]', tail))):
                     raise AnalysisLimit('Go decoder aggregate storage is unsupported; analysis is incomplete')
             else:
                 natives = (self.native_callable(root, member, offset + match.start(), state, scope),)
                 info = self.value_info(match.group(), offset + match.start(), state, scope)
+                self.escape_buffer(info, state=state)
                 if info is not None and info.reader is not None:
                     raise AnalysisLimit('Go reader aggregate storage is unsupported; analysis is incomplete')
                 if info is not None and info.decoder is not None:
@@ -1108,6 +1277,8 @@ class _Analysis:
 
     def value_info(self, expr, offset, state, scope):
         expr, offset = self.unparenthesize(expr, offset)
+        if expr == 'nil' and 'nil' not in scope.bindings and 'nil' not in self.summaries:
+            return _ValueInfo(buffer=_BufferInfo(0))
         closure = self.closure_results.get(offset)
         if closure is not None:
             return closure[1][0] if closure[1] else _ValueInfo()
@@ -1128,7 +1299,10 @@ class _Analysis:
                                      frozenset({'stdin'}), frozenset({_ReaderOrigin((-1, -1))}))
             elif re.fullmatch(r'(?:r|req|request)\s*\.\s*Body', code):
                 reader = _ReaderInfo(frozenset({_Trace(code, path=(code,))}), frozenset({'request'}))
-            return _ValueInfo(native, decoder, self.pointers(expr, state, scope), reader)
+            buffer = state.get(_BufferKey(cell)) if name.group(2) is None else None
+            if buffer is not None and cell in self.global_cells:
+                buffer = replace(buffer, definite=False)
+            return _ValueInfo(native, decoder, self.pointers(expr, state, scope), reader, buffer)
         call = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
         if call:
             end = _pairs(code).get(call.end() - 1)
@@ -1144,7 +1318,8 @@ class _Analysis:
             owner = self.value_info(expr[:selection.start()], offset, state, scope)
             if owner is not None and owner.decoder is not None and owner.decoder.methods == {''}:
                 return _ValueInfo(decoder=replace(owner.decoder, methods=frozenset({selection.group(1)})))
-        return _ValueInfo(pointers=self.pointers(expr, state, scope))
+        buffer, _fresh, _zeroed = self.buffer_expression(expr, offset, state, scope)
+        return buffer if buffer is not None else _ValueInfo(pointers=self.pointers(expr, state, scope))
 
     def reader_payload(self, expr, offset, fact, state, scope, *, require=False):
         """Reader handles carry contents separately from ordinary value facts."""
@@ -1245,6 +1420,36 @@ class _Analysis:
                 return 'text'
         return ''
 
+    def read_into(self, operations, arguments, values, state, scope):
+        """Native Reader payloads weakly modify a byte slice's backing array.
+
+        ReadFull calls ReadAtLeast with len(buffer). ReadAtLeast never calls
+        the Reader for a nonpositive minimum or a minimum above len(buffer).
+        A positive read can stop after a prefix, even with an error; neither
+        the count/error results nor later fixed input clear prior contents.
+        """
+        if len(operations) != 1:
+            raise AnalysisLimit('Go reader destination operation alternatives are unsupported; analysis is incomplete')
+        operation = next(iter(operations))[1]
+        if len(arguments) != (2 if operation == 'ReadFull' else 3):
+            raise AnalysisLimit('Go reader destination argument shape is unsupported; analysis is incomplete')
+        minimum = self.integer_literal(arguments[2][0]) if operation == 'ReadAtLeast' else None
+        if minimum is not None and minimum <= 0:
+            return
+        info = self.value_info(*arguments[1], state, scope)
+        if info is None or info.native is None:
+            return  # A selected forward result has not reached the worklist yet.
+        buffer = info.buffer
+        if buffer is not None and buffer.definite:
+            if buffer.length == 0 or (minimum is not None and buffer.length is not None
+                                      and minimum > buffer.length):
+                return
+        self.check_buffer_write(info, state)
+        payload = self.reader_payload(*arguments[0], values[0], state, scope, require=True)
+        self.write_targets(info.pointers, payload, state, 'io.' + operation, buffer=True)
+        for target in info.pointers:
+            self.buffer_writes[target] = _join(self.buffer_writes.get(target, _CLEAN), payload)
+
     def scan_input(self, operations, arguments, values, targets, state, scope):
         """Bounded native text scanning; unsupported protocols remain visible.
 
@@ -1327,7 +1532,7 @@ class _Analysis:
             if re.fullmatch(r'[A-Za-z_]\w*', name) and name in scope.bindings:
                 self.invalidate_native_targets((_Target(scope.bindings[name]),), state)
 
-    def write_targets(self, targets, fact, state, label):
+    def write_targets(self, targets, fact, state, label, *, buffer=False):
         # Decode can partially modify an object even when it returns an error.
         # It can also leave omitted fields untouched. Weak aggregate writes
         # preserve both possibilities; a clean document is not a sanitizer.
@@ -1338,8 +1543,17 @@ class _Analysis:
             if target in seen:
                 continue
             seen.add(target)
+            self.invalidate_borrowed_buffer(target)
             if not target.path:
                 pending.extend(state.get(_PointerKey(target.cell), ()))
+                previous_buffer = state.get(_BufferKey(target.cell))
+                if not buffer and previous_buffer is not None:
+                    # Decoder writes through &slice may replace its header as
+                    # well as reuse its old backing array. Keep both content
+                    # effects without preserving the old length/identity proof.
+                    replacement = _BufferInfo(definite=False)
+                    state[_BufferKey(target.cell)] = replacement
+                    self.buffer_cell_writes[target.cell] = replacement
             self.store_target(target, _join(_field_fact(state, target.cell, target.path), fact), state)
             if target.parameter is not None:
                 key = (target.parameter, target.path)
@@ -1363,6 +1577,9 @@ class _Analysis:
         fact = _advance(fact, label)
         self.invalidate_native_targets(targets, state)
         for target in targets:
+            if (target.cell.startswith('@byte-buffer:')
+                    and any(escaped.cell == target.cell for escaped in self.buffer_escapes)):
+                raise AnalysisLimit('Go escaped buffer mutation is unsupported; analysis is incomplete')
             decoder = state.get(_DecoderKey(target.cell))
             if decoder is not None and decoder.methods == {''} and (target.path or target.indexed):
                 raise AnalysisLimit('Go decoder receiver mutation is unsupported; analysis is incomplete')
@@ -1389,6 +1606,10 @@ class _Analysis:
                 native = info.native if info is not None else None
                 self.native_writes[key] = _join_native(self.native_writes.get(key), native)
             if target.path or target.indexed:
+                self.invalidate_borrowed_buffer(target)
+                self.escape_buffer(info, state=state)
+                if target.cell.startswith('@byte-buffer:') or state.get(_BufferKey(target.cell)) is not None:
+                    self.buffer_writes[target] = _join(self.buffer_writes.get(target, _CLEAN), fact)
                 if info is not None and info.native is not None and info.native.operations & _CALLABLE_OPERATIONS:
                     raise _callable_boundary(info.native.operations, 'field/index storage')
                 if info is not None and info.reader is not None:
@@ -1421,6 +1642,12 @@ class _Analysis:
             self.reader_cell_writes[target.cell] = (
                 _join_readers(self.reader_cell_writes[target.cell], replacement)
                 if target.cell in self.reader_cell_writes else replacement)
+            buffer_key = _BufferKey(target.cell)
+            replacement = info.buffer if info is not None else None
+            state[buffer_key] = replacement if strong else _join_buffers(state.get(buffer_key), replacement)
+            self.buffer_cell_writes[target.cell] = (
+                _join_buffers(self.buffer_cell_writes[target.cell], replacement)
+                if target.cell in self.buffer_cell_writes else replacement)
 
     def native_call(self, expression, match, state, scope, *, whole=False):
         """Known result shapes and output-parameter effects, never name-only Decode."""
@@ -1450,6 +1677,7 @@ class _Analysis:
         sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
         environment = operations & _ENVIRONMENT_OPERATIONS
         scanning = operations & _SCAN_OPERATIONS
+        reading_into = operations & _READ_INTO_OPERATIONS
         commands = operations & _COMMAND_OPERATIONS
         unbound_command = (not commands and root == 'exec' and member in _NATIVE_MEMBERS['exec']
                            and root not in scope.bindings and root not in self.summaries
@@ -1474,7 +1702,7 @@ class _Analysis:
                 outer_end = pairs.get(end + chain.end())
                 if outer_end is None:
                     return None
-        if not (constructor or unmarshal or readall or sanitizer or environment or scanning or commands
+        if not (constructor or unmarshal or readall or sanitizer or environment or scanning or reading_into or commands
                 or unbound_command or method
                 or reader_constructor or reader_method):
             return None
@@ -1496,7 +1724,10 @@ class _Analysis:
                 origin = offset + start + left
                 values.append(self.value(value, origin, state, scope))
                 info = self.value_info(value, origin, state, scope)
-                targets.append(info.pointers if info is not None else frozenset())
+                # A slice value is not a Go output pointer. Read-into uses
+                # its separate backing capability; Decode/Unmarshal still
+                # require an actual address, such as &buffer.
+                targets.append(info.pointers if info is not None and info.buffer is None else frozenset())
             return values, targets
 
         values, targets = arguments(match.end(), end)
@@ -1536,6 +1767,7 @@ class _Analysis:
         operations = native.operations if native is not None else frozenset()
         environment = operations & _ENVIRONMENT_OPERATIONS
         scanning = operations & _SCAN_OPERATIONS
+        reading_into = operations & _READ_INTO_OPERATIONS
         commands = operations & _COMMAND_OPERATIONS
         if commands:
             # Constructor identity belongs to its file-local import or saved
@@ -1569,6 +1801,11 @@ class _Analysis:
                 raise AnalysisLimit('Go reader constructor argument alternatives are unsupported; analysis is incomplete')
             payload = (self.reader_payload(*raw_arguments[0], values[0], state, scope, require=True)
                        if wrapped else values[0])
+            if any(package == 'bytes' and operation in {'NewReader', 'NewBuffer'}
+                   for package, operation in reader_constructor):
+                # These objects retain the supplied backing array. A later
+                # write cannot be represented by a snapshot of its old facts.
+                self.escape_buffer(self.value_info(*raw_arguments[0], state, scope), borrow=True)
             input_reader = _ReaderInfo(payload, kinds, frozenset({_ReaderOrigin((result_offset, result_offset))}))
             if not chain:
                 return finish(end, (_CLEAN,), reader=input_reader)
@@ -1589,6 +1826,11 @@ class _Analysis:
             if native.unknown or operations != scanning:
                 raise AnalysisLimit('Go formatted input unknown callable alternative is unsupported; analysis is incomplete')
             self.scan_input(scanning, raw_arguments, values, targets, state, scope)
+            return finish(end, (_CLEAN, _CLEAN))
+        if reading_into:
+            if native.unknown or operations != reading_into:
+                raise AnalysisLimit('Go reader destination callable alternative is unsupported; analysis is incomplete')
+            self.read_into(reading_into, raw_arguments, values, state, scope)
             return finish(end, (_CLEAN, _CLEAN))
         if environment:
             if len(values) != 1:
@@ -1727,6 +1969,15 @@ class _Analysis:
         for index in summary.reader_scans:
             if index < len(infos) and infos[index] is not None and infos[index].reader is not None:
                 self.mark_scanned(infos[index].reader.origins, state)
+        for index in summary.buffer_escapes:
+            if index < len(infos):
+                self.escape_buffer(infos[index], state=state)
+        for index in summary.buffer_borrows:
+            if index < len(infos):
+                self.escape_buffer(infos[index], borrow=True)
+        for index in summary.buffer_writes:
+            info = infos[index] if index < len(infos) else None
+            self.check_buffer_write(info, state)
         for (_sink_offset, label), fact in summary.effects.items():
             # Concrete sources are reported at the helper itself. Only an
             # input-dependent sink produces an additional call-site finding.
@@ -1735,7 +1986,14 @@ class _Analysis:
         for (index, path), fact in summary.writes.items():
             if index < len(targets):
                 destinations = frozenset(_field_target(target, path) for target in targets[index])
-                self.write_targets(destinations, self.instantiate(fact, arguments, name, infos), state, name + '()')
+                payload = self.instantiate(fact, arguments, name, infos)
+                if index < len(infos) and infos[index] is not None and infos[index].buffer is not None:
+                    if any(target.cell in {escaped.cell for escaped in self.buffer_escapes}
+                           for target in destinations):
+                        raise AnalysisLimit('Go helper escaped buffer write is unsupported; analysis is incomplete')
+                    for target in destinations:
+                        self.buffer_writes[target] = _join(self.buffer_writes.get(target, _CLEAN), payload)
+                self.write_targets(destinations, payload, state, name + '()', buffer=index in summary.buffer_writes)
         for (index, path), native in summary.native_writes.items():
             if index >= len(targets):
                 continue
@@ -1784,7 +2042,13 @@ class _Analysis:
                                  for target in info.pointers
                                  if target.parameter is not None and target.parameter < len(targets)
                                  for actual in targets[target.parameter])
-            result_infos.append(replace(info, decoder=decoder, pointers=pointers, reader=reader))
+            buffer = info.buffer
+            if buffer is not None and info.pointers and not complete:
+                # A helper-local allocation needs an escaped heap identity;
+                # retain its contents but refuse native writes through a
+                # falsely empty or borrowed backing capability.
+                buffer = replace(buffer, definite=False)
+            result_infos.append(replace(info, decoder=decoder, pointers=pointers, reader=reader, buffer=buffer))
         self.call_results[call_offset] = tuple(result_infos)
         return tuple(self.instantiate(fact, arguments, name, infos) for fact in summary.returns)
 
@@ -1840,8 +2104,17 @@ class _Analysis:
         expr, offset = self.unparenthesize(expr, offset)
         self.closure_results.pop(offset, None)
         code = _call_code(_masked_source(expr))
-        self.check_source_storage(code, offset, state, scope)
         pairs = _pairs(code)
+        whole_call = pairs.get(code.find('(')) == len(code) - 1
+        conversion = re.fullmatch(r'string\s*\((.*)\)', code, re.DOTALL)
+        if conversion and whole_call and 'string' not in scope.bindings and 'string' not in self.summaries:
+            return self.value(expr[conversion.start(1):conversion.end(1)],
+                              offset + conversion.start(1), state, scope)
+        size = re.fullmatch(r'(len|cap)\s*\((.*)\)', code, re.DOTALL)
+        if size and whole_call and size.group(1) not in scope.bindings and size.group(1) not in self.summaries:
+            self.value(expr[size.start(2):size.end(2)], offset + size.start(2), state, scope)
+            return _CLEAN
+        self.check_source_storage(code, offset, state, scope)
         masked = list(code)
         facts = []
 
@@ -1942,6 +2215,8 @@ class _Analysis:
                             closure_state[key] = replace(native, definite=False)
                         elif isinstance(key, _DecoderKey) and native is not None:
                             closure_state[key] = replace(native, definite=False)
+                        elif isinstance(key, _BufferKey) and native is not None:
+                            closure_state[key] = replace(native, definite=False)
                 for index, parameter in enumerate(parameters):
                     if parameter:
                         key = closure_scope.declare(parameter, offset + match.start())
@@ -1962,12 +2237,16 @@ class _Analysis:
                                 closure_state[_DecoderKey(key)] = info.decoder
                             if info.reader is not None:
                                 closure_state[_ReaderKey(key)] = info.reader
+                            if info.buffer is not None:
+                                closure_state[_BufferKey(key)] = info.buffer
                             closure_state[_PointerKey(key)] = info.pointers
                             if info.pointers and all(target.parameter is None for target in info.pointers):
                                 closure_state[key] = _CLEAN
                 nested = _Analysis(self.source, self.code, self.rule, self.summaries, self.imports,
                                    self.uncertain_globals, self.global_cells, self.resolve_summary)
                 nested.native_escapes = set(self.native_escapes)
+                nested.buffer_escapes = set(self.buffer_escapes)
+                nested.buffer_borrows = set(self.buffer_borrows)
                 result = code[param_end + 1:opening].strip()
                 nested.named_returns = (_parameter_names(result[1:-1])
                                         if result.startswith('(') and result.endswith(')')
@@ -2049,6 +2328,9 @@ class _Analysis:
                             self.decoder_cell_writes[cell] = (
                                 _join_decoders(self.decoder_cell_writes[cell], decoder)
                                 if cell in self.decoder_cell_writes else decoder)
+                        if cell in nested.buffer_cell_writes and (
+                                state.get(_BufferKey(cell)) is not None or nested.buffer_cell_writes[cell] is not None):
+                            raise AnalysisLimit('Go captured buffer replacement is unsupported; analysis is incomplete')
                 captured_scans = {target: fact for target, fact in nested.scan_writes.items()
                                   if target.cell in state}
                 if captured_scans and not immediate:
@@ -2056,6 +2338,15 @@ class _Analysis:
                 for target, fact in captured_scans.items():
                     self.write_targets((target,), fact, state, 'closure scanning')
                     self.scan_writes[target] = _join(self.scan_writes.get(target, _CLEAN), fact)
+                captured_buffers = {target: fact for target, fact in nested.buffer_writes.items()
+                                    if target.cell in state}
+                if captured_buffers and not immediate:
+                    raise AnalysisLimit('Go delayed buffer writes are unsupported; analysis is incomplete')
+                self.buffer_escapes.update(nested.buffer_escapes)
+                self.buffer_borrows.update(nested.buffer_borrows)
+                for target, fact in captured_buffers.items():
+                    self.write_targets((target,), fact, state, 'closure buffer write', buffer=True)
+                    self.buffer_writes[target] = _join(self.buffer_writes.get(target, _CLEAN), fact)
                 captured_readers = frozenset().union(*(reader.origins for key, reader in state.items()
                                                        if isinstance(key, _ReaderKey) and reader is not None))
                 scanned_readers = nested.reader_scans & captured_readers
@@ -2082,7 +2373,8 @@ class _Analysis:
                                 # written inside the closure. Publishing only
                                 # its identity would drop the observed content
                                 # when assignment clears the handle's own fact.
-                                self.write_targets(info.pointers, nested.returns[index], state, 'closure result')
+                                self.write_targets(info.pointers, nested.returns[index], state, 'closure result',
+                                                   buffer=info.buffer is not None)
                         self.closure_results[offset] = (nested.returns, nested.value_returns)
                     else:
                         if any(info is not None and info.decoder is not None for info in nested.value_returns):
@@ -2099,6 +2391,13 @@ class _Analysis:
         for match in re.finditer(r'(?<![\w.])([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code):
             if masked[match.start()].isspace():
                 continue
+            if (match.group(2) is None and match.group(1) in {'string', 'len', 'cap'}
+                    and match.group(1) not in scope.bindings and match.group(1) not in self.summaries):
+                end = pairs.get(match.end() - 1)
+                if end is not None:
+                    facts.append(self.value(expr[match.start():end + 1], offset + match.start(), state, scope))
+                    cover(match.start(), end + 1)
+                    continue
             result = self.native_call(_CallExpression(expr, code, pairs, offset), match, state, scope)
             if result is not None:
                 end, values = result
@@ -2118,6 +2417,9 @@ class _Analysis:
                                 match.group(2) is None and match.group(1) in self.summaries
                                 and match.group(1) not in scope.bindings):
                             info = self.value_info(argument, offset + match.end() + start, state, scope)
+                            if not (match.group(2) is None and match.group(1) in {'string', 'len', 'cap'}
+                                    and match.group(1) not in scope.bindings and match.group(1) not in self.summaries):
+                                self.escape_buffer(info, state=state)
                             if info is not None and ((info.reader is not None and info.reader.kinds != {'request'}) or any(
                                     state.get(_ReaderKey(target.cell)) is not None for target in info.pointers)):
                                 raise AnalysisLimit('Go reader opaque-call transport is unsupported; analysis is incomplete')
@@ -2206,7 +2508,16 @@ class _Analysis:
                 facts.append(_field_fact(state, target.cell, target.path + path))
                 if not target.path:
                     pending.extend(state.get(_PointerKey(target.cell), ()))
-        return _join(*facts)
+        fact = _join(*facts)
+        info, fresh, zeroed = self.buffer_expression(expr, offset, state, scope)
+        if fresh:
+            for target in info.pointers:
+                state[target.cell] = _join(state.get(target.cell, _CLEAN), _CLEAN if zeroed else fact)
+            if zeroed:
+                return _CLEAN
+        if info is not None and info.buffer is not None and info.buffer.definite and info.buffer.length == 0:
+            return _CLEAN
+        return fact
 
     def simple(self, start: int, end: int, state, scope, declaration_kind: str = '') -> _Flow:
         prefix = declaration_kind + ' ' if declaration_kind else ''
@@ -2317,6 +2628,7 @@ class _Analysis:
                 updates[_PointerKey(key)] = pointers
                 updates[_DecoderKey(key)] = decoder
                 updates[_ReaderKey(key)] = info.reader if info is not None else None
+                updates[_BufferKey(key)] = info.buffer if info is not None else None
                 updates[_NativeKey(key)] = native
                 declared_type = re.match(r'\s*(?:var|const)\s+'
                                          r'[A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*\s+(.+?)\s*=', code, re.DOTALL)
@@ -2332,6 +2644,9 @@ class _Analysis:
                                                  if key in self.reader_cell_writes else reader)
                 self.decoder_cell_writes[key] = (_join_decoders(self.decoder_cell_writes[key], decoder)
                                                  if key in self.decoder_cell_writes else decoder)
+                buffer = info.buffer if info is not None else None
+                self.buffer_cell_writes[key] = (_join_buffers(self.buffer_cell_writes[key], buffer)
+                                                if key in self.buffer_cell_writes else buffer)
             assigned = {key for key in updates if isinstance(key, str)}
             for key in list(state):
                 if isinstance(key, _FieldKey) and key.cell in assigned:
@@ -2346,6 +2661,8 @@ class _Analysis:
                 state[_NativeKey(key)] = _UNKNOWN_NATIVE
                 typename = code[declaration.end(1):].strip()
                 state[_ScanKindKey(key)] = self.scan_type(typename, scope)
+                if re.sub(r'\s+', '', typename) in {'[]byte', '[]uint8'} and self.scan_type(typename, scope) == 'text':
+                    state[_BufferKey(key)] = _BufferInfo(0)
         self.value(self.source[start:end], start, state, scope)
         return _Flow(state)
 
@@ -2355,6 +2672,10 @@ class _Analysis:
             if state is None:
                 break
             flow = self.statement(node, state, scope)
+            if self.buffer_invalidated:
+                # Retain sinks reached in the statement before reporting the
+                # unsupported mutation; never publish its return capabilities.
+                raise AnalysisLimit('Go native buffer backing mutation or escape is unsupported; analysis is incomplete')
             state = flow.normal
             breaks.extend(flow.breaks)
             continues.extend(flow.continues)
@@ -2508,11 +2829,11 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
             return bottoms[name]
         signature = tuple((info.native, (info.decoder.definite, info.decoder.methods) if info.decoder is not None else None,
                            (info.reader.kinds, info.reader.scanned, info.reader.definite, info.reader.methods)
-                           if info.reader is not None else None)
+                           if info.reader is not None else None, info.buffer)
                           for info in infos[:parameter_counts[name]])
-        signature += ((_UNKNOWN_NATIVE, None, None),) * (parameter_counts[name] - len(signature))
-        if all(native == _UNKNOWN_NATIVE and decoder is None and reader is None
-               for native, decoder, reader in signature):
+        signature += ((_UNKNOWN_NATIVE, None, None, None),) * (parameter_counts[name] - len(signature))
+        if all(native == _UNKNOWN_NATIVE and decoder is None and reader is None and buffer is None
+               for native, decoder, reader, buffer in signature):
             return summaries[name]
         key = (name, signature)
         dependents[key].add(current)
@@ -2560,7 +2881,8 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                 if parameter and parameter != '_':
                     key = scope.declare(parameter, function.start)
                     state[key] = frozenset({_Trace(parameter, index, (parameter,))})
-                    native, decoder, reader = signature[index] if signature is not None else (_UNKNOWN_NATIVE, None, None)
+                    native, decoder, reader, buffer = (signature[index] if signature is not None
+                                                       else (_UNKNOWN_NATIVE, None, None, None))
                     state[_NativeKey(key)] = native
                     typename = function.parameter_types[index] if index < len(function.parameter_types) else ''
                     state[_ScanKindKey(key)] = analysis.scan_type(
@@ -2574,6 +2896,10 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
                         state[_ReaderKey(key)] = _ReaderInfo(
                             frozenset({_Trace(parameter, index, (parameter,), 'reader-data')}), kinds,
                             frozenset({_ReaderOrigin((function.start, index), index)}), scanned, definite, methods)
+                    if buffer is not None:
+                        state[_BufferKey(key)] = buffer
+                    elif signature is None and typename in {'[]byte', '[]uint8'} and analysis.scan_type(typename, scope) == 'text':
+                        state[_BufferKey(key)] = _BufferInfo()
                     if index in function.reference_parameters:
                         state[_PointerKey(key)] = frozenset({_Target(key, index)})
             for result in function.results:
@@ -2590,7 +2916,13 @@ def _summaries(source: str, code: str, functions: list[_Function], parser: _Pars
             variants.append(_Summary(analysis.returns, analysis.effects, function.variadic,
                                      analysis.writes, analysis.value_returns, analysis.native_writes,
                                      frozenset(origin.parameter for origin in analysis.reader_scans
-                                               if origin.parameter is not None)))
+                                               if origin.parameter is not None),
+                                     frozenset(target.parameter for target in analysis.buffer_escapes
+                                               if target.parameter is not None),
+                                     frozenset(target.parameter for target in analysis.buffer_writes
+                                               if target.parameter is not None),
+                                     frozenset(target.parameter for target in analysis.buffer_borrows
+                                               if target.parameter is not None)))
         newly_uncertain = (mutations & global_cells) - uncertain_globals
         if newly_uncertain:
             # Package callbacks are mutable cells. A write in any selected

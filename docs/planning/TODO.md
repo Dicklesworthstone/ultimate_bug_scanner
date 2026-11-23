@@ -684,3 +684,101 @@ This is preserved source work, not an activated scanner repair or release claim.
   `8dd56b328b033f8653fdcc47bc91a6288c998ec28ad7fdcaa2abb1a852d14765`.
   Full language cohorts, whole-repository and release qualification remain
   open; unsupported native protocols continue to report incomplete analysis.
+
+## 17. November 23 continuation: converted worktrees and native input transport
+
+The implementation gaps below are now addressed on main through development
+versions 5.5.119–5.5.122. The existing acceptance criteria remain unchanged:
+implementation progress, observed runtime results, interrupted checks and
+checksum reconstruction are recorded separately. The three native-dataflow
+Beads remain in progress because their broader qualification is unfinished.
+
+### Functionality delivered
+
+- [x] C4 cache correctness: use actual working-tree bytes when Git attributes
+  or core.autocrlf can transform content. A normalized index object must not
+  replay a clean scan over changed source. Preserve the ordinary-file fast
+  path; cover filters literally named unset/unspecified, dependency changes
+  and edits during analysis. Commit: `9ff9eb6867df3270cfb75c2fc064a8d5a926eef1`.
+- [x] `1b9j.6.16`: native Array.from copies and selected synchronous mappers
+  retain payloads, shallow identities, captured writes, live length and dense
+  holes. Capture evaluated callable identity and supply exactly two mapper
+  arguments. Mixed bindings and unsupported protocols stay explicitly partial.
+  Commit: `83f5135a771eb5ff29f04299212e2d383d217c16`.
+- [x] `1b9j.6.17`: native filter(None, stdin) transports consumed text/bytes
+  through next, loops, materialization, aliases, selected helpers and native
+  joins. Saved bytes-literal join methods retain their receiver. Shared cursor
+  and EOF uncertainty cannot become a false clean after seeking or alias reuse.
+  Commit: `0fc10c0a47247f7dde3bf93e739c26c75524d498`.
+- [x] `1b9j.6.18`: native io.ReadFull/io.ReadAtLeast write provenance into
+  supported byte-slice backing arrays, aliases/reslices and selected helper
+  destinations. Preserve possible old contents after partial writes; keep
+  count/error/length metadata clean. Borrowed readers and opaque slice-header
+  escapes revoke stale backing proofs. This is the 5.5.122 implementation.
+
+### Runtime evidence actually observed through DSR
+
+| Area | Source/native evidence | Real public scanner evidence |
+| --- | --- | --- |
+| Cache | Frozen baseline: 9 methods, 10 failures. Final: all 9 pass, plus 2 preserved filename/index-flag controls. | Both module and runner SARIF pass cold clean, filtered edit and warm positive reuse. |
+| JavaScript | All 19 feature methods pass. Unchanged 18-case corpus: 15 exact, 3 explicit partial, 0 incorrect-complete; all 18 Node witnesses match. | All 27 module/runner JSON/SARIF, selection, suppression, cache/edit and partial-nonreuse calls pass, zero skips. |
+| Python | All 12 focused and 22 selected adjacent methods pass. Unchanged 17-case corpus: 16 exact, 1 unsupported-predicate partial, 0 incorrect-complete; all 17 CPython witnesses match. | The 27-call gate launched; completion was unobserved after workspace loss. |
+| Go | 23 source methods and 1 package-cache regression pass; unchanged independent corpus is 18/18 exact. Seven opaque header-escape failures were reproduced and then fixed. | All 32 module/runner JSON/SARIF calls pass with original assertions and 45-second child deadlines. |
+
+The real Go compiler witness remains skipped. The other two skips in the
+27-method Go source selection were the public methods, which subsequently
+passed separately. CPython witnesses used Python 3.12.14.
+
+Useful log SHA256 receipts:
+
+- Cache final regressions: `a445c3db7e8a39b11e0715b0919a9903e609cdd9e9b9f692c05e3a82c09594b2`.
+- Cache module SARIF: `5aacdbf9edeb6e642ee502da0ed99b95a22c634f94f46c2c2f59f6a73d35fbb5`.
+- Cache runner SARIF: `5306641d0beaef12219f2940b422f841fc935d2211c790b8e997ab5e807c31cd`.
+- JS public 27: `57be1850160fbdd8d988a0c61fe0ca2cb6474b996cefd81485ea210f3bf76912`.
+- Python focused/oracle: `e46faf3e484a6682017795ffe5e3b712ee399764f0c52e7d2bde3dc7642ebc16`.
+- Python adjacent: `5d29e3ab72134633f205ffb34d22ec43842c1551d33ccacd2bb9ba06bba1f81c`.
+- Go source/cache/oracle: `d5300510d46dfdcff767c76c68a186663da0cf0e08d54be616863e3a64c0c083`.
+- Go public 32: `0d9e038b6d35011d250296aefadc2e4899722ed9500cfb59583dbe8c3d027395`.
+- Go final integrity/syntax/diff: `1876a8b2a1246aef02b01de9d121b03f06d4bf3a44aa75a8a4f7bfa3ebcc10c1`.
+
+### Integrity recovery and remaining gates
+
+Canonical generation and checksum/syntax/diff verification passed on each
+isolated candidate before workspace loss. All implementation/test blobs were
+verified against live file Git hashes. The complete JS publication matched
+all 23 tracked changed paths, including scripts/new-module.sh; that commit
+also carried the scaffolder pin omitted from the first cache publication.
+
+The executor then disconnected before the final Python/Go pin files could
+be read for upload. Two independent implementations recovered the canonical
+chains from separately preserved exact bytes, following the repository
+updater's dependency order. All 21 observed JS control files matched their
+Git SHA, SHA256 and UTF-8 size; both reconstructions matched on all 42 later
+pin files, and all uploads returned their expected Git hashes. This is
+content-reconstruction evidence, not a runtime rerun or a direct comparison
+against the unavailable 5.5.121/5.5.122 working files. The independent report
+is Git blob `e27c7b757688ac377aa723a9d9eea54362b668b1`, SHA256
+`9f9317f3fae63d9286cc0b5452f1aa52d49f38f83bce402c8b8fbd3df0bcefa6`.
+
+- [ ] Recover or rerun the two Python public methods; do not count the
+  interrupted 27-call launch as a pass. Its following self-scan did not launch.
+- [ ] Complete strict changed-source scans. Cache self-scan was explicitly
+  partial (exit 2, 0 critical, 13 warnings, 252 info). JS self-scan submission
+  had no observed launch/result. The combined eight-file scan launched but
+  its result was lost with the executor.
+- [ ] Complete the broader JS/Go cohorts. Recorded native-witness and outer
+  timeouts remain failures/incomplete attempts, not aggregate passes.
+- [ ] Complete repository qualification. The unchanged full suite was
+  attempted on the cache delivery: all 12 rule-inventory gates passed, then
+  the existing Swift buggy/clean fixture-pair assertion failed. Unit discovery
+  started, but the 240-second DSR deadline ended the run before its summary.
+  Log SHA256: `a5a9aae25ce16ad75a4d481fa34d7a76f5b8c26fbc751db12cfa23cf42e362ab`.
+  No completed full-suite result exists for the final combined tree.
+- [ ] ShellCheck remains unavailable (observed exit 127); the real Go compiler
+  witness remains unavailable. Version-tag and release qualification stay open.
+- [ ] Cache primary-JSON attempts reached their subprocess deadlines after
+  native findings were written. Successful SARIF runs and correct JSON
+  sidecars do not count as completed primary-JSON command qualification.
+
+No assertions, deadlines, suppressions or acceptance criteria were weakened.
+No broad D6, whole-repository or release closure is claimed.

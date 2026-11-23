@@ -187,3 +187,41 @@ after functional completion and run prescribed gates. Keep the broader Go input,
 D6 and release goals open. All 25 recorded manual hunks were checked against the
 immutable base and the recovery patch replayed both ways in tool memory; this
 does not establish that the unfinished candidate executes correctly.
+
+## November 23 continuation — candidates remain unactivated
+
+The starting revision was `b27c0dcc126a4181ca0766a69ed91cffb9ed305e`.
+The workspace filesystem ran out of space, so the session copied its checkout
+and DSR into a separate temporary filesystem without deleting the originals.
+The execution service subsequently disconnected again. Interrupted launches and
+missing receipts are not test passes. These commits preserve implementations
+and regression tests for qualification in a working executor; the production
+analyzers and integrity pins are not changed by the checkpoint commits.
+
+### JavaScript Array.from
+
+The updated `javascript-array-from-candidate.patch` applies to the starting
+revision above. It includes the native mapper/copy implementation, 20 maintained
+and opt-in public methods, evaluated-mapper identity checks, explicit incomplete
+handling for mixed mapper alternatives, and native-member deletion tracking.
+Saved native aliases remain distinct from later property deletion. The public
+methods specify 16 format/selection calls and seven cache/edit/suppression/partial
+calls; they have not run.
+
+Static review also found that native Array.from probing must follow existing
+SQL receiver dispatch. The final candidate preserves that dispatch order and
+adds a bound/raw Drizzle regression. These review follow-ups were reconstructed
+in tool memory after the disconnect, not applied or executed in the lost workspace.
+
+Recovery objects: exact last authored snapshot patch
+`6685704650bbc56dfd8029ed64f1693c9d9fa522`; reviewed final patch
+`393101150245677e54b00a818438a3c90d7151fa`. Both target the immutable
+base source/test blobs documented in the patch. Root independently replayed the
+final patch forward and backward against those base files with exact equality.
+That establishes patch reconstruction only. The candidate DSR run and unchanged
+18-case independent replay produced no recovered completion; no new JavaScript
+runtime pass, accuracy result, activation or release qualification is claimed.
+
+Before activation, run the maintained and independent cases, the new public
+methods and affected heap/callback/SQL cohorts, then regenerate canonical pins
+and complete the original Bead's DSR gates. Keep `1b9j.6.16` in progress.

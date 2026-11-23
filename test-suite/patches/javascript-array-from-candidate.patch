@@ -24,32 +24,37 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
              if self.rule == 'js.taint.sql':
                  if _sql_object_ref(ref) or _sql_name_ref(ref):
                      self.incomplete.add('Drizzle SQL object property access requires unsupported wrapper semantics')
-@@ -1954,7 +1963,9 @@
+@@ -1954,7 +1963,8 @@
                  value = self.property(fact, key, state)
                  if not _refs(fact) or frozenset(fact):
                      value = _join(value, selected)
 -                absent = (bool(_refs(fact)) and not frozenset(fact) and key is not None
-+                # Builtin properties can have a proven native value without
-+                # an own slot in the modeled heap (for example Array.from).
++                # A proven native property need not have an own heap slot.
 +                absent = (bool(_refs(fact)) and not frozenset(fact) and not _refs(value) and key is not None
                            and all(key not in state.heap.get(parent, {}) and None not in state.heap.get(parent, {})
                                    for parent in _refs(fact)))
                  self.bind_pattern(begin, right, value, state, position, absent, binding, target_reference)
-@@ -2923,16 +2934,19 @@
+@@ -2939,16 +2949,19 @@
              # Unlike the other visitors, find calls the predicate for absent
              # slots too: an optional object can therefore supply undefined.
              scalar = (undefined or not _refs(value) or bool(frozenset(value))
 -                      or (method in {'find', 'findIndex', 'findLast', 'findLastIndex'}
-+                      or (method in {'from', 'find', 'findIndex', 'findLast', 'findLastIndex'}
-                           and getattr(value, 'absent', False)))
-             actual.append((value, scalar))
-             if scalar and not undefined:
-                 missing.add(index)
-                 if index < len(callee.params) and callee.params[index][2] is not None:
-                     self.incomplete.add(f'Array.{method} {label} default requires a known undefined or present value')
+-                          and getattr(value, 'absent', False)))
+-            actual.append((value, scalar))
+-            if scalar and not undefined:
+-                missing.add(index)
+-                if index < len(callee.params) and callee.params[index][2] is not None:
+-                    self.incomplete.add(f'Array.{method} {label} default requires a known undefined or present value')
 -        actual.extend([(frozenset(), False), (receiver, False)])
 -        prepared = (actual, None, missing,
 -                    {len(values): 'present', len(values) + 1: 'present'})
++                      or (method in {'from', 'find', 'findIndex', 'findLast', 'findLastIndex'}
++                          and getattr(value, 'absent', False)))
++            actual.append((value, scalar))
++            if scalar and not undefined:
++                missing.add(index)
++                if index < len(callee.params) and callee.params[index][2] is not None:
++                    self.incomplete.add(f'Array.{method} {label} default requires a known undefined or present value')
 +        actual.append((frozenset(), False))
 +        kinds = {len(values): 'present'}
 +        if method != 'from':
@@ -59,11 +64,15 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
          bound = self.bind(callee, prepared, state, location, receiver=this_arg)
          returned, effects, normal, thrown, exceptional, incomplete = self.engine.heap_call(
              callee, self.rule, location, bound, state)
-@@ -3166,11 +3180,41 @@
+@@ -3182,11 +3195,55 @@
                      for index in range(next(iter(sizes)))], True
          return [_join(*(item for items in variants for item in items))], False
  
 -    def array_iteration(self, receiver, method, arguments, prepared, state, location, callback=None):
+-        """Execute native callbacks over live finite array slots.
+-
+-        The source length is captured once, while elements are read immediately
+-        before each callback. Methods that skip holes visit only present slots;
 +    def array_from(self, arguments, prepared, state, location, callback):
 +        """Copy native array iterators through the shared callback transfer.
 +
@@ -89,22 +98,34 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
 +            self.escape_callbacks((value for value, _missing in actual[1:]), state)
 +            self.incomplete.add('Array.from requires a proven native array iterator; array-like and custom iterable inputs are unsupported')
 +            return self.materialize(receiver, state)
-+        mapper = (actual[1:], None, {index - 1 for index in missing if index > 0},
-+                  {index - 1: kind for index, kind in kinds.items() if index > 0})
++        undefined_mapper = (len(actual) < 2 or kinds.get(1) == 'undefined'
++                            or (actual[1][1] and 1 not in missing))
++        if not undefined_mapper:
++            mapper_value = actual[1][0]
++            # A scalar/unknown alternative may be undefined (identity copy),
++            # another callable or a throwing noncallable. A cached lexical
++            # callback must not turn any of those paths into definite cleanup.
++            if (_function_target(mapper_value) is None
++                    or getattr(mapper_value, 'scalar_alternative', False)):
++                self.escape_callbacks((value for value, _missing in actual[1:]), state)
++                self.incomplete.add('Array.from mapper requires an unambiguous selected callable or undefined')
++                return self.materialize(receiver, state)
++        mapper_kinds = {index - 1: kind for index, kind in kinds.items() if index > 0}
++        if undefined_mapper and len(actual) > 1:
++            mapper_kinds[0] = 'undefined'
++        mapper = (actual[1:], None, {index - 1 for index in missing if index > 0}, mapper_kinds)
 +        return self.array_iteration(receiver, 'from', arguments[1:], mapper, state, location, callback)
 +
 +    def array_iteration(self, receiver, method, arguments, prepared, state, location, callback=None):
-         """Execute native callbacks over live finite array slots.
- 
--        The source length is captured once, while elements are read immediately
--        before each callback. Methods that skip holes visit only present slots;
++        """Execute native callbacks over live finite array slots.
++
 +        Array.from reads the iterator's live length; other methods capture it
 +        once. Elements are read immediately before each callback.
 +        Methods that skip holes visit only present slots;
          Find variants visit every index, charged against the shared work budget.
          Callback writes, throws and borrowed object identities use the same
          bounded heap summaries as ordinary local calls. Map preserves source
-@@ -3184,7 +3228,9 @@
+@@ -3200,7 +3257,9 @@
          order; index variants return clean indices. Missing and deleted slots
          still execute their predicates in either direction.
          """
@@ -115,34 +136,41 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
          callee = (_function_target(actual[0][0]) or callback) if actual else None
          reducing = method in {'reduce', 'reduceRight'}
          searching = method in {'find', 'findIndex', 'findLast', 'findLastIndex'}
-@@ -3192,15 +3238,15 @@
+@@ -3208,15 +3267,15 @@
          testing = method in {'some', 'every'} or searching
          filtering = method == 'filter'
          reverse = method in {'reduceRight', 'findLast', 'findLastIndex'}
 -        produces_array = method in {'map', 'flatMap', 'filter'}
-+        produces_array = method in {'from', 'map', 'flatMap', 'filter'}
-         result = (self.scope, location, 'array-' + method)
-         returned = (_Fact(refs=(result,)) if produces_array else
-                     actual[1][0] if reducing and len(actual) > 1 else frozenset())
-         previous = state.heap.get(result) if produces_array else None
-         previous_length = state.array_lengths.get(result) if produces_array else None
-         refs = _refs(receiver)
+-        result = (self.scope, location, 'array-' + method)
+-        returned = (_Fact(refs=(result,)) if produces_array else
+-                    actual[1][0] if reducing and len(actual) > 1 else frozenset())
+-        previous = state.heap.get(result) if produces_array else None
+-        previous_length = state.array_lengths.get(result) if produces_array else None
+-        refs = _refs(receiver)
 -        if (uncertain is not None or callee is None or callee.generator or callee.asynchronous
 -                or self.escaped_callable(callee)):
++        produces_array = method in {'from', 'map', 'flatMap', 'filter'}
++        result = (self.scope, location, 'array-' + method)
++        returned = (_Fact(refs=(result,)) if produces_array else
++                    actual[1][0] if reducing and len(actual) > 1 else frozenset())
++        previous = state.heap.get(result) if produces_array else None
++        previous_length = state.array_lengths.get(result) if produces_array else None
++        refs = _refs(receiver)
 +        if (uncertain is not None or (mapping and (
 +                callee is None or callee.generator or callee.asynchronous or self.escaped_callable(callee)))):
              if callee is not None:
                  self.engine.escaped_callbacks.add(callee)
              self.incomplete.add(f'Array.{method} requires a selected synchronous callback')
-@@ -3208,10 +3254,12 @@
+@@ -3224,10 +3283,12 @@
                  state.heap[result] = dict(previous or {})
                  state.array_lengths[result] = None
              return returned
 -        if any(not self.array_mutation_contract(ref, state, species=produces_array)
-+        if any(not self.array_mutation_contract(ref, state, species=produces_array and not collecting)
-                or state.array_lengths[ref] is None or None in state.heap[ref] for ref in refs):
+-               or state.array_lengths[ref] is None or None in state.heap[ref] for ref in refs):
 -            self.engine.escaped_callbacks.add(callee)
 -            requirement = 'finite ordinary arrays and native array species' if produces_array else 'finite ordinary arrays'
++        if any(not self.array_mutation_contract(ref, state, species=produces_array and not collecting)
++               or state.array_lengths[ref] is None or None in state.heap[ref] for ref in refs):
 +            if callee is not None:
 +                self.engine.escaped_callbacks.add(callee)
 +            requirement = ('finite ordinary arrays and native array species'
@@ -150,24 +178,30 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
              self.incomplete.add(f'Array.{method} requires {requirement}')
              if produces_array:
                  state.heap[result] = dict(previous or {})
-@@ -3220,14 +3268,14 @@
+@@ -3236,14 +3297,14 @@
          this_arg = actual[1][0] if not reducing and len(actual) > 1 else frozenset()
          result_kind = self.flatmap_result_kind(callee) if method == 'flatMap' else None
          predicate_truth = self.predicate_result_truth(callee) if testing or filtering else None
 -        if (not callee.arrow and not _refs(this_arg)
-+        if (mapping and not callee.arrow and not _refs(this_arg)
-                 and re.search(r'\bthis\b', callee.code[callee.body_start:callee.body_end])):
-             self.incomplete.add(f'Array.{method} callback requires a known this receiver')
-             if produces_array:
-                 state.heap[result] = dict(previous or {})
-                 state.array_lengths[result] = None
-             return returned
+-                and re.search(r'\bthis\b', callee.code[callee.body_start:callee.body_end])):
+-            self.incomplete.add(f'Array.{method} callback requires a known this receiver')
+-            if produces_array:
+-                state.heap[result] = dict(previous or {})
+-                state.array_lengths[result] = None
+-            return returned
 -        if callee.name and not callee.declaration and not callee.arrow:
++        if (mapping and not callee.arrow and not _refs(this_arg)
++                and re.search(r'\bthis\b', callee.code[callee.body_start:callee.body_end])):
++            self.incomplete.add(f'Array.{method} callback requires a known this receiver')
++            if produces_array:
++                state.heap[result] = dict(previous or {})
++                state.array_lengths[result] = None
++            return returned
 +        if mapping and callee.name and not callee.declaration and not callee.arrow:
              # The general binding model does not create a function
              # expression's private immutable self-name environment. A
              # callback that exposes that name can outlive this invocation;
-@@ -3238,8 +3286,9 @@
+@@ -3254,8 +3315,9 @@
                         callee.code[callee.body_start:callee.body_end])):
                  self.incomplete.add(f'Array.{method} named callback self-reference requires unsupported lexical binding semantics')
                  self.engine.escaped_callbacks.add(callee)
@@ -179,7 +213,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
                  and arguments[0][0] <= callee.start < callee.end <= arguments[0][1]):
              # A literal callback is not an independent entrypoint. In
              # particular an empty/sparse array cannot execute its sink body.
-@@ -3260,7 +3309,7 @@
+@@ -3276,7 +3338,7 @@
              accumulator = actual[1][0] if initialized else frozenset()
              seed_state = branch.copy() if uninitialized else None
              stopped = None
@@ -188,7 +222,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
                  source = branch.heap[ref]
                  self.engine.budget.spend(1 + len(source))
                  if not self.array_mutation_contract(ref, branch) or None in source:
-@@ -3272,7 +3321,9 @@
+@@ -3288,7 +3350,9 @@
                      self.incomplete.add(f'Array.{method} callback changed the source to an unknown length')
                      size = None
                      break
@@ -199,7 +233,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
                      # FindViaPredicate uses Get without HasProperty. Even a
                      # hole, or an index removed by an earlier callback, is a
                      # definite visit within the original length snapshot.
-@@ -3285,7 +3336,7 @@
+@@ -3301,7 +3365,7 @@
                          break
                      index = max(positions) if reverse else min(positions)
                  value = self.property(selected, str(index), branch)
@@ -208,7 +242,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
                  next_cursor = index - 1 if reverse else index + 1
                  if reducing and not initialized:
                      # Without an initial value, the first present element is
-@@ -3305,8 +3356,8 @@
+@@ -3321,8 +3385,8 @@
                      mapped = self.array_callback(callee, value, selected, this_arg, branch,
                                                   (location, method + '-index', index), method,
                                                   accumulator if reducing else None,
@@ -219,19 +253,20 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
                  except _NoNormalCompletion:
                      if bypass is None:
                          branch = None
-@@ -3346,8 +3397,10 @@
+@@ -3362,8 +3426,10 @@
                          branch = _join_states(branch, bypass)
                      if reducing:
                          accumulator = _join(mapped, retained, seed)
 -                    elif method == 'map':
+-                        slots[str(index)] = _Fact(mapped, _refs(mapped), absent=not definite)
 +                    elif collecting or method == 'map':
-                         slots[str(index)] = _Fact(mapped, _refs(mapped), absent=not definite)
++                        slots[str(index)] = _Fact(mapped, _refs(mapped), absent=not definite)
 +                        if collecting:
 +                            size = next_cursor
                      elif filtering and predicate_truth is not False:
                          # The predicate chooses the original value; its return
                          # fact is never the output element. Unknown choices and
-@@ -3376,6 +3429,12 @@
+@@ -3392,6 +3458,12 @@
                              size = None
                  uninitialized = uninitialized and not definite
                  cursor = next_cursor
@@ -244,29 +279,46 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
              if testing:
                  if value_search and branch is not None:
                      # A completed nonmatching path returns undefined. Keep it
-@@ -3463,8 +3522,13 @@
+@@ -3479,8 +3551,13 @@
          """Capture GetValue(callee) before arguments can replace a method."""
          receiver_name, dot, method = name.rpartition('.')
          if not dot:
+-            if self.rule == 'js.taint.sql':
+-                target = self.reference(name, state)
 +            target = self.reference(name, state)
 +            if _ARRAY_FROM in _refs(target):
 +                proven = (_refs(target) == {_ARRAY_FROM} and not frozenset(target)
 +                          and not getattr(target, 'absent', False)
 +                          and not getattr(target, 'scalar_alternative', False))
 +                return 'array-from' if proven else 'array-from-unknown', target, 'from'
-             if self.rule == 'js.taint.sql':
--                target = self.reference(name, state)
++            if self.rule == 'js.taint.sql':
                  if not frozenset(target) and len(_refs(target)) == 1:
                      ref = next(iter(_refs(target)))
                      if _sql_builtin_ref(ref) and ref[1].split('.')[-1] in _SQL_FACTORIES:
-@@ -3479,6 +3543,22 @@
+@@ -3495,14 +3572,30 @@
          for key in parts[1:]:
              receiver = self.property(receiver, key, state)
          refs = _refs(receiver)
+-        if self.rule == 'js.taint.sql' and refs:
+-            if refs == {('builtin', 'drizzle.sql')} and not frozenset(receiver):
+-                slots = state.heap.get(('builtin', 'drizzle.sql'), {})
+-                if method in _SQL_FACTORIES and method not in slots and None not in slots:
+-                    return 'sql-factory', receiver, method
+-                return 'sql-unknown', receiver, method
+-            if any(_sql_object_ref(ref) or _sql_name_ref(ref) for ref in refs):
+-                return self.sql_method(receiver, method, state)
 +        if _ARRAY_FROM in refs:
 +            # Borrowed constructor invocation and bound receiver semantics
 +            # need a separate proof; the captured native must not vanish.
 +            return 'array-from-unknown', receiver, method
++        if self.rule == 'js.taint.sql' and refs:
++            if refs == {('builtin', 'drizzle.sql')} and not frozenset(receiver):
++                slots = state.heap.get(('builtin', 'drizzle.sql'), {})
++                if method in _SQL_FACTORIES and method not in slots and None not in slots:
++                    return 'sql-factory', receiver, method
++                return 'sql-unknown', receiver, method
++            if any(_sql_object_ref(ref) or _sql_name_ref(ref) for ref in refs):
++                return self.sql_method(receiver, method, state)
 +        target = self.property(receiver, method, state)
 +        if _ARRAY_FROM in _refs(target):
 +            ordinary = (refs == {('builtin', 'Array')} or bool(refs) and all(
@@ -279,10 +331,10 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
 +                      and not getattr(target, 'absent', False)
 +                      and not getattr(target, 'scalar_alternative', False))
 +            return 'array-from' if proven else 'array-from-unknown', target, 'from'
-         if self.rule == 'js.taint.sql' and refs:
-             if refs == {('builtin', 'drizzle.sql')} and not frozenset(receiver):
-                 slots = state.heap.get(('builtin', 'drizzle.sql'), {})
-@@ -3512,6 +3592,12 @@
+         object_native = (refs == {('builtin', 'Object')} and not frozenset(receiver)
+                          and method not in state.heap.get(('builtin', 'Object'), {})
+                          and None not in state.heap.get(('builtin', 'Object'), {}))
+@@ -3528,6 +3621,12 @@
          kind, receiver, method = native
          actual, uncertain, _missing, _kinds = prepared
          values = [value for value, _missing in actual]
@@ -295,7 +347,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
          if kind == 'array' and method == 'fill':
              return self.array_fill(receiver, arguments, prepared, state)
          if kind == 'array' and method == 'copyWithin':
-@@ -3871,6 +3957,9 @@
+@@ -3887,6 +3986,9 @@
              self.incomplete.add(f'Array.{key} requires a known native or selected callable')
          if callable_value and report:
              self.incomplete.add('Own method requires an unambiguous callable and ordinary property semantics')
@@ -305,7 +357,19 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
          return None, receiver
  
      def callable(self, start, end, state):
-@@ -4522,6 +4611,8 @@
+@@ -4320,6 +4422,11 @@
+                         for name in ((key,) if key is not None else tuple(slots)):
+                             if name not in _HEAP_METADATA:
+                                 slots[name] = _alternatives(slots.get(name, _ABSENT), _ABSENT)
++                    if ref == ('builtin', 'Array') and key in {None, 'from'}:
++                        # Do not resurrect an implicit native property after
++                        # an exact or possible deletion. Saved function aliases
++                        # still refer to the original native independently.
++                        slots['from'] = _ABSENT
+                 return frozenset()
+         if code[start] in '[{' and start in self.pairs:
+             closing = self.pairs[start]
+@@ -4538,6 +4645,8 @@
                              'sort', 'toSorted', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
                              'find', 'findIndex', 'findLast', 'findLastIndex'}
                          and arguments else None)
@@ -314,7 +378,7 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
              if arguments and callback is None:
                  unmodeled = self.callable(*arguments[0], state)
                  if (unmodeled is not None and unmodeled.parent is self.scope
-@@ -5224,7 +5315,7 @@
+@@ -5240,7 +5349,7 @@
          self.flatmap_result_kinds = {}
          self.predicate_result_truths = {}
          self.has_array_callbacks = any(name in self.text for name in (
@@ -326,11 +390,44 @@ diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ub
 diff --git a/test-suite/quality/test_taint_js_heap.py b/test-suite/quality/test_taint_js_heap.py
 --- a/test-suite/quality/test_taint_js_heap.py
 +++ b/test-suite/quality/test_taint_js_heap.py
-@@ -4235,7 +4235,174 @@
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ from collections import Counter
++from contextlib import contextmanager
+ import hashlib
+ import itertools
+ import json
+@@ -20,6 +21,14 @@
+ from ubs_core.registry import RunContext
+ 
+ 
++@contextmanager
++def retained_directory(prefix):
++    """Keep scanner inputs under the approved artifact root for inspection."""
++    artifacts = ROOT / 'test-suite/artifacts/javascript-heap'
++    artifacts.mkdir(parents=True, exist_ok=True)
++    yield tempfile.mkdtemp(prefix=prefix, dir=artifacts)
++
++
+ class HeapTaintTests(unittest.TestCase):
+     def run(self, result=None):
+         started = time.monotonic()
+@@ -30,7 +39,7 @@
+         return result
+ 
+     def scan(self, source, *rules):
+-        with tempfile.TemporaryDirectory(prefix='ubs-heap-') as scratch:
++        with retained_directory(prefix='ubs-heap-') as scratch:
+             path = Path(scratch) / 'handler.js'
+             path.write_text(source + '\n', encoding='utf-8')
+             findings = list(taint.run(RunContext(lang='javascript', files=[path])))
+@@ -4441,8 +4450,285 @@
              'items.flatMap((value, index, source) => { source.length = unknown; return [value]; });',
              'xss', reason='flatMap.*length')
  
 -    def assert_fill_partial(self, source, *rules, reason='Array.fill'):
+-        with tempfile.TemporaryDirectory(prefix='ubs-fill-partial-') as scratch:
 +    def test_array_from_mapper_returns_and_sanitizer_domains(self):
 +        source = ('const out = Array.from([1], value => req.query.html); '
 +                  'res.send(out[0]); res.send(out.length);')
@@ -498,7 +595,118 @@ diff --git a/test-suite/quality/test_taint_js_heap.py b/test-suite/quality/test_
 +        self.assert_fill_partial('res.send(req.query.html); const items = []; items.length = 4294967294; '
 +            'Array.from(items, value => "safe");', 'xss', reason='Array.from.*work limit')
 +
++    def test_array_from_mixed_mapper_cannot_prove_definite_cleanup(self):
++        for choice in ('flag ? clear : undefined', 'flag ? undefined : clear'):
++            with self.subTest(choice=choice):
++                source = ('const box = {html: req.query.html}; '
++                          'function clear(value) { box.html = "safe"; return "safe"; } '
++                          f'const mapper = {choice}; '
++                          'const out = Array.from([req.query.html], mapper); '
++                          'res.send(box.html); res.send(out[0]);')
++                self.assert_fill_partial(source, 'xss', 'xss', reason='Array.from.*mapper')
++                for flag in ('true', 'false'):
++                    mapped = (flag == 'true') == choice.startswith('flag ? clear')
++                    self.assert_runtime_sends('const flag = ' + flag + '; ' + source,
++                                              ['safe', 'safe'] if mapped else
++                                              ['review-input', 'review-input'])
++
++    def test_array_from_uses_mapper_snapshot_after_source_argument_effects(self):
++        source = ('let mapper = value => "safe"; '
++                  'function source() { mapper = value => value; return [req.query.html]; } '
++                  'const out = Array.from(source(), mapper); res.send(out[0]);')
++        self.scan(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input'])
++        for call in ('Array.from(...[[req.query.html], ,])',
++                     'copy([req.query.html])', 'copy([req.query.html], undefined)'):
++            with self.subTest(call=call):
++                source = ('function copy(items, mapper) { return Array.from(items, mapper); } '
++                          f'const out = {call}; res.send(out[0]);')
++                self.scan(source, 'xss')
++                self.assert_runtime_sends(source, ['review-input'])
++
++    def test_array_from_deleted_factory_does_not_replace_saved_native_identity(self):
++        for deletion in ('delete Array.from;', 'delete Array[unknown];'):
++            with self.subTest(deletion=deletion):
++                self.assert_fill_partial('res.send(req.query.html); ' + deletion +
++                                         ' Array.from(["safe"], value => value);', 'xss', reason='Array.from')
++        source = ('const copy = Array.from; delete Array.from; '
++                  'const out = copy([1], value => req.query.html); res.send(out[0]);')
++        self.scan(source, 'xss')
++        self.assert_runtime_sends(source, ['review-input'])
++
++    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
++                         'real module and meta-runner integration requires ast-grep')
++    def test_array_from_public_json_sarif_selection_and_partial(self):
++        cases = (
++            ('effects', 'let saved="safe";\nconst box={html:"safe"};\n'
++             'const out=Array.from([box], value=>{saved=req.query.html;value.html=saved;return value;});\n'
++             'res.send(saved);\nres.send(out[0].html);\nres.send(box.html);\n',
++             [('javascript.taint.xss', line, 1) for line in (4, 5, 6)], False),
++            ('clean', 'const out=Array.from([req.query.html], value=>"safe");\n'
++             'res.send(out[0]);\nres.send(out.length);\n', [], False),
++            ('partial', 'res.send(req.query.html);\nArray.from(["safe"], external);\n',
++             [('javascript.taint.xss', 1, 1)], True),
++            ('mixed', 'const box={html:req.query.html};\n'
++             'function clear(value){box.html="safe";return "safe";}\n'
++             'const mapper=flag?clear:undefined;\n'
++             'const out=Array.from([req.query.html], mapper);\n'
++             'res.send(box.html);\nres.send(out[0]);\n',
++             [('javascript.taint.xss', line, 1) for line in (5, 6)], True),
++        )
++        artifacts = ROOT / 'test-suite/artifacts/javascript-array-from-public'
++        artifacts.mkdir(parents=True, exist_ok=True)
++        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
++        for name, source, expected, partial in cases:
++            if not partial:
++                self.assert_runtime_sends(source, ['review-input'] * 3 if name == 'effects' else ['safe', 1])
++            project = scratch / name
++            project.mkdir()
++            target = project / 'handler.js'
++            target.write_text(source, encoding='utf-8')
++            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
++            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
++                with self.subTest(case=name, meta=meta, format=fmt):
++                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
++                                            expected=expected, partial=partial, partial_reason='Array.from')
++
++    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
++                         'real meta-runner cache integration requires ast-grep')
++    def test_array_from_public_cache_edits_suppression_and_partial_nonreuse(self):
++        artifacts = ROOT / 'test-suite/artifacts/javascript-array-from-public'
++        artifacts.mkdir(parents=True, exist_ok=True)
++        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
++        target = scratch / 'handler.js'
++        unsafe = 'const out=Array.from(["safe"], value=>req.query.html);\nres.send(out[0]);\n'
++        clean = unsafe.replace('value=>req.query.html', 'value=>"safe"')
++        suppressed = unsafe.replace('res.send(out[0]);', 'res.send(out[0]); // ubs:ignore')
++        partial = 'res.send(req.query.html);\nArray.from(["safe"], external);\n'
++        cases = (
++            (unsafe, [('javascript.taint.xss', 2, 1)], False, 0),
++            (unsafe, [('javascript.taint.xss', 2, 1)], False, 1),
++            (clean, [], False, 0), (suppressed, [], False, 0),
++            (unsafe, [('javascript.taint.xss', 2, 1)], False, 1),
++            (partial, [('javascript.taint.xss', 1, 1)], True, 0),
++            (partial, [('javascript.taint.xss', 1, 1)], True, 0),
++        )
++        for index, (source, expected, incomplete, cache_hits) in enumerate(cases):
++            with self.subTest(index=index):
++                if index not in (1, 6):
++                    target.write_text(source, encoding='utf-8')
++                report = self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
++                                                expected=expected, cache=True, partial=incomplete,
++                                                partial_reason='Array.from')
++                self.assertEqual(report['profile']['cache_hits'], cache_hits, report)
++
++    def test_array_from_preserves_native_sql_method_dispatch(self):
++        values = ('import {sql} from "drizzle-orm"; '
++                  'const values = Array.from([req.query.name], value => value); ')
++        self.scan(values + 'const query = sql`SELECT * FROM items WHERE name = ${values[0]}`; '
++                  'query.append(sql` AND code = ${req.query.code}`); db.execute(query);')
++        self.scan(values + 'const query = sql.empty(); query.append(sql.raw(values[0])); '
++                  'db.execute(query);', 'sql')
++
 +    def assert_fill_partial(self, source, *rules, reason='Array.fill'):
-         with tempfile.TemporaryDirectory(prefix='ubs-fill-partial-') as scratch:
++        with retained_directory(prefix='ubs-fill-partial-') as scratch:
              path = Path(scratch) / 'handler.js'
              path.write_text(source + '\n', encoding='utf-8')
+             findings = []

@@ -616,10 +616,12 @@ Recoverable implementations and unchanged probes are preserved as **unactivated*
 patches; see [the checkpoint](../../notes/native-dataflow-checkpoint-2026-11-22.md).
 This is preserved source work, not an activated scanner repair or release claim.
 
-- [ ] `1b9j.6.16`: finish native JavaScript `Array.from`. The archived candidate
-  passes all 14 new maintained methods (41 baseline assertion failures), but
-  mixed mapper alternatives, independent candidate replay, public reports and
-  adjacent/full gates remain pending.
+- [ ] `1b9j.6.16`: finish native JavaScript `Array.from`. The November 23
+  checkpoint rebases the candidate to `b27c0dcc` and adds mixed-mapper,
+  deleted-native-member, SQL-dispatch and public-report regressions (20 methods).
+  The final patch replays exactly in both directions; its runtime, independent,
+  public and adjacent/full checks remain unexecuted after executor loss. The
+  earlier 14-method pass applies only to the older archived candidate.
 - [ ] `1b9j.6.17`: finish Python `filter(None, stdin)` provenance. The exact
   archived candidate reduces 54 maintained baseline assertion failures to one
   diagnostic-label failure across ten methods. Native join consumption,

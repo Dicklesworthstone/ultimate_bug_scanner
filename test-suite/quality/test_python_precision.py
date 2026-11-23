@@ -3270,6 +3270,35 @@ class HeaderInjectionFlowTests(unittest.TestCase):
                 def view(request, response):
                     response.headers['X'] = asyncio.run(relay(request.args['x']))  # header-finding
             ''',
+            # GH #210: awaiting a task object is an Await over a Name, with
+            # no Call.func, inside a handler that returns a Response.
+            'awaited-task-name-in-finally': '''
+                import asyncio
+                from fastapi.responses import Response
+
+                async def handler():
+                    async def watch():
+                        await asyncio.sleep(1)
+                    watcher = asyncio.create_task(watch())
+                    try:
+                        return Response("ok")
+                    finally:
+                        watcher.cancel()
+                        try:
+                            await watcher
+                        except asyncio.CancelledError:
+                            pass
+            ''',
+            'awaited-task-name-keeps-later-header-sink': '''
+                import asyncio
+
+                async def view(request, response):
+                    async def watch():
+                        await asyncio.sleep(1)
+                    watcher = asyncio.create_task(watch())
+                    await watcher
+                    response.headers['X'] = request.args['x']  # header-finding
+            ''',
         })
 
     def test_exhausted_coroutines_preserve_actual_arguments_and_revoke_proofs(self):

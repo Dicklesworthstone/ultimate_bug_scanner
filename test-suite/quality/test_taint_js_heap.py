@@ -17,6 +17,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'modules/helpers'))
 from ubs_core.analyzers import taint_js as taint
+from ubs_core.io import temporary_directory
 from ubs_core.registry import RunContext
 
 
@@ -30,7 +31,7 @@ class HeapTaintTests(unittest.TestCase):
         return result
 
     def scan(self, source, *rules):
-        with tempfile.TemporaryDirectory(prefix='ubs-heap-') as scratch:
+        with temporary_directory(prefix='ubs-heap-') as scratch:
             path = Path(scratch) / 'handler.js'
             path.write_text(source + '\n', encoding='utf-8')
             findings = list(taint.run(RunContext(lang='javascript', files=[path])))
@@ -4441,8 +4442,316 @@ class HeapTaintTests(unittest.TestCase):
             'items.flatMap((value, index, source) => { source.length = unknown; return [value]; });',
             'xss', reason='flatMap.*length')
 
+    def test_array_from_mapper_returns_and_sanitizer_domains(self):
+        source = ('const out = Array.from([1], value => req.query.html); '
+                  'res.send(out[0]); res.send(out.length);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 1])
+        self.scan('const out = Array.from([req.query.html], value => "safe"); '
+                  'res.send(out[0]); eval(out[0]); db.query(out[0]); shell.exec(out[0]);')
+        self.scan('const out = Array.from([req.query.html], value => DOMPurify.sanitize(value)); '
+                  'res.send(out[0]); eval(out[0]); db.query(out[0]); shell.exec(out[0]);',
+                  'eval', 'sql', 'command')
+
+    def test_array_from_callback_effects_and_borrowed_objects(self):
+        source = ('let saved = "safe"; const box = {html: "safe"}; '
+                  'const out = Array.from([box], value => { value.html = req.query.html; '
+                  'saved = req.query.html; return value; }); '
+                  'res.send(box.html); res.send(out[0].html); res.send(saved);')
+        self.scan(source, 'xss', 'xss', 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'review-input', 'review-input'])
+        self.scan('const box = {html: req.query.html}; '
+                  'Array.from([box], value => { value.html = "safe"; return 0; }); res.send(box.html);')
+        self.scan('Array.from([req.query.html], value => { res.send(value); return "safe"; });', 'xss')
+
+    def test_array_from_plain_copy_is_fresh_and_shallow(self):
+        source = ('const box = {html: "safe"}; const items = [req.query.html, box]; '
+                  'const out = Array.from(items); items[0] = "safe"; out[1].html = req.query.html; '
+                  'res.send(out[0]); res.send(items[0]); res.send(box.html); res.send(out.length);')
+        self.scan(source, 'xss', 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe', 'review-input', 2])
+        self.scan('const items = [req.query.html, "safe"]; '
+                  'const out = Array.from(items); out[0] = "safe"; '
+                  'res.send(items[0]); res.send(out[0]); res.send(out[1]); res.send(out[2]);', 'xss')
+
+    def test_array_from_visits_holes_and_creates_dense_elements(self):
+        source = ('const out = Array.from([,], (value = req.query.html) => value); '
+                  'res.send(out[0]); res.send(out.length);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 1])
+        source = ('const items = Array.from([,]); let saved = "safe"; '
+                  'items.map(value => { saved = req.query.html; return value; }); res.send(saved);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan('let saved = "safe"; Array.from([], value => { '
+                  'saved = req.query.html; res.send(req.query.html); return value; }); res.send(saved);')
+
+    def test_array_from_uses_live_array_length_and_element_values(self):
+        cases = (
+            ('const items = ["safe"]; const out = Array.from(items, value => { '
+             'items[1] = req.query.html; return value; }); '
+             'res.send(out[0]); res.send(out[1]); res.send(out.length);',
+             ('xss',), ['safe', 'review-input', 2]),
+            ('const items = ["safe", req.query.html]; const out = Array.from(items, value => { '
+             'items.length = 1; return value; }); res.send(out[1]); res.send(out.length);',
+             (), [None, 1]),
+            ('const items = [req.query.html, req.query.html]; const out = Array.from(items, value => { '
+             'items[1] = "safe"; return value; }); res.send(out[0]); res.send(out[1]);',
+             ('xss',), ['review-input', 'safe']),
+        )
+        for source, rules, expected in cases:
+            with self.subTest(source=source):
+                self.scan(source, *rules)
+                self.assert_runtime_sends(source, expected)
+
+    def test_array_from_mapper_receives_two_arguments_and_this(self):
+        source = ('const out = Array.from(["safe"], function(value, index, missing = req.query.html) { '
+                  'return {value, index, missing, html: this.html}; }, {html: req.query.html}); '
+                  'res.send(out[0].value); res.send(out[0].index); '
+                  'res.send(out[0].missing); res.send(out[0].html);')
+        self.scan(source, 'xss', 'xss')
+        self.assert_runtime_sends(source, ['safe', 0, 'review-input', 'review-input'])
+        self.scan('const out = Array.from([req.query.html], value => "safe", {html: req.query.html}); '
+                  'res.send(out[0]);')
+
+    def test_array_from_missing_mapper_parameter_has_proven_undefined_identity(self):
+        for expression in ('third === undefined ? "safe" : value',
+                           'third !== undefined ? value : "safe"',
+                           'undefined === third ? "safe" : value',
+                           '(third === undefined) ? "safe" : value'):
+            source = ('const out = Array.from([req.query.html], function(value, index, third) { '
+                      f'return {expression};' + ' }); res.send(out[0]);')
+            with self.subTest(expression=expression):
+                self.scan(source)
+                self.assert_runtime_sends(source, ['safe'])
+        source = ('const out = Array.from([req.query.html], function(value, index, third) { '
+                  'if (third === undefined) return "safe"; return value; }); res.send(out[0]);')
+        self.scan(source)
+        self.assert_runtime_sends(source, ['safe'])
+        for setup in ('const undefined = req.query.html;', 'const undefined = "fixed";'):
+            source = ('function run() { ' + setup
+                      + 'const out = Array.from([req.query.html], function(value, index, third) { '
+                      'return third === undefined ? "safe" : value; }); res.send(out[0]); } run();')
+            with self.subTest(setup=setup):
+                self.scan(source, 'xss')
+                self.assert_runtime_sends(source, ['review-input'])
+        self.scan('const out = [req.query.html].map(function(value, index, third) { '
+                  'return third === undefined ? "safe" : value; }); res.send(out[0]);', 'xss')
+        self.scan('const out = Array.from([req.query.html], function(value, index, third = req.query.html) { '
+                  'return third === undefined ? "safe" : value; }); res.send(out[0]);', 'xss')
+        source = ('function select(value, missing) { return missing === undefined ? "safe" : value; } '
+                  'res.send(select(req.query.html)); res.send(select(req.query.html, null));')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['safe', 'review-input'])
+
+    def test_array_from_native_aliases_and_optional_mapper(self):
+        for setup, call in (
+                ('const Native = Array;', 'Native.from'),
+                ('const copy = Array.from;', 'copy'),
+                ('const {from: copy} = Array;', 'copy'),
+                ('const operations = {copy: Array.from};', 'operations.copy'),
+                ('function factory() { return Array.from; } const copy = factory();', 'copy')):
+            for extra in ('', ', undefined', ', void 0'):
+                with self.subTest(setup=setup, extra=extra):
+                    self.scan(setup + f'const out = {call}([req.query.html, "safe"]{extra}); '
+                              'res.send(out[0]); res.send(out[1]); res.send(out.length);', 'xss')
+        self.scan('const copy = Array.from; Array.from = external; '
+                  'const out = copy([1], value => req.query.html); res.send(out[0]);', 'xss')
+
+    def test_array_from_captures_callee_and_mapper_before_later_arguments(self):
+        source = ('const items = ["safe"]; let map = value => value; '
+                  'const out = Array.from(items, map, (map = () => "safe", items[0] = req.query.html)); '
+                  'res.send(out[0]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan('const out = Array.from([1], value => req.query.html, Array.from = external); '
+                  'res.send(out[0]);', 'xss')
+
+    def test_array_from_selected_helpers_keep_context_and_module_locations(self):
+        source = ('function map(value) { return {html: value}; } '
+                  'function copy(items, mapper) { return Array.from(items, mapper); } '
+                  'const dirty = copy([req.query.html], map); const clean = copy(["safe"], map); '
+                  'res.send(dirty[0].html); res.send(clean[0].html);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        artifacts = ROOT / 'test-suite/artifacts/javascript-array-from'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='modules-', dir=artifacts))
+        helper, entry = scratch / 'copy.mjs', scratch / 'handler.mjs'
+        helper.write_text('export function copy(items) { return Array.from(items, value => ({html: value})); }\n',
+                          encoding='utf-8')
+        entry.write_text('import {copy} from "./copy.mjs";\nconst out = copy([req.query.html]);\n'
+                         'res.send(out[0].html);\n', encoding='utf-8')
+        findings = list(taint.run(RunContext(lang='javascript', files=[entry, helper])))
+        self.assertEqual([(f['rule'], f['path'], f['line']) for f in findings],
+                         [('javascript.taint.xss', str(entry), 3)])
+
+    def test_array_from_shadowed_or_replaced_functions_use_selected_bodies(self):
+        for setup in ('const Array = {from(items, mapper) { return ["safe"]; }};',
+                      'Array.from = function(items, mapper) { return ["safe"]; };'):
+            with self.subTest(setup=setup):
+                self.scan(setup + 'const out = Array.from([req.query.html], value => req.query.html); '
+                          'res.send(out[0]);')
+        self.scan('const Array = {from(items, mapper) { return [req.query.html]; }}; '
+                  'const out = Array.from(["safe"], value => "safe"); res.send(out[0]);', 'xss')
+        self.scan('function copy(Array) { return Array.from([req.query.html]); } '
+                  'res.send(copy({from() { return ["safe"]; }})[0]);')
+
+    def test_array_from_exceptions_keep_effects_and_skip_later_work(self):
+        source = ('let saved = "safe"; try { Array.from([req.query.html], value => { '
+                  'saved = value; throw "stop"; }); saved = "safe"; '
+                  '} catch (error) { res.send(saved); }')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+        source = ('try { Array.from([req.query.html], value => { throw value; }); '
+                  'res.send(req.query.html); } catch (error) { res.send(error); }')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_array_from_unknown_inputs_and_mapper_protocols_stay_partial(self):
+        for expression in ('opaque', '{0: req.query.html, length: 1}',
+                           'new Set([req.query.html])', 'flag ? [req.query.html] : "safe"'):
+            with self.subTest(expression=expression):
+                self.assert_fill_partial('res.send(req.query.html); '
+                    f'const out = Array.from({expression}, value => "safe");', 'xss', reason='Array.from')
+        for callback in ('external', 'async value => value', 'function*(value) { yield value; }'):
+            with self.subTest(callback=callback):
+                self.assert_fill_partial('res.send(req.query.html); '
+                    f'const out = Array.from(["safe"], {callback});', 'xss', reason='Array.from')
+        self.assert_fill_partial('res.send(req.query.html); const items = ["safe"]; '
+            'Array.from(items, value => { items.length = unknown; return value; });',
+            'xss', reason='Array.from.*length')
+
+    def test_array_from_custom_iteration_and_factory_protocols_stay_partial(self):
+        for setup in ('items[Symbol.iterator] = external;',
+                      'Array.prototype[Symbol.iterator] = external;',
+                      'Object.defineProperty(items, "0", {get() { return req.query.html; }});',
+                      'external(items);'):
+            with self.subTest(setup=setup):
+                self.assert_fill_partial('res.send(req.query.html); const items = ["safe"]; '
+                    + setup + ' Array.from(items, value => "safe");', 'xss', reason='Array.from')
+        for call in ('Array.from.call(external, ["safe"]);',
+                     'Array.from = external; Array.from(["safe"]);'):
+            with self.subTest(call=call):
+                self.assert_fill_partial('res.send(req.query.html); ' + call, 'xss', reason='Array.from')
+
+    def test_array_from_sparse_traversal_respects_work_limit(self):
+        self.assert_fill_partial('res.send(req.query.html); const items = []; items.length = 4294967294; '
+            'Array.from(items, value => "safe");', 'xss', reason='Array.from.*work limit')
+
+    def test_array_from_mixed_mapper_cannot_prove_unconditional_cleanup(self):
+        for mapper in ('flag ? clear : undefined', 'flag ? undefined : clear',
+                       'flag ? clear : external', 'flag ? clear : null'):
+            source = ('const box = {html: req.query.html}; '
+                      'function clear(value) { box.html = "safe"; return "safe"; } '
+                      f'const mapper = {mapper}; '
+                      'res.send(req.query.html); const out = Array.from([req.query.html], mapper); '
+                      'res.send(box.html);')
+            with self.subTest(mapper=mapper):
+                self.assert_fill_partial(source, 'xss', 'xss', reason='Array.from.*mapper')
+        source = ('const box = {html: req.query.html}; '
+                  'function clear(value) { box.html = "safe"; return "safe"; } '
+                  'const mapper = flag ? clear : undefined; '
+                  'const out = Array.from([req.query.html], mapper); '
+                  'res.send(box.html); res.send(out[0]);')
+        self.assert_runtime_sends('const flag = false; ' + source, ['review-input', 'review-input'])
+        self.assert_runtime_sends('const flag = true; ' + source, ['safe', 'safe'])
+
+    def test_array_from_invalid_mappers_and_missing_sources_throw_before_iteration(self):
+        for expression in ('Array.from()', 'Array.from(null)', 'Array.from(undefined)',
+                           'Array.from([req.query.html], null)', 'Array.from([req.query.html], 1)',
+                           'Array.from([req.query.html], false)', 'new Array.from([req.query.html])'):
+            source = ('let saved = "safe"; try { ' + expression + '; saved = req.query.html; '
+                      '} catch (error) {} res.send(saved);')
+            with self.subTest(expression=expression):
+                self.scan(source)
+                self.assert_runtime_sends(source, ['safe'])
+
+    def test_array_from_argument_evaluation_cannot_reuse_an_earlier_mapper_binding(self):
+        source = ('const box = {html: req.query.html}; '
+                  'let mapper = value => { box.html = "safe"; return "safe"; }; '
+                  'function inputs() { mapper = external; return [req.query.html]; } '
+                  'res.send(req.query.html); const out = Array.from(inputs(), mapper); '
+                  'res.send(box.html);')
+        self.assert_fill_partial(source, 'xss', 'xss', reason='Array.from.*mapper')
+        source = ('let mapper = value => "safe"; '
+                  'function inputs() { mapper = undefined; return [req.query.html]; } '
+                  'const out = Array.from(inputs(), mapper); res.send(out[0]);')
+        self.scan(source, 'xss')
+        self.assert_runtime_sends(source, ['review-input'])
+
+    def test_array_from_uncertain_this_argument_cannot_clean_a_possible_receiver(self):
+        source = ('const box = {html: req.query.html}; const receiver = flag ? box : undefined; '
+                  'res.send(req.query.html); Array.from([1], function(value) { this.html = "safe"; }, receiver); '
+                  'res.send(box.html);')
+        self.assert_fill_partial(source, 'xss', 'xss', reason='Array.from.*this')
+        self.assert_runtime_sends('const flag = false; ' + source, ['review-input', 'review-input'])
+        self.assert_runtime_sends('const flag = true; ' + source, ['review-input', 'safe'])
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_array_from_public_json_sarif_selection_and_partial(self):
+        cases = (
+            ('mapped-source', 'const out=Array.from([1],value=>req.query.html);\n'
+             'res.send(out[0]);\nres.send(out.length);\n',
+             [('javascript.taint.xss', 2, 1)], False),
+            ('mapped-clean', 'const out=Array.from([req.query.html],value=>"safe");\n'
+             'res.send(out[0]);\n', [], False),
+            ('borrowed-object', 'const box={html:"safe"};\nconst out=Array.from([box]);\n'
+             'box.html=req.query.html;\nres.send(out[0].html);\n',
+             [('javascript.taint.xss', 4, 1)], False),
+            ('partial-iterator', 'res.send(req.query.html);\nconst items=["safe"];\n'
+             'items[Symbol.iterator]=external;\nArray.from(items);\n',
+             [('javascript.taint.xss', 1, 1)], True),
+            ('partial-mapper', 'res.send(req.query.html);\nconst box={html:req.query.html};\n'
+             'function clear(value){box.html="safe";return "safe";}\n'
+             'const mapper=flag?clear:undefined;\nArray.from([1],mapper);\nres.send(box.html);\n',
+             [('javascript.taint.xss', 1, 1), ('javascript.taint.xss', 6, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-array-from-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Array.from')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_array_from_public_cache_edits_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-array-from-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = 'const out=Array.from([1],value=>req.query.html);\nres.send(out[0]);\n'
+        clean = 'const out=Array.from([req.query.html],value=>"safe");\nres.send(out[0]);\n'
+        suppressed = unsafe.replace('res.send(out[0]);', 'res.send(out[0]); // ubs:ignore')
+        partial = 'res.send(req.query.html);\nArray.from(unknown,value=>"safe");\n'
+        cases = (
+            (unsafe, [('javascript.taint.xss', 2, 1)], False, 0),
+            (unsafe, [('javascript.taint.xss', 2, 1)], False, 1),
+            (clean, [], False, 0), (suppressed, [], False, 0),
+            (unsafe, [('javascript.taint.xss', 2, 1)], False, 1),
+            (partial, [('javascript.taint.xss', 1, 1)], True, 0),
+            (partial, [('javascript.taint.xss', 1, 1)], True, 0),
+        )
+        for index, (source, expected, incomplete, cache_hits) in enumerate(cases):
+            with self.subTest(index=index):
+                if index not in (1, 6):
+                    target.write_text(source, encoding='utf-8')
+                report = self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
+                                                expected=expected, cache=True, partial=incomplete,
+                                                partial_reason='Array.from')
+                self.assertEqual(report['profile']['cache_hits'], cache_hits, report)
+
     def assert_fill_partial(self, source, *rules, reason='Array.fill'):
-        with tempfile.TemporaryDirectory(prefix='ubs-fill-partial-') as scratch:
+        with temporary_directory(prefix='ubs-fill-partial-') as scratch:
             path = Path(scratch) / 'handler.js'
             path.write_text(source + '\n', encoding='utf-8')
             findings = []

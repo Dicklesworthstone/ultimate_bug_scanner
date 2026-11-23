@@ -500,6 +500,50 @@ class SQLSinkArguments(unittest.TestCase):
                                 encoding='utf-8')
                 self.assertEqual(list(detector.find([path])), [])
 
+    def test_reported_unrelated_closure_cells_beside_literal_sql(self):
+        # GH #215 (an augmented write to a captured list cell) and GH #217 (a
+        # nonlocal rebinding next to a captured list append) used to stop the
+        # whole file with SQLFlowLimit, although the only SQL is a literal in
+        # a separate function. Both remain clean and complete.
+        sources = {
+            'gh215': ('def timer():\n'
+                      '    clock = [0.0]\n'
+                      '    def advance(seconds):\n'
+                      '        clock[0] += seconds\n'
+                      '    return advance\n\n'
+                      'def read(db):\n'
+                      '    return db.execute("SELECT 1")\n'),
+            'gh217': ('def collect(value):\n'
+                      '    label = None\n'
+                      '    found = []\n'
+                      '    def add():\n'
+                      '        nonlocal label\n'
+                      '        label = value\n'
+                      '        found.append(value)\n'
+                      '    add()\n'
+                      '    return label, found\n\n'
+                      'def read(db):\n'
+                      '    return db.execute("SELECT 1")\n'),
+        }
+        for name, source in sources.items():
+            with self.subTest(case=name):
+                path = self.artifacts / (name + '-closure-cells.py')
+                path.write_text(source, encoding='utf-8')
+                self.assertEqual(list(detector.find([path])), [])
+                # The literal proof does not extend to a file with computed
+                # SQL: it must report the sink or stay explicitly incomplete,
+                # never come back clean.
+                unsafe = self.artifacts / (name + '-closure-cells-unsafe.py')
+                unsafe.write_text(source + '\ndef search(db, request):\n'
+                                  '    return db.execute("SELECT " + request.args["q"])\n',
+                                  encoding='utf-8')
+                try:
+                    findings = list(detector.find([unsafe]))
+                except detector.SQLFlowLimit:
+                    continue
+                self.assertEqual([(finding[0], finding[2]) for finding in findings],
+                                 [(CRITICAL, len(unsafe.read_text(encoding='utf-8').splitlines()))])
+
     def test_core_tests_literal_sql_fits_the_original_budget(self):
         # This real source triggered the failure: fixed SQLite statements in
         # one method caused every unrelated test body to consume SQL flow.

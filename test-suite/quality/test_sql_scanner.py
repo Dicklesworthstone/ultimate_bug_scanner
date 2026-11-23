@@ -489,6 +489,33 @@ CASES = (
         CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
         LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
     """),
+    Case("reported_lock_table", """
+        LOCK TABLE public.example IN SHARE ROW EXCLUSIVE MODE;
+        select 1;
+    """),
+    Case("locks_and_maintenance_preserve_function_transaction", """
+        BEGIN;
+        LOCK TABLE app.settings IN ACCESS EXCLUSIVE MODE;
+        CREATE FUNCTION app.f() RETURNS integer LANGUAGE sql SECURITY DEFINER
+        SET search_path = pg_catalog, pg_temp AS $$ SELECT 1 $$;
+        LOCK app.settings, app.archive IN SHARE MODE NOWAIT;
+        NOTIFY app_changes, 'function created';
+        REVOKE ALL ON FUNCTION app.f() FROM PUBLIC;
+        COMMIT;
+        REFRESH MATERIALIZED VIEW CONCURRENTLY app.summary WITH DATA;
+        REINDEX INDEX CONCURRENTLY app.settings_pkey;
+        CLUSTER app.settings USING settings_pkey;
+        CHECKPOINT;
+        LISTEN app_changes;
+        UNLISTEN *;
+    """),
+    Case("locks_and_maintenance_do_not_hide_later_function_exposure", """
+        LOCK TABLE app.settings IN SHARE MODE;
+        REFRESH MATERIALIZED VIEW app.summary;
+        REINDEX TABLE app.settings;
+        CREATE FUNCTION app.f() RETURNS integer -- expect:path,public
+        LANGUAGE sql SECURITY DEFINER AS $$ SELECT 1 $$;
+    """),
     Case("reported_psql_error_stop", r"""
         \set ON_ERROR_STOP on
         SELECT 1;
@@ -879,6 +906,11 @@ INCOMPLETE_CASES = (
         WITH RECURSIVE sample(n) AS (SELECT 1)
         SEARCH DEPTH FIRST BY n SET order_column SELECT * FROM sample;
     """),
+    Case("server_side_copy_remains_outside_statement_model", """
+        COPY app.settings FROM PROGRAM 'generate-settings';
+        SELECT 1;
+    """),
+    Case("library_load_remains_outside_statement_model", "LOAD 'auto_explain';\nSELECT 1;\n"),
     Case("cte_cannot_hide_dynamic_primary_statement", """
         WITH sample AS (SELECT 1) EXECUTE external_statement;
     """),
@@ -1485,6 +1517,15 @@ class EvidenceTest(unittest.TestCase):
 
 
 class SQLNativeTests(EvidenceTest):
+    def test_unsupported_statement_diagnostics_name_their_line_once(self):
+        analyzer = importlib.import_module("ubs_core.sql_scan")
+        source = "SELECT 1;\nLOAD 'auto_explain';\nUSE app;\n42;\n"
+        records, errors = analyzer.analyze_source(source, "diagnostics.sql")
+        self.assertEqual(records, [], errors)
+        self.assertEqual(errors, ["line 2: unsupported PostgreSQL statement 'load'",
+                                  "line 3: non-PostgreSQL dialect syntax",
+                                  "line 4: unsupported SQL or psql command"])
+
     def test_role_changes_do_not_reuse_another_owners_schema_defaults(self):
         analyzer = importlib.import_module("ubs_core.sql_scan")
         for index, change in enumerate(("SET ROLE next_owner", "RESET ROLE",

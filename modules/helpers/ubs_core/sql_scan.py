@@ -6,8 +6,9 @@ grants. Routines share an input-signature namespace but retain their object kind
 procedure lookup also checks the unmarked OUT-argument signature convention.
 Privilege changes take effect at transaction publication boundaries. Selected
 routine renames and schema transfers preserve privileges and local settings.
-Ordinary WITH queries and literal psql error/display controls preserve this
-state; client substitution and effectful commands remain explicit boundaries.
+Ordinary WITH queries, table locks, maintenance and notification statements,
+and literal psql error/display controls preserve this state; client
+substitution and effectful commands remain explicit boundaries.
 Unknown DDL context is reported explicitly and is never cached as complete.
 """
 from __future__ import annotations
@@ -1002,9 +1003,9 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
         split_top(statement)  # Check delimiters even in ordinary DML.
         reject_sql_interpolation(statement, text)
         if first.kind != "word":
-            raise Incomplete(f"line {first.line}: unsupported SQL or psql command")
+            raise Incomplete("unsupported SQL or psql command")
         if first.value in {"delimiter", "pragma", "go"} or sequence(statement, "use"):
-            raise Incomplete(f"line {first.line}: non-PostgreSQL dialect syntax")
+            raise Incomplete("non-PostgreSQL dialect syntax")
         if sequence(statement, "begin") or sequence(statement, "start", "transaction"):
             if transaction is not None:
                 raise Incomplete("nested transaction start")
@@ -1165,8 +1166,14 @@ def analyze_source(text: str, path: str = "<input>") -> tuple[list[dict], list[s
                 invalidate_default_privileges(state)
                 raise Incomplete("role change invalidates selected default privileges")
         elif first.value not in {"select", "insert", "update", "delete", "create", "alter", "drop",
-                                 "comment", "set", "reset", "truncate", "vacuum", "analyze", "explain"}:
-            raise Incomplete(f"line {first.line}: unsupported PostgreSQL statement {first.value!r}")
+                                 "comment", "set", "reset", "truncate", "vacuum", "analyze", "explain",
+                                 # Table locks, maintenance and notification
+                                 # channels change no routine, ACL, default
+                                 # privilege, role or search_path state.
+                                 "lock", "refresh", "reindex", "cluster", "checkpoint",
+                                 "listen", "unlisten", "notify"}:
+            # The statement loop prefixes the statement's line number.
+            raise Incomplete(f"unsupported PostgreSQL statement {first.value!r}")
         if transaction is None:
             publish()
 

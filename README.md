@@ -404,7 +404,11 @@ and unqualified creation names whose schema would change the effective ACL remai
 explicitly incomplete.
 
 Ordinary queries and bounded `WITH` CTEs preserve this migration state, including
-recursive, nested, materialized and data modifying forms. Literal psql controls
+recursive, nested, materialized and data modifying forms. `LOCK`, `REFRESH
+MATERIALIZED VIEW`, `REINDEX`, `CLUSTER`, `CHECKPOINT`, `LISTEN`, `UNLISTEN` and
+`NOTIFY` change no routine or privilege state and are accepted the same way.
+Server-side `COPY`, `LOAD` and other unrecognized statements remain explicitly
+incomplete. Literal psql controls
 (`\set ON_ERROR_STOP`, `\set ECHO`, `\set VERBOSITY`, `\echo`, and `\warn`) preserve
 the SQL query buffer without executing a client. Single-quoted and unquoted
 literal arguments are supported; expanded, escaped or double-quoted command

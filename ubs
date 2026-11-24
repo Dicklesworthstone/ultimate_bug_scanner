@@ -10210,22 +10210,24 @@ merge_json_scanners(){
     say "${YELLOW}${WARN}${RESET} jq not found; cannot emit combined JSON"; return 1
   fi
   ensure_git_metadata
-  # Avoid the jq merge when one module ran (bead C3)
-  if [[ ${#jsons[@]} -eq 1 ]]; then
-    local single="${jsons[0]}"
-    local lang_name
-    lang_name=$(basename "$single" .json)
-    local findings_file="$TMPDIR_RUN/$lang_name.findings.json"
-    local proj_real top_real prefix
-    proj_real="$(cd "$SOURCE_PROJECT_DIR" 2>/dev/null && pwd -P)" || proj_real="$SOURCE_PROJECT_DIR"
-    top_real="$(cd "${GIT_TOPLEVEL:-$SOURCE_PROJECT_DIR}" 2>/dev/null && pwd -P)" || top_real="$proj_real"
-    prefix="${proj_real#"$top_real"}"
-    prefix="${prefix#/}"
-    local -a f_args=(--argjson fnd '[]')
-    if [[ -f "$findings_file" ]]; then
-      f_args=(--slurpfile fnd "$findings_file")
-    fi
-    jq "${f_args[@]}" \
+  # Only legacy summary sidecars carry a findings array. Native sidecars
+  # contain one occurrence per line; the canonical merger reads those later.
+  # Keep previews off argv and never slurp the native stream into jq or Bash.
+  local previews="$TMPDIR_RUN/scanner-previews.ndjson"
+  : > "$previews" || return 1
+  for lang in "${langs[@]}"; do
+    f="$TMPDIR_RUN/$lang.findings.json"
+    [[ -s "$f" ]] || continue
+    jq -nc --arg lang "$lang" '
+      first(try inputs) | objects | select((.findings|type) == "array")
+      | {($lang): .findings}' "$f" >> "$previews" || return 1
+  done
+  local proj_real top_real prefix
+  proj_real="$(cd "$SOURCE_PROJECT_DIR" 2>/dev/null && pwd -P)" || proj_real="$SOURCE_PROJECT_DIR"
+  top_real="$(cd "${GIT_TOPLEVEL:-$SOURCE_PROJECT_DIR}" 2>/dev/null && pwd -P)" || top_real="$proj_real"
+  prefix="${proj_real#"$top_real"}"
+  prefix="${prefix#/}"
+  jq -s --slurpfile previews "$previews" \
       --arg project "$SOURCE_PROJECT_DIR" --arg ts "$(date_iso)" \
       --arg repo "${GIT_REMOTE_HTTP:-}" --arg commit "${GIT_COMMIT_SHA:-}" --arg blob "${GIT_BLOB_BASE:-}" \
       --arg top "$top_real" --arg prefix "$prefix" '
@@ -10247,128 +10249,30 @@ merge_json_scanners(){
                  + (if ($commit|length) > 0 then {commit:$commit} else {} end)
                  + (if ($blob|length) > 0 then {blob_base:$blob} else {} end))}
         else {} end;
-      . as $sc |
-      (if ($fnd|length) > 0 and ($fnd[0].findings|type) == "array" then
-         $sc + {findings: $fnd[0].findings}
-       else $sc end) as $sc_with_findings |
-      ($sc_with_findings |
+      ($previews | add // {}) as $by_lang |
+      map(if $by_lang[.language] != null then .findings = $by_lang[.language] else . end |
        if (.findings|type) == "array" then
          .findings |= map(if (.samples|type) == "array" then .samples |= map(link(.)) else . end)
-       else . end) as $sc_linked |
+       else . end) as $scanners |
+      map(select((.status // "ok") != "ok") | {language, status, module_error, message}
+          + (if (.analysis_errors|type) == "array" then {analysis_errors} else {} end)) as $failed |
       {
         project: $project,
         timestamp: $ts,
-        status: (if ($sc.status // "ok") != "ok" then "partial" else "ok" end),
-        failed_modules: (if ($sc.status // "ok") != "ok" then [$sc | {language, status, module_error, message}
-          + (if (.analysis_errors|type) == "array" then {analysis_errors} else {} end)] else [] end)
+        status: (if ($failed|length) > 0 then "partial" else "ok" end),
+        failed_modules: $failed
       }
       + git_block
       + {
-        scanners: [$sc_linked],
+        scanners: $scanners,
         totals: {
-          critical: nz($sc.critical),
-          warning: nz($sc.warning),
-          info: nz($sc.info),
-          files: nz($sc.files)
+          critical: (map(nz(.critical)) | add),
+          warning: (map(nz(.warning)) | add),
+          info: (map(nz(.info)) | add),
+          files: (map(nz(.files)) | add)
         }
       }
-    ' "$single"
-    return 0
-  fi
-  # First merge the summary JSONs
-  local base_json
-  base_json=$(jq -s --arg project "$SOURCE_PROJECT_DIR" --arg ts "$(date_iso)" \
-      --arg repo "${GIT_REMOTE_HTTP:-}" --arg commit "${GIT_COMMIT_SHA:-}" --arg blob "${GIT_BLOB_BASE:-}" '
-    def nz(x): if (x|type)=="number" then x else 0 end;
-    def failed: map(select((.status // "ok") != "ok") | {language, status, module_error, message}
-      + (if (.analysis_errors|type) == "array" then {analysis_errors} else {} end));
-    def git_block:
-      if ($repo|length) > 0 then
-        {git: ({repository:$repo}
-               + (if ($commit|length) > 0 then {commit:$commit} else {} end)
-               + (if ($blob|length) > 0 then {blob_base:$blob} else {} end))}
-      else {} end;
-    {project:$project, timestamp:$ts,
-     status: (if (failed|length) > 0 then "partial" else "ok" end),
-     failed_modules: failed}
-    + git_block
-    + {scanners: .,
-     totals:{
-       critical: (map(nz(.critical)) | add),
-       warning:  (map(nz(.warning))  | add),
-       info:     (map(nz(.info))     | add),
-       files:    (map(nz(.files))    | add)
-     }}' "${jsons[@]}")
-
-  # Findings sidecars have the same selected-module ownership as summaries.
-  local findings_jsons=()
-  for lang in "${langs[@]}"; do
-    f="$TMPDIR_RUN/$lang.findings.json"
-    [[ -f "$f" ]] && findings_jsons+=("$f")
-  done
-  if [[ ${#findings_jsons[@]} -gt 0 ]]; then
-    # Build a map of language -> findings array
-    local findings_map="{}"
-    local fm_parts=""
-    for f in "${findings_jsons[@]}"; do
-      [[ -f "$f" ]] || continue
-      local lang_name
-      lang_name=$(basename "$f" .findings.json)
-      local part
-      part=$(jq -c --arg lang "$lang_name" '{($lang): .findings}' "$f" 2>/dev/null) || continue
-      [[ -n "$part" ]] && fm_parts+="$part"$'\n'
-    done
-    if [[ -n "$fm_parts" ]]; then
-      findings_map=$(printf '%s' "$fm_parts" | jq -s 'add // {}')
-    fi
-
-    # Merge findings into each scanner entry (only if we have valid findings_map)
-    if [[ -n "$findings_map" && "$findings_map" != "{}" && "$findings_map" != "null" ]]; then
-      base_json=$(echo "$base_json" | jq --argjson fm "$findings_map" '
-        .scanners |= map(
-          if .language and $fm[.language] then
-            . + {findings: $fm[.language]}
-          else . end
-        )')
-    fi
-  fi
-  add_json_permalinks "$base_json"
-}
-
-# Every finding sample that names a file and a line gets a GitHub permalink
-# (blob_base/<project-relative path>#L<line>) when the project has a GitHub
-# remote — the same links the text report prints (README "shareable output").
-add_json_permalinks(){
-  local doc="$1"
-  if [[ -z "${GIT_BLOB_BASE:-}" ]]; then
-    printf '%s\n' "$doc"
-    return 0
-  fi
-  local proj_real top_real prefix
-  proj_real="$(cd "$SOURCE_PROJECT_DIR" 2>/dev/null && pwd -P)" || proj_real="$SOURCE_PROJECT_DIR"
-  top_real="$(cd "${GIT_TOPLEVEL:-$SOURCE_PROJECT_DIR}" 2>/dev/null && pwd -P)" || top_real="$proj_real"
-  # Scanned directory relative to the repository root ("" when they coincide).
-  prefix="${proj_real#"$top_real"}"
-  prefix="${prefix#/}"
-  printf '%s' "$doc" | jq --arg blob "$GIT_BLOB_BASE" --arg top "$top_real" --arg prefix "$prefix" '
-    def repo_rel(f):
-      if f | startswith("/") then
-        (if f | startswith($top + "/") then (f | ltrimstr($top + "/")) else null end)
-      else
-        (if ($prefix|length) > 0 then $prefix + "/" + (f | ltrimstr("./")) else (f | ltrimstr("./")) end)
-      end;
-    def link(sample):
-      if (sample|type) == "object" and (sample.file|type) == "string" and (sample.line|type) == "number" then
-        (repo_rel(sample.file)) as $rel
-        | if $rel == null then sample else sample + {permalink: ($blob + "/" + $rel + "#L" + (sample.line|tostring))} end
-      else sample end;
-    if (.scanners|type) == "array" then
-      .scanners |= map(
-        if (.findings|type) == "array" then
-          .findings |= map(if (.samples|type) == "array" then .samples |= map(link(.)) else . end)
-        else . end)
-    else . end
-  ' 2>/dev/null || printf '%s\n' "$doc"
+    ' "${jsons[@]}"
 }
 
 # Re-assert run-level completion state on the combined document, after every
@@ -10398,11 +10302,11 @@ qualify_combined_json(){
       exit_code=2
     fi
   fi
-  jq -c --arg status "$run_status" --argjson failed "$failed" \
+  jq -c --arg status "$run_status" --slurpfile failures <(printf '%s' "$failed") \
         --arg reason "$reason" --arg message "$message" \
         --argjson exit_code "$exit_code" \
         --argjson env_error "${HAS_ENV_ERROR:-0}" --argjson analysis_error "${HAS_ANALYSIS_ERROR:-0}" '
-    . + {status: $status, failed_modules: $failed}
+    . + {status: $status, failed_modules: $failures[0]}
     + (if $reason == "" then {}
        else {reason: $reason, message: $message}
             + (if $exit_code == null then {} else {exit_code: $exit_code} end)
@@ -10571,10 +10475,10 @@ merge_sarif_runs(){
       # SARIF consumers must not read a partial run as a clean one: every run
       # gets invocations[].executionSuccessful=false plus one notification per
       # failed module (SARIF 2.1.0 §3.20.21 toolExecutionNotifications).
-      jq --argjson failed "$FAILED_MODULES_JSON" '
+      jq --slurpfile failures <(printf '%s' "$FAILED_MODULES_JSON") '
         .runs |= map(. + {invocations: [{
           executionSuccessful: false,
-          toolExecutionNotifications: ($failed | map({
+          toolExecutionNotifications: ($failures[0] | map({
             level: "error",
             descriptor: {id: ("ubs/module-" + .status)},
             message: {text: (.language + ": " + .status + " — " + (.message // .module_error // "module did not complete"))}

@@ -756,6 +756,15 @@ class ScannerMergeResults(unittest.TestCase):
                         "language": lang, "files": 1, "critical": 1, "warning": 0,
                         "info": 0, "status": "ok", "findings": [],
                     }))
+                # Large compatibility previews must not become an exec argument.
+                samples = [{"file": f"src/file-{i}.sh", "line": i + 1} for i in range(6000)]
+                (root / "bash.findings.json").write_text(json.dumps({
+                    "language": "bash", "files": 1, "findings": [{"samples": samples}],
+                }))
+                if "python" in languages:
+                    # Native modules supply one canonical occurrence per line.
+                    (root / "python.findings.json").write_text(
+                        '{"rule":"test.rule","path":"sample.py"}\n' * 6000)
                 # Both authentic internal metadata and a scanner-looking file
                 # are irrelevant unless a selected module owns that basename.
                 (root / "detection-contract.json").write_text('{"modules":{}}')
@@ -763,10 +772,10 @@ class ScannerMergeResults(unittest.TestCase):
                 script = '''set -euo pipefail
 TMPDIR_RUN="$1"; SOURCE_PROJECT_DIR="$1"; shift
 langs=("$@")
+GIT_BLOB_BASE=https://example.test/repo/blob/rev
 need_cmd(){ command -v "$1" >/dev/null; }
 ensure_git_metadata(){ :; }
 date_iso(){ printf '%s' '2026-01-01T00:00:00Z'; }
-add_json_permalinks(){ printf '%s\\n' "$1"; }
 say(){ printf '%s\\n' "$*" >&2; }
 ''' + function + '''
 merge_json_scanners > "$TMPDIR_RUN/first.out"
@@ -781,6 +790,10 @@ cat "$TMPDIR_RUN/second.out"
                 doc = json.loads(proc.stdout)
                 self.assertEqual([s["language"] for s in doc["scanners"]], list(languages))
                 self.assertEqual(doc["totals"]["critical"], len(languages))
+                result = doc["scanners"][0]["findings"][0]["samples"]
+                self.assertEqual(len(result), len(samples))
+                self.assertEqual(result[-1]["permalink"],
+                                 "https://example.test/repo/blob/rev/src/file-5999.sh#L6000")
 
 
 @unittest.skipUnless(os.name == "posix", "Python module requires a POSIX shell")

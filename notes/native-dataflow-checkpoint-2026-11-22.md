@@ -342,3 +342,76 @@ the prescribed checks without weakening existing limits or expectations.
 
 This does not implement `Object.keys` shape refinement or close
 `ultimate_bug_scanner-1b9j.6.22`, D6, or release qualification.
+
+## November 24 source review — native Go copy and rune bounds
+
+Bead: `ultimate_bug_scanner-go-native-copy`.
+
+This candidate targets the unchanged production files at
+`34fcffa6744c4d15b0fc939b753ff29b31d9e599`. The existing native read-into work is
+already active there; this is a separate current destination-write gap, not a
+replacement for that earlier implementation.
+
+Builtin `copy` lacks a native backing-write transfer. A fresh clean buffer can
+remain clean after copying native input into it, and the integer count can
+inherit argument taint. Independently, `buffer_expression` reads slice bounds
+from masked source, which rewrites rune literals as zero. Consequently a
+nonempty reslice such as `buffer[:'\x01']` can be treated as an empty buffer and
+hide real writes. These are source-traced predicted defects, not observed
+scanner or native baseline results.
+
+Preserved candidate:
+
+- `test-suite/patches/go-native-copy-candidate.patch`, Git blob
+  `d440b98692385963dc66a8021212529e954d6584`.
+- Base analyzer: `modules/helpers/ubs_core/analyzers/taint_go.py`,
+  blob `4a3d8bc9b9ec535d751c6a91716eeb82643b29df`.
+- Base tests: `test-suite/quality/test_taint_go_decoding.py`,
+  blob `812ab65bc8db5580375d66b5626d353828e13bcc`.
+- Fourteen new maintained source methods and two public methods specify
+  32 module/runner JSON/SARIF calls. The public methods use the existing
+  `UBS_TAINT_E2E=1` gate. All are unexecuted.
+
+The native transfer uses weak backing-cell writes, preserves aliases,
+overlap and untouched suffixes, keeps the integer return clean, recognizes
+builtin shadowing, and retains selected `[]byte` helper write summaries.
+Proven empty operands do not write. Supported source proof is intentionally
+bounded to established owned byte buffers, string literals, exact imported
+`os.Getenv`, and supported native sanitizers/string conversions over proved
+inputs. An arbitrary string parameter or a direct `r.FormValue` string is not
+promoted to complete native support by this patch.
+
+Independent review found and corrected several unsafe assumptions. Effectful
+destination expressions remain incomplete because Go does not completely
+order ordinary reads against calls. Missing buffer metadata is not proof of
+an immutable string: untracked `io.ReadAll` byte slices and direct
+`string(source)` conversions are refused. Existing captured slice-header
+replacement remains incomplete, with findings reached earlier retained.
+Escaped or borrowed targets and deferred/asynchronous copies also remain
+explicitly incomplete. No existing test expectation was weakened.
+
+The rune-bound repair uses masked text only to find delimiters and the original
+source spans to prove integer values. Unsupported rune bounds therefore yield
+unknown length instead of fabricated zero. Saved destination/source aliases
+retain weak flows, and existing `io.ReadFull` receives a regression for the same
+shared defect. Direct rune-bound copy destinations are still unsupported;
+the candidate does not implement a general rune decoder or exact range model.
+
+An inherited provenance gap remains outside this change: aliases of an
+untracked `io.ReadAll` slice can lose contents before
+`[]byte(string(source))` creates fresh owned metadata. The new copy handling
+must not be described as proving the full ancestry of every owned buffer.
+Keep that witness and D6 open for independent reproduction and repair.
+
+Root reconstructed all five source and three test hunks forward and backward
+against the immutable blobs, with exact equality, and independently reviewed
+the implementation and regression expectations. That establishes patch
+integrity only. No Python/Go execution, native witness, syntax check, scanner
+baseline, public CLI, cache check or DSR result was obtained in this session.
+The production analyzer, development version and canonical pins are unchanged.
+
+Before activation, reproduce the defects, execute the new methods and native
+witnesses through DSR, run the real report/selection/suppression/partial-result
+matrix and affected Go cohorts, then refresh canonical pins/version and run
+the prescribed lint, full-suite and self-scan gates. Keep D6 and release
+qualification open; text reconstruction is not a substitute for these gates.

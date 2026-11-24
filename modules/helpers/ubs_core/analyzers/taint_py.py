@@ -3463,19 +3463,7 @@ class _Flow:
             return True
         # A revoked producer contract must not regain authority from a
         # returned parameter's independently retained object references.
-        def revoked(value):
-            for choice in _binding_choices(value):
-                self.engine.budget.spend()
-                if isinstance(choice, _UnprovedProducer):
-                    return True
-                if isinstance(choice, (_LiteralString, _GeneratorString)) and not choice.format_safe:
-                    return True
-                if isinstance(choice, _ArgumentVector) and any(
-                        revoked(operand) for operand, _fact in choice.operands):
-                    return True
-            return False
-
-        if revoked(binding):
+        if self.borrowed_producer_revoked(binding):
             return False
         signature = self.scope.args
         parameters = {argument.arg for argument in (*signature.posonlyargs, *signature.args,
@@ -3485,11 +3473,15 @@ class _Flow:
         if references and references <= parameters:
             return True
 
-        def literal_local(local, seen):
+        if references:
+            return False
+        seen = set()
+        while True:
             self.engine.budget.spend()
-            if local in seen:
+            if name in seen:
                 return False
-            binders = self.engine.generator_binders.get(self.scope, {}).get(local, ())
+            seen.add(name)
+            binders = self.engine.generator_binders.get(self.scope, {}).get(name, ())
             if len(binders) != 1 or not isinstance(binders[0], ast.Name):
                 return False
             statement = self.engine.parents.get(binders[0])
@@ -3508,9 +3500,21 @@ class _Flow:
             value = statement.value
             if isinstance(value, ast.Constant):
                 return type(value.value) in {str, bytes, int, float, complex, bool, type(None)}
-            return isinstance(value, ast.Name) and literal_local(value.id, seen | {local})
+            if not isinstance(value, ast.Name):
+                return False
+            name = value.id
 
-        return not references and literal_local(name, frozenset())
+    def borrowed_producer_revoked(self, binding):
+        for choice in _binding_choices(binding):
+            self.engine.budget.spend()
+            if isinstance(choice, _UnprovedProducer):
+                return True
+            if isinstance(choice, (_LiteralString, _GeneratorString)) and not choice.format_safe:
+                return True
+            if isinstance(choice, _ArgumentVector) and any(
+                    self.borrowed_producer_revoked(operand) for operand, _fact in choice.operands):
+                return True
+        return False
 
     def materialized_generator_string(self, node, state):
         """Require the evaluated value to be an exact, callback-free string."""
@@ -3904,40 +3908,46 @@ class _Flow:
                     return isinstance(exception, type) and issubclass(exception, BaseException)
             return False
 
-        body = [ast.Return(value=target.body)] if isinstance(target, ast.Lambda) else target.body
-        for statement in body:
-            self.engine.budget.spend()
-            if isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)):
-                continue
-            if isinstance(statement, ast.Assign) and primitive(statement.value):
-                expression = statement.value
-                prompt_value = (expression if isinstance(expression, ast.Constant)
-                                else prompt_values.get(expression.id, lookup(expression.id))
-                                if isinstance(expression, ast.Name)
-                                else _GeneratorString() if isinstance(expression, ast.Call) else None)
-                for destination in statement.targets:
-                    if not isinstance(destination, ast.Name):
-                        return False
-                    if destination.id not in local_names:
-                        # Replacing a borrowed global/cell may release its
-                        # last owner even when the new value is just a string.
-                        if not self.materialized_generator_binding(lookup(destination.id), NO_REFERENCES, state):
+        try:
+            body = [ast.Return(value=target.body)] if isinstance(target, ast.Lambda) else target.body
+            for statement in body:
+                self.engine.budget.spend()
+                if isinstance(statement, (ast.Global, ast.Nonlocal, ast.Pass)):
+                    continue
+                if isinstance(statement, ast.Assign) and primitive(statement.value):
+                    expression = statement.value
+                    prompt_value = (expression if isinstance(expression, ast.Constant)
+                                    else prompt_values.get(expression.id, lookup(expression.id))
+                                    if isinstance(expression, ast.Name)
+                                    else _GeneratorString() if isinstance(expression, ast.Call) else None)
+                    for destination in statement.targets:
+                        if not isinstance(destination, ast.Name):
                             return False
-                    # The proof environment records ownership/hashability,
-                    # not a substitute runtime value. A list alias must not
-                    # become a supposedly hashable key on its next use.
-                    values[destination.id] = (_GeneratorString() if hashable(statement.value)
-                                               else _ArgumentVector(()))
-                    prompt_values[destination.id] = prompt_value
-                continue
-            if isinstance(statement, ast.Expr) and primitive(statement.value):
-                continue
-            if isinstance(statement, ast.Return):
-                return statement.value is None or primitive(statement.value)
-            if isinstance(statement, ast.Raise):
-                return statement.cause is None and raised(statement.exc)
-            return False
-        return True
+                        if destination.id not in local_names:
+                            # Replacing a borrowed global/cell may release its
+                            # last owner even when the new value is just a string.
+                            if not self.materialized_generator_binding(lookup(destination.id), NO_REFERENCES, state):
+                                return False
+                        # The proof environment records ownership/hashability,
+                        # not a substitute runtime value. A list alias must not
+                        # become a supposedly hashable key on its next use.
+                        values[destination.id] = (_GeneratorString() if hashable(statement.value)
+                                                   else _ArgumentVector(()))
+                        prompt_values[destination.id] = prompt_value
+                    continue
+                if isinstance(statement, ast.Expr) and primitive(statement.value):
+                    continue
+                if isinstance(statement, ast.Return):
+                    return statement.value is None or primitive(statement.value)
+                if isinstance(statement, ast.Raise):
+                    return statement.cause is None and raised(statement.exc)
+                return False
+            return True
+        finally:
+            # The predicates call each other through closure cells. Release
+            # those cells when the proof finishes, including on a work limit,
+            # so the entire flow and its branch state can die with the solve.
+            del primitive, prompt, hashable
 
     def borrowed_alias_helper(self, node, target, state):
         """Prove a transparent helper cannot release a caller-owned operand.

@@ -3018,10 +3018,14 @@ class SwiftEngine:
         inner = SwiftLexer(self.text).scan(tokens[0].end, tokens[-1].start)
         captures, parameters, body_tokens, explicit = self.parser.closure_signature(inner)
         if not explicit:
+            # A stored closure can read just $2, or only mention it inside
+            # interpolation. Bind all supplied slots before any extra names
+            # that need the conservative unknown-argument fallback below.
+            supplied = tuple(f'${index}' for index in range(len(argument_values or ())))
             names = {'$0', *(item.value for item in body_tokens
                             if item.kind == 'code' and re.fullmatch(r'\$\d+', item.value))}
             parameters = tuple((SwiftToken(name, tokens[0].start, tokens[0].end), '')
-                               for name in sorted(names))
+                               for name in (*supplied, *sorted(names.difference(supplied))))
         parent = self.function
         body = self.parser.block(body_tokens, parent.owner, (*parent.scope, parent.key))
         body = self.parser.result_body(body) or body

@@ -123,6 +123,21 @@ class SwiftClosureWorkTests(unittest.TestCase):
             }
         ''', unsafe=True)
 
+    def test_shorthand_selects_the_actual_argument_position(self):
+        cases = ((3, '$2', 2), (11, '$10 + $2', 10), (3, r'"item-\($2)"', 2))
+        for case, (arity, body, selected) in enumerate(cases):
+            for unsafe in (False, True):
+                arguments = ['"/fixed"'] * arity
+                arguments[selected if unsafe else 1] = 'req.query["path"]!'
+                self.check('''
+                    func handle(req: Request) {
+                        let choose: (%s) -> String = { %s }
+                        let path = choose(%s)
+                        _ = String(contentsOfFile: path) // expect-path
+                    }
+                ''' % (', '.join(['String'] * arity), body, ', '.join(arguments)),
+                    unsafe=unsafe, suffix=f'-{case}-{unsafe}')
+
     def test_callable_getter_and_alias_keep_stored_parameter_binding(self):
         for unsafe, value in ((False, '"/srv/fixed"'), (True, 'req.query["path"]!')):
             self.check('''

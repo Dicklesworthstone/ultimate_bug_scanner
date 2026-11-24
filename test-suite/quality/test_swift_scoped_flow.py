@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import textwrap
 from types import SimpleNamespace
@@ -2371,6 +2373,595 @@ func unrelated() {
                             actual = [(row['ruleId'], row['locations'][0]['physicalLocation']['region']['startLine'],
                                        row['level']) for row in records if row['ruleId'] == self.RULE]
                             self.assertEqual(actual, [(self.RULE, line, 'error') for line in expected], context)
+
+
+class SwiftStoredRequestReceiverTests(unittest.TestCase):
+    """Typed receiver sources must not depend on a field's spelling."""
+
+    POLICIES = {
+        'path': ('swift.taint.request_path_traversal',
+                 '_ = try? String(contentsOfFile: target)'),
+        'redirect': ('swift.taint.request_open_redirect',
+                     '_ = Response.redirect(to: target)'),
+        'header': ('swift.taint.header-injection',
+                   '_ = HTTPHeaders([("X-Test", target)])'),
+        'outbound': ('swift.taint.outbound-url',
+                     '_ = try? await URLSession.shared.data(from: URL(string: target)!)'),
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.artifacts = ROOT / 'test-suite/artifacts' / ('swift-stored-request-' + uuid.uuid4().hex)
+        cls.artifacts.mkdir(parents=True)
+
+    def program(self, body, *, field='incoming', declaration='Request', parameters='', helpers=''):
+        helper_lines = ''.join('    ' + line + '\n' for line in helpers.splitlines())
+        body_lines = ''.join('        ' + line + '\n' for line in body.splitlines())
+        return ('import Foundation\nimport Vapor\nstruct Download {\n'
+                '    let %s: %s\n%s'
+                '    func get(%s) async {\n%s    }\n}\n'
+                % (field, declaration, helper_lines, parameters, body_lines))
+
+    def probe(self, source, policy, suffix, *, incomplete=False, allow_incomplete=False):
+        source = textwrap.dedent(source).strip() + '\n'
+        path = self.artifacts / (self.id().rsplit('.', 1)[-1] + '-' + suffix + '.swift')
+        path.write_text(source, encoding='utf-8')
+        findings = flow_findings(path, source, policy, recover=True)
+        path.with_suffix('.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+        if incomplete:
+            self.assertTrue(findings, 'Unmodeled declaration storage must remain incomplete')
+            self.assertTrue(all(row['rule'] == 'swift.taint.analysis-limited'
+                                and row['severity'] == 'warning' for row in findings), findings)
+            return findings
+        # The source marks real unsafe sinks; no frontend classification is
+        # used to derive expected findings or decide whether a case is safe.
+        expected = [(self.POLICIES[policy][0], number, 'critical')
+                    for number, line in enumerate(source.splitlines(), 1) if '// unsafe' in line]
+        observed = findings
+        if allow_incomplete:
+            self.assertTrue(expected, 'Incomplete positive controls must mark a real sink')
+            limitations = [row for row in findings if row['rule'] == 'swift.taint.analysis-limited']
+            self.assertTrue(all(row['severity'] == 'warning' for row in limitations), findings)
+            observed = [row for row in findings if row['rule'] != 'swift.taint.analysis-limited']
+        self.assertEqual([(row['rule'], row['line'], row['severity']) for row in observed],
+                         expected, findings)
+        for finding in observed:
+            route = finding['extras']['taint_path']
+            self.assertEqual(route[0]['kind'], 'source', finding)
+            self.assertEqual((route[-1]['kind'], route[-1]['line']),
+                             ('sink', finding['line']), finding)
+        return findings
+
+    def test_stored_request_name_type_and_self_preserve_all_policy_findings(self):
+        cases = (
+            ('named', 'request', 'Request', 'request'),
+            ('renamed', 'incoming', 'Request', 'incoming'),
+            ('qualified', 'incoming', 'Vapor.Request', 'self.incoming'),
+            ('optional', 'incoming', 'Request?', 'incoming?'),
+            ('qualified-optional', 'incoming', 'Vapor.Request?', 'self.incoming?'),
+        )
+        for policy, (_, sink) in self.POLICIES.items():
+            for label, field, declaration, receiver in cases:
+                with self.subTest(policy=policy, case=label):
+                    source = self.program('let target = %s.query["value"] ?? ""\n%s // unsafe'
+                                          % (receiver, sink), field=field, declaration=declaration)
+                    self.probe(source, policy, policy + '-' + label)
+            with self.subTest(policy=policy, case='self-alias'):
+                self.probe(self.program('let carrier = self\n'
+                    'let target = carrier.incoming.query["value"] ?? ""\n' + sink + ' // unsafe'),
+                    policy, policy + '-self-alias')
+            with self.subTest(policy=policy, case='global-helper-receiver'):
+                source = 'func passthrough(_ value: Download) -> Download { value }\n' + self.program(
+                    'let carrier = passthrough(self)\n'
+                    'let target = carrier.incoming.query["value"] ?? ""\n' + sink + ' // unsafe')
+                self.probe(source, policy, policy + '-global-helper-receiver')
+            with self.subTest(policy=policy, case='qualified-despite-bare-alias'):
+                source = 'typealias Request = String\n' + self.program(
+                    'let target = incoming.query["value"] ?? ""\n' + sink + ' // unsafe',
+                    declaration='Vapor.Request')
+                self.probe(source, policy, policy + '-qualified-despite-bare-alias')
+            callback_sink = (sink if policy != 'outbound' else
+                             'URLSession.shared.dataTask(with: URL(string: target)!).resume()')
+            for field in ('request', 'incoming'):
+                with self.subTest(policy=policy, case='collection-callback', field=field):
+                    source = self.program(
+                        '[self].forEach { carrier in\n'
+                        '    let target = carrier.%s.query["value"] ?? ""\n'
+                        '    %s // unsafe\n}' % (field, callback_sink), field=field)
+                    self.probe(source, policy, policy + '-collection-' + field)
+                with self.subTest(policy=policy, case='implicit-collection-callback', field=field):
+                    source = self.program(
+                        '[self].forEach {\n'
+                        '    let target = $0.%s.query["value"] ?? ""\n'
+                        '    %s // unsafe\n}' % (field, callback_sink), field=field)
+                    self.probe(source, policy, policy + '-implicit-collection-' + field)
+            with self.subTest(policy=policy, case='collection-loop'):
+                self.probe(self.program(
+                    'for carrier in [self] {\n'
+                    '    let target = carrier.incoming.query["value"] ?? ""\n'
+                    '    ' + sink + ' // unsafe\n}'), policy, policy + '-collection-loop')
+
+    def test_stored_request_helper_getter_and_interpolation_preserve_sources(self):
+        cases = (
+            ('helper', 'selected()', 'func selected() -> String { incoming.query["value"] ?? "" }', ''),
+            ('helper-alias', 'reader()', 'func selected() -> String { incoming.query["value"] ?? "" }',
+             'let reader = selected'),
+            ('getter', 'selected', 'var selected: String { incoming.query["value"] ?? "" }', ''),
+            ('interpolation', r'"\(incoming.query["value"] ?? "")"', '', ''),
+        )
+        unrelated = ('func unrelated(_ values: [Any]) {\n'
+                     '    for case let value as String in values { print(value) }\n'
+                     '}')
+        for policy, (_, sink) in self.POLICIES.items():
+            for label, value, helper, prelude in cases:
+                with self.subTest(policy=policy, case=label):
+                    source = self.program(prelude + '\nlet target = %s\n%s // unsafe' % (value, sink),
+                                          helpers=helper + '\n' + unrelated)
+                    self.probe(source, policy, policy + '-' + label)
+            with self.subTest(policy=policy, case='unused-helper-reference'):
+                source = self.program(
+                    'let unused = selected\n_ = unused\n'
+                    'for case let value as String in values { print(value) }\n'
+                    'let target = "https://api.example.com/fixed"\n' + sink,
+                    parameters='values: [Any]',
+                    helpers='func selected() -> String { incoming.query["value"] ?? "" }')
+                self.probe(source, policy, policy + '-unused-helper-reference')
+            overloads = ('func selected(_ flag: Bool) -> String { "https://api.example.com/fixed" }\n'
+                         'func selected(flag: Bool) -> String { incoming.query["value"] ?? "" }')
+            with self.subTest(policy=policy, case='unlabeled-overload'):
+                source = self.program(
+                    'let target = selected(true)\n'
+                    'for case let value as String in values { print(value) }\n' + sink,
+                    parameters='values: [Any]', helpers=overloads)
+                self.probe(source, policy, policy + '-unlabeled-overload')
+            with self.subTest(policy=policy, case='labeled-overload'):
+                source = self.program('let target = selected(flag: true)\n' + sink + ' // unsafe',
+                                      helpers=overloads)
+                self.probe(source, policy, policy + '-labeled-overload')
+            with self.subTest(policy=policy, case='forward-local-callback'):
+                callback_sink = (sink if policy != 'outbound' else
+                                 'URLSession.shared.dataTask(with: URL(string: target)!).resume()')
+                source = self.program(
+                    'execute {\n'
+                    '    let target = self.incoming.query["value"] ?? ""\n'
+                    '    ' + callback_sink + ' // unsafe\n}\n'
+                    'func execute(_ action: () -> Void) { action() }')
+                self.probe(source, policy, policy + '-forward-local-callback')
+
+    def test_stored_request_activation_respects_binding_and_owner_scope(self):
+        for policy, (_, sink) in self.POLICIES.items():
+            cases = (
+                ('local', self.program(
+                    'let incoming = "https://api.example.com/fixed"\nlet target = incoming\n' + sink)),
+                ('parameter', self.program('let target = incoming\n' + sink, parameters='incoming: String')),
+                ('sibling-owner', '''
+                    import Foundation
+                    import Vapor
+                    struct Carrier { let incoming: Request }
+                    struct Download {
+                        let incoming: String
+                        func get() async {
+                            let target = incoming
+                            %s
+                        }
+                    }
+                ''' % sink),
+                ('static-method', '''
+                    import Foundation
+                    import Vapor
+                    struct Download {
+                        let incoming: Request
+                        static func get(incoming: String) async {
+                            let target = incoming
+                            %s
+                        }
+                    }
+                ''' % sink),
+                ('closure-parameter', self.program(
+                    'let work: (String) async -> Void = { incoming in\n'
+                    '    let target = incoming\n    ' + sink + '\n}\n'
+                    'await work("https://api.example.com/fixed")')),
+                # The field is never read. An unrelated opaque callback must
+                # not become a selected receiver entry because of its label.
+                ('opaque-closure-parameter', self.program(
+                    'importedOperation { incoming in opaque(incoming) }\n'
+                    'let target = "https://api.example.com/fixed"\n' + sink)),
+                ('typealias', '''
+                    import Foundation
+                    import Vapor
+                    struct LocalInput { let query: [String: String] }
+                    typealias Request = LocalInput
+                    struct Download {
+                        let incoming: Request
+                        func get() async {
+                            let target = incoming.query["value"] ?? ""
+                            %s
+                        }
+                    }
+                ''' % sink),
+                ('local-request-type', '''
+                    import Foundation
+                    import Vapor
+                    struct Request { let query: [String: String] }
+                    struct Download {
+                        let incoming: Request
+                        func get() async {
+                            let target = incoming.query["value"] ?? ""
+                            %s
+                        }
+                    }
+                ''' % sink),
+                ('generic', '''
+                    import Foundation
+                    import Vapor
+                    protocol QueryHolder { var query: [String: String] { get } }
+                    struct Download<Request: QueryHolder> {
+                        let incoming: Request
+                        func get() async {
+                            let target = incoming.query["value"] ?? ""
+                            %s
+                        }
+                    }
+                ''' % sink),
+                ('later-generic', '''
+                    import Foundation
+                    import Vapor
+                    protocol QueryHolder { var query: [String: String] { get } }
+                    struct Download<Tag: Equatable, Request: QueryHolder> {
+                        let incoming: Request
+                        func get() async {
+                            let target = incoming.query["value"] ?? ""
+                            %s
+                        }
+                    }
+                ''' % sink),
+                ('module-shadow', '''
+                    import Foundation
+                    import Vapor
+                    enum Vapor {
+                        struct Request { let query: [String: String] }
+                    }
+                    struct Download {
+                        let incoming: Vapor.Request
+                        func get() async {
+                            let target = incoming.query["value"] ?? ""
+                            %s
+                        }
+                    }
+                ''' % sink),
+                ('generic-vapor-qualifier', '''
+                    import Foundation
+                    import Vapor
+                    protocol LocalQueryHolder { var query: [String: String] { get } }
+                    protocol LocalProvider { associatedtype Request: LocalQueryHolder }
+                    struct Download<Vapor: LocalProvider> {
+                        let incoming: Vapor.Request
+                        func get() async {
+                            let target = incoming.query["value"] ?? ""
+                            %s
+                        }
+                    }
+                ''' % sink),
+            )
+            for label, source in cases:
+                with self.subTest(policy=policy, case=label):
+                    self.probe(source, policy, policy + '-' + label,
+                               incomplete=label == 'typealias')
+            with self.subTest(policy=policy, case='self-survives-local-shadow'):
+                self.probe(self.program(
+                    'let incoming = "/fixed"\n'
+                    'let target = self.incoming.query["value"] ?? incoming\n' + sink + ' // unsafe'),
+                    policy, policy + '-self-survives-local-shadow')
+            # The established lexical request convention remains supported;
+            # new typed-receiver activation must still respect local types.
+            with self.subTest(policy=policy, case='local-request-legacy-name'):
+                source = 'struct Request { let query: [String: String] }\n' + self.program(
+                    'let target = request.query["value"] ?? ""\n' + sink + ' // unsafe',
+                    field='request')
+                self.probe(source, policy, policy + '-local-request-legacy-name')
+
+    def test_stored_request_literal_overwrites_and_policy_validation_remain_safe(self):
+        safe = {
+            'path': ('let raw = incoming.query["value"] ?? ""\n'
+                     'let root = URL(fileURLWithPath: "/srv/public").standardizedFileURL\n'
+                     'let target = root.appendingPathComponent(raw).standardizedFileURL\n'
+                     'guard target.path.hasPrefix(root.path + "/") else { return }\n'
+                     '_ = try? String(contentsOf: target)'),
+            'redirect': ('let target = incoming.query["value"] ?? ""\n'
+                         'guard ' + LOCAL + ' else { return }\n'
+                         '_ = Response.redirect(to: target)'),
+            'header': (r'let target = (incoming.query["value"] ?? "").replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")'
+                       '\n_ = HTTPHeaders([("X-Test", target)])'),
+            'outbound': ('let raw = incoming.query["value"] ?? ""\n'
+                         'guard let target = URL(string: raw), target.scheme == "https", '
+                         'target.host == "api.example.com" else { return }\n'
+                         '_ = try? await URLSession.shared.data(from: target)'),
+        }
+        for policy, (_, sink) in self.POLICIES.items():
+            for label, body in (
+                    ('literal', 'let target = "https://api.example.com/fixed"\n' + sink),
+                    ('overwrite', 'var target = incoming.query["value"] ?? ""\n'
+                     'target = "https://api.example.com/fixed"\n' + sink),
+                    ('validated', safe[policy])):
+                with self.subTest(policy=policy, case=label):
+                    self.probe(self.program(body), policy, policy + '-' + label)
+            # A typed parameter twin proves that validation is not passing
+            # merely because discovery failed to activate the receiver entry.
+            with self.subTest(policy=policy, case='validated-parameter'):
+                source = ('import Foundation\nimport Vapor\nfunc get(incoming: Request) async {\n'
+                          + '\n'.join('    ' + line for line in safe[policy].splitlines()) + '\n}\n')
+                self.probe(source, policy, policy + '-validated-parameter')
+
+
+    def test_typed_envelope_parameters_expose_request_fields(self):
+        for policy, (_, sink) in self.POLICIES.items():
+            for label, declaration, receiver, prelude in (
+                    ('plain', 'Request', 'box.incoming', ''),
+                    ('optional', 'Vapor.Request?', 'box.incoming?', ''),
+                    ('alias', 'Request', 'carrier.incoming', 'let carrier = box')):
+                with self.subTest(policy=policy, case=label):
+                    source = '''
+                        import Foundation
+                        import Vapor
+                        struct Envelope { let incoming: %s }
+                        func get(box: Envelope) async {
+                            %s
+                            let target = %s.query["value"] ?? ""
+                            %s // unsafe
+                        }
+                    ''' % (declaration, prelude, receiver, sink)
+                    self.probe(source, policy, policy + '-' + label)
+            callback_sink = (sink if policy != 'outbound' else
+                             'URLSession.shared.dataTask(with: URL(string: target)!).resume()')
+            for field in ('request', 'incoming'):
+                with self.subTest(policy=policy, case='collection-callback', field=field):
+                    source = '''
+                        import Foundation
+                        import Vapor
+                        struct Envelope { let %s: Request }
+                        func get(box: Envelope) async {
+                            [box].forEach { carrier in
+                                let target = carrier.%s.query["value"] ?? ""
+                                %s // unsafe
+                            }
+                        }
+                    ''' % (field, field, callback_sink)
+                    self.probe(source, policy, policy + '-collection-' + field)
+                with self.subTest(policy=policy, case='implicit-collection-callback', field=field):
+                    source = '''
+                        import Foundation
+                        import Vapor
+                        struct Envelope { let %s: Request }
+                        func get(box: Envelope) async {
+                            [box].forEach {
+                                let target = $0.%s.query["value"] ?? ""
+                                %s // unsafe
+                            }
+                        }
+                    ''' % (field, field, callback_sink)
+                    self.probe(source, policy, policy + '-implicit-collection-' + field)
+        for field in ('request', 'incoming'):
+            with self.subTest(policy='path', case='future-captured-alias', field=field):
+                source = '''
+                    import Foundation
+                    import Vapor
+                    struct Envelope { let %s: Request }
+                    func get(box: Envelope) {
+                        var carrier: Envelope? = nil
+                        register {
+                            _ = try? String(contentsOfFile: carrier!.%s.query["value"] ?? "") // unsafe
+                        }
+                        carrier = box
+                    }
+                ''' % (field, field)
+                # An opaque registration API may require incomplete coverage,
+                # but a callback's real sink must retain the later captured source.
+                self.probe(source, 'path', 'future-captured-alias-' + field, allow_incomplete=True)
+
+    def test_stored_request_literal_collection_projection_preserves_sources(self):
+        projections = (
+            ('subscript', '[self][0]'),
+            ('first', '[self].first!'),
+            ('last', '[self].last!'),
+            ('identity-map', '[self].map { $0 }.first!'),
+            ('filter', '[self].filter { _ in true }.first!'),
+        )
+        for policy, (_, sink) in self.POLICIES.items():
+            for field in ('request', 'incoming'):
+                for label, receiver in projections:
+                    with self.subTest(policy=policy, case=label, field=field):
+                        source = self.program(
+                            'let target = %s.%s.query["value"] ?? ""\n%s // unsafe'
+                            % (receiver, field, sink), field=field)
+                        self.probe(source, policy, policy + '-' + label + '-' + field)
+
+        with self.subTest(policy='path', case='mixed-native-opaque'):
+            mixed = self.program(
+                'var carriers = [self]\n'
+                'if chooseOpaque { carriers = load() }\n'
+                'carriers.forEach { carrier in\n'
+                '    let target = carrier.incoming.query["value"] ?? ""\n'
+                '    _ = try? String(contentsOfFile: target) // unsafe\n}',
+                parameters='chooseOpaque: Bool, load: () -> [Download]')
+            findings = self.probe(mixed, 'path', 'mixed-native-opaque', allow_incomplete=True)
+            self.assertTrue(any(row['rule'] == 'swift.taint.analysis-limited' for row in findings), findings)
+
+        for label, collection, receiver in (
+                ('dictionary', '["x": self]', 'entry.value'),
+                ('tuple-pair', '[("x", self)]', 'entry.1')):
+            with self.subTest(policy='path', case=label):
+                source = self.program(
+                    collection + '.forEach { entry in\n'
+                    '    let target = ' + receiver + '.incoming.query["value"] ?? ""\n'
+                    '    _ = try? String(contentsOfFile: target) // callback-sink\n}\n'
+                    'let target = self.incoming.query["value"] ?? ""\n'
+                    '_ = try? String(contentsOfFile: target) // independent-sink')
+                path = self.artifacts / (self.id().rsplit('.', 1)[-1] + '-' + label + '.swift')
+                path.write_text(source, encoding='utf-8')
+                findings = flow_findings(path, source, 'path', recover=True)
+                path.with_suffix('.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+                sink_lines = {number for number, line in enumerate(source.splitlines(), 1)
+                              if '// callback-sink' in line or '// independent-sink' in line}
+                independent = next(number for number, line in enumerate(source.splitlines(), 1)
+                                   if '// independent-sink' in line)
+                limitations = [row for row in findings if row['rule'] == 'swift.taint.analysis-limited']
+                critical = [row for row in findings if row['rule'] != 'swift.taint.analysis-limited']
+                self.assertTrue(limitations, findings)
+                self.assertTrue(all(row['severity'] == 'warning' for row in limitations), findings)
+                self.assertIn(independent, [row['line'] for row in critical], findings)
+                # A future precise callback model may retain its additional
+                # genuine sink. The independent later sink is always required.
+                for finding in critical:
+                    self.assertEqual((finding['rule'], finding['severity']),
+                                     (self.POLICIES['path'][0], 'critical'), finding)
+                    self.assertIn(finding['line'], sink_lines, finding)
+                    route = finding['extras']['taint_path']
+                    self.assertEqual(route[0]['kind'], 'source', finding)
+                    self.assertEqual((route[-1]['kind'], route[-1]['line']),
+                                     ('sink', finding['line']), finding)
+
+    def test_stored_request_activation_honors_existing_source_directives(self):
+        ignored = (
+            ('declaration', '''
+                struct Ignored {
+                    let incoming: Request // ubs:ignore[taint-source] trusted local adapter
+                    func get() {
+                        let target = incoming.query["value"] ?? ""
+                        _ = try? String(contentsOfFile: target)
+                    }
+                }
+            '''),
+            ('named-read', '''
+                struct Ignored {
+                    let request: Request
+                    func get() {
+                        let target = request.query["value"] ?? "" // ubs:ignore[taint-source] trusted local adapter
+                        _ = try? String(contentsOfFile: target)
+                    }
+                }
+            '''),
+            ('helper-dependency', '''
+                struct Ignored {
+                    let request: Request
+                    func selected() -> String {
+                        return request.query["value"] ?? "" // ubs:ignore[taint-source] trusted local adapter
+                    }
+                    func get() {
+                        let target = selected()
+                        _ = try? String(contentsOfFile: target)
+                    }
+                }
+            '''),
+            ('getter-dependency', '''
+                struct Ignored {
+                    let request: Request
+                    var selected: String {
+                        request.query["value"] ?? "" // ubs:ignore[taint-source] trusted local adapter
+                    }
+                    func get() {
+                        let target = selected
+                        _ = try? String(contentsOfFile: target)
+                    }
+                }
+            '''),
+        )
+        active = '''
+            struct Active {
+                let request: Request
+                func get() {
+                    _ = try? String(contentsOfFile: request.query["value"]!) // unsafe
+                }
+            }
+        '''
+        for label, source in ignored:
+            with self.subTest(case=label):
+                self.probe('import Vapor\n' + textwrap.dedent(source)
+                           + textwrap.dedent(active), 'path', label)
+
+    def test_stored_request_receivers_through_module_and_cli_json_and_sarif(self):
+        markers = {
+            'swift.taint.request_path_traversal': '// path-sink',
+            'swift.taint.request_open_redirect': '// redirect-sink',
+            'swift.taint.header-injection': '// header-sink',
+            'swift.taint.outbound-url': '// outbound-sink',
+        }
+        for label, field, clean in (('named', 'request', False), ('renamed', 'incoming', False),
+                                    ('safe', 'incoming', True)):
+            project = self.artifacts / label
+            project.mkdir()
+            source = ('import Foundation\nimport Vapor\nstruct Download {\n'
+                      '    let %s: Request\n'
+                      '    func get() async {\n'
+                      '        var target = %s.query["value"] ?? ""\n' % (field, field)
+                      + ('        target = "https://api.example.com/fixed"\n' if clean else '')
+                      + '        _ = try? String(contentsOfFile: target) // path-sink\n'
+                        '        _ = Response.redirect(to: target) // redirect-sink\n'
+                        '        _ = HTTPHeaders([("X-Test", target)]) // header-sink\n'
+                        '        if let address = URL(string: target) {\n'
+                        '            _ = try? await URLSession.shared.data(from: address) // outbound-sink\n'
+                        '        }\n    }\n}\n')
+            path = project / 'Download.swift'
+            path.write_text(source, encoding='utf-8')
+            expected = sorted((rule, number) for rule, marker in markers.items()
+                              for number, line in enumerate(source.splitlines(), 1)
+                              if marker in line) if not clean else []
+            for mode in ('module', 'runner'):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=label, mode=mode, format=fmt):
+                        evidence = self.artifacts / (label + '-' + mode + '-' + fmt)
+                        evidence.mkdir()
+                        command = ([str(ROOT / 'modules/ubs-swift.sh'), '--ci', '--no-color',
+                                    '--format=' + fmt, str(project)] if mode == 'module' else
+                                   [str(ROOT / 'ubs'), '--module-dir=' + str(ROOT / 'modules'),
+                                    '--only=swift', '--ci', '--no-cache', '--no-auto-update',
+                                    '--format=' + fmt, str(project)])
+                        environment = {
+                            **os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
+                            'UBS_NO_CACHE': '1', 'UBS_CACHE_DIR': str(evidence / 'cache'),
+                            'PYTHONDONTWRITEBYTECODE': '1', 'NO_COLOR': '1',
+                        }
+                        for name in ('UBS_ALLOW_UNVERIFIED_HELPERS', 'UBS_VERIFIED_ASSET_DIR',
+                                     'UBS_ALLOW_PARTIAL', 'UBS_SKIP_TYPE_NARROWING'):
+                            environment.pop(name, None)
+                        result = subprocess.run(command, cwd=evidence, env=environment, text=True,
+                                                capture_output=True, timeout=90, check=False)
+                        (evidence / 'stdout.log').write_text(result.stdout, encoding='utf-8')
+                        (evidence / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+                        (evidence / 'command.json').write_text(json.dumps({
+                            'command': command, 'cwd': str(evidence), 'exit': result.returncode,
+                        }, indent=2), encoding='utf-8')
+                        context = 'exit=%s\nstderr=%s' % (result.returncode, result.stderr)
+                        self.assertEqual(result.returncode, int(not clean), context)
+                        try:
+                            payload = json.loads(result.stdout)
+                        except json.JSONDecodeError as error:
+                            self.fail('Invalid scanner JSON: %s\n%s' % (error, context))
+                        if fmt == 'json':
+                            scanner = payload if mode == 'module' else payload['scanners'][0]
+                            self.assertEqual(payload['status'], 'ok', payload)
+                            self.assertEqual(scanner['status'], 'ok', payload)
+                            self.assertEqual(scanner['files'], 1, payload)
+                            self.assertNotIn('module_error', scanner)
+                            if mode == 'runner':
+                                self.assertEqual(payload['failed_modules'], [], payload)
+                            key = 'rule' if mode == 'module' else 'rule_id'
+                            rows = [row for row in payload['findings'] if row[key].startswith('swift.taint.')]
+                            self.assertEqual(sorted((row[key], row['line']) for row in rows), expected, rows)
+                            self.assertTrue(all(row['severity'] == 'critical' for row in rows), rows)
+                            totals = payload if mode == 'module' else payload['totals']
+                            self.assertEqual(totals['critical'], len(expected), payload)
+                        else:
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])
+                                    if row['ruleId'].startswith('swift.taint.')]
+                            actual = sorted((row['ruleId'],
+                                             row['locations'][0]['physicalLocation']['region']['startLine'])
+                                            for row in rows)
+                            self.assertEqual(actual, expected, rows)
+                            self.assertTrue(all(row['level'] == 'error' for row in rows), rows)
+                            invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                            self.assertTrue(all(item.get('executionSuccessful', True) for item in invocations), payload)
+                        self.assertNotIn('ANALYZER_ERROR', result.stderr)
+                        self.assertNotIn('swift: partial', result.stderr)
 
 
 if __name__ == '__main__':

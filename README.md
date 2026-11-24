@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.142-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.143-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1662,6 +1662,15 @@ and previous value alternatives. Opaque values, executable defaults,
 projected/backing storage, custom notifications, unmodeled inheritance,
 observers, custom accessors and compound writes remain explicit analysis limits.
 Refusal diagnostics retain independently established request shapes and findings.
+
+Entry selection also follows native typed `Request` fields through selected
+same-file receiver aliases, helpers, getters and array callbacks. Such a
+field does not have to be named `request` or `req`. This bounded discovery
+respects lexical bindings, type shadows and source-activation directives;
+an unrelated method on the same owner is not activated merely because that
+owner stores a request. Literal array elements keep their receiver identities
+through supported reads and iteration. The ordinary interpreter establishes
+each source-to-sink flow and reports unsupported effects as incomplete analysis.
 
 **Python coverage limitations.** A bounded native analysis that cannot prove
 complete coverage reports `module_error: "ANALYSIS_INCOMPLETE"`, with

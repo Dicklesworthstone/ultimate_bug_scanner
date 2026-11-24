@@ -1670,12 +1670,514 @@ class SwiftEngine:
                     if swift_tainted(self.globals[name]):
                         self.globals[name] = join(self.globals[name], self.limitation(
                             'Swift request-derived global state needs capture analysis', statement.tokens[0].start))
-        for function in self.parser.functions.values():
+        receiver_entries = self.receiver_source_entries()
+        for function in tuple(self.parser.functions.values()):
             request_parameter = any(re.fullmatch(r'(?:Vapor\.)?Request\??', item[2]) for item in function.parameters)
-            if function.key == -1 or request_parameter or swift_source_tokens(swift_statement_tokens(function.body), self.parser.suppressed):
+            if (function.key == -1 or request_parameter or function.key in receiver_entries
+                    or swift_source_tokens(swift_statement_tokens(function.body), self.parser.suppressed)):
                 if self.parser.obligation is not None and _swift_observer_obligation(swift_statement_tokens(function.body), self.parser.obligation):
                     self.limitation('Swift property observer with a sink needs assignment binding analysis', function.key)
                 self.context(function, tuple(CLEAN for _ in function.parameters), entry=True)
+
+    def receiver_source_entries(self):
+        """Discover typed receiver entries without treating field names as taint.
+
+        Selection follows nominal receiver identities through lexical bindings,
+        aliases, closures and helper/getter references. It does not evaluate
+        sinks or create request facts: those remain the ordinary interpreter's
+        responsibility. A method that never reads such a receiver stays outside
+        this additional entry set, even if its owner stores a Request.
+        """
+        parser = self.parser
+
+        def owner_id(owner):
+            qualified = tuple('.'.join(owner).split('.')) if owner else ()
+            return qualified if qualified in parser.type_declarations else owner
+
+        def nominal(declaration, owner):
+            declaration = declaration.replace('\n', '').removeprefix('inout').rstrip('?!')
+            if (not re.fullmatch(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*', declaration)
+                    or any(part in parser.aliased_types for part in declaration.split('.'))):
+                return ()
+            parts, owner = tuple(declaration.split('.')), owner_id(owner)
+            return next(((*owner[:index], *parts) for index in range(len(owner), -1, -1)
+                         if (*owner[:index], *parts) in parser.type_declarations), ())
+
+        def generic_binding(owner, name):
+            # Owner spellings stop at a constraint colon. The full declaration
+            # header retains later parameters and nested constraint arguments.
+            for length in range(1, len(owner) + 1):
+                declaration = parser.type_declarations.get(owner[:length])
+                header = tuple(token for token in declaration[2]
+                               if token.kind == 'code' and token.value != '\n') if declaration else ()
+                if not header or header[0].value != '<':
+                    continue
+                depth, binder = 0, False
+                for token in header:
+                    if token.value == '<':
+                        depth += 1
+                        if depth == 1:
+                            binder = True
+                    elif token.value == '>':
+                        depth -= 1
+                        if not depth:
+                            break
+                    elif depth == 1 and token.value == ',':
+                        binder = True
+                    elif depth == 1 and binder and token.value != 'each':
+                        if token.value == name:
+                            return True
+                        binder = False
+            return False
+
+        code = tuple(token for token in parser.tokens if token.kind == 'code' and token.value != '\n')
+        positions = {token.start: index for index, token in enumerate(code)}
+        fields = {}
+        for owner, declarations in parser.fields.items():
+            fields.setdefault(owner_id(owner), {}).update(declarations)
+        source_fields, contained = set(), {}
+        for owner, declarations in parser.stored_fields.items():
+            for name, (declaration, _default, _mutable, token, _reason) in declarations.items():
+                self.budget.spend()
+                declaration = declaration.replace('\n', '')
+                if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
+                    qualified = declaration.startswith('Vapor.')
+                    shadowed = ('Vapor' in parser.attribute_type_names or generic_binding(owner, 'Vapor') if qualified else
+                                'Request' in parser.aliased_types or generic_binding(owner, 'Request')
+                                or bool(nominal('Request', owner)))
+                    following = code[positions[token.start] + 1:positions[token.start] + 7]
+                    request = next((item for item in following if item.value == 'Request'), None)
+                    if not shadowed and request is not None and request.start not in parser.suppressed:
+                        source_fields.add((owner_id(owner), name))
+                else:
+                    target = nominal(declaration, owner)
+                    if target:
+                        contained[owner_id(owner), name] = target
+        if not source_fields:
+            return frozenset()
+
+        owners = {owner for owner, _name in source_fields}
+        parents = {}
+        for (owner, _name), target in contained.items():
+            parents.setdefault(target, set()).add(owner)
+        pending = deque(owners)
+        while pending:
+            for owner in parents.get(pending.popleft(), ()):
+                self.budget.spend()
+                if owner not in owners:
+                    owners.add(owner)
+                    pending.append(owner)
+
+        # Parsing closures/lowering graphs can create synthetic functions.
+        # Discovery uses an isolated parser so it cannot change the real
+        # interpreter's declaration set, recovery diagnostics or graph cache.
+        from copy import copy, deepcopy
+        discovery = copy(self)
+        discovery.parser, discovery.recover = deepcopy(parser), True
+        parser = discovery.parser
+        parser.recover = True
+        functions = tuple(parser.functions.values())
+        dependencies, selected = {}, set()
+        jobs, inputs, graphs = {}, {}, {}
+        pending, queued = deque(), set()
+        definitions, uses = {}, {}
+        closures, capture_readers = {}, {}
+        methods_by_name, indexed = {}, set()
+        getters = {(owner_id(owner), name): key for (owner, name), key in parser.field_functions.items()}
+
+        def index_methods():
+            for key, candidate in parser.functions.items():
+                if key not in indexed:
+                    self.budget.spend()
+                    indexed.add(key)
+                    methods_by_name.setdefault((owner_id(candidate.owner), candidate.name), []).append(candidate)
+
+        index_methods()
+
+        def identity(owner, static=False):
+            return (frozenset({Trace('entry-owner', (owner_id(owner), static))})
+                    if owner else CLEAN)
+
+        def collection(values):
+            # Selection needs possible element identities, not collection
+            # contents or an ever-growing nesting path.
+            elements = frozenset(trace if trace.kind == 'entry-element' else
+                Trace('entry-element', (trace.kind, trace.key))
+                for trace in values if trace.kind != 'entry-collection')
+            return join(elements, frozenset({Trace('entry-collection', ())}))
+
+        def elements(values):
+            return frozenset(Trace(*trace.key) for trace in values if trace.kind == 'entry-element')
+
+        def static_context(function):
+            return function.static or any(parser.functions[key].static
+                for key in function.scope if key in parser.functions)
+
+        def schedule(function, scope, state, root, arguments=None):
+            scope = dict(scope)
+            initial = dict(state)
+            initial['self'] = identity(function.owner, static_context(function))
+            for index, (name, _label, declaration, _default) in enumerate(function.parameters):
+                scope[name] = 'parameter:' + name
+                initial[scope[name]] = join(identity(nominal(declaration, function.owner)),
+                                           arguments[index] if arguments is not None else CLEAN)
+            key = root, function.key, tuple(sorted(scope.items()))
+            previous = inputs.get(key)
+            merged = initial if previous is None else join_states(previous, initial)
+            if previous is None or merged != previous:
+                self.budget.spend()
+                inputs[key], jobs[key] = merged, (function, scope, root)
+                if key not in queued:
+                    pending.append(key)
+                    queued.add(key)
+            dependencies.setdefault(root, set())
+            return key
+
+        def lower_definitions(statements):
+            result = []
+            for statement in statements:
+                if statement.kind == 'definition' and statement.extra:
+                    key = statement.extra[0]
+                    if key in parser.functions and parser.functions[key].scope:
+                        statement = SwiftStatement('entry-definition', (
+                            SwiftToken('<entry-definition>', key, key),))
+                result.append(replace(statement, body=lower_definitions(statement.body),
+                                      alternate=lower_definitions(statement.alternate)))
+            return tuple(result)
+
+        for function in functions:
+            if (function.owner and owner_id(function.owner) in owners or any(
+                    nominal(declaration, function.owner) in owners
+                    for _name, _label, declaration, _default in function.parameters)):
+                if not function.scope:
+                    schedule(function, {}, {}, function.key)
+            if (any(re.fullmatch(r'(?:Vapor\.)?Request\??', item[2]) for item in function.parameters)
+                    or swift_source_tokens(swift_statement_tokens(function.body), parser.suppressed)):
+                selected.add(function.key)
+
+        while pending:
+            context = pending.popleft()
+            queued.remove(context)
+            function, outer_scope, root = jobs[context]
+            owner, is_static = owner_id(function.owner), static_context(function)
+
+            def methods(receiver_owner, name, static, bindings, state, lexical=False):
+                if len(indexed) != len(parser.functions):
+                    index_methods()
+                matches = [candidate for candidate in methods_by_name.get((receiver_owner, name), ())
+                    if static_context(candidate) == static and (not candidate.scope or lexical and
+                        tuple((*function.scope, function.key)[:len(candidate.scope)]) == candidate.scope)]
+                if not matches and lexical and receiver_owner:
+                    matches = [candidate for candidate in methods_by_name.get(((), name), ())
+                               if not candidate.scope]
+                if not matches:
+                    return CLEAN
+                nearest = max(len(candidate.scope) for candidate in matches)
+                return frozenset(Trace('entry-callable', (candidate.key,))
+                                 for candidate in matches if len(candidate.scope) == nearest)
+
+            def closure_value(token, close, bindings, state):
+                # Newlines belong to the closure's binding/control-flow graph;
+                # the surrounding expression's compact token view omits them.
+                inner = tuple(SwiftLexer(self.text).tokens(token.end, close.start))
+                try:
+                    captures, parameters, body, _explicit = parser.closure_signature(inner)
+                    statements = parser.block(body, function.owner, (*function.scope, function.key))
+                except SwiftUnsupported:
+                    expression(inner, bindings, state)
+                    return CLEAN
+                scope, initial = dict(bindings), dict(state)
+                for capture, value in captures:
+                    scope[capture.value] = 'entry-capture:' + str(capture.start)
+                    initial[scope[capture.value]] = expression(value, bindings, state)
+                slots = []
+                for index, (parameter, declaration) in enumerate(parameters):
+                    slot = 'entry-argument:' + str(parameter.start)
+                    scope[parameter.value] = slot
+                    initial[slot] = identity(nominal(declaration, function.owner))
+                    slots.append((index, slot))
+                if not parameters and not _explicit:
+                    def implicit_names(tokens):
+                        for item in tokens:
+                            if item.kind == 'code' and re.fullmatch(r'\$\d+', item.value):
+                                yield item.value
+                            for part in item.parts:
+                                yield from implicit_names(part)
+                    for name in sorted(set(implicit_names(body))):
+                        scope[name] = 'entry-argument:' + str(token.start) + ':' + name
+                        slots.append((int(name[1:]), scope[name]))
+                closure = SwiftFunction(token.start, '<entry-closure>', function.owner,
+                    (*function.scope, function.key), (), statements, static=is_static)
+                key = root, token.start, tuple(sorted(scope.items()))
+                previous = closures.get(key)
+                initial = initial if previous is None else join_states(previous[2], initial)
+                closures[key] = closure, scope, initial, tuple(slots), dict(bindings)
+                return frozenset({Trace('entry-closure', key)})
+
+            def invoke(value, arguments, bindings, state, *, escaping=False, erased_labels=False):
+                result, known = CLEAN, False
+                native = next((trace.key[0] for trace in value if trace.kind == 'entry-collection-call'), None)
+                if native is not None:
+                    argument = elements(value)
+                    callback_arguments = [('', argument)]
+                    if native == 'reduce':
+                        initial = next((item for _label, item in arguments
+                                        if not any(trace.kind in {'entry-callable', 'entry-closure'} for trace in item)), CLEAN)
+                        callback_arguments = [('', initial), ('', argument)]
+                    elif native == 'sorted':
+                        callback_arguments.append(('', argument))
+                    for _label, callback in arguments:
+                        if any(trace.kind in {'entry-callable', 'entry-closure'} for trace in callback):
+                            invoke(callback, callback_arguments, bindings, state, erased_labels=True)
+                    return CLEAN if native == 'forEach' else collection(argument)
+                for trace in value:
+                    if trace.kind == 'entry-owner':
+                        receiver_owner, static = trace.key
+                        if static:
+                            result = join(result, identity(receiver_owner))
+                        continue
+                    if trace.kind == 'entry-closure':
+                        known = True
+                        closure, captured, at_creation, slots, outer = closures[trace.key]
+                        initial = join_states(at_creation, state)
+                        for index, slot in slots:
+                            initial[slot] = join(initial.get(slot, CLEAN),
+                                arguments[index][1] if index < len(arguments) else CLEAN)
+                        key = schedule(closure, captured, initial, root)
+                        # Escaped callbacks can observe writes after registration.
+                        # Watching lexical slots keeps a shadowing call-site local
+                        # from replacing the declaration's captured binding.
+                        for binding in outer.values():
+                            capture_readers.setdefault((root, binding), set()).add(key)
+                        continue
+                    if trace.kind != 'entry-callable':
+                        continue
+                    candidate = parser.functions[trace.key[0]]
+                    values, position = [], 0
+                    for _name, label, _declaration, default in candidate.parameters:
+                        if (position < len(arguments) and (arguments[position][0] == label
+                                or arguments[position][0] is None or erased_labels)):
+                            values.append(arguments[position][1])
+                            position += 1
+                        elif default or escaping:
+                            values.append(CLEAN)
+                        else:
+                            break
+                    else:
+                        if position == len(arguments) or escaping:
+                            known = True
+                            if candidate.scope:
+                                use = root, candidate.key
+                                previous = uses.get(use, tuple(CLEAN for _ in values))
+                                uses[use] = tuple(join(old, new) for old, new in zip(previous, values))
+                                if use in definitions:
+                                    captured, at_definition = definitions[use]
+                                    schedule(candidate, captured, join_states(at_definition, state), root, uses[use])
+                            else:
+                                dependencies[root].add(candidate.key)
+                                if any(values):
+                                    schedule(candidate, {}, {}, root, values)
+                            result = join(result, identity(nominal(candidate.return_type, candidate.owner)))
+                if not known:
+                    for _label, argument in arguments:
+                        if any(trace.kind in {'entry-callable', 'entry-closure'} for trace in argument):
+                            invoke(argument, (), bindings, state, escaping=True, erased_labels=True)
+                return result
+
+            def member(receivers, token, bindings, state):
+                if token.start in parser.suppressed:
+                    return CLEAN
+                result = CLEAN
+                if any(trace.kind == 'entry-collection' for trace in receivers):
+                    if token.value in {'forEach', 'map', 'compactMap', 'flatMap', 'filter', 'sorted', 'reduce'}:
+                        return join(receivers, frozenset({Trace('entry-collection-call', (token.value,))}))
+                    if token.value in {'first', 'last'}:
+                        return elements(receivers)
+                for trace in receivers:
+                    if trace.kind in {'entry-callable', 'entry-closure'} and token.value in {'self', 'callAsFunction'}:
+                        result = join(result, frozenset({trace}))
+                    if trace.kind != 'entry-owner':
+                        continue
+                    receiver_owner, static = trace.key
+                    name = token.value
+                    if not static and name in fields.get(receiver_owner, {}):
+                        if (receiver_owner, name) in source_fields:
+                            selected.add(root)
+                        getter = getters.get((receiver_owner, name))
+                        if getter is not None and not parser.functions[getter].static:
+                            dependencies[root].add(getter)
+                        result = join(result, identity(nominal(fields[receiver_owner][name], receiver_owner)))
+                    else:
+                        result = join(result, methods(receiver_owner, name, static, bindings, state))
+                return result
+
+            def expression(tokens, bindings, state):
+                items = tuple(token for token in tokens if token.kind != 'code' or token.value != '\n')
+                result, cursor = CLEAN, 0
+                while cursor < len(items):
+                    self.budget.spend()
+                    token = items[cursor]
+                    cursor += 1
+                    for part in token.parts:
+                        expression(part, bindings, state)
+                    if token.kind != 'code':
+                        continue
+                    if token.value == '{':
+                        close = swift_close(items, cursor - 1)
+                        result = join(result, closure_value(token, items[close], bindings, state))
+                        cursor = close + 1
+                        continue
+                    if token.value in {'(', '['}:
+                        close = swift_close(items, cursor - 1)
+                        value = CLEAN
+                        for part in swift_parts(items[cursor:close], {','}):
+                            if (token.value == '(' and len(part) >= 2
+                                    and part[0].kind == 'code' and part[1].value == ':'):
+                                part = part[2:]
+                            value = join(value, expression(part, bindings, state))
+                        if token.value == '[':
+                            value = collection(value)
+                        call_value = True
+                        cursor = close + 1
+                    elif (token.start in parser.suppressed
+                          or not re.fullmatch(r'[A-Za-z_]\w*|\$\d+', token.value)
+                          or cursor >= 2 and items[cursor - 2].value == '.'):
+                        continue
+                    else:
+                        name = token.value
+                        call_value = name in bindings
+                        if name == 'self':
+                            value = state.get('self', CLEAN)
+                        elif name == 'Self':
+                            value = identity(owner, True)
+                        elif name in bindings:
+                            value = state.get(bindings[name], CLEAN)
+                        elif not is_static and name in fields.get(owner, {}):
+                            value = member(identity(owner), token, bindings, state)
+                        else:
+                            value = methods(owner, name, is_static, bindings, state, lexical=True)
+                            if not value and name not in self.local_globals:
+                                value = identity(nominal(name, function.owner), True)
+                    while cursor < len(items):
+                        next_token = items[cursor]
+                        if next_token.value in {'?', '!'}:
+                            cursor += 1
+                        elif next_token.value == '.' and cursor + 1 < len(items):
+                            call_value = (items[cursor + 1].value in {'self', 'callAsFunction'}
+                                          and any(trace.kind in {'entry-callable', 'entry-closure'} for trace in value))
+                            value = member(value, items[cursor + 1], bindings, state)
+                            cursor += 2
+                        elif next_token.value == '[':
+                            close = swift_close(items, cursor)
+                            expression(items[cursor + 1:close], bindings, state)
+                            value, call_value = elements(value), True
+                            cursor = close + 1
+                        elif next_token.value == '(':
+                            close = swift_close(items, cursor)
+                            arguments = []
+                            for part in swift_parts(items[cursor + 1:close], {','}):
+                                label = ''
+                                if len(part) >= 2 and part[0].kind == 'code' and part[1].value == ':':
+                                    label = part[0].value
+                                    part = part[2:]
+                                if part:
+                                    arguments.append((label, expression(part, bindings, state)))
+                            cursor = close + 1
+                            if cursor < len(items) and items[cursor].value == '{':
+                                close = swift_close(items, cursor)
+                                arguments.append((None, closure_value(items[cursor], items[close], bindings, state)))
+                                cursor = close + 1
+                            value = invoke(value, arguments, bindings, state, erased_labels=call_value)
+                            call_value = True
+                        elif next_token.value == '{':
+                            close = swift_close(items, cursor)
+                            callback = closure_value(next_token, items[close], bindings, state)
+                            value = invoke(value, [(None, callback)], bindings, state, erased_labels=call_value)
+                            call_value = True
+                            cursor = close + 1
+                        else:
+                            break
+                    result = join(result, value)
+                return result
+
+            def transfer(action, state):
+                kind, tokens, bindings, extra, reads = action
+                if kind == 'entry-definition':
+                    use = root, tokens[0].start
+                    previous = definitions.get(use)
+                    initial = state if previous is None else join_states(previous[1], state)
+                    definitions[use] = dict(reads), initial
+                    if use in uses:
+                        schedule(parser.functions[use[1]], reads, initial, root, uses[use])
+                    return state
+                if kind == 'optional-shorthand':
+                    name = tokens[1].value
+                    state[bindings.get(name, name)] = state.get(reads.get(name, name), CLEAN)
+                    return state
+                if kind == 'switch-subject':
+                    state[extra] = expression(tokens, reads, state)
+                    return state
+                if kind == 'switch-bind':
+                    slot, names = extra
+                    for name, _projected in names:
+                        state[bindings[name]] = state.get(slot, CLEAN)
+                    return state
+                if kind == 'element':
+                    value = elements(expression(tokens, reads, state))
+                    for name in extra:
+                        state[bindings[name]] = value
+                    return state
+                assignment = parser.assignment(tokens) if kind in {'simple', 'optional'} else None
+                if assignment:
+                    name, lhs, rhs, _operator, declaration = assignment
+                    value = expression(rhs, reads, state)
+                    if name and name in bindings:
+                        binding = bindings[name]
+                        state[binding] = value
+                        for reader in capture_readers.get((root, binding), ()):
+                            merged = join(inputs[reader].get(binding, CLEAN), value)
+                            if merged != inputs[reader].get(binding, CLEAN):
+                                inputs[reader][binding] = merged
+                                if reader not in queued:
+                                    pending.append(reader)
+                                    queued.add(reader)
+                    elif not declaration:
+                        expression(lhs, reads, state)
+                elif kind == 'simple' and parser.uninitialized(tokens) is not None:
+                    declaration = parser.uninitialized(tokens)
+                    state.pop(bindings.get(declaration.value, declaration.value), None)
+                else:
+                    value = expression(tokens, reads, state)
+                    if kind == 'return':
+                        invoke(value, (), reads, state, escaping=True, erased_labels=True)
+                return state
+
+            if context not in graphs:
+                lowered = replace(function, body=lower_definitions(function.body))
+                try:
+                    graphs[context] = discovery.graph(lowered, outer_scope)
+                except SwiftUnsupported:
+                    # Unknown binding syntax cannot establish that a possible
+                    # receiver read is irrelevant. The selected real context
+                    # will retain the ordinary incomplete-analysis diagnostic.
+                    expression(tuple(swift_statement_tokens(function.body)), outer_scope, inputs[context])
+                    continue
+            entry, actions, edges = graphs[context]
+            solve(entry, inputs[context], edges, lambda node, state: transfer(actions[node], state), self.budget)
+
+        readers = {}
+        for caller, callees in dependencies.items():
+            for callee in callees:
+                readers.setdefault(callee, set()).add(caller)
+        pending = deque(selected)
+        while pending:
+            for caller in readers.get(pending.popleft(), ()):
+                self.budget.spend()
+                if caller not in selected:
+                    selected.add(caller)
+                    pending.append(caller)
+        return frozenset(function.key for function in functions
+                         if function.key in selected and not function.scope)
 
     def step(self, offset, kind, label):
         offset = max(0, offset)
@@ -1814,6 +2316,33 @@ class SwiftEngine:
                     and trace.key[0] in {'request', 'request-collection', 'request-content'}]
         plain = join(plain, *requests)
         return swift_retag(plain, remove=tags | links)
+
+    def iteration_value(self, value, offset, label):
+        """Project literal elements without confusing them with their collection.
+
+        Nominal identities and stored-field paths describe the selected value;
+        they are not validation proofs. Keep those identities when binding an
+        element, while invalidating scalar/property proofs as for other loops.
+        """
+        projected = (self.project_field('<element>', value)
+                     if swift_has_shape(value, 'literal-array') else None)
+        if projected is not None:
+            mixed = any(trace.kind != 'shape' or trace.key[0] != 'literal-array'
+                        for trace in swift_top(value))
+            opaque = any(trace.kind == 'opaque-value' or trace.kind == 'shape' and trace.key[0] == 'unknown'
+                         for trace in swift_top(projected))
+            links = frozenset(tag for trace in projected for tag in trace.tags
+                              if tag.startswith(('property-of:', 'url-id:')))
+            result = swift_retag(projected, remove=SWIFT_VALUE_TAGS | links)
+            if mixed or opaque:
+                result = join(result, self.limitation(
+                    'Swift opaque collection element needs value binding analysis', offset))
+            return result
+        if any(swift_has_shape(value, kind) for kind in {'request-collection', 'request-content'}):
+            value = join(value, self.source(offset, label))
+        requests = frozenset(trace for trace in value if trace.kind == 'shape'
+                            and trace.key[0] in {'request', 'request-collection', 'request-content'})
+        return join(self.forget(value), requests)
 
     def record(self, offset, value, file_leaf=False):
         if self.policy == 'redirect':
@@ -2759,6 +3288,8 @@ class SwiftEngine:
     def member(self, name, receiver, token, owner_binding=None, state=None):
         if state is not None:
             receiver = self.reference_value(receiver, state)
+        if name in {'first', 'last'} and swift_has_shape(receiver, 'literal-array'):
+            return self.iteration_value(receiver, token.start, 'request collection element')
         owners = {tuple(instance.key[0].split(':', 1)[1].split('.')) for instance in swift_top(receiver)
                   if instance.kind == 'shape' and instance.key[0].startswith(('instance:', 'dynamic-instance:', 'type:'))}
         if owners and all(name in self.parser.stored_fields.get(owner, {}) for owner in owners):
@@ -3104,13 +3635,9 @@ class SwiftEngine:
             argument = CLEAN
         elif (member_call and leaf in {'map', 'compactMap', 'flatMap', 'filter', 'forEach', 'contains', 'first'}
               and not any(function.name == leaf for function in self.parser.functions.values())
-              and not any(trace.kind == 'shape' and trace.key[0].startswith(('dynamic-instance:', 'instance:')) for trace in receiver)):
-            argument = receiver
-            if any(swift_has_shape(receiver, kind) for kind in {'request-collection', 'request-content'}):
-                argument = join(argument, self.source(tokens[0].start, 'request callback element'))
-            requests = frozenset(trace for trace in argument if trace.kind == 'shape'
-                and trace.key[0] in {'request', 'request-collection', 'request-content'})
-            argument = join(self.forget(argument), requests)
+              and not any(trace.kind == 'shape' and trace.key[0].startswith(('dynamic-instance:', 'instance:'))
+                          for trace in swift_top(receiver))):
+            argument = self.iteration_value(receiver, tokens[0].start, 'request callback element')
         else:
             # Unknown call: the closure parameter has unknown provenance. It is
             # request-tainted if the receiver or any argument is (call() folds the
@@ -3123,12 +3650,24 @@ class SwiftEngine:
             if not swift_request_dependency(argument):
                 argument = join(argument, swift_retag(self.source(tokens[0].start, 'unknown closure parameter'),
                                                 add=frozenset({'unknown-provenance'})))
+            if swift_has_shape(receiver, 'literal-array'):
+                # A mixed or shadowed callback can still receive the known
+                # literal element. Keep that flow beside the dispatch refusal.
+                argument = join(argument, self.iteration_value(receiver, tokens[0].start, 'request callback element'),
+                                self.limitation('Swift collection callback needs dispatch analysis', tokens[0].start))
         value = self.inline_closure(tokens, argument, state, bindings, depth + 1,
                                     catches_errors=name in {'#expect', '#require'})
         # A method name also does not prove that its result is exactly the
         # callback return (an external map may ignore the callback). Retain
         # receiver dependencies rather than treating map as a sanitizer.
-        return join(self.forget(receiver), argument, value)
+        result = join(self.forget(receiver), argument, value)
+        if (swift_has_shape(receiver, 'literal-array')
+                and leaf in {'map', 'compactMap', 'flatMap', 'filter'}):
+            # These operations keep a collection result. Unknown dispatch has
+            # already refused above; its possible element flow still survives.
+            result = join(self.stored_value('<element>', result, tokens[0].start),
+                          swift_shape('literal-array', tokens[0].start))
+        return result
 
     def expression(self, tokens, state, bindings, depth=0):
         if depth > 64:
@@ -3209,12 +3748,14 @@ class SwiftEngine:
             cursor, name, owner_binding = 1, '', None
         elif tokens[0].value == '[':
             close = swift_close(tokens, 0)
-            parts = []
+            parts, array_elements = [], True
             for part in swift_parts(tokens[1:close], {','}):
                 if not part:
                     continue
                 keyed = swift_parts(part, {':'})
                 paired = swift_parts(swift_ungroup(part), {','})
+                if len(keyed) == 2 or len(paired) > 1:
+                    array_elements = False
                 pair = keyed if len(keyed) == 2 else paired
                 key = swift_ungroup(pair[0]) if len(pair) == 2 else ()
                 if len(key) == 1 and key[0].kind == 'literal':
@@ -3226,6 +3767,16 @@ class SwiftEngine:
                 value = join(*parts, swift_shape('literal-list', tokens[0].start))
             else:
                 value = join(*parts)
+                if array_elements and any(trace.kind == 'shape' and (
+                        trace.key[0].startswith(('instance:', 'dynamic-instance:', 'reference:'))
+                        or trace.key[0] == 'literal-array') for trace in value):
+                    # Element identities belong to the literal's contents, not
+                    # to the collection receiver. Reuse the bounded aggregate
+                    # projection so reference aliases and nested fields survive.
+                    # Scalar/opaque-only lists retain their existing transfer;
+                    # an outbound unknown shape alone is no structural layout.
+                    value = join(self.stored_value('<element>', value, tokens[0].start),
+                                 swift_shape('literal-array', tokens[0].start))
             cursor, name, owner_binding = close + 1, '', None
         elif tokens[0].value == '(':
             close = swift_close(tokens, 0)
@@ -3336,6 +3887,8 @@ class SwiftEngine:
                 if swift_has_shape(value, 'request-collection'):
                     value = self.source(tokens[0].start, self.text[tokens[0].start:tokens[close].end])
                 else:
+                    if swift_has_shape(value, 'literal-array'):
+                        value = self.iteration_value(value, token.start, 'request collection element')
                     value = join(value, self.expression(tokens[cursor + 1:close], state, bindings, depth + 1))
                 cursor = close + 1
                 continue
@@ -4243,12 +4796,8 @@ class SwiftEngine:
                 state[bindings[name]] = value
             return state
         if kind == 'element':
-            value = self.expression(tokens, state, reads)
-            if any(swift_has_shape(value, shape) for shape in {'request-collection', 'request-content'}):
-                value = join(value, self.source(tokens[0].start, 'request iteration'))
-            requests = frozenset(trace for trace in value if trace.kind == 'shape'
-                and trace.key[0] in {'request', 'request-collection', 'request-content'})
-            value = join(self.forget(value), requests)
+            value = self.iteration_value(self.expression(tokens, state, reads),
+                                         tokens[0].start, 'request iteration')
             for name in extra:
                 state[bindings[name]] = advance(value, self.step(tokens[0].start, 'assign', name))
             return state

@@ -6,7 +6,9 @@ frontend. Retain each source and result so failures are directly reproducible.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import textwrap
 import unittest
@@ -19,6 +21,66 @@ from ubs_core.analyzers.taint_swift_traversal import (
     SwiftEngine, SwiftUnsupported, flow_findings,
 )
 from ubs_core.taint_flow import AnalysisLimit
+
+
+def issue229_sources():
+    """The reporter's complete seven-case matrix, including source directives."""
+    view = textwrap.dedent('''\
+        import SwiftUI
+
+        struct Screen: View {
+            @State private var busy = false
+            var body: some View { Text(busy ? "Loading" : "Idle") }
+
+            func load(_ url: URL) async {
+                busy = true
+                let request = URLRequest(url: url)
+                _ = try? await URLSession.shared.data(for: request)
+                busy = false
+            }
+        }
+    ''')
+    model = textwrap.dedent('''\
+        import Foundation
+        import Combine
+
+        final class Model: ObservableObject {
+            @Published var busy = false
+
+            func start() {
+                busy = true
+                let request = 1
+                _ = request
+                _ = FileManager.default
+            }
+        }
+    ''')
+    derived = textwrap.dedent('''\
+        import Foundation
+        import Combine
+        import Vapor
+
+        final class Model: ObservableObject {
+            @Published var path = ""
+
+            func handle(req: Request) -> String? {
+                path = req.query["path"]!
+                return try? String(contentsOfFile: path)
+            }
+        }
+    ''')
+    return {
+        'view': view,
+        'model': model,
+        'attribute': model.replace('@Published var busy', '@MainActor var busy')
+                          .replace('    func start', '    @MainActor func start'),
+        'derived': derived,
+        'renamed': model.replace('request', 'payload'),
+        'plain': model.replace('@Published var busy', 'var busy'),
+        'directive': '\n'.join(
+            line + ' // ubs:ignore[taint-source] a counter, not an incoming request'
+            if 'request' in line else line for line in model.split('\n')),
+    }
 
 
 class SwiftInitializerTests(unittest.TestCase):
@@ -56,6 +118,555 @@ class SwiftInitializerTests(unittest.TestCase):
         self.assertTrue(limited, findings)
         self.assertTrue(any(reason in row['extras']['reason'] for row in limited), findings)
         return findings
+
+    def wrapper_scan(self, path, mode, fmt, label, *, cache_dir=None):
+        """Use verified public entrypoints; retain every actual command/result."""
+        evidence = self.artifacts / label
+        evidence.mkdir()
+        command = ([str(ROOT / 'modules/ubs-swift.sh'), '--format=' + fmt, str(path)]
+                   if mode == 'module' else
+                   [str(ROOT / 'ubs'), '--module-dir=' + str(ROOT / 'modules'),
+                    '--no-auto-update', '--only=swift', '--format=' + fmt,
+                    *(['--no-cache'] if cache_dir is None else []), str(path)])
+        environment = {
+            **os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
+            'UBS_NO_CACHE': '1' if cache_dir is None else '0',
+            'UBS_CACHE_DIR': str(cache_dir or evidence / 'cache'),
+            'PYTHONDONTWRITEBYTECODE': '1', 'NO_COLOR': '1',
+        }
+        # Ambient escape hatches must not turn these into integrity/partial
+        # bypass tests. The same cwd also keeps cache identities comparable.
+        for name in ('UBS_ALLOW_UNVERIFIED_HELPERS', 'UBS_VERIFIED_ASSET_DIR',
+                     'UBS_ALLOW_PARTIAL', 'UBS_SKIP_TYPE_NARROWING'):
+            environment.pop(name, None)
+        result = subprocess.run(command, cwd=self.artifacts, env=environment,
+                                text=True, capture_output=True, timeout=90, check=False)
+        (evidence / 'stdout.log').write_text(result.stdout, encoding='utf-8')
+        (evidence / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+        (evidence / 'command.json').write_text(json.dumps({
+            'command': command, 'cwd': str(self.artifacts), 'exit': result.returncode,
+        }, indent=2), encoding='utf-8')
+        if fmt == 'text':
+            return result, result.stdout
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            self.fail('Invalid scanner JSON for %s: %s\nexit=%s\nstderr=%s' %
+                      (label, error, result.returncode, result.stderr))
+        return result, payload
+
+    def assert_wrapper_report(self, result, payload, mode, *, incomplete, sink_line=None):
+        self.assertEqual(result.returncode, 2 if incomplete else int(sink_line is not None),
+                         (payload, result.stderr))
+        self.assertEqual(payload['status'], 'partial' if incomplete else 'ok', payload)
+        scanner = payload if mode == 'module' else payload['scanners'][0]
+        self.assertEqual(scanner['status'], payload['status'], payload)
+        self.assertEqual(scanner['files'], 1, scanner)
+        if incomplete:
+            self.assertEqual(scanner['module_error'], 'ANALYZER_ERROR', scanner)
+            self.assertIn('analysis is incomplete', scanner['message'], scanner)
+        else:
+            self.assertNotIn('module_error', scanner)
+            if mode == 'runner':
+                self.assertEqual(payload['failed_modules'], [], payload)
+        rows = payload['findings']
+        key = 'rule' if mode == 'module' else 'rule_id'
+        sinks = [row for row in rows if row[key] == 'swift.taint.request_path_traversal']
+        self.assertEqual([(row['line'], row['severity']) for row in sinks],
+                         [(sink_line, 'critical')] if sink_line is not None else [], rows)
+        return rows
+
+    def test_issue229_complete_reporter_matrix_in_all_taint_policies(self):
+        for case, source in issue229_sources().items():
+            path, source = self.source(source, '-' + case)
+            for policy in ('path', 'redirect', 'header', 'outbound'):
+                with self.subTest(case=case, policy=policy):
+                    findings = flow_findings(path, source, policy, recover=True)
+                    path.with_suffix('.' + policy + '.json').write_text(
+                        json.dumps(findings, indent=2), encoding='utf-8')
+                    limits = [row for row in findings if row['rule'] == 'swift.taint.analysis-limited']
+                    # Proven native scalar transfer preserves request facts
+                    # and completes; the path policy still reports its sink.
+                    self.assertEqual(limits, [], findings)
+                    sinks = [row for row in findings if row['severity'] == 'critical']
+                    expected = [('swift.taint.request_path_traversal', 10)] \
+                        if case == 'derived' and policy == 'path' else []
+                    self.assertEqual([(row['rule'], row['line']) for row in sinks], expected, findings)
+
+    def test_issue229_complete_reporter_matrix_through_module_and_runner(self):
+        for case, source in issue229_sources().items():
+            path, _ = self.source(source, '-' + case)
+            for mode in ('module', 'runner'):
+                with self.subTest(case=case, mode=mode):
+                    result, payload = self.wrapper_scan(path, mode, 'json', 'matrix-' + case + '-' + mode)
+                    rows = self.assert_wrapper_report(result, payload, mode, incomplete=False,
+                                                      sink_line=10 if case == 'derived' else None)
+                    key = 'rule' if mode == 'module' else 'rule_id'
+                    self.assertFalse(any(row[key] == 'swift.taint.analysis-limited' for row in rows), rows)
+
+    def test_issue229_text_and_sarif_retain_completion_and_findings(self):
+        cases = issue229_sources()
+        for case in ('view', 'derived'):
+            path, _ = self.source(cases[case], '-' + case)
+            for mode in ('module', 'runner'):
+                for fmt in ('text', 'sarif'):
+                    with self.subTest(case=case, mode=mode, format=fmt):
+                        result, payload = self.wrapper_scan(path, mode, fmt, '-'.join((case, mode, fmt)))
+                        self.assertEqual(result.returncode, 1 if case == 'derived' else 0, result.stderr)
+                        if fmt == 'text':
+                            combined = result.stdout + result.stderr
+                            self.assertNotIn('Swift analysis did not complete', combined)
+                            self.assertEqual('Request-derived path reaches file' in combined, case == 'derived', combined)
+                            if mode == 'runner':
+                                self.assertNotIn('Status: partial', combined)
+                        else:
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])]
+                            sinks = [row for row in rows if row['ruleId'] == 'swift.taint.request_path_traversal']
+                            self.assertEqual([row['locations'][0]['physicalLocation']['region']['startLine']
+                                              for row in sinks], [10] if case == 'derived' else [], rows)
+                            self.assertFalse(any(row['ruleId'] == 'swift.taint.analysis-limited' for row in rows), rows)
+                            invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                            self.assertTrue(all(item.get('executionSuccessful', True) for item in invocations), payload)
+
+    def test_issue229_ordinary_attributes_preserve_storage_flow(self):
+        for index, attribute in enumerate((
+                '@MainActor', '@_Concurrency.MainActor', '@objc', '@objc(path)',
+                '@available(iOS 16, *)', '@MainActor\n    @available(iOS 16, *)',
+                '@available(iOS 16, *) private(set) @MainActor')):
+            with self.subTest(attribute=attribute):
+                self.check('''
+                    import Foundation
+                    final class Model: NSObject {
+                        %s var path = ""
+                        @MainActor func handle(req: Request) {
+                            path = req.query["path"]!
+                            _ = String(contentsOfFile: path) // unsafe
+                        }
+                    }
+                ''' % attribute, suffix='-attribute' + str(index))
+        self.check('''
+            import AppKit
+            final class Model: NSObject {
+                @IBOutlet weak var label: NSTextField?
+                func start() {
+                    label = nil
+                    let request = 1
+                    _ = request
+                    _ = String(contentsOfFile: "/fixed")
+                }
+            }
+        ''', suffix='-outlet')
+
+    def test_issue229_framework_scalar_writes_and_readback_are_clean(self):
+        for index, attribute in enumerate((
+                '@State', '@Published', '@SwiftUI.State', '@Combine.Published',
+                '@SwiftUI.State<String>', '@Combine.Published<String>',
+                '@MainActor @Published', '@available(iOS 16, *)\n    @State',
+                '@SwiftUI.State private(set)', '@MainActor\n    @Combine.Published')):
+            with self.subTest(attribute=attribute):
+                self.check('''
+                    import SwiftUI
+                    import Combine
+                    final class Model {
+                        %s var path = ""
+                        func handle(req: Request) {
+                            let fixed = "/fixed"
+                            self.path = fixed
+                            _ = String(contentsOfFile: self.path)
+                        }
+                    }
+                ''' % attribute, suffix='-framework' + str(index))
+        for index, (declaration, assigned) in enumerate((
+                ('var busy = false', 'true'), ('var count = 0', '2'),
+                ('var busy: Bool = false', 'false'), ('var label: String = ""', '"fixed"'))):
+            self.check('''
+                import SwiftUI
+                struct Model {
+                    @State %s
+                    func handle(req: Request) {
+                        _ = req
+                        self.%s = %s
+                        _ = String(contentsOfFile: "/fixed")
+                    }
+                }
+            ''' % (declaration, declaration.split()[1].rstrip(':'), assigned), suffix='-scalar' + str(index))
+
+    def test_issue229_unknown_wrappers_and_effectful_setters_remain_incomplete(self):
+        cases = (
+            ('@Unknown var busy = false', 'busy = true', 'wrapped stored property'),
+            ('@Binding var busy: Bool', 'busy = true', 'wrapped stored property'),
+            ('@AppStorage("busy") var busy = false', 'busy = true', 'wrapped stored property'),
+            ('@Published @Unknown var busy = false', 'busy = true', 'wrapped stored property'),
+            ('@State(wrappedValue: false) var busy: Bool', 'busy = true', 'wrapped stored property'),
+            ('@State var count = 0', 'count += 1', 'wrapped stored property'),
+            ('@Published var busy = false { didSet { observe(busy) } }', 'busy = true', 'observer'),
+            ('@State var busy = false { willSet { observe(newValue) } }', 'busy = true', 'observer'),
+            ('var busy: Bool { get { false } set { observe(newValue) } }', 'busy = true', 'accessor'),
+            ('@Published var busy = false', 'busy = unknownValue()', 'wrapped stored property'),
+        )
+        for index, (declaration, assignment, reason) in enumerate(cases):
+            with self.subTest(declaration=declaration, assignment=assignment):
+                findings = self.unsupported('''
+                    import SwiftUI
+                    import Combine
+                    final class Model {
+                        %s
+                        func handle(req: Request) {
+                            %s
+                            _ = String(contentsOfFile: req.query["independent"]!)
+                        }
+                    }
+                ''' % (declaration, assignment), reason, '-effects' + str(index))
+                self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal'
+                                    and row['line'] == 7 for row in findings), findings)
+
+    def test_issue229_native_names_do_not_authorize_shadowed_wrappers(self):
+        cases = (
+            ('State', 'import SwiftUI', '@propertyWrapper struct State<T> { var wrappedValue: T }'),
+            ('Published', 'import Combine', '@propertyWrapper struct Published<T> { var wrappedValue: T }'),
+            ('Published', 'import Combine', 'typealias Published = Unknown'),
+            ('State', '', ''),
+            ('Published', '', ''),
+            ('MainActor', '', '@propertyWrapper struct MainActor<T> { var wrappedValue: T }'),
+            ('SwiftUI.State', 'import SwiftUI', 'enum SwiftUI { @propertyWrapper struct State<T> { var wrappedValue: T } }'),
+            ('Combine.Published', 'import Combine', 'enum Combine { @propertyWrapper struct Published<T> { var wrappedValue: T } }'),
+            ('State', 'import SwiftUI', 'extension State<Bool> {}'),
+            ('SwiftUI.State', 'import SwiftUI', 'extension SwiftUI.State<Bool> {}'),
+            ('Published', 'import Combine', 'extension Published<Bool> {}'),
+            ('Combine.Published', 'import Combine', 'extension Combine.Published<Bool> {}'),
+            ('SwiftUI.State', 'import SwiftUI',
+             'typealias LocalState = SwiftUI.State<Bool>; extension LocalState {}'),
+            ('Combine.Published', 'import Combine',
+             'typealias LocalPublished = Combine.Published<Bool>; extension LocalPublished {}'),
+        )
+        for index, (name, imported, shadow) in enumerate(cases):
+            with self.subTest(wrapper=name, shadow=shadow):
+                findings = self.unsupported('''
+                    %s
+                    final class Model {
+                        @%s var busy = false
+                        func handle(req: Request) {
+                            busy = true
+                            _ = String(contentsOfFile: req.query["independent"]!)
+                        }
+                    }
+                    %s
+                ''' % (imported, name, shadow), 'wrapped stored property', '-identity' + str(index))
+                self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal'
+                                    for row in findings), findings)
+
+    def test_issue229_request_overwrite_keeps_flow_and_wrapper_boundaries(self):
+        for wrapper in ('State', 'Published'):
+            # Both stores are modeled for native scalar storage. Weak updates
+            # retain the earlier request source without inventing incompleteness.
+            self.check('''
+                import SwiftUI
+                import Combine
+                final class Model {
+                    @%s var path = ""
+                    func handle(req: Request) {
+                        path = req.query["path"]!
+                        path = "/fixed"
+                        _ = String(contentsOfFile: path) // unsafe
+                    }
+                }
+            ''' % wrapper, suffix='-' + wrapper)
+        findings = self.unsupported('''
+            final class Model {
+                @Unknown var path = ""
+                func handle(req: Request) {
+                    path = req.query["path"]!
+                    path = "/fixed"
+                    _ = String(contentsOfFile: path)
+                }
+            }
+        ''', 'wrapped stored property', '-unknown')
+        self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal'
+                            and row['line'] == 6 for row in findings), findings)
+
+    def test_issue229_dispatch_and_declaration_effects_are_not_plain_storage(self):
+        cases = (
+            ('class Model', '@Published var busy = false', 'busy = true'),
+            ('enum Other { final class Model {} }; class Model', '@Published var busy = false', 'busy = true'),
+            ('final class Model: NSObject', '@Published @objc dynamic var busy = false', 'busy = true'),
+            ('final class Model: NSObject', '@objc dynamic var busy = false', 'busy = true'),
+            ('final class Model: NSObject', '@MainActor lazy var busy = false', 'busy = true'),
+            ('final class Model: NSObject', '@NSManaged var busy: Bool', 'busy = true'),
+            ('final class Model: NSObject', '@NSCopying var label: NSString = ""', 'label = "fixed"'),
+            ('@Observable final class Model', '@Published var busy = false', 'busy = true'),
+            ('final class Model', '@Published<String> var busy = false', 'busy = true'),
+            ('final class Model', '@CustomActor var busy = false', 'busy = true'),
+        )
+        for index, (owner, declaration, assignment) in enumerate(cases):
+            with self.subTest(owner=owner, declaration=declaration):
+                source = '''
+                    import Foundation
+                    import SwiftUI
+                    import Combine
+                    %s {
+                        %s
+                        func handle(req: Request) {
+                            %s
+                            _ = String(contentsOfFile: req.query["independent"]!) // independent
+                        }
+                    }
+                ''' % (owner, declaration, assignment)
+                findings = self.unsupported(source, 'analysis', '-dispatch' + str(index))
+                sink_line = next(number for number, line in enumerate(
+                    textwrap.dedent(source).strip().splitlines(), 1) if '// independent' in line)
+                self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal'
+                                    and row['line'] == sink_line for row in findings), findings)
+
+    def test_issue229_attribute_arguments_do_not_become_declaration_modifiers(self):
+        for word in ('static', 'class', 'final', 'lazy'):
+            with self.subTest(attribute_message=word):
+                self.check('''
+                    import Foundation
+                    final class Model {
+                        @available(*, deprecated, message: "%s")
+                        var path = ""
+                        @available(*, deprecated, message: "%s")
+                        func store(_ value: String) { path = value }
+                        @available(*, deprecated, message: "%s")
+                        var current: String { path }
+                        func handle(req: Request) {
+                            store(req.query["path"]!)
+                            _ = String(contentsOfFile: current) // unsafe
+                        }
+                    }
+                ''' % (word, word, word), suffix='-argument-' + word)
+        # An availability message cannot make an overridable class final and
+        # therefore cannot authorize native wrapper dispatch for its fields.
+        self.unsupported('''
+            import Combine
+            @available(*, deprecated, message: "final")
+            class Model {
+                @Published var busy = false
+                func handle(req: Request) {
+                    busy = true
+                    _ = String(contentsOfFile: req.query["path"]!)
+                }
+            }
+        ''', 'wrapped stored property', '-owner-final-message')
+
+    def test_issue229_generic_owner_bindings_cannot_borrow_framework_identity(self):
+        cases = (
+            ('final class Model<State>', '@State', ''),
+            ('final class Model<Published>', '@Published', ''),
+            ('final class Model<Bool>', '@State', ''),
+            ('final class Outer<SwiftUI> { final class Model', '@SwiftUI.State', '}'),
+            ('final class Outer<Combine> { final class Model', '@Combine.Published', '}'),
+        )
+        for index, (owner, wrapper, ending) in enumerate(cases):
+            with self.subTest(owner=owner):
+                self.unsupported('''
+                    import SwiftUI
+                    import Combine
+                    %s {
+                        %s var busy = false
+                        func handle(req: Request) {
+                            busy = true
+                            _ = String(contentsOfFile: req.query["path"]!)
+                        }
+                    } %s
+                ''' % (owner, wrapper, ending), 'analysis', '-generic' + str(index))
+
+    def test_issue229_custom_values_and_callable_storage_stay_incomplete(self):
+        cases = (
+            ('final class Payload { var value = false }', '@State var value = Payload()', 'value = Payload()'),
+            ('', '@State var work: () -> String = { "fixed" }', 'work = { req.query["path"]! }'),
+            ('', '@Published var value: Any = false', 'value = true'),
+            ('struct Custom: ExpressibleByBooleanLiteral { init(booleanLiteral value: Swift.Bool) {} }; '
+             'typealias Bool = Custom', '@State var busy: Bool = false', 'busy = true'),
+            ('struct Custom: ExpressibleByStringLiteral { init(stringLiteral value: Swift.String) {} }; '
+             'typealias String = Custom', '@Published var path: String = ""', 'path = "fixed"'),
+        )
+        for index, (setup, declaration, assignment) in enumerate(cases):
+            with self.subTest(declaration=declaration):
+                source = '''
+                    import SwiftUI
+                    import Combine
+                    %s
+                    final class Model {
+                        %s
+                        func handle(req: Request) {
+                            %s
+                            _ = Swift.String(contentsOfFile: req.query["independent"]!) // independent
+                        }
+                    }
+                ''' % (setup, declaration, assignment)
+                findings = self.unsupported(source, 'wrapped stored property', '-custom-value' + str(index))
+                sink_line = next(number for number, line in enumerate(
+                    textwrap.dedent(source).strip().splitlines(), 1) if '// independent' in line)
+                self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal'
+                                    and row['line'] == sink_line for row in findings), findings)
+
+    def test_issue229_wrapped_typed_request_read_keeps_the_original_finding(self):
+        # Keep the original late-review source, including its no-argument
+        # method: an incomplete accessor must not erase the declared Request.
+        source = '''
+            import Vapor
+            final class Model {
+                @Unknown var request: Request
+                func handle() {
+                    _ = try? String(contentsOfFile: request.query["path"]!)
+                }
+            }
+        '''
+        findings = self.unsupported(source, 'wrapped stored property')
+        self.assertEqual([(row['rule'], row['line'], row['severity'])
+                          for row in findings if row['severity'] == 'critical'],
+                         [('swift.taint.request_path_traversal', 5, 'critical')], findings)
+        path, _ = self.source(source)
+        for mode in ('module', 'runner'):
+            with self.subTest(mode=mode):
+                result, payload = self.wrapper_scan(path, mode, 'json', 'typed-request-' + mode)
+                self.assert_wrapper_report(result, payload, mode, incomplete=True, sink_line=5)
+
+    def test_issue229_executable_wrapper_defaults_are_not_proven_clean(self):
+        template = '''
+            import SwiftUI
+            import Vapor
+            enum Incoming { static var request: Request? }
+            struct Screen: View {
+                @State private var path: String = %s
+                var body: some View { Text("Example") }
+                func load(req: Request) {
+                    path = "/fixed"
+                    _ = try? String(contentsOfFile: path)
+                    _ = String(contentsOfFile: req.query["independent"]!) // unsafe
+                }
+            }
+        '''
+        for index, default in enumerate(('initialPath()', 'Incoming.request!.query["path"]!')):
+            with self.subTest(default=default):
+                findings = self.unsupported(template % default, 'wrapped stored property',
+                                            '-default' + str(index))
+                self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal'
+                                    and row['line'] == 10 for row in findings), findings)
+        # A literal default establishes the bounded value model. The same
+        # independent unsafe sink remains a finding without a coverage limit.
+        self.check(template % '"/original"', suffix='-literal-control')
+
+    def test_issue229_published_callbacks_and_inheritance_remain_incomplete(self):
+        sources = (
+            '''
+                import Combine
+                import Vapor
+                final class Model: ObservableObject {
+                    var current: Request?
+                    @Published var busy = false
+                    var subscription: AnyCancellable?
+                    func observe() {
+                        subscription = $busy.sink { [unowned self] _ in
+                            _ = try? String(contentsOfFile: self.current!.query["path"]!)
+                        }
+                    }
+                    func handle(req: Request) {
+                        current = req
+                        busy = true
+                        _ = String(contentsOfFile: req.query["independent"]!) // independent
+                    }
+                }
+            ''',
+            '''
+                import Combine
+                import Vapor
+                final class Model: ObservableObject {
+                    var current: Request?
+                    @Published var busy = false
+                    var objectWillChange: ObservableObjectPublisher {
+                        _ = try? String(contentsOfFile: current!.query["path"]!)
+                        return ObservableObjectPublisher()
+                    }
+                    func handle(req: Request) {
+                        current = req
+                        busy = true
+                        _ = String(contentsOfFile: req.query["independent"]!) // independent
+                    }
+                }
+            ''',
+        )
+        for index, source in enumerate(sources):
+            with self.subTest(callback=index):
+                findings = self.unsupported(source, 'wrapped stored property', '-callback' + str(index))
+                sink_line = next(number for number, line in enumerate(
+                    textwrap.dedent(source).strip().splitlines(), 1) if '// independent' in line)
+                self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal'
+                                    and row['line'] == sink_line for row in findings), findings)
+        for index, (setup, inherited) in enumerate((
+                ('protocol CustomObserver: ObservableObject {}', 'CustomObserver'),
+                ('class Base: ObservableObject {}', 'Base'))):
+            with self.subTest(inherited=inherited):
+                findings = self.unsupported('''
+                    import Combine
+                    %s
+                    final class Model: %s {
+                        @Published var busy = false
+                        func handle(req: Request) {
+                            busy = true
+                            _ = String(contentsOfFile: req.query["independent"]!)
+                        }
+                    }
+                ''' % (setup, inherited), 'wrapped stored property', '-inheritance' + str(index))
+                self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal'
+                                    and row['line'] == 7 for row in findings), findings)
+
+    def test_issue229_projected_and_backing_storage_are_not_plain_assignments(self):
+        for index, (wrapper, access) in enumerate((
+                ('State', '_ = $busy'), ('State', '_busy = State(initialValue: true)'),
+                ('Published', '_ = $busy'), ('Published', '_busy = Published(initialValue: true)'))):
+            with self.subTest(wrapper=wrapper, access=access):
+                findings = self.unsupported('''
+                    import SwiftUI
+                    import Combine
+                    final class Model {
+                        @%s var busy = false
+                        func accessStorage() { %s }
+                        func handle(req: Request) {
+                            busy = true
+                            _ = String(contentsOfFile: req.query["independent"]!)
+                        }
+                    }
+                ''' % (wrapper, access), 'wrapped stored property', '-storage' + str(index))
+                self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal'
+                                    and row['line'] == 8 for row in findings), findings)
+        for wrapper in ('State', 'Published'):
+            with self.subTest(inert_identifiers=wrapper):
+                self.check('''
+                    import SwiftUI
+                    import Combine
+                    final class Model: Combine.ObservableObject {
+                        @%s var busy = false
+                        func handle(req: Request) {
+                            let note = "$busy _busy objectWillChange"
+                            _ = note
+                            // $busy _busy objectWillChange are inert here.
+                            busy = true
+                            _ = String(contentsOfFile: req.query["independent"]!) // unsafe
+                        }
+                    }
+                ''' % wrapper, suffix='-inert-' + wrapper)
+
+    def test_issue229_partial_suppression_and_cache_invalidation(self):
+        path, clean = self.source(issue229_sources()['model'], '-cache')
+        cache = self.artifacts / 'wrapper-cache'
+        for attempt in range(2):
+            result, payload = self.wrapper_scan(path, 'runner', 'json', 'clean-cache-' + str(attempt), cache_dir=cache)
+            self.assert_wrapper_report(result, payload, 'runner', incomplete=False)
+            self.assertEqual(payload['scanners'][0]['extras']['profile']['cache_hits'], attempt, payload)
+        unsupported = clean.replace('@Published', '@Unknown').replace(
+            'busy = true', 'busy = true // ubs:ignore[swift.taint.analysis-limited] supported later')
+        path.write_text(unsupported, encoding='utf-8')
+        for attempt in range(2):
+            result, payload = self.wrapper_scan(path, 'runner', 'json', 'partial-cache-' + str(attempt), cache_dir=cache)
+            rows = self.assert_wrapper_report(result, payload, 'runner', incomplete=True)
+            self.assertFalse(any(row['rule_id'] == 'swift.taint.analysis-limited' for row in rows), rows)
+            self.assertEqual(payload['scanners'][0]['extras']['profile']['cache_hits'], 0, payload)
+        path.write_text(clean, encoding='utf-8')
+        result, payload = self.wrapper_scan(path, 'runner', 'json', 'restored-cache', cache_dir=cache)
+        self.assert_wrapper_report(result, payload, 'runner', incomplete=False)
+        self.assertEqual(payload['scanners'][0]['extras']['profile']['cache_hits'], 1, payload)
 
     def test_incoming_callable_field_alias_keeps_opaque_alternative(self):
         for default in ('', ' = { _ in "/default" }'):

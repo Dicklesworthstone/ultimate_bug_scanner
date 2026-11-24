@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.137-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.138-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1652,6 +1652,16 @@ receipt, and incomplete scans do not populate the reusable analysis cache.
 The separately documented, reason-required `taint-source` directive retains
 its narrow source-activation behavior; it does not clear another active
 source's analysis failure.
+
+Swift declaration attributes such as `@MainActor`, `@objc`, `@available` and
+`@IBOutlet` do not by themselves imply property-wrapper storage. The bounded
+value-flow model tracks scalar assignments through unshadowed SwiftUI `State`
+and Combine `Published` properties with literal native scalar defaults and
+statically resolved setters. Known request-derived values retain their source
+and previous value alternatives. Opaque values, executable defaults,
+projected/backing storage, custom notifications, unmodeled inheritance,
+observers, custom accessors and compound writes remain explicit analysis limits.
+Refusal diagnostics retain independently established request shapes and findings.
 
 **Python coverage limitations.** A bounded native analysis that cannot prove
 complete coverage reports `module_error: "ANALYSIS_INCOMPLETE"`, with

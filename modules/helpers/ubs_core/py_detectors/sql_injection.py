@@ -3213,6 +3213,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         present = [state for state in states if state is not None]
         if not present:
             return None
+        if len(present) == 1:
+            # Snapshots already satisfy the lattice invariants. A lone
+            # reachable edge only needs independent mutable stores, so avoid
+            # rebuilding every binding at each straight-line statement.
+            return tuple(part.copy() for part in present[0])
         unsafe = set().union(*(state[0] for state in present))
         weak = set().union(*(state[1] for state in present)) - unsafe
         fragments, selects = {}, {}

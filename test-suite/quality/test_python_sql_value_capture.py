@@ -7089,6 +7089,10 @@ class SetAndDictHashCallbackRefusalTests(unittest.TestCase):
             ('dict-pop', 'd = {"x": 1}\n    _ = d.pop(Key(), None)'),
             ('dict-update-pairs', 'd = {}\n    d.update([(Key(), 1)])'),
             ('dict-in', 'd = {}\n    _ = Key() in d'),
+            ('dict-instance-fromkeys-literal', '_ = {}.fromkeys([Key()])'),
+            ('dict-instance-fromkeys-var', 'd = {}\n    _ = d.fromkeys([Key()])'),
+            ('dict-instance-fromkeys-saved', 'd = {}\n    fn = d.fromkeys\n    _ = fn([Key()])'),
+            ('dict-instance-fromkeys-gen', 'd = {}\n    _ = d.fromkeys(Key() for _ in (1,))'),
         )
         for name, stmt in cases:
             with self.subTest(case=name):
@@ -7112,6 +7116,9 @@ class SetAndDictHashCallbackRefusalTests(unittest.TestCase):
             ('primitive-dict-in', 'd = {}\n    _ = "alice" in d', False),
             ('literal-set-update-generator', 'seen = set()\n    seen.update(x for x in ("a", "b"))', False),
             ('inert-hash-set-and-dict', 'seen = set()\n    seen.add(Key())\n    d = {}\n    d[Key()] = 1', True),
+            ('primitive-dict-instance-fromkeys', 'd = {}\n    _ = d.fromkeys(["a", "b"])', False),
+            ('literal-dict-instance-fromkeys-gen', 'd = {}\n    _ = d.fromkeys(x for x in ("a", "b"))', False),
+            ('inert-hash-dict-instance-fromkeys', '_ = {}.fromkeys([Key()])', True),
         )
         for name, stmt, inert in controls:
             with self.subTest(case=name):

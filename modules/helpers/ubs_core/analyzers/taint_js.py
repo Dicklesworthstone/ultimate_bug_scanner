@@ -1463,7 +1463,7 @@ class _Flow:
                 ref = ('builtin', 'drizzle.' + provider)
                 state.heap.setdefault(ref, {})
                 return _Fact(refs=(ref,))
-        if name in {'Object', 'Array', 'Reflect'} and not any(
+        if name in {'Object', 'Array', 'Reflect', 'Function'} and not any(
                 local == name and begin == key[1]
                 for begin, _end, local in self.engine.binding_regions[key[0]]):
             # These identities are shared by aliases. A spelling-based check
@@ -3737,12 +3737,16 @@ class _Flow:
                         break
                     bmethod = borrowed.group(1)
                     fill_slots = state.heap.get(_ARRAY_FILL, {})
+                    func_proto = state.heap.get(('builtin', 'Function.prototype'), {})
+                    obj_proto = state.heap.get(('builtin', 'Object.prototype'), {})
                     proven_call = (
                         bmethod == 'call' and _refs(fact) == {_ARRAY_FILL} and not frozenset(fact)
                         and not getattr(fact, 'absent', False)
                         and not getattr(fact, 'scalar_alternative', False)
-                        and not any(k in fill_slots for k in (
-                            'call', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')))
+                        and not any(
+                            k in container
+                            for container in (fill_slots, func_proto, obj_proto)
+                            for k in ('call', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')))
                     arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
                                  if self.engine.code[left:right].strip()]
                     values, prepared = self.evaluate_arguments(arguments, state)
@@ -3808,12 +3812,16 @@ class _Flow:
             return 'array-at-unknown', receiver, 'at'
         if _ARRAY_FILL in refs:
             fill_slots = state.heap.get(_ARRAY_FILL, {})
+            func_proto = state.heap.get(('builtin', 'Function.prototype'), {})
+            obj_proto = state.heap.get(('builtin', 'Object.prototype'), {})
             proven_call = (
                 method == 'call' and refs == {_ARRAY_FILL} and not frozenset(receiver)
                 and not getattr(receiver, 'absent', False)
                 and not getattr(receiver, 'scalar_alternative', False)
-                and not any(k in fill_slots for k in (
-                    'call', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')))
+                and not any(
+                    k in container
+                    for container in (fill_slots, func_proto, obj_proto)
+                    for k in ('call', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')))
             return ('array-fill-call' if proven_call else 'array-fill-unknown'), receiver, method
         if _ARRAY_FROM in refs:
             # Borrowed constructor invocation and bound receiver semantics
@@ -4719,6 +4727,9 @@ class _Flow:
                         # Implicit native members are not stored initially.
                         # Their deletion must not make lookup recreate them.
                         for member in (('at', 'fill') if key is None else (key,)):
+                            slots[member] = _ABSENT
+                    if ref == ('builtin', 'Function.prototype') and key in {None, 'call', 'apply', 'bind'}:
+                        for member in (('call', 'apply', 'bind') if key is None else (key,)):
                             slots[member] = _ABSENT
                 return frozenset()
         if code[start] in '[{' and start in self.pairs:

@@ -3750,7 +3750,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def visit_Attribute(self, node):
         self.generic_visit(node)
         if (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
-                and node.attr in (SET_ITERABLE_HASH_METHODS | SET_ELEMENT_HASH_METHODS | DICT_KEY_HASH_METHODS)):
+                and node.attr in (SET_ITERABLE_HASH_METHODS | SET_ELEMENT_HASH_METHODS
+                                  | DICT_KEY_HASH_METHODS | {'fromkeys'})):
             capabilities = self.set_update_capabilities(self.value_kind(node.value)[0])
             methods = set()
             if node.attr in SET_ITERABLE_HASH_METHODS:
@@ -3768,6 +3769,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     methods.add('dict-bound-update')
                 if 'dict-constructor' in capabilities:
                     methods.add('dict-unbound-update')
+            if node.attr == 'fromkeys' and 'dict-receiver' in capabilities:
+                methods.add('dict-fromkeys')
             if node.attr in DICT_KEY_HASH_METHODS:
                 if 'dict-receiver' in capabilities:
                     methods.add('dict-bound-key')
@@ -4150,6 +4153,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         active = capabilities.intersection({
             'bound', 'unbound', 'bound-element', 'unbound-element',
             'dict-bound-key', 'dict-unbound-key', 'dict-bound-update', 'dict-unbound-update',
+            'dict-fromkeys',
         })
         if (not active
                 or not self.has_collection_key_callbacks()
@@ -4188,6 +4192,27 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             for keyword in node.keywords:
                 if keyword.arg is None:
                     self.check_collection_keys(self.collection_key_facts(keyword.value, mapping=True))
+        if 'dict-fromkeys' in active:
+            if arguments:
+                self.step()
+                iterable = arguments[0]
+                references = self.generator_refs(self.value_facts(iterable))
+                if references:
+                    probe = self.flow_probe()
+                    try:
+                        probe.materialize_generators(references, hash_keys=True)
+                    except SQLNoNormalReturn as exc:
+                        raise SQLFlowLimit('SQL dict.fromkeys key iteration is unresolved; analysis is incomplete') from exc
+                    finally:
+                        for identity, finding in probe._sink_risks.items():
+                            previous = self._sink_risks.get(identity)
+                            if previous is None or finding[0] == 'critical':
+                                self._sink_risks[identity] = finding
+                else:
+                    self.check_collection_keys(self.collection_key_facts(iterable))
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    self.check_collection_keys([(None, None, None, False, 'unknown')])
         if not active.intersection({'bound', 'unbound'}):
             return
         offset = 0 if 'bound' in active else 1
@@ -4260,7 +4285,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     if (cell is not None and cell['node'] is not function
                             and (isinstance(parent, ast.Call) and parent.func is node and target is None
                                  or isinstance(parent, ast.Attribute) and parent.value is node
-                                 and parent.attr in (SET_ITERABLE_HASH_METHODS | SET_ELEMENT_HASH_METHODS | DICT_KEY_HASH_METHODS))):
+                                 and parent.attr in (SET_ITERABLE_HASH_METHODS | SET_ELEMENT_HASH_METHODS | DICT_KEY_HASH_METHODS | {'fromkeys'}))):
                         structural = True
         cache[function] = structural, frozenset(cells)
         return self.set_update_helper(function)

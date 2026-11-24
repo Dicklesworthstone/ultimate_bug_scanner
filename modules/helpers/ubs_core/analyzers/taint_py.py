@@ -157,7 +157,9 @@ SOURCE_PATTERNS = [
     re.compile(r"input\s*\(", re.IGNORECASE),
     re.compile(r"raw_input\s*\(", re.IGNORECASE),
     re.compile(r"^sys\.argv$"),
+    re.compile(r"^sys\.argv\.(?:pop|copy|__getitem__)\($"),
     re.compile(r"^os\.environb?$"),
+    re.compile(r"^os\.environb?\.(?:get|pop|setdefault|popitem|copy|values|items|keys|__getitem__)\($"),
     re.compile(r"^os\.(?:getenv|getenvb)\($"),
     re.compile(r"event\['body'\]", re.IGNORECASE),
     re.compile(r"params\[[^\]]+\]", re.IGNORECASE),
@@ -1139,7 +1141,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'len', 'list', 'tuple', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'filter', 'map', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'len', 'list', 'tuple', 'set', 'frozenset', 'dict', 'sorted', 'min', 'max', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'filter', 'map', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -2537,8 +2539,12 @@ class _Flow:
         if not state.reachable:
             return None
         binding = self.expression_bindings.get(context)
+        if item.optional_vars is not None:
+            self.require_value(binding)
         choices = _binding_choices(binding)
         native_context = any(_http_contract(value) for value in choices)
+        stdin_context = (not native_context
+                         and any(self.stdin_identity(value) in _STDIN_STREAMS for value in choices))
         if native_context:
             entered = []
             for value in choices:
@@ -2558,6 +2564,20 @@ class _Flow:
                     entered.append(value)
             self.expression_bindings[context] = _join_bindings(*entered)
             fact = CLEAN
+        elif stdin_context:
+            if isinstance(node, ast.AsyncWith):
+                raise AnalysisLimit('stdin context manager protocol mismatch; analysis is incomplete')
+            if not all(self.stdin_identity(value) in _STDIN_STREAMS for value in choices):
+                raise AnalysisLimit('ambiguous stdin context manager; analysis is incomplete')
+            if (any(isinstance(value, _BoundCallable) and value.producer_unproved for value in choices)
+                    or any(engine.generator_builtin_reflection or engine.generator_namespace_exposed
+                           or engine.generator_frame_exposed
+                           or {'__enter__', '__exit__'} & engine.generator_attribute_writes
+                           for engine in self.engine.generator_peers)):
+                raise AnalysisLimit('stdin context manager identity or producer effects are unresolved; analysis is incomplete')
+            self.expression_bindings[context] = _join_bindings(*choices)
+            fact = CLEAN
+            native_context = True
         if item.optional_vars is not None:
             self.assign(item.optional_vars, fact, state, context if native_context else None)
         outer = self.pending
@@ -4651,6 +4671,30 @@ class _Flow:
                 self.assign_captured(target, fact, self.expression_bindings.get(value),
                                      self.expression_references.get(value, NO_REFERENCES), state)
             else:
+                if value is not None:
+                    rhs_binding = self.expression_bindings.get(value)
+                    rhs_choices = _binding_choices(rhs_binding)
+                    if any(isinstance(choice, _ZipIterator) for choice in rhs_choices):
+                        if not all(isinstance(choice, _ZipIterator) for choice in rhs_choices):
+                            raise AnalysisLimit('native zip unpacking alternatives are unresolved; analysis is incomplete')
+                        materialized = self.zip_materialize(value, state, list(rhs_choices))
+                        self.possible_exception(state)
+                        unpacked_binding = self.expression_bindings.get(value)
+                        if (unpacked_binding and all(isinstance(choice, _ArgumentVector)
+                                for choice in _binding_choices(unpacked_binding))
+                                and not any(isinstance(item, ast.Starred) for item in target.elts)):
+                            self.assign_captured(target, join_facts(fact, materialized), unpacked_binding,
+                                                 self.expression_references.get(value, NO_REFERENCES), state)
+                            return
+                        fact = join_facts(fact, materialized)
+                    else:
+                        consumed = self.stdin_source(rhs_binding, exhausting=True)
+                        if consumed:
+                            if any(isinstance(choice, _BoundCallable) and choice.producer_unproved
+                                   for choice in rhs_choices):
+                                raise AnalysisLimit('stdin unpacking producer effects are unresolved; analysis is incomplete')
+                            self.possible_exception(state)
+                            fact = join_facts(fact, consumed)
                 for item in target.elts:
                     self.assign(item, fact, state)
         elif isinstance(target, ast.Starred):
@@ -5639,11 +5683,31 @@ class _Flow:
                 ancestors.add(child)
             if enclosing_body_after or execution in ancestors:
                 return True  # The enclosing eval executes after its argument.
+            consumer_steps = {}
+            node_cur = consumer
+            while node_cur in engine.parents and engine.parents[node_cur] is not scope:
+                consumer_steps[engine.parents[node_cur]] = node_cur
+                node_cur = engine.parents[node_cur]
+            consumer_steps[scope] = node_cur
             after = execution
-            while after in engine.parents and engine.parents[after] is not scope:
-                after = engine.parents[after]
-            return (child in scope.body and after in scope.body
-                    and scope.body.index(child) < scope.body.index(after))
+            while after in engine.parents:
+                parent = engine.parents[after]
+                if parent in consumer_steps:
+                    left_stmt = consumer_steps[parent]
+                    if left_stmt is after:
+                        return False
+                    if isinstance(parent, ast.With) and any(
+                            left_stmt is item for item in parent.items) and after in parent.body:
+                        return True
+                    for block in (getattr(parent, 'body', None), getattr(parent, 'orelse', None),
+                                  getattr(parent, 'finalbody', None)):
+                        if isinstance(block, list) and left_stmt in block and after in block:
+                            return block.index(left_stmt) < block.index(after)
+                    return False
+                if parent is scope:
+                    break
+                after = parent
+            return False
 
         if scope is engine.tree:
             return ordered_in_scope()
@@ -6196,8 +6260,13 @@ class _Flow:
                 raise AnalysisLimit('stdin join receiver producer effects are unresolved; '
                                     'analysis is incomplete')
         consumer = name if native else None
-        builtins_consumer = consumer in {'iter', 'list', 'tuple', 'next',
-                                        'builtins.iter', 'builtins.list', 'builtins.tuple', 'builtins.next'}
+        _stdin_collection_consumers = {
+            'iter', 'list', 'tuple', 'next', 'set', 'frozenset', 'sorted', 'min', 'max',
+            'builtins.iter', 'builtins.list', 'builtins.tuple', 'builtins.next',
+            'builtins.set', 'builtins.frozenset', 'builtins.sorted', 'builtins.min', 'builtins.max',
+            'dict.fromkeys', 'builtins.dict.fromkeys',
+        }
+        builtins_consumer = consumer in _stdin_collection_consumers
         bound_join = isinstance(target, _BoundCallable) and name.rsplit('.', 1)[-1] == 'join'
         join_receiver = (target.receiver_binding if bound_join and target.receiver_binding is not None
                          else self.expression_bindings.get(node.func.value)
@@ -6277,14 +6346,51 @@ class _Flow:
                     and all(isinstance(value, _StdinCallableIterator) for value in original_bindings)):
                 self.possible_exception(state)
                 return CLEAN
+        consumer_short = consumer.rsplit('.', 1)[-1] if consumer else ''
         native_readers = any(isinstance(value, (_CsvReader, _StdinCallableIterator))
                              for value in _binding_choices(binding))
-        if native_readers and builtins_consumer and (
-                keywords or len(positions) > (2 if consumer.rsplit('.', 1)[-1] == 'next' else 1)):
+        if builtins_consumer and consumer_short in {'set', 'frozenset', 'fromkeys'}:
+            max_args = 2 if consumer_short == 'fromkeys' else 1
+            if keywords or len(positions) > max_args:
+                if self.stdin_source(binding):
+                    self.possible_exception(state)
+                    return CLEAN
+                return None
+            # csv.reader / csv.DictReader yield unhashable list/dict rows, which
+            # raise TypeError inside set/frozenset/dict.fromkeys before returning.
+            if all(isinstance(value, _CsvReader) for value in _binding_choices(binding)) and _binding_choices(binding):
+                self.possible_exception(state)
+                return CLEAN
+        if builtins_consumer and consumer_short in {'sorted', 'min', 'max'}:
+            if not self.stdin_source(binding) and not native_readers:
+                return None
+            if consumer_short == 'sorted' and len(positions) != 1:
+                self.possible_exception(state)
+                return CLEAN
+            if consumer_short in {'min', 'max'} and len(positions) != 1:
+                return None
+            allowed_kw = {'key', 'reverse'} if consumer_short == 'sorted' else {'key', 'default'}
+            if None in keywords:
+                raise AnalysisLimit('stdin reducer keyword expansion is unresolved; analysis is incomplete')
+            if keywords.keys() - allowed_kw:
+                self.possible_exception(state)
+                return CLEAN
+            if 'key' in inputs.keyword_nodes:
+                key_binding = self.expression_bindings.get(inputs.keyword_nodes['key'], inputs.keyword_nodes['key'])
+                self.require_value(key_binding)
+                if not (isinstance(key_binding, ast.Constant) and key_binding.value is None):
+                    raise AnalysisLimit('stdin reducer key callback is unmodeled; analysis is incomplete')
+            if 'reverse' in inputs.keyword_nodes:
+                rev_binding = self.expression_bindings.get(inputs.keyword_nodes['reverse'], inputs.keyword_nodes['reverse'])
+                self.require_value(rev_binding)
+                if not (isinstance(rev_binding, ast.Constant) and type(rev_binding.value) in {bool, int}):
+                    raise AnalysisLimit('stdin reducer reverse protocol is unmodeled; analysis is incomplete')
+        if native_readers and builtins_consumer and consumer_short in {'iter', 'list', 'tuple', 'next'} and (
+                keywords or len(positions) > (2 if consumer_short == 'next' else 1)):
             self.possible_exception(state)
             return CLEAN
         consumed = self.stdin_source(binding, exhausting=string_join or bytes_join
-                                     or consumer in {'list', 'tuple', 'builtins.list', 'builtins.tuple'})
+                                     or consumer_short in {'list', 'tuple', 'set', 'frozenset', 'sorted', 'min', 'max', 'fromkeys'})
         if not consumed and not native_readers:
             return None
         if builtins_consumer and any(
@@ -9780,6 +9886,8 @@ class _Flow:
             try:
                 for index, generator in enumerate(node.generators):
                     value = iterable if index == 0 else self.expr(generator.iter, nested)
+                    iter_binding = self.expression_bindings.get(generator.iter)
+                    value = join_facts(value, self.stdin_source(iter_binding, exhausting=True))
                     self.assign(generator.target, value, nested)
                     for condition in generator.ifs:
                         self.expr(condition, nested)

@@ -2825,5 +2825,195 @@ class RunnerIntegrationTests(unittest.TestCase):
                 self.assertEqual(bool(ids & {'py.taint.sql', 'python.taint.sql'}), expected, report)
 
 
+class SavedEnvironmentMethodProvenanceTests(SourceTest):
+    def test_saved_environ_and_argv_bound_methods_reach_all_domains_with_witness(self):
+        witness = subprocess.run(
+            [sys.executable, '-c',
+             'import os, sys; '
+             'g = os.environ.get; gb = os.environb.get; p = sys.argv.pop; '
+             'd = {"UBS_W": "clean"}; cg = d.get; '
+             'print(g("UBS_W"), gb(b"UBS_W").decode(), p(), cg("UBS_W"))',
+             'ARG_TAINT'],
+            env={**os.environ, 'UBS_W': 'ENV_TAINT'},
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(witness.returncode, 0, witness.stdout + witness.stderr)
+        self.assertEqual(witness.stdout.strip(), 'ENV_TAINT ENV_TAINT ARG_TAINT clean')
+
+        sinks = (
+            ("os.system(value)", 'command'),
+            ("eval(value)", 'eval'),
+            ("cursor.execute('SELECT ' + value)", 'sql'),
+            ("HttpResponse(value)", 'xss'),
+            ("requests.get(value)", 'ssrf'),
+        )
+        for setup, expr in (
+            ("import os, requests\ng = os.environ.get\n", "g('UBS_W')"),
+            ("import os, requests\ng = os.environ.pop\n", "g('UBS_W', 'safe')"),
+            ("import os, requests\ng = os.environ.setdefault\n", "g('UBS_W', 'safe')"),
+            ("import os, requests\ng = os.environ.copy\n", "g()['UBS_W']"),
+            ("import os, requests\ng = os.environb.get\n", "g(b'UBS_W').decode()"),
+            ("from os import environ\nimport os, requests\ng = environ.get\n", "g('UBS_W')"),
+            ("from os import environb\nimport os, requests\ng = environb.get\n", "g(b'UBS_W').decode()"),
+            ("import os, sys, requests\np = sys.argv.pop\n", "p()"),
+            ("from sys import argv\nimport os, requests\np = argv.pop\n", "p()"),
+            ("import os, requests\ndef read(fn):\n    return fn('UBS_W')\n", "read(os.environ.get)"),
+            ("import os, requests\ndef read(fn=os.environ.get):\n    return fn('UBS_W')\n", "read()"),
+        ):
+            for sink, rule in sinks:
+                with self.subTest(expr=expr, sink=sink):
+                    self.assert_rules(setup + f"value = {expr}\n{sink}\n", rule)
+        self.assert_rules("import os\ng = os.environ.values\nfor v in g():\n    eval(v)\n", 'eval')
+        self.assert_rules("import os\ng = os.environ.items\nfor k, v in g():\n    eval(v)\n", 'eval')
+
+    def test_saved_environ_method_controls_and_sanitizers_stay_clean(self):
+        self.assert_rules('''
+            import os, html, shlex
+            local_map = {"UBS_W": "safe"}
+            g = local_map.get
+            eval(g("UBS_W"))
+            env_get = os.environ.get
+            cursor.execute("SELECT %s", (env_get("UBS_W"),))
+            os.system("echo " + shlex.quote(env_get("UBS_W")))
+            HttpResponse(html.escape(env_get("UBS_W")))
+        ''')
+        self.assert_rules("from .os import environ\ng = environ.get\neval(g('UBS_W'))\n")
+        self.assert_rules("import os, html\ng = os.environ.get\neval(html.escape(g('UBS_W')))\n", 'eval')
+
+
+class StdinContextUnpackAndReducerTests(SourceTest):
+    def test_stdin_context_manager_unpack_reducers_and_genexpr_with_witness(self):
+        witness_script = (
+            "import io, sys\n"
+            "raw = 'line1\\nline2\\n'\n"
+            "sys.stdin = io.StringIO(raw)\n"
+            "with sys.stdin as s:\n"
+            "    a, *rest = s\n"
+            "sys.stdin = io.StringIO(raw); s1 = sorted(sys.stdin)\n"
+            "sys.stdin = io.StringIO(raw); s2 = set(sys.stdin)\n"
+            "sys.stdin = io.StringIO(raw); s3 = [x.strip() for x in (l for l in sys.stdin)]\n"
+            "sys.stdin = io.StringIO(raw); z = sys.stdin.read(0)\n"
+            "print(a.strip(), rest[0].strip(), len(s1), len(s2), s3, repr(z))\n"
+        )
+        witness = subprocess.run(
+            [sys.executable, '-c', witness_script],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(witness.returncode, 0, witness.stdout + witness.stderr)
+        self.assertEqual(witness.stdout.strip(), "line1 line2 2 2 ['line1', 'line2'] ''")
+
+        for source in (
+            "import sys\nwith sys.stdin as s:\n    eval(s.read())\n",
+            "import sys\nwith sys.stdin.buffer as b:\n    eval(b.read())\n",
+            "import sys\nwith sys.stdin.buffer.raw as r:\n    eval(r.read())\n",
+            "import sys\nwith sys.__stdin__ as s:\n    eval(s.readline())\n",
+            "import sys\ndef read_it(stream):\n    with stream as s:\n        return s.read()\neval(read_it(sys.stdin))\n",
+            "import sys\na, b = sys.stdin\neval(a)\n",
+            "import sys\na, b = sys.stdin\neval(b)\n",
+            "import sys\nfirst, *rest = sys.stdin\neval(rest[0])\n",
+            "import sys\na, *rest = sys.stdin.buffer\neval(rest[0])\n",
+            "import sys\n[a, b] = sys.stdin\neval(a)\n",
+            "import sys\n(a, (b, *c)) = ('x', sys.stdin)\neval(b)\n",
+            "import sys\ns = set(sys.stdin)\nfor x in s:\n    eval(x)\n",
+            "import sys\ns = frozenset(sys.stdin)\nfor x in s:\n    eval(x)\n",
+            "import sys\nd = dict.fromkeys(sys.stdin)\nfor k in d:\n    eval(k)\n",
+            "import sys\nfor line in sorted(sys.stdin):\n    eval(line)\n",
+            "import sys\nfor line in sorted(sys.stdin, reverse=True):\n    eval(line)\n",
+            "import sys\neval(min(sys.stdin))\n",
+            "import sys\neval(max(sys.stdin))\n",
+            "import sys\nfor line in (x.strip() for x in sys.stdin):\n    eval(line)\n",
+            "import sys\na, *rest = iter(sys.stdin.readline, '')\neval(a)\n",
+            "import sys\na, *rest = map(str.strip, sys.stdin)\neval(a)\n",
+            "import sys\na, *rest = filter(None, sys.stdin)\neval(a)\n",
+        ):
+            with self.subTest(source=source):
+                self.assert_rules(source, 'eval')
+
+    def test_stdin_context_unpack_and_reducer_clean_controls_and_boundaries(self):
+        for clean in (
+            "import sys\nwith sys.stdin as s:\n    eval(s.read(0))\n",
+            "import io\nwith io.StringIO('safe') as s:\n    eval(s.read())\n",
+            "import sys, html\na, *rest = map(html.escape, sys.stdin)\nHttpResponse(a)\n",
+            "s = set(['safe'])\nfor x in s:\n    eval(x)\n",
+            "for x in sorted(['safe']):\n    eval(x)\n",
+            "import sys, html, shlex, os\nwith sys.stdin as s:\n    v = s.read()\n"
+            "cursor.execute('SELECT %s', (v,))\nos.system('echo ' + shlex.quote(v))\nHttpResponse(html.escape(v))\n",
+        ):
+            with self.subTest(clean=clean):
+                self.assert_rules(clean)
+
+        for partial in (
+            "import sys\nasync def f():\n    async with sys.stdin as s:\n        eval(s.read())\n",
+            "import sys\nstream = sys.stdin if cond else other()\nwith stream as s:\n    eval(s.read())\n",
+            "import sys\nclass X: pass\nX.__enter__ = lambda self: self\nwith sys.stdin as s:\n    eval(s.read())\n",
+            "import sys\nfor line in sorted(sys.stdin, key=len):\n    eval(line)\n",
+            "import sys\n(i, a), *rest = enumerate(sys.stdin)\neval(a)\n",
+        ):
+            with self.subTest(partial=partial):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(partial)
+
+
+class ContextManagedAndUnpackedStdinParserTests(SourceTest):
+    def test_context_managed_and_unpacked_stdin_parsers_with_witness(self):
+        j_witness = subprocess.run(
+            [sys.executable, '-c', 'import json, sys\nwith sys.stdin as f:\n    print(json.load(f)["k"])\n'],
+            input='{"k": "JSON_TAINT"}', capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(j_witness.returncode, 0, j_witness.stderr)
+        self.assertEqual(j_witness.stdout.strip(), 'JSON_TAINT')
+
+        t_witness = subprocess.run(
+            [sys.executable, '-c', 'import tomllib, sys\nwith sys.stdin.buffer as f:\n    print(tomllib.load(f)["k"])\n'],
+            input=b'k = "TOML_TAINT"\n', capture_output=True, timeout=15,
+        )
+        self.assertEqual(t_witness.returncode, 0, t_witness.stderr)
+        self.assertEqual(t_witness.stdout.decode().strip(), 'TOML_TAINT')
+
+        c_witness = subprocess.run(
+            [sys.executable, '-c', 'import csv, sys; a, *rest = csv.reader(sys.stdin); print(a[0], rest[0][0])'],
+            input='c1,c2\nc3,c4\n', capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(c_witness.returncode, 0, c_witness.stderr)
+        self.assertEqual(c_witness.stdout.strip(), 'c1 c3')
+
+        for source in (
+            "import json, sys\nwith sys.stdin as f:\n    d = json.load(f)\neval(d['k'])\n",
+            "import json, sys\nwith sys.stdin as f:\n    d = json.load(f)\n    eval(d['k'])\n",
+            "import json, sys\nload = json.load\nwith sys.stdin as f:\n    eval(load(f)['k'])\n",
+            "import json, sys\ndef parse(s):\n    return json.load(s)\nwith sys.stdin as f:\n    eval(parse(f)['k'])\n",
+            "import tomllib, sys\nwith sys.stdin.buffer as f:\n    d = tomllib.load(f)\neval(d['k'])\n",
+            "import tomllib, sys\nwith sys.stdin.buffer as f:\n    d = tomllib.load(f)\n    eval(d['k'])\n",
+            "import tomllib, sys\nwith sys.stdin.buffer.raw as f:\n    eval(tomllib.load(f)['k'])\n",
+            "import csv, sys\nwith sys.stdin as f:\n    for row in csv.reader(f):\n        eval(row[0])\n",
+            "import csv, sys\nwith sys.stdin as f:\n    r = csv.DictReader(f)\n    eval(r.fieldnames[0])\n",
+            "import csv, sys\na, *rest = csv.reader(sys.stdin)\neval(a[0])\n",
+            "import csv, sys\na, *rest = csv.DictReader(sys.stdin)\neval(a['k'])\n",
+            "import csv, sys\nfor row in sorted(csv.reader(sys.stdin)):\n    eval(row[0])\n",
+            "import csv, sys\neval(min(csv.reader(sys.stdin))[0])\n",
+        ):
+            with self.subTest(source=source):
+                self.assert_rules(source, 'eval')
+
+        for clean in (
+            "import tomllib, sys\nwith sys.stdin as f:\n    d = tomllib.load(f)\neval(d)\n",
+            "import json, io\nwith io.StringIO('{\"k\": \"safe\"}') as f:\n    eval(json.load(f)['k'])\n",
+            "import csv, sys\ns = set(csv.reader(sys.stdin))\neval(s)\n",
+            "import json, sys, html\nwith sys.stdin as f:\n    d = json.load(f)\n"
+            "cursor.execute('SELECT %s', (d['k'],))\nHttpResponse(html.escape(d['k']))\n",
+        ):
+            with self.subTest(clean=clean):
+                self.assert_rules(clean)
+
+        for partial in (
+            "import json, sys\nwith sys.stdin as f:\n    eval(input())\n    d = json.load(f)\n    eval(d)\n",
+            "import json, sys\nfor _ in range(2):\n    with sys.stdin as f:\n        d = json.load(f)\n        eval(d)\n",
+            "import json, sys\nwith sys.stdin as f:\n    d = json.load(f, object_hook=hook)\n    eval(d)\n",
+        ):
+            with self.subTest(partial=partial):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(partial)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

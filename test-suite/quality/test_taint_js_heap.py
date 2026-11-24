@@ -5975,5 +5975,53 @@ class BorrowedArrayFillTests(unittest.TestCase):
                 with self.assertRaises(taint_js.AnalysisLimit, msg=name):
                     self.scan_file(body)
 
+    def test_borrowed_array_fill_mutated_or_deleted_function_prototype_call_reports_incomplete(self):
+        from ubs_core.analyzers import taint_js
+        node_bin = shutil.which('node')
+        prefix = (
+            'const _origCall = Function.prototype.call; '
+            'const req = {query:{html:"<UNTRUSTED>"}}; const outputs = []; '
+            'const res = {send: value => outputs.push(value)}; '
+        )
+        restore = ' Object.defineProperty(Function.prototype, "call", { value: _origCall, writable: true, configurable: true }); '
+        noop_cases = [
+            ('func-proto-call-noop-direct',
+             'Function.prototype.call = function() {}; const a = [req.query.html]; Array.prototype.fill.call(a, "clean"); res.send(a[0]);'),
+            ('func-proto-call-noop-saved',
+             'Function.prototype.call = function() {}; const a = [req.query.html]; const fn = Array.prototype.fill; fn.call(a, "clean"); res.send(a[0]);'),
+            ('func-proto-call-noop-literal',
+             'Function.prototype.call = function() {}; const a = [req.query.html]; [].fill.call(a, "clean"); res.send(a[0]);'),
+        ]
+        for name, body in noop_cases:
+            with self.subTest(case=name):
+                if node_bin is not None:
+                    node = subprocess.run(
+                        [node_bin, '-e', prefix + body + restore + 'console.log(JSON.stringify(outputs));'],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertEqual(node.returncode, 0, node.stdout + node.stderr)
+                    self.assertIn('<UNTRUSTED>', node.stdout, (name, node.stdout))
+                with self.assertRaises(taint_js.AnalysisLimit, msg=name):
+                    self.scan_file(body)
+        defineprop_body = 'Object.defineProperty(Function.prototype, "call", { value: function() {}, configurable: true }); const a = [req.query.html]; Array.prototype.fill.call(a, "clean"); res.send(a[0]);'
+        if node_bin is not None:
+            node = subprocess.run(
+                [node_bin, '-e', prefix + defineprop_body + restore + 'console.log(JSON.stringify(outputs));'],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(node.returncode, 0, node.stdout + node.stderr)
+            self.assertIn('<UNTRUSTED>', node.stdout, node.stdout)
+        self.assertEqual([f[0] for f in self.scan_file(defineprop_body)], ['js.taint.xss'])
+        delete_body = 'delete Function.prototype.call; const a = [req.query.html]; Array.prototype.fill.call(a, "clean"); res.send(a[0]);'
+        if node_bin is not None:
+            node = subprocess.run(
+                [node_bin, '-e', prefix + 'let msg = ""; try { ' + delete_body + ' } catch (e) { msg = "THREW:" + e.name; }' + restore + 'console.log(msg);'],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(node.returncode, 0, node.stdout + node.stderr)
+            self.assertIn('THREW:TypeError', node.stdout, node.stdout)
+        with self.assertRaises(taint_js.AnalysisLimit, msg='delete-func-proto-call'):
+            self.scan_file(delete_body)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -1678,6 +1678,123 @@ class FiniteFilterTests(SourceTest):
             with self.subTest(body=body), self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter predicate ownership'):
                 self.scan(prefix + body + 'cursor.execute(value)\n')
 
+    @staticmethod
+    def late_capture_source(body, *, initial='"safe"', helpers=''):
+        return ('class Owner:\n def __del__(self):\n  global value\n  value=input()\nvalue="safe"\n'
+                f'def run():\n held={initial}\n def predicate(row):\n  unused=held\n  return True\n'
+                + helpers + ' rows=filter(predicate,[])\n' + body
+                + 'run()\ncursor.execute(value)\n')
+
+    def test_late_owned_captures_remain_partial_without_consumption(self):
+        for body in (' held=Owner()\n', ' held=Owner()\n del rows\n',
+                     ' alias=rows\n del rows\n held=Owner()\n',
+                     ' held=Owner()\n held="safe"\n',
+                     ' if input():\n  held=Owner()\n else:\n  held="safe"\n',
+                     # Ordinary guards retain their existing joined traversal.
+                     ' if False:\n  held=Owner()\n else:\n  held="safe"\n',
+                     ' del rows\n held=Owner()\n'):
+            with self.subTest(body=body), self.assertRaisesRegex(taint_py.AnalysisLimit,
+                                                                'filter predicate ownership'):
+                self.scan(self.late_capture_source(body))
+
+    def test_helper_transient_ownership_cannot_hide_in_final_cell_contents(self):
+        for writer in ('  held=Owner()\n', '  held=Owner()\n  held="safe"\n',
+                       '  try:\n   held=Owner()\n   raise ValueError()\n'
+                       '  finally:\n   held="safe"\n'):
+            helpers = ' def change():\n  nonlocal held\n' + writer
+            for relay in (False, True):
+                called = 'relay' if relay else 'change'
+                declarations = helpers + (' def relay():\n  change()\n' if relay else '')
+                body = f' try:\n  {called}()\n except ValueError:\n  pass\n'
+                with self.subTest(writer=writer, relay=relay), self.assertRaisesRegex(
+                        taint_py.AnalysisLimit, 'filter predicate ownership'):
+                    self.scan(self.late_capture_source(body, helpers=declarations))
+
+    def test_captured_container_mutation_and_restored_aliases_remain_partial(self):
+        cases = (
+            (' held.append(Owner())\n held=[]\n', ''),
+            (' alias=held\n alias.append(Owner())\n alias.clear()\n', ''),
+            (' change()\n', ' def change():\n  held.append(Owner())\n  held.clear()\n'),
+            (' change(held)\n', ' def change(items):\n  items.append(Owner())\n  items.clear()\n'),
+        )
+        for body, helpers in cases:
+            with self.subTest(body=body, helpers=helpers), self.assertRaisesRegex(
+                    taint_py.AnalysisLimit, 'filter predicate ownership'):
+                self.scan(self.late_capture_source(body, initial='[]', helpers=helpers))
+
+    def test_captured_filter_cell_and_global_exports_remain_explicit(self):
+        prefix = ('class Owner:\n def __del__(self):\n  global value\n  value=input()\n'
+                  'value="safe"\nrows="safe"\n')
+        for scope in ('nonlocal', 'global'):
+            for suffix in ('', '.__next__', '.__iter__'):
+                for raises in (False, True):
+                    source = (prefix + 'def run():\n held="safe"\n'
+                              + (' rows="safe"\n' if scope == 'nonlocal' else ' global rows\n')
+                              + ' def predicate(row):\n  unused=held\n  return True\n'
+                              + f' def install():\n  {scope} rows\n  rows=filter(predicate,[]){suffix}\n'
+                              + ('  raise ValueError()\n' if raises else '')
+                              + ' try:\n  install()\n except ValueError:\n  pass\n'
+                              ' held=Owner()\n rows="safe"\nrun()\ncursor.execute(value)\n')
+                    with self.subTest(scope=scope, suffix=suffix, raises=raises), self.assertRaisesRegex(
+                            taint_py.AnalysisLimit, 'filter predicate ownership'):
+                        self.scan(source)
+        self.assert_rules('rows=None\ndef install():\n global rows\n'
+                          ' rows=filter(None,["safe"])\ninstall()\n')
+
+    def test_factory_owned_filter_and_bound_method_exports_remain_partial(self):
+        for suffix in ('', '.__next__'):
+            source = ('class Owner:\n def __del__(self):\n  global value\n  value=input()\n'
+                      'value="safe"\ndef run():\n exported=None\n def create():\n'
+                      '  held="safe"\n  def predicate(row):\n   unused=held\n   return True\n'
+                      '  def update():\n   nonlocal held\n   held=Owner()\n'
+                      '  nonlocal exported\n'
+                      f'  exported=filter(predicate,[]){suffix}\n  return update\n'
+                      ' updater=create()\n updater()\n del updater\n del exported\n'
+                      'run()\ncursor.execute(value)\n')
+            with self.subTest(suffix=suffix), self.assertRaisesRegex(taint_py.AnalysisLimit,
+                                                                   'filter predicate ownership'):
+                self.scan(source)
+
+    def test_primitive_capture_writes_and_deletion_remain_complete(self):
+        for body in (' held="other"\n', ' held=input()\n', ' del held\n',
+                     ' del rows\n held="other"\n',
+                     ' if input():\n  held="first"\n else:\n  held="other"\n'):
+            with self.subTest(body=body):
+                self.assert_rules(self.late_capture_source(body))
+        self.assert_rules(self.late_capture_source(' change()\n',
+                          helpers=' def change():\n  nonlocal held\n  held="other"\n'))
+        self.assert_rules(self.late_capture_source(' change(input())\n',
+                          helpers=' def change(item):\n  nonlocal held\n  held=item\n'))
+        self.assert_rules(self.late_capture_source(' held=input()\n cursor.execute(held)\n'), 'sql')
+
+    def test_late_capture_refusal_retains_prefix_and_independent_findings(self):
+        source = ('cursor.execute(input())\n' + self.late_capture_source(' held=Owner()\n')
+                  + 'def independent():\n cursor.execute(input())\nindependent()\n')
+        engine = taint_py._Analysis(ast.parse(source))
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter predicate ownership') as caught:
+            engine.analyze()
+        sites = {(kind, line) for kind, line, _column, _label in caught.exception.effects}
+        self.assertIn(('sql', 1), sites)
+        self.assertIn(('sql', source.splitlines().index(' cursor.execute(input())') + 1), sites)
+
+    def test_native_late_capture_witnesses_run_finalizers_without_consumption(self):
+        cases = (
+            self.late_capture_source(' held=Owner()\n'),
+            self.late_capture_source(' held=Owner()\n del rows\n'),
+            self.late_capture_source(' change()\n', helpers=
+                ' def change():\n  nonlocal held\n  held=Owner()\n  held="safe"\n'),
+            self.late_capture_source(' held.append(Owner())\n held=[]\n', initial='[]'),
+        )
+        for source in cases:
+            witness = ('import json\nseen=[]\ndef input(): return "tainted"\n'
+                       'class Cursor:\n def execute(self, value): seen.append(value)\ncursor=Cursor()\n'
+                       + source + '\nprint(json.dumps(seen))\n')
+            with self.subTest(source=source):
+                result = subprocess.run([sys.executable, '-I', '-B', '-c', witness],
+                                        text=True, capture_output=True, timeout=20, check=False)
+                self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                self.assertEqual(json.loads(result.stdout), ['tainted'])
+
     def test_bare_stop_iteration_proof_does_not_authorize_other_exception_classes(self):
         with self.assertRaisesRegex(taint_py.AnalysisLimit, 'callback frame lifetime'):
             self.scan('def fail(row):\n raise UnicodeDecodeError\n'
@@ -2844,6 +2961,10 @@ class RunnerIntegrationTests(unittest.TestCase):
             ('partial-owner', 'cursor.execute(input())\nclass Owner:\n def __del__(self):\n'
              '  global value\n  value=input()\nvalue="safe"\n'
              'list(filter(lambda row,held=Owner():True,[]))\ncursor.execute(value)\n', [(1, 1)], True),
+            ('late-capture', 'cursor.execute(input())\nclass Owner:\n def __del__(self):\n'
+             '  global value\n  value=input()\nvalue="safe"\ndef run():\n held="safe"\n'
+             ' def predicate(row):\n  unused=held\n  return True\n rows=filter(predicate,[])\n'
+             ' held=Owner()\nrun()\ncursor.execute(value)\n', [(1, 1)], True),
         )
         artifacts = ROOT / 'test-suite/artifacts/python-finite-filter-public'
         artifacts.mkdir(parents=True, exist_ok=True)

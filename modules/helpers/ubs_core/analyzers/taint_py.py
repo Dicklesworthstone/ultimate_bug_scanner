@@ -2211,6 +2211,10 @@ class _Flow:
         self.stdin_iterator_parameters = set()
         self.zip_parameters = set()
         self.filter_parameters = set()
+        # A constructed filter retains its predicate's lexical cells even
+        # without consumption. Keep this conservative ownership obligation
+        # through branches and until this flow ends, including after del.
+        self.filter_capture_cells = set()
         self.map_parameters = set()
         self.http_parameters = set()
         self.generator_predicate_parameters = set()
@@ -2609,6 +2613,20 @@ class _Flow:
     def mutate(self, references, fact, state):
         # Weak updates preserve other fields and possible aliases. A write of
         # clean data to one field is not proof that the whole object is safe.
+        if references and self.filter_capture_cells:
+            # Reuse the recursive primitive/producer proof for nested native
+            # containers too. This proof only reads the mutation set; do not
+            # change the actual state before deciding whether it is safe.
+            changed = _State()
+            changed.mutated = state.mutated | references
+            for ref in self.filter_capture_cells:
+                self.engine.budget.spend()
+                contents = state.cells.contents.get(ref) if state.cells is not None else None
+                if (contents is not None and contents.bound is not False
+                        and not self.materialized_generator_binding(
+                            contents.binding, contents.references, changed)):
+                    raise AnalysisLimit('native filter predicate ownership changed through captured mutation; '
+                                        'analysis is incomplete')
         state.mutated.update(references)
         for ref in references:
             if fact:
@@ -2783,6 +2801,10 @@ class _Flow:
             if (previous.bound is not False
                     and not self.materialized_generator_binding(previous.binding, previous.references, state)):
                 raise AnalysisLimit('generator materialization releases an opaque binding; analysis is incomplete')
+        if state.cells is not None and name in state.cells.names:
+            ref = state.cells.names[name]
+            self.check_filter_cell_write(ref, _CellContents(fact, references, binding, bound), state,
+                                         weak=ref in state.cells.multiple)
         declared = name in self.engine.declared_globals.get(self.scope, ())
         module_replacement = (isinstance(self.scope, ast.Module)
                               and '@global:' + name in state.bindings)
@@ -2815,8 +2837,9 @@ class _Flow:
                 state.maybe_unbound = state.maybe_unbound - {marker}
         if state.cells is not None and name in state.cells.names:
             ref = state.cells.names[name]
+            contents = _CellContents(fact, references, binding, bound)
             self.engine.budget.spend(1 + len(state.cells.names))
-            state.put_cell(ref, _CellContents(fact, references, binding, bound), written=True,
+            state.put_cell(ref, contents, written=True,
                            weak=ref in state.cells.multiple)
 
     def lexical_cell(self, function, name, state):
@@ -4602,7 +4625,11 @@ class _Flow:
                 for obj in contents.references))
             binding = self.substitute_binding(contents.binding, bound, references, node, '<closure>()',
                                               values, substitute=substitute, cells=cell_map)
+            if self.captured_filter_escape(binding):
+                raise AnalysisLimit('native filter predicate ownership across a cell transfer is unresolved; '
+                                    'analysis is incomplete')
             projected = _CellContents(substitute(contents.fact), actual_refs, binding, contents.bound)
+            self.check_filter_cell_write(target, projected, state, weak=target in cells.multiple)
             self.engine.budget.spend(1 + len(cells.names) + len(actual_refs))
             state.put_cell(target, projected, written=True, weak=target in cells.multiple)
 
@@ -4635,6 +4662,9 @@ class _Flow:
                 for ref in contents.references))
             binding = self.substitute_binding(contents.binding, bound, references, node, '<global>()',
                                               values, substitute=substitute, cells=cell_map)
+            if self.captured_filter_escape(binding):
+                raise AnalysisLimit('native filter predicate ownership across a global transfer is unresolved; '
+                                    'analysis is incomplete')
             projected = _CellContents(substitute(contents.fact), actual_refs, binding, contents.bound)
             if weak:
                 projected = _join_cells(self.global_contents(name, state), projected)
@@ -5158,9 +5188,63 @@ class _Flow:
             raise AnalysisLimit('native filter input protocol is unresolved: ' + str(exc)) from exc
         if iterator.repeating or iterator.optional or iterator.fallible:
             raise AnalysisLimit('native filter input is not finite; analysis is incomplete')
-        return self.install_zip_iterator(node, state, replace(
+        result = self.install_zip_iterator(node, state, replace(
             iterator, native_kind='filter', mapper=mapper, mapper_call=call,
             references=iterator.references | predicate_refs))
+        if isinstance(mapper, _ClosureValue):
+            self.engine.budget.spend(len(mapper.cells))
+            self.filter_capture_cells.update(ref for _name, ref in mapper.cells)
+        return result
+
+    def check_filter_cell_write(self, ref, contents, state, *, weak=False):
+        if ref not in self.filter_capture_cells:
+            return
+        previous = self.cell_contents(ref, state)
+        effective = _join_cells(previous, contents) if weak else contents
+        for value in (previous, effective):
+            if (value.bound is not False and not self.materialized_generator_binding(
+                    value.binding, value.references, state)):
+                raise AnalysisLimit('native filter predicate ownership changed through a captured cell; '
+                                    'analysis is incomplete')
+
+    def captured_filter_escape(self, binding):
+        """Keep retained-cell obligations local to their proved filter flow.
+
+        A factory can export a filter through a cell/global and return a
+        sibling updater. Its caller cannot inherit ownership authority from
+        the filter's old primitive snapshot. Native methods and defaults can
+        retain the same owner without exposing the filter as a direct value.
+        """
+        if not isinstance(binding, (frozenset, _ZipIterator, _BoundCallable, _BoundClassMethod,
+                                    _ClosureValue, _FunctionValue, _DeferredCall, _ArgumentVector,
+                                    _LiteralMapping)):
+            return False
+        pending, seen = [binding], set()
+        while pending:
+            binding = pending.pop()
+            if id(binding) in seen:
+                continue
+            seen.add(id(binding))
+            for value in _binding_choices(binding):
+                self.engine.budget.spend()
+                if isinstance(value, _ZipIterator):
+                    if (value.native_kind == 'filter' and not value.repeating
+                            and isinstance(value.mapper, _ClosureValue) and value.mapper.cells):
+                        return True
+                    pending.extend((*value.rows, value.mapper))
+                elif isinstance(value, _BoundCallable):
+                    pending.append(value.receiver_binding)
+                elif isinstance(value, _BoundClassMethod):
+                    pending.append(value.function)
+                elif isinstance(value, _ClosureValue):
+                    pending.append(value.value)
+                elif isinstance(value, (_FunctionValue, _DeferredCall)):
+                    pending.extend(child for _name, child in value.values)
+                elif isinstance(value, _ArgumentVector):
+                    pending.extend(child for child, _fact in value.operands)
+                elif isinstance(value, _LiteralMapping):
+                    pending.append(value.value_binding)
+        return False
 
     def filter_predicate_inert(self, mapper, state):
         """Check retained callable objects even when no predicate will run.
@@ -8940,6 +9024,17 @@ class _Flow:
                 # environment without evaluating either syntax a second time.
                 return self.incomplete_call(node, function, summary, bound, references,
                                             receiver, state, substitute, values, cell_map)
+            if self.filter_capture_cells:
+                # Written-cell records survive a helper restoring its input.
+                # Its final primitive value cannot prove that a temporary
+                # owner was never released on a normal or exceptional route.
+                writes = (summary.cells, *(exception.cells for exception in summary.exceptions))
+                guarded = any(cell_map.get(ref) in self.filter_capture_cells
+                              for items in writes for ref, _contents in items)
+                if guarded and (not isinstance(node, ast.Call) or not self.materialized_generator_call(
+                        node, callee.binding, state, native_callback=True)):
+                    raise AnalysisLimit('native filter predicate ownership of a captured cell writer is unresolved; '
+                                        'analysis is incomplete')
             for exception in summary.exceptions:
                 exceptional = state.copy()
                 exceptional_cells = cell_map.copy()

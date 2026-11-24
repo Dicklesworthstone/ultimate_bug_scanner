@@ -1496,7 +1496,257 @@ JSON_DECODE_PARTIAL = (
          + "json_decode('" + "[" * 1500 + "0" + "]" * 1500 + "', depth: 2000);"),
 )
 
-CASES = (*CASES, *REDIRECT_CASES, *ENVIRONMENT_CASES, *JSON_DECODE_CASES)
+# Native request maps retain values, not generic trust in a function's name.
+# Bulk input filtering reads the original SAPI request rather than assignments to
+# the mutable superglobals. Sources: php.net/manual/en/function.getallheaders.php,
+# function.apache-request-headers.php, function.filter-input-array.php and
+# function.filter-var-array.php; php/php-src PHP-8.4 ext/filter/filter.c.
+REQUEST_MAP_CASES = (
+    Case("request_headers_all_sink_domains", """
+        $headers = getallheaders();
+        $value = $headers['X-Input'];
+        $db = new PDO('sqlite::memory:');
+        $db->query($value); // expect: sql $db->query
+        system($value); // expect: command system
+        eval($value); // expect: code eval
+        include $value; // expect: include include
+        unserialize($value); // expect: deserialize unserialize
+        echo $value; // expect: xss echo
+        header('Location: ' . $value); // expect: redirect header
+    """),
+    Case("request_headers_native_alias_and_helper", r"""
+        namespace App;
+        use function apache_request_headers as incoming;
+        function fields() { return incoming(); }
+        function selected($fields) { return $fields['X-Input']; }
+        echo selected(fields()); // expect: xss echo
+    """),
+    Case("request_headers_global_qualification", r"""
+        namespace App;
+        function getallheaders() { return ['X-Input' => 'fixed']; }
+        $headers = \getallheaders();
+        echo $headers['X-Input']; // expect: xss echo
+    """),
+    Case("request_headers_local_shadow", """
+        namespace App;
+        function getallheaders() { return ['X-Input' => 'fixed']; }
+        $headers = getallheaders();
+        echo $headers['X-Input'];
+    """),
+    Case("request_headers_custom_method", """
+        class Headers {
+            function getallheaders() { return ['X-Input' => 'fixed']; }
+        }
+        $receiver = new Headers();
+        $headers = $receiver->getallheaders();
+        echo $headers['X-Input'];
+    """),
+    Case("request_headers_copy_and_strong_update", """
+        $headers = apache_request_headers();
+        $copy = $headers;
+        $copy['X-Input'] = 'fixed';
+        echo $copy['X-Input'];
+        echo $headers['X-Input']; // expect: xss echo
+        $headers = ['X-Input' => 'fixed'];
+        echo $headers['X-Input'];
+    """),
+    Case("request_headers_values_iteration", """
+        foreach (getallheaders() as $name => $value) {
+            echo $value; // expect: xss echo
+        }
+    """),
+    Case("request_headers_metadata_and_escaping", """
+        $headers = getallheaders();
+        echo count($headers);
+        echo htmlspecialchars($headers['X-Input'], ENT_QUOTES);
+        $db = new PDO('sqlite::memory:');
+        $query = $db->prepare('SELECT ?');
+        $query->execute([$headers['X-Input']]);
+    """),
+    Case("request_filter_default_raw", """
+        $data = filter_input_array(INPUT_GET);
+        $value = $data['value'];
+        $db = new PDO('sqlite::memory:');
+        $db->query($value); // expect: sql $db->query
+        system($value); // expect: command system
+        eval($value); // expect: code eval
+        include $value; // expect: include include
+        unserialize($value); // expect: deserialize unserialize
+        echo $value; // expect: xss echo
+        header('Location: ' . $value); // expect: redirect header
+    """),
+    Case("request_filter_raw_ignores_superglobal_writes", """
+        $_POST = ['command' => 'fixed'];
+        $raw = filter_input_array(INPUT_POST);
+        system($raw['command']); // expect: command system
+        $current = filter_var_array($_POST);
+        system($current['command']);
+    """),
+    Case("request_filter_selected_schema", """
+        $data = filter_input_array(INPUT_GET, [
+            'id' => FILTER_VALIDATE_INT,
+            'html' => FILTER_SANITIZE_SPECIAL_CHARS,
+            'raw' => FILTER_DEFAULT
+        ]);
+        system('echo ' . $data['id']);
+        echo $data['html'];
+        echo $data['raw']; // expect: xss echo
+        echo $data['unselected'];
+    """),
+    Case("request_filter_html_proofs_are_domain_specific", """
+        $data = filter_input_array(INPUT_POST, FILTER_SANITIZE_FULL_SPECIAL_CHARS);
+        echo $data['value'];
+        system($data['value']); // expect: command system
+        $db = new PDO('sqlite::memory:');
+        $db->query($data['value']); // expect: sql $db->query
+    """),
+    Case("request_filter_quote_flag_keeps_attribute_unsafe", """
+        $data = filter_input_array(INPUT_GET, ['value' => [
+            'filter' => FILTER_SANITIZE_FULL_SPECIAL_CHARS,
+            'flags' => FILTER_FLAG_NO_ENCODE_QUOTES
+        ]]);
+        echo $data['value'];
+        echo "<a title='" . $data['value'] . "'>link</a>"; // expect: xss echo
+    """),
+    Case("request_filter_default_value_is_not_filtered", """
+        $data = filter_input_array(INPUT_GET, ['value' => [
+            'filter' => FILTER_VALIDATE_INT,
+            'options' => ['default' => $_POST['fallback']]
+        ]]);
+        echo $data['value']; // expect: xss echo
+    """),
+    Case("request_filter_named_alias_and_helper", r"""
+        namespace App;
+        use function filter_input_array as inputs;
+        function fields() {
+            return inputs(add_empty: false, options: ['value' => FILTER_DEFAULT], type: INPUT_COOKIE);
+        }
+        $data = fields();
+        echo $data['value']; // expect: xss echo
+    """),
+    Case("request_filter_literal_argument_unpacking", """
+        $data = filter_input_array(...['type' => INPUT_ENV, 'options' => FILTER_DEFAULT]);
+        echo $data['value']; // expect: xss echo
+    """),
+    Case("request_filter_empty_schema", """
+        $data = filter_input_array(INPUT_SERVER, []);
+        echo $data['anything'];
+    """),
+    Case("request_filter_var_preserves_selected_values", """
+        $data = filter_var_array(['raw' => $_GET['value'], 'fixed' => 'constant'], FILTER_DEFAULT);
+        echo $data['raw']; // expect: xss echo
+        echo $data['fixed'];
+        $clean = filter_var_array($data, ['raw' => FILTER_VALIDATE_INT, 'fixed' => FILTER_DEFAULT]);
+        echo $clean['raw'];
+        echo $clean['fixed'];
+    """),
+    Case("request_filter_var_recursive_numeric_values", """
+        $data = filter_var_array(['values' => [$_GET['value']]], FILTER_VALIDATE_INT);
+        echo $data['values'][0];
+    """),
+    Case("request_filter_var_raw_preserves_html_proof", """
+        $data = filter_var_array(['value' => htmlspecialchars($_GET['value'], ENT_QUOTES)]);
+        echo "<a title='" . $data['value'] . "'>link</a>";
+    """),
+    Case("request_filter_var_named_array_and_copy", """
+        $input = ['value' => $_GET['value']];
+        $data = filter_var_array(add_empty: false, options: FILTER_VALIDATE_INT, array: $input);
+        echo $data['value'];
+        echo $input['value']; // expect: xss echo
+    """),
+    Case("request_filter_array_failure_ignores_default", """
+        $data = filter_var_array(['value' => [$_GET['value']]], ['value' => [
+            'filter' => FILTER_VALIDATE_INT,
+            'options' => ['default' => $_POST['fallback']]
+        ]]);
+        echo $data['value'];
+    """),
+    Case("request_filter_missing_field_ignores_default", """
+        $data = filter_var_array([], ['value' => [
+            'filter' => FILTER_VALIDATE_INT,
+            'options' => ['default' => $_POST['fallback']]
+        ]], false);
+        echo $data['value'];
+    """),
+    Case("request_filter_var_missing_field_never_calls_callback", """
+        $data = filter_var_array(['fixed' => 'constant'], [
+            'absent' => ['filter' => FILTER_CALLBACK, 'options' => 'unknown_callback']
+        ]);
+        echo $data['absent'];
+    """),
+    Case("request_filter_local_shadow", """
+        namespace App;
+        function filter_input_array($type) { return ['value' => 'fixed']; }
+        $data = filter_input_array(INPUT_GET);
+        echo $data['value'];
+    """),
+)
+
+REQUEST_MAP_PARTIAL = (
+    Case("request_headers_invalid_arity", """
+        echo $_GET['value']; // expect: xss echo
+        getallheaders('not-an-argument');
+    """),
+    Case("request_headers_unknown_named_argument", """
+        echo $_GET['value']; // expect: xss echo
+        apache_request_headers(unexpected: 1);
+    """),
+    Case("request_filter_callback_is_not_sanitizer_proof", """
+        echo $_GET['value']; // expect: xss echo
+        filter_input_array(INPUT_GET, ['value' => ['filter' => FILTER_CALLBACK, 'options' => 'unknown_callback']]);
+    """),
+    Case("request_filter_unknown_schema", """
+        echo $_GET['value']; // expect: xss echo
+        filter_input_array(INPUT_GET, $_POST['schema']);
+    """),
+    Case("request_filter_unknown_source_selector", """
+        echo $_GET['value']; // expect: xss echo
+        filter_input_array($_GET['source']);
+    """),
+    Case("request_filter_invalid_schema_key", """
+        echo $_GET['value']; // expect: xss echo
+        filter_input_array(INPUT_GET, [FILTER_DEFAULT]);
+    """),
+    Case("request_filter_array_flags_require_shape_proof", """
+        echo $_GET['value']; // expect: xss echo
+        filter_input_array(INPUT_GET, ['value' => ['filter' => FILTER_DEFAULT, 'flags' => FILTER_REQUIRE_ARRAY]]);
+    """),
+    Case("request_filter_unknown_add_empty", """
+        echo $_GET['value']; // expect: xss echo
+        filter_input_array(INPUT_GET, [], $_GET['add']);
+    """),
+    Case("request_filter_missing_argument", """
+        echo $_GET['value']; // expect: xss echo
+        filter_input_array();
+    """),
+    Case("request_filter_var_unknown_container", """
+        echo $_GET['value']; // expect: xss echo
+        filter_var_array($_GET['value']);
+    """),
+    Case("request_filter_partial_retains_selected_field", """
+        $data = filter_input_array(INPUT_GET, [
+            'known' => FILTER_DEFAULT,
+            'callback' => ['filter' => FILTER_CALLBACK, 'options' => 'unknown_callback']
+        ]);
+        echo $data['known']; // expect: xss echo
+    """),
+    Case("request_filter_unpacked_unknown_array", """
+        echo $_GET['value']; // expect: xss echo
+        filter_input_array(...$_GET);
+    """),
+    Case("request_filter_unpacked_duplicate_argument", """
+        echo $_GET['value']; // expect: xss echo
+        filter_input_array(INPUT_GET, ...['type' => INPUT_POST]);
+    """),
+    Case("request_filter_unpacked_local_shadow", """
+        namespace App;
+        function filter_input_array($type) { return ['value' => 'fixed']; }
+        echo $_GET['value']; // expect: xss echo
+        filter_input_array(...[INPUT_GET]);
+    """),
+)
+
+CASES = (*CASES, *REDIRECT_CASES, *ENVIRONMENT_CASES, *JSON_DECODE_CASES, *REQUEST_MAP_CASES)
 
 
 def identities():
@@ -1638,6 +1888,8 @@ for _case in ENVIRONMENT_PARTIAL:
     setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
 for _case in JSON_DECODE_PARTIAL:
     setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
+for _case in REQUEST_MAP_PARTIAL:
+    setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
 
 
 @unittest.skipUnless(os.environ.get("UBS_PHP_E2E") == "1",
@@ -1716,6 +1968,45 @@ class PHPPublicTests(EvidenceTest):
         for mode in ("module-json", "module-sarif", "json", "sarif"):
             with self.subTest(mode=mode):
                 self.assert_report(*self.execute(directory, mode), mode, CASES)
+
+    def test_public_native_request_maps_and_partial_retention(self):
+        selected = tuple(case for case in REQUEST_MAP_CASES if case.name in {
+            "request_headers_all_sink_domains", "request_filter_default_raw",
+            "request_headers_metadata_and_escaping", "request_filter_selected_schema",
+            "request_filter_default_value_is_not_filtered", "request_filter_local_shadow",
+        })
+        directory = self.materialize(selected, "request-maps")
+        partial_cases = (REQUEST_MAP_PARTIAL[2],)
+        partial = self.materialize(partial_cases, "request-maps-partial")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, selected)
+                self.assert_report(*self.execute(partial, mode), mode, partial_cases, partial=True)
+
+    def test_public_request_map_selection_and_cache(self):
+        unsafe = Case("request_map_cache", "$data = filter_input_array(INPUT_GET);\n"
+                      "echo $data['value']; // expect: xss echo")
+        clean = next(case for case in REQUEST_MAP_CASES
+                     if case.name == "request_headers_metadata_and_escaping")
+        suppressed = Case("request_map_suppressed", "$data = getallheaders();\n"
+                          "echo $data['X-Input']; // ubs:ignore[" + RULES["xss"] + "]")
+        cases = (unsafe, clean, suppressed)
+        directory = self.materialize(cases, "request-map-cache")
+        for _ in range(2):
+            self.assert_report(*self.execute(directory, cached=True), "json", cases)
+        self.assert_report(*self.execute(directory, extra=("--skip-php=5",), cached=True),
+                           "json", cases, expected_override=[])
+        selected = self.artifact / "request-map-selected.nul"
+        selected.write_bytes(os.fsencode(directory / clean.filename) + b"\0")
+        self.assert_report(*self.execute(directory, "module-json", ("--files-from=" + str(selected),)),
+                           "module-json", (clean,))
+        target = directory / unsafe.filename
+        sanitized = Case(unsafe.name, "$data = filter_input_array(INPUT_GET, FILTER_SANITIZE_FULL_SPECIAL_CHARS);\n"
+                         "echo $data['value'];")
+        target.write_text(sanitized.source, encoding="utf-8")
+        self.assert_report(*self.execute(directory, cached=True), "json", (sanitized, clean, suppressed))
+        target.write_text(unsafe.source, encoding="utf-8")
+        self.assert_report(*self.execute(directory, cached=True), "json", cases)
 
     def test_public_redirect_formats_categories_and_suppression(self):
         unsafe = REDIRECT_CASES[0]

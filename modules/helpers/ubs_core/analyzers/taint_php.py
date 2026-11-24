@@ -222,6 +222,9 @@ _CONSTANTS = {
     "FILTER_SANITIZE_SPECIAL_CHARS": 515, "FILTER_SANITIZE_FULL_SPECIAL_CHARS": 522,
     "FILTER_SANITIZE_NUMBER_INT": 519, "FILTER_SANITIZE_NUMBER_FLOAT": 520,
     "FILTER_SANITIZE_URL": 518, "FILTER_FLAG_NO_ENCODE_QUOTES": 128,
+    "FILTER_CALLBACK": 1024, "FILTER_REQUIRE_ARRAY": 16777216,
+    "FILTER_REQUIRE_SCALAR": 33554432, "FILTER_FORCE_ARRAY": 67108864,
+    "FILTER_NULL_ON_FAILURE": 134217728,
     "INPUT_GET": 1, "INPUT_POST": 0, "INPUT_COOKIE": 2, "INPUT_SERVER": 5, "INPUT_ENV": 4,
     "JSON_HEX_TAG": 1, "JSON_HEX_AMP": 2, "JSON_HEX_APOS": 4, "JSON_HEX_QUOT": 8,
     "JSON_UNESCAPED_SLASHES": 64, "JSON_UNESCAPED_UNICODE": 256,
@@ -246,6 +249,8 @@ class NativeSignature:
 # *.stub.php and https://www.php.net/manual/en/functions.arguments.php.
 _NATIVE_FUNCTIONS = {
     "getenv": NativeSignature(("name", "local_only"), (scalar(None), scalar(False))),
+    "getallheaders": NativeSignature(()),
+    "apache_request_headers": NativeSignature(()),
     "header": NativeSignature(("header", "replace", "response_code"), (scalar(True), scalar(0))),
     "http_response_code": NativeSignature(("response_code",), (scalar(0),)),
     "system": NativeSignature(("command", "result_code"), (scalar(None),)),
@@ -270,6 +275,8 @@ _NATIVE_FUNCTIONS = {
                                   (scalar(None), scalar(512), scalar(0))),
     "filter_input": NativeSignature(("type", "var_name", "filter", "options"), (scalar(516), scalar(0))),
     "filter_var": NativeSignature(("value", "filter", "options"), (scalar(516), scalar(0))),
+    "filter_input_array": NativeSignature(("type", "options", "add_empty"), (scalar(516), scalar(True))),
+    "filter_var_array": NativeSignature(("array", "options", "add_empty"), (scalar(516), scalar(True))),
     "escapeshellarg": NativeSignature(("arg",)),
     "escapeshellcmd": NativeSignature(("command",)),
     "base64_decode": NativeSignature(("string", "strict"), (scalar(False),)),
@@ -961,8 +968,8 @@ class Engine:
         return tuple(self.evaluate(node.children[0] if node.kind == "named" else node)
                      for node in nodes)
 
-    def header_arguments(self, nodes: tuple[Node, ...]):
-        """Expand only proven native header arrays, once and in source order."""
+    def native_request_arguments(self, nodes: tuple[Node, ...]):
+        """Expand exact arrays for selected native calls, once in source order."""
         values, targets = [], []
         unpacked, invalid = False, False
         for node in nodes:
@@ -970,7 +977,7 @@ class Engine:
                 unpacked = True
                 value = self.evaluate(node.children[0])
                 if not value.array or value.fallback is not None:
-                    self.issue("PHP header argument unpacking requires an exact array")
+                    self.issue("PHP native argument unpacking requires an exact array")
                     invalid = True
                     continue
                 for key, item in value.items:
@@ -982,7 +989,7 @@ class Engine:
                 values.append(self.evaluate(node.children[0] if node.kind == "named" else node))
                 targets.append(node)
                 if unpacked and node.kind != "named":
-                    self.issue("PHP positional header argument follows unpacking")
+                    self.issue("PHP positional native argument follows unpacking")
                     invalid = True
         return None if invalid else (tuple(values), tuple(targets))
 
@@ -1614,8 +1621,8 @@ class Engine:
         target, arg_nodes = node.children[0], node.children[1:]
         if target.kind == "name":
             selected = self.resolve(target.value, "function").lower()
-            if selected == "header" and selected not in self.functions:
-                bound = self.header_arguments(arg_nodes)
+            if selected in {"header", "getallheaders", "apache_request_headers", "filter_input_array", "filter_var_array"} and selected not in self.functions:
+                bound = self.native_request_arguments(arg_nodes)
                 return self.builtin(selected, *bound, node.token) if bound is not None else EMPTY
             args = self.call_arguments(arg_nodes)
             name = self.resolve(target.value, "function").lower()
@@ -1632,7 +1639,7 @@ class Engine:
             return self.method(receiver, name, args, arg_nodes, node.token)
         receiver = self.evaluate(target)
         if isinstance(receiver.literal, str) and receiver.literal.lower() in {"header", "\\header"}:
-            bound = self.header_arguments(arg_nodes)
+            bound = self.native_request_arguments(arg_nodes)
             return self.builtin("header", *bound, node.token) if bound is not None else EMPTY
         args = self.call_arguments(arg_nodes)
         if receiver.refs and all(ref in self.closures for ref in receiver.refs):
@@ -1752,6 +1759,110 @@ class Engine:
             position = match.end()
         return self.concat(result, scalar(template.literal[position:]))
 
+    def filtered_request_value(self, value: Value, definition: Value, *, recursive: bool = False) -> Value:
+        """Bounded native filter transfer; callback and object effects stay partial."""
+        self.budget.spend()
+        flags, options = 0, array_value({})
+        if definition.array and not definition.refs and definition.fallback is None:
+            fields = dict(definition.items)
+            filter_id = fields.get("filter", scalar(516)).literal
+            flags = fields.get("flags", scalar(0)).literal
+            options = fields.get("options", options)
+        elif not definition.array and not definition.refs:
+            filter_id = definition.literal
+        else:
+            self.issue("PHP bulk filter definition needs a finite native shape")
+            return EMPTY
+        if type(filter_id) is not int or filter_id not in {257, 258, 259, 513, 515, 516, 518, 519, 520, 522}:
+            self.issue("PHP bulk filter callback or unknown filter is outside the selected subset")
+            return EMPTY
+        if type(flags) is not int or flags < 0 or flags & (16777216 | 67108864):
+            self.issue("PHP bulk filter flags need a scalar result shape")
+            return EMPTY
+        if not options.array:
+            self.issue("PHP bulk filter options need a finite native array")
+            return EMPTY
+        pending = [options]
+        while pending:
+            self.budget.spend()
+            option = pending.pop()
+            if option.refs or option.json_array or option.fallback is not None:
+                self.issue("PHP bulk filter options contain unresolved object or array effects")
+                return EMPTY
+            pending.extend(item for _key, item in option.items)
+        if value.refs or value.json_array or (not value.array and (value.items or value.fallback is not None)):
+            self.issue("PHP bulk filter value needs native scalar or array identity")
+            return EMPTY
+        if value.array:
+            if not recursive:
+                # Per-key schemas require scalars by default. Native shape
+                # rejection happens before validation and does not use default.
+                return scalar(None if flags & 134217728 else False)
+            return array_value({key: self.filtered_request_value(item, definition, recursive=True)
+                                for key, item in value.items},
+                               self.filtered_request_value(value.fallback, definition, recursive=True)
+                               if value.fallback is not None else None)
+        # FILTER_DEFAULT with no transforming flags preserves existing proof.
+        # Other sanitizers can undo earlier encodings, so grant only their own
+        # sink-specific guarantees, never a generic "sanitized" fact.
+        filtered = value if filter_id == 516 and flags & ~(33554432 | 134217728) == 0 else without_proofs(value)
+        if filter_id in (257, 258, 259):
+            filtered = tagged(filtered, "numeric")
+            default = dict(options.items).get("default")
+            # Validation failure copies this value without filtering it.
+            return joined(filtered, default) if default is not None else filtered
+        if filter_id in (515, 522):
+            tags = ["html-text"]
+            if not flags & 128:
+                tags.extend(("html-double", "html-single"))
+            filtered = tagged(filtered, *tags)
+        return filtered
+
+    def request_filter_map(self, name: str, args: tuple[Value, ...], token: Token) -> Value:
+        """PHP 8 bulk filters: original SAPI input or the supplied current array.
+
+        See php/php-src PHP-8.4 ext/filter/filter.c, php_filter_array_handler.
+        A scalar filter recurses over every value; a finite schema selects only
+        its named keys and checks missing fields before invoking their filters.
+        """
+        if not 1 <= len(args) <= 3:
+            self.issue("Unsupported PHP bulk filter argument arity")
+            return EMPTY
+        if name == "filter_input_array":
+            if type(args[0].literal) is not int or args[0].literal not in {0, 1, 2, 4, 5}:
+                self.issue("PHP bulk input filter needs a known INPUT_* selector")
+                return EMPTY
+            # filter_input_array reads raw SAPI storage, not assignments to
+            # $_GET/$_POST/etc. filter_var_array consumes those current values.
+            values = array_value({}, self.source(token, "PHP bulk request input value"))
+        else:
+            values = args[0]
+            if not values.array or values.refs or self.unknown_json_aggregate(values):
+                self.issue("PHP filter_var_array needs a selected native input array")
+                return EMPTY
+        definition = args[1] if len(args) > 1 else scalar(516)
+        add_empty = args[2].literal if len(args) > 2 else True
+        if type(add_empty) is not bool:
+            self.issue("PHP bulk filter add_empty behavior is unresolved")
+            return EMPTY
+        if not definition.array:
+            return self.filtered_request_value(values, definition, recursive=True)
+        if definition.refs or definition.fallback is not None or definition.json_array:
+            self.issue("PHP bulk filter schema needs finite named keys")
+            return EMPTY
+        inputs, result = dict(values.items), {}
+        for key, field in definition.items:
+            self.budget.spend()
+            if not isinstance(key, str) or not key:
+                self.issue("PHP bulk filter schema requires nonempty string keys")
+                return EMPTY
+            if key not in inputs and values.fallback is None:
+                if add_empty:
+                    result[key] = scalar(None)
+                continue
+            result[key] = self.filtered_request_value(inputs.get(key, values.fallback), field)
+        return array_value(result)
+
     def builtin(self, name: str, args: tuple[Value, ...], arg_nodes: tuple[Node | None, ...], token: Token) -> Value:
         signature = _NATIVE_CONSTRUCTORS["mysqli"] if name == "mysqli_connect" else _NATIVE_FUNCTIONS.get(name)
         bound = self.native_arguments(args, arg_nodes, signature)
@@ -1777,6 +1888,13 @@ class Engine:
             if first.literal is UNKNOWN:
                 return joined(value, array_value({}, value))
             return value
+        if name in ("getallheaders", "apache_request_headers"):
+            if args:
+                self.issue("PHP request header functions do not accept arguments")
+                return EMPTY
+            return array_value({}, self.source(token, "PHP request header value"))
+        if name in ("filter_input_array", "filter_var_array"):
+            return self.request_filter_map(name, args, token)
         if name == "header":
             self.response_header(args, token)
             return EMPTY

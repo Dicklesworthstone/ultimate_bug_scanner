@@ -2,6 +2,18 @@
 
 All tasks reference Beads issue IDs so progress stays traceable. Update this list whenever you discover new work or finish a sub-task.
 
+## 2026-11-24: Native projections, predicates, and request maps
+
+These bounded implementation slices extend the shared dataflow engines. The D6 and PHP umbrellas remain open; passing these cases does not establish arbitrary heap, callback, or framework coverage.
+
+- [x] Reproduce gaps against `c4b10cf4`: 14 JavaScript projection methods produced 36 failed assertions; 10 finite Python filter methods produced 15 failed assertions; 39 selected PHP request-map methods produced 18 failures. The unchanged-source DSR baseline retained all three failures.
+- [x] `ultimate_bug_scanner-mj1j.32.1`: model native header maps and bounded bulk input filters with original SAPI provenance, finite schemas, raw validation defaults and context-specific proofs. Share the existing exact-array argument expander with these verified native calls; keep local shadows, unknown schemas/callbacks and shape-changing flags explicitly incomplete.
+- [x] `ultimate_bug_scanner-mj1j.32.1`: the full PHP native suite passes 334 methods (one existing opt-in PHP runtime skip), and both new public methods pass 14 real scanner invocations: module/runner JSON and SARIF, complete/partial retention, suppression, category and file selection, cache reuse and source invalidation. Stable DSR check log SHA-256: `999c67ff7a1dbeff69589fae6d568ceedc6c804af2210a69d750cc3828082691`. Native PHP execution is not claimed.
+- [ ] `ultimate_bug_scanner-1b9j.6.22`: preserve shallow JavaScript object-projection aliases, clean keys and own-property ordering through joins, summaries, spread, assignment and rest; retain explicit uncertainty for scalar alternatives and unknown native dispatch. Finish focused, adjacent, budget and public report/cache verification before integration.
+- [ ] `ultimate_bug_scanner-1b9j.6.23`: execute finite Python predicates lazily, retain rejected-item writes and original yielded values, and preserve shared cursor progress. Prove empty-input callback ownership, exact StopIteration behavior, backing mutations and alternative-input boundaries; verify neighboring iterator/callback tests and public reports.
+- [x] PHP integration: both canonical checksum validators pass. The aggregate ShellCheck invocation was interrupted (exit 137); serial checks of every same file pass. Changed-file self-scan remains partial (exit 2, zero critical, two exact-boolean-type warnings), with unresolved Python generator/SQL analysis. The docs-claims gate still reports language-count/HCL-intro drift. These are retained failures, not release qualification.
+- [ ] Complete the prescribed broader suite and the remaining changed-file self-scans without lowering limits.
+
 ## 1. Root UBS triage (ultimate_bug_scanner-9dk)
 - [x] Run per-language UBS scans to get baseline counts. (`./ubs --format=json --ci --only=<lang> .`)
 - [x] Record baseline in notes/root-scan-2025-11-16.md.

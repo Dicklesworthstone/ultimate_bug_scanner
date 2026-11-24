@@ -8,6 +8,7 @@ already established findings remain available to the public module adapter.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from bisect import bisect_right
@@ -89,6 +90,8 @@ class Value:
     refs: frozenset[int] = frozenset()
     parts: tuple[Part, ...] = ()
     string_choices: tuple[tuple[Part, ...], ...] = ()
+    json_array: bool = False
+    json_depth: int = 0
 
 
 EMPTY = Value()
@@ -146,10 +149,14 @@ def joined(*values: Value) -> Value:
                     # Losing the header's name cannot establish a clean
                     # redirect. The selected sink reports that boundary.
                     return Value(fact, literal=literal, refs=refs, parts=(Part(None, fact),),
-                                 items=tuple(items.items()), fallback=fallback)
+                                 items=tuple(items.items()), fallback=fallback,
+                                 json_array=any(item.json_array for item in values),
+                                 json_depth=max(item.json_depth for item in values))
                 choices.append(choice)
     return Value(fact, literal=literal, refs=refs, parts=(Part(None, fact),),
-                 string_choices=tuple(choices), items=tuple(items.items()), fallback=fallback)
+                 string_choices=tuple(choices), items=tuple(items.items()), fallback=fallback,
+                 json_array=any(value.json_array for value in values),
+                 json_depth=max(value.json_depth for value in values))
 
 
 def tagged(value: Value, *tags: str, remove: frozenset[str] = frozenset()) -> Value:
@@ -186,6 +193,8 @@ class Object:
     fields: tuple[tuple[str, Value], ...] = ()
     query: Value = EMPTY
     connection: frozenset[int] = frozenset()
+    elements: tuple[tuple[Any, Value], ...] = ()
+    json_depth: int = 512
 
 
 @dataclass(frozen=True)
@@ -217,6 +226,8 @@ _CONSTANTS = {
     "JSON_HEX_TAG": 1, "JSON_HEX_AMP": 2, "JSON_HEX_APOS": 4, "JSON_HEX_QUOT": 8,
     "JSON_UNESCAPED_SLASHES": 64, "JSON_UNESCAPED_UNICODE": 256,
     "JSON_THROW_ON_ERROR": 4194304,
+    "JSON_OBJECT_AS_ARRAY": 1, "JSON_BIGINT_AS_STRING": 2,
+    "JSON_INVALID_UTF8_IGNORE": 1048576, "JSON_INVALID_UTF8_SUBSTITUTE": 2097152,
 }
 _HTML_TAGS = frozenset({"html-text", "html-double", "html-single", "html-url", "url-component", "js-literal"})
 _REQUEST_CLASSES = frozenset({"illuminate\\http\\request", "symfony\\component\\httpfoundation\\request"})
@@ -344,6 +355,11 @@ class Engine:
         self.try_depth = 0
         self.html = ""
         self.declaration_probe = False
+        # Unknown decoded children get stable identities when selected. These
+        # immutable seeds also represent a branch which has not read that
+        # child yet; a different branch's writes must not become its default.
+        self.json_children: dict[tuple[int, str, Any], int] = {}
+        self.json_seeds: dict[int, Object] = {}
 
     def location(self, token: Token) -> tuple[int, int]:
         line = bisect_right(self.line_starts, token.start)
@@ -367,6 +383,143 @@ class Engine:
         ref = self.next_object
         self.heap[ref] = Object(kind, name, query=query, connection=connection)
         return Value(refs=frozenset({ref}))
+
+    def json_value(self, value: Value, *, wildcard: bool = False, depth: int = 512) -> Value:
+        if depth <= 1:
+            return Value(value.fact, parts=(Part(None, value.fact),))
+        result = self.allocate("json", name="wildcard" if wildcard else "", query=value)
+        ref = next(iter(result.refs))
+        self.heap[ref] = replace(self.heap[ref], json_depth=depth)
+        self.json_seeds[ref] = self.heap[ref]
+        # A nonliteral JSON document can also decode to a scalar. Keep its
+        # scalar fact alongside the possible object/array structural facet.
+        return Value(value.fact, refs=result.refs, parts=(Part(None, value.fact),))
+
+    def json_child(self, ref: int, key: Any, *, element: bool = False) -> Value:
+        self.budget.spend()
+        parent = self.heap.get(ref, self.json_seeds.get(ref))
+        if parent is None:
+            self.issue("Unresolved PHP decoded JSON child ownership")
+            return EMPTY
+        if parent.json_depth <= 2:
+            return Value(parent.query.fact, parts=(Part(None, parent.query.fact),))
+        identity = (ref, "index" if element else "property", key)
+        child_ref = self.json_children.get(identity)
+        if child_ref is None:
+            child = self.json_value(parent.query, wildcard=key is UNKNOWN, depth=parent.json_depth - 1)
+            child_ref = next(iter(child.refs))
+            self.json_children[identity] = child_ref
+        elif child_ref not in self.heap:
+            self.heap[child_ref] = self.json_seeds[child_ref]
+        fact = parent.query.fact
+        return Value(fact, refs=frozenset({child_ref}), parts=(Part(None, fact),))
+
+    def decoded_json(self, args: tuple[Value, ...]) -> Value:
+        """Decode the selected native shape without trusting its payload.
+
+        PHP's nullable association option defers to JSON_OBJECT_AS_ARRAY;
+        explicit false overrides that bit. Literal documents have finite
+        shapes. Unknown object children are materialized lazily, while
+        associative arrays remain ordinary copy-by-value arrays.
+        """
+        if not 1 <= len(args) <= 4:
+            self.issue("Unsupported PHP json_decode arity")
+            return EMPTY
+        source = args[0]
+        associative = args[1].literal if len(args) > 1 else None
+        depth = args[2].literal if len(args) > 2 else 512
+        flags = args[3].literal if len(args) > 3 else 0
+        if source.array or source.refs or source.json_array:
+            self.issue("Unsupported PHP json_decode input type")
+            return EMPTY
+        if associative is not None and type(associative) is not bool:
+            self.issue("Unresolved PHP json_decode association option")
+            return EMPTY
+        if type(flags) is not int or flags < 0:
+            self.issue("Unresolved PHP json_decode flags")
+            return EMPTY
+        if type(depth) is not int or not 0 < depth <= 2147483647:
+            self.issue("Unresolved or invalid PHP json_decode depth")
+            return EMPTY
+        arrays = bool(flags & 1) if associative is None else associative
+        if source.literal is UNKNOWN:
+            value = without_proofs(source)
+            if depth <= 1:
+                return value
+            if arrays:
+                return array_value({}, Value(value.fact, parts=value.parts, json_array=True, json_depth=depth - 1))
+            return self.json_value(value, depth=depth)
+
+        text = php_string(source.literal)
+        self.budget.spend(len(text))
+
+        def invalid_constant(_text):
+            raise ValueError("non-JSON numeric constant")
+
+        def convert(value, level=0):
+            self.budget.spend()
+            if level > self.limits["UBS_PHP_MAX_NESTING"]:
+                raise AnalysisLimit("PHP literal JSON nesting limit exceeded; analysis is incomplete")
+            if isinstance(value, (list, dict)):
+                if level + 1 >= depth:
+                    raise ValueError("JSON nesting depth exceeded")
+                if isinstance(value, list):
+                    return array_value({index: convert(item, level + 1) for index, item in enumerate(value)})
+                fields = {}
+                for key, item in value.items():
+                    if any(0xD800 <= ord(char) <= 0xDFFF for char in key) or (not arrays and key.startswith("\0")):
+                        raise ValueError("invalid JSON property name")
+                    fields[key_of(key) if arrays else key] = convert(item, level + 1)
+                if arrays:
+                    return array_value(fields)
+                result = self.allocate("json_object")
+                ref = next(iter(result.refs))
+                self.heap[ref] = replace(self.heap[ref], fields=tuple(fields.items()))
+                return result
+            if isinstance(value, str) and any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+                raise ValueError("invalid JSON string surrogate")
+            if type(value) is int and not -(2 ** 63) <= value < 2 ** 63:
+                return scalar(str(value) if flags & 2 else float(value))
+            return scalar(value)
+
+        try:
+            parsed = json.loads(text, parse_constant=invalid_constant)
+            return convert(parsed)
+        except AnalysisLimit:
+            raise
+        except RecursionError as exc:
+            raise AnalysisLimit("PHP literal JSON nesting limit exceeded; analysis is incomplete") from exc
+        except (ValueError, OverflowError):
+            if flags & 4194304:
+                self.issue("PHP json_decode exception completion is outside the selected subset")
+            return scalar(None)
+
+    def unknown_json_aggregate(self, value: Value) -> bool:
+        """Array consumers need element shape beyond a lazy JSON child."""
+        return (value.json_array
+                or any(self.heap[ref].kind == "json" for ref in value.refs)
+                or (value.fallback is not None and self.unknown_json_aggregate(value.fallback)))
+
+    def json_contents(self, value: Value) -> Fact:
+        """Include current native JSON object fields when serializing them."""
+        pending, seen, fact = [value], set(), CLEAN
+        while pending:
+            self.budget.spend()
+            current = pending.pop()
+            fact = join(fact, current.fact)
+            pending.extend(item for _key, item in current.items)
+            if current.fallback is not None:
+                pending.append(current.fallback)
+            for ref in current.refs:
+                if ref in seen:
+                    continue
+                seen.add(ref)
+                obj = self.heap.get(ref)
+                if obj is not None and obj.kind in ("json", "json_object"):
+                    fact = join(fact, obj.query.fact)
+                    pending.extend(item for _key, item in obj.fields)
+                    pending.extend(item for _key, item in obj.elements)
+        return fact
 
     def resolve(self, name: str, kind: str, context: Context | None = None) -> str:
         ctx = context or self.context
@@ -709,6 +862,26 @@ class Engine:
         return Value(fact, literal=literal, parts=parts, string_choices=choices)
 
     def read_index(self, value: Value, key: Value) -> Value:
+        if value.json_array:
+            return Value(value.fact, parts=(Part(None, value.fact),),
+                         json_array=value.json_depth > 1, json_depth=max(0, value.json_depth - 1))
+        decoded = [ref for ref in value.refs if self.heap[ref].kind in ("json", "json_object")]
+        if decoded:
+            normalized = key_of(key.literal)
+            if normalized is UNKNOWN:
+                self.issue("Unresolved PHP decoded JSON index alias")
+            values = []
+            for ref in decoded:
+                obj = self.heap[ref]
+                if obj.kind == "json_object":
+                    self.issue("PHP decoded object cannot establish array-offset access")
+                    continue
+                fields = dict(obj.elements)
+                if normalized not in fields:
+                    fields[normalized] = self.json_child(ref, normalized, element=True)
+                    self.heap[ref] = replace(obj, elements=tuple(fields.items()))
+                values.append(fields[normalized])
+            return joined(*values)
         if not value.array:
             return Value(join(value.fact, key.fact), parts=(Part(None, join(value.fact, key.fact)),))
         normalized = key_of(key.literal)
@@ -724,13 +897,18 @@ class Engine:
         elif target.kind == "index":
             container, key_node = target.children
             base = self.evaluate(container)
+            if any(self.heap[ref].kind in ("json", "json_object") for ref in base.refs):
+                # The unknown default decoder result can be an array or an
+                # object. Array-header copies cannot share an object write.
+                self.issue("PHP decoded JSON offset mutation needs array ownership proof")
+                return
             items = dict(base.items)
             if key_node.kind == "append":
                 numeric = [key for key in items if isinstance(key, int)]
                 key = max(numeric, default=-1) + 1
             else:
                 key = key_of(self.evaluate(key_node).literal)
-            fallback = base.fallback
+            fallback = base if base.json_array else base.fallback
             if key is UNKNOWN:
                 items = {existing: joined(previous, value) for existing, previous in items.items()}
                 fallback = joined(fallback or EMPTY, value)
@@ -739,10 +917,27 @@ class Engine:
             self.assign(container, array_value(items, fallback))
         elif target.kind == "member":
             receiver = self.evaluate(target.children[0])
+            member = target.value[1]
+            if target.value[2] != "name":
+                member_value = self.env.get(member, EMPTY)
+                if not isinstance(member_value.literal, str):
+                    self.issue("Unresolved PHP property-write name")
+                    return
+                member = member_value.literal
             for ref in receiver.refs:
                 obj = self.heap[ref]
                 fields = dict(obj.fields)
-                fields[target.value[1]] = value
+                assigned = value
+                if obj.kind in ("json", "json_object"):
+                    if obj.name == "wildcard":
+                        self.issue("PHP decoded JSON wildcard mutation needs alias proof")
+                        continue
+                    if len(receiver.refs) > 1:
+                        previous = fields.get(member)
+                        if previous is None:
+                            previous = self.json_child(ref, member) if obj.kind == "json" else scalar(None)
+                        assigned = joined(previous, value)
+                fields[member] = assigned
                 self.heap[ref] = replace(obj, fields=tuple(fields.items()))
             if not receiver.refs:
                 self.issue("Unresolved PHP property write")
@@ -948,12 +1143,25 @@ class Engine:
         refs = {ref: None for _env, heap, _flow, _value in active for ref in heap}
         heap = {}
         for ref in refs:
-            objects = [branch_heap[ref] for _env, branch_heap, _flow, _value in active if ref in branch_heap]
+            objects = [branch_heap.get(ref, self.json_seeds.get(ref))
+                       for _env, branch_heap, _flow, _value in active
+                       if ref in branch_heap or ref in self.json_seeds]
             first = objects[0]
             fields = {key: None for obj in objects for key, _value in obj.fields}
+            elements = {key: None for obj in objects for key, _value in obj.elements}
+
+            def field_value(obj, key, element=False):
+                value = dict(obj.elements if element else obj.fields).get(key)
+                if value is not None:
+                    return value
+                if obj.kind == "json":
+                    return self.json_child(ref, key, element=element)
+                return scalar(None) if obj.kind == "json_object" else EMPTY
+
             heap[ref] = replace(first, query=joined(*(obj.query for obj in objects)),
-                                fields=tuple((key, joined(*(dict(obj.fields).get(key, EMPTY) for obj in objects))) for key in fields))
-        self.heap = heap
+                                fields=tuple((key, joined(*(field_value(obj, key) for obj in objects))) for key in fields),
+                                elements=tuple((key, joined(*(field_value(obj, key, True) for obj in objects))) for key in elements))
+        self.heap = {**self.json_seeds, **heap}
 
     def truth(self, value: Value) -> bool | None:
         if value.literal is UNKNOWN:
@@ -1080,9 +1288,15 @@ class Engine:
             iterable = self.evaluate(children[0])
             targets = [child for child in children[1:] if child.kind not in ("as", "arrow")]
             value = joined(*(item for _key, item in iterable.items), iterable.fallback or EMPTY)
+            if iterable.json_array and iterable.json_depth > 1:
+                value = joined(value, iterable)
+            if any(self.heap[ref].kind in ("json", "json_object") for ref in iterable.refs):
+                self.issue("PHP decoded JSON object iteration needs selected element ownership")
             if targets:
                 self.assign(targets[-1], value)
             if len(targets) > 1:
+                if self.unknown_json_aggregate(iterable):
+                    self.issue("PHP decoded JSON iteration keys need selected element shape")
                 self.assign(targets[0], EMPTY)
         elif node.kind == "for":
             self.issue("PHP for-loop header semantics are outside the selected subset")
@@ -1224,11 +1438,25 @@ class Engine:
         if kind == "member":
             receiver = self.evaluate(node.children[0])
             member = node.value[1]
+            if node.value[2] != "name":
+                selected = self.env.get(member, EMPTY)
+                if not isinstance(selected.literal, str):
+                    self.issue("Unresolved PHP property-read name")
+                    return EMPTY
+                member = selected.literal
             results = []
             for ref in receiver.refs:
                 obj = self.heap[ref]
                 if obj.kind == "request" and member in ("query", "request", "cookies", "headers", "files", "server"):
                     results.append(self.allocate("requestbag", name=member))
+                elif obj.kind == "json":
+                    fields = dict(obj.fields)
+                    if member not in fields:
+                        fields[member] = self.json_child(ref, member)
+                        self.heap[ref] = replace(obj, fields=tuple(fields.items()))
+                    results.append(fields[member])
+                elif obj.kind == "json_object":
+                    results.append(dict(obj.fields).get(member, scalar(None)))
                 else:
                     results.append(dict(obj.fields).get(member, EMPTY))
             return joined(*results)
@@ -1255,8 +1483,16 @@ class Engine:
             if kind == "cast":
                 if operation in ("int", "integer", "float", "double", "real", "bool", "boolean"):
                     return tagged(value, "numeric")
+                if operation == "string":
+                    return scalar(php_string(value.literal)) if value.literal is not UNKNOWN else Value(value.fact, parts=value.parts)
                 if operation == "array":
+                    if any(self.heap[ref].kind in ("json", "json_object") for ref in value.refs):
+                        self.issue("PHP decoded JSON aggregate cast needs shape and copy proof")
+                        return EMPTY
                     return value if value.array else array_value({0: value})
+                if operation == "object" and (value.json_array or value.array or value.refs):
+                    self.issue("PHP aggregate object cast needs shape and ownership proof")
+                    return EMPTY
                 return value
             if operation in ("include", "include_once", "require", "require_once"):
                 self.record(INCLUDE, node.token, value.fact)
@@ -1523,6 +1759,11 @@ class Engine:
             return EMPTY
         args, arg_nodes = bound
         first = args[0] if args else EMPTY
+        if name in ("array_values", "array_keys", "implode", "join", "vprintf", "vsprintf"):
+            aggregate = args[1] if name in ("implode", "join", "vprintf", "vsprintf") and len(args) > 1 else first
+            if self.unknown_json_aggregate(aggregate):
+                self.issue("PHP decoded JSON %s needs selected element shape" % name)
+                return EMPTY
         if name == "getenv":
             # PHP 8 accepts a nullable name and an optional local_only flag.
             # The flag selects where values come from, not whether their
@@ -1576,6 +1817,8 @@ class Engine:
         if name == "unserialize":
             self.record(DESERIALIZE, token, first.fact)
             return Value(first.fact)
+        if name == "json_decode":
+            return self.decoded_json(args)
         if name in ("printf", "vprintf"):
             values = args if name == "printf" else (first, *(value for _key, value in args[1].items)) if len(args) > 1 else args
             self.output(self.format_string(values), token)
@@ -1595,9 +1838,8 @@ class Engine:
             if flags & 1:
                 tags.append("html-single")
             return tagged(first, *tags)
-        if name in ("html_entity_decode", "htmlspecialchars_decode", "urldecode", "rawurldecode", "json_decode", "base64_decode", "hex2bin", "stripslashes", "stripcslashes"):
-            value = without_proofs(first)
-            return array_value({}, value) if name == "json_decode" and len(args) > 1 and args[1].literal is True else value
+        if name in ("html_entity_decode", "htmlspecialchars_decode", "urldecode", "rawurldecode", "base64_decode", "hex2bin", "stripslashes", "stripcslashes"):
+            return without_proofs(first)
         if name in ("rawurlencode", "urlencode"):
             return tagged(first, "url-component")
         if name == "escapeshellarg":
@@ -1626,7 +1868,8 @@ class Engine:
             return value
         if name in ("json_encode", "wp_json_encode"):
             flags = args[1].literal if len(args) > 1 else 0
-            return tagged(first, "js-literal") if isinstance(flags, int) and flags & 15 == 15 else Value(first.fact)
+            value = Value(self.json_contents(first))
+            return tagged(value, "js-literal") if isinstance(flags, int) and flags & 15 == 15 else value
         if name in ("sprintf", "vsprintf"):
             values = args if name == "sprintf" else (first, *(value for _key, value in args[1].items)) if len(args) > 1 else args
             return self.format_string(values)
@@ -1642,17 +1885,17 @@ class Engine:
                 result = self.concat(result, values.fallback)
             return result
         if name == "strval":
-            return scalar(php_string(first.literal)) if first.literal is not UNKNOWN else first
+            return scalar(php_string(first.literal)) if first.literal is not UNKNOWN else Value(first.fact, parts=first.parts)
         if name in ("strtolower", "strtoupper", "ucfirst", "lcfirst"):
             if isinstance(first.literal, str):
                 text = first.literal
                 converted = text.lower() if name == "strtolower" else text.upper() if name == "strtoupper" else text[:1].upper() + text[1:] if name == "ucfirst" else text[:1].lower() + text[1:]
                 return scalar(converted)
-            return first
+            return Value(first.fact, parts=first.parts)
         if name in ("trim", "ltrim", "rtrim") and len(args) == 1:
             if isinstance(first.literal, str):
                 return scalar({"trim": str.strip, "ltrim": str.lstrip, "rtrim": str.rstrip}[name](first.literal))
-            return first
+            return Value(first.fact, parts=first.parts)
         if name == "str_replace":
             return without_proofs(joined(args[1], args[2])) if len(args) >= 3 else EMPTY
         if name == "preg_replace_callback":

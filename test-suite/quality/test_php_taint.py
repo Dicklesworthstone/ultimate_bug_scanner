@@ -1196,7 +1196,307 @@ ENVIRONMENT_PARTIAL = (
     """),
 )
 
-CASES = (*CASES, *REDIRECT_CASES, *ENVIRONMENT_CASES)
+JSON_DECODE_CASES = (
+    Case("json_decoded_command", """
+        $data = json_decode(file_get_contents('php://input'));
+        system($data->command); // expect: command system
+    """),
+    Case("json_decoded_sql", """
+        $data = json_decode($_POST['json']);
+        $db = new PDO('sqlite::memory:');
+        $db->query($data->sql); // expect: sql $db->query
+    """),
+    Case("json_decoded_code", """
+        $data = json_decode($_POST['json']);
+        eval($data->code); // expect: code eval
+    """),
+    Case("json_decoded_include", """
+        $data = json_decode($_POST['json']);
+        include $data->file; // expect: include include
+    """),
+    Case("json_decoded_deserialize", """
+        $data = json_decode($_POST['json']);
+        unserialize($data->serialized); // expect: deserialize unserialize
+    """),
+    Case("json_decoded_output", """
+        $data = json_decode($_POST['json']);
+        echo $data->html; // expect: xss echo
+    """),
+    Case("json_decoded_redirect", """
+        $data = json_decode($_POST['json']);
+        header('Location: ' . $data->next); // expect: redirect header
+    """),
+    Case("json_decoded_nested_object", """
+        $data = json_decode($_POST['json']);
+        system($data->account->command); // expect: command system
+    """),
+    Case("json_decoded_nested_array", """
+        $data = json_decode($_POST['json']);
+        system($data->accounts[0]->command); // expect: command system
+    """),
+    Case("json_decoded_root_array", """
+        $data = json_decode($_POST['json']);
+        system($data[0]->command); // expect: command system
+    """),
+    Case("json_decoded_named_arguments", """
+        $data = json_decode(flags: JSON_THROW_ON_ERROR, json: $_POST['json'], associative: false);
+        system($data->command); // expect: command system
+    """),
+    Case("json_decoded_explicit_false_overrides_flag", """
+        $data = json_decode($_POST['json'], false, 512, JSON_OBJECT_AS_ARRAY);
+        system($data->command); // expect: command system
+    """),
+    Case("json_decoded_null_uses_array_flag", """
+        $data = json_decode($_POST['json'], null, 512, JSON_OBJECT_AS_ARRAY);
+        system($data['command']); // expect: command system
+    """),
+    Case("json_decoded_associative_nested_array", """
+        $data = json_decode($_POST['json'], true);
+        system($data['account']['command']); // expect: command system
+    """),
+    Case("json_decoded_native_import", r"""
+        namespace Application;
+        use function json_decode as decode;
+        $data = decode($_POST['json']);
+        system($data->command); // expect: command system
+    """),
+    Case("json_decoded_helper_return", """
+        function decodeBody($body) { return json_decode($body); }
+        $data = decodeBody($_POST['json']);
+        system($data->command); // expect: command system
+    """),
+    Case("json_decoded_helper_consumption", """
+        function executeBody($data) {
+            system($data->command); // expect: command system
+        }
+        executeBody(json_decode($_POST['json']));
+    """),
+    Case("json_decoded_object_alias_overwrite", """
+        $data = json_decode($_POST['json']);
+        $alias = $data;
+        $alias->command = 'fixed';
+        system($data->command);
+    """),
+    Case("json_decoded_repeated_child_alias", """
+        $data = json_decode($_POST['json']);
+        $alias = $data->left;
+        $alias->command = 'fixed';
+        system($data->left->command);
+    """),
+    Case("json_decoded_distinct_children", """
+        $data = json_decode($_POST['json']);
+        $alias = $data->left;
+        $alias->command = 'fixed';
+        system($data->right->command); // expect: command system
+    """),
+    Case("json_decoded_child_replacement_preserves_old_alias", """
+        $data = json_decode($_POST['json']);
+        $alias = $data->left;
+        $data->left = json_decode('{"command":"fixed"}');
+        system($alias->command); // expect: command system
+        system($data->left->command);
+    """),
+    Case("json_decoded_conditional_overwrite", """
+        $data = json_decode($_POST['json']);
+        if ($_GET['mode']) { $data->command = 'fixed'; }
+        system($data->command); // expect: command system
+    """),
+    Case("json_decoded_selected_alias_weak_write", """
+        $first = json_decode($_POST['json']);
+        $second = json_decode('{"command":"fixed"}');
+        $selected = $_GET['mode'] ? $first : $second;
+        $selected->command = 'fixed';
+        system($first->command); // expect: command system
+    """),
+    Case("json_decoded_conditional_child_overwrite", """
+        $data = json_decode($_POST['json']);
+        if ($_GET['mode']) { $data->left->command = 'fixed'; }
+        system($data->left->command); // expect: command system
+    """),
+    Case("json_decoded_all_branches_child_overwrite", """
+        $data = json_decode($_POST['json']);
+        if ($_GET['mode']) { $data->left->command = 'fixed'; }
+        else { $data->left->command = 'other'; }
+        system($data->left->command);
+    """),
+    Case("json_decoded_associative_copy", """
+        $data = json_decode($_POST['json'], true);
+        $copy = $data;
+        $copy['command'] = 'fixed';
+        system($data['command']); // expect: command system
+        system($copy['command']);
+    """),
+    Case("json_decoded_literal_array_copy", """
+        $data = json_decode('[{"command":"fixed"}]');
+        $copy = $data;
+        $copy[0] = json_decode('{"command":"other"}');
+        $data[0]->command = $_GET['command'];
+        system($data[0]->command); // expect: command system
+        system($copy[0]->command);
+    """),
+    Case("json_decoded_associative_nested_copy", """
+        $data = json_decode($_POST['json'], true);
+        $copy = $data['account'];
+        $copy['command'] = 'fixed';
+        system($data['account']['command']); // expect: command system
+        system($copy['command']);
+    """),
+    Case("json_decoded_associative_nested_iteration", """
+        $data = json_decode($_POST['json'], true);
+        foreach ($data['accounts'] as $account) {
+            system($account['command']); // expect: command system
+        }
+    """),
+    Case("json_decoded_literal_array_shares_objects", """
+        $data = json_decode('[{"command":"fixed"}]');
+        $copy = $data;
+        $copy[0]->command = $_GET['command'];
+        system($data[0]->command); // expect: command system
+    """),
+    Case("json_decoded_post_decode_escaping", """
+        $data = json_decode($_POST['json']);
+        system('printf %s ' . escapeshellarg($data->command));
+        echo htmlspecialchars($data->html, ENT_QUOTES);
+        $db = new PDO('sqlite::memory:');
+        $statement = $db->prepare('SELECT ?');
+        $statement->execute([$data->value]);
+        header('Location: /account/' . $data->next);
+    """),
+    Case("json_decoded_earlier_escaping_is_not_proof", """
+        $data = json_decode(htmlspecialchars($_POST['json'], ENT_QUOTES));
+        echo $data->html; // expect: xss echo
+    """),
+    Case("json_decoded_literal_safe", """
+        $data = json_decode('{"command":"fixed","account":{"name":"safe"}}');
+        system($data->command);
+        echo $data->account->name;
+    """),
+    Case("json_decoded_literal_scalar", """
+        $data = json_decode('"fixed"');
+        system($data);
+    """),
+    Case("json_decoded_depth_one_has_no_properties", """
+        $data = json_decode($_POST['json'], depth: 1);
+        echo $data->html;
+    """),
+    Case("json_decoded_depth_two_bounds_nested_properties", """
+        $data = json_decode($_POST['json'], depth: 2);
+        echo $data->html; // expect: xss echo
+        echo $data->nested->html;
+    """),
+    Case("json_decoded_invalid_literal_is_null", """
+        $data = json_decode('not json');
+        echo $data;
+    """),
+    Case("json_decoded_local_function_shadow", """
+        namespace Application;
+        function json_decode($text) { return 'fixed'; }
+        $data = json_decode($_POST['json']);
+        echo $data;
+    """),
+    Case("json_decoded_object_overwrite_then_encode", """
+        $data = json_decode('{"html":"fixed"}');
+        $data->html = $_GET['html'];
+        echo json_encode($data); // expect: xss echo
+    """),
+    Case("json_decoded_literal_array_consumers", """
+        $data = json_decode('["fixed"]', true);
+        system(implode('', array_values($data)));
+        echo vsprintf('%s', $data);
+    """),
+)
+
+JSON_DECODE_PARTIAL = (
+    Case("json_decoded_unknown_association", """
+        echo $_GET['html']; // expect: xss echo
+        json_decode($_POST['json'], $_GET['mode']);
+    """),
+    Case("json_decoded_unknown_flags", """
+        echo $_GET['html']; // expect: xss echo
+        json_decode($_POST['json'], flags: $_GET['flags']);
+    """),
+    Case("json_decoded_invalid_depth", """
+        echo $_GET['html']; // expect: xss echo
+        json_decode($_POST['json'], depth: 0);
+    """),
+    Case("json_decoded_invalid_input_type", """
+        echo $_GET['html']; // expect: xss echo
+        json_decode(['not', 'json']);
+    """),
+    Case("json_decoded_unknown_property_write", """
+        echo $_GET['html']; // expect: xss echo
+        $data = json_decode($_POST['json']);
+        $key = $_GET['key'];
+        $data->$key = 'fixed';
+    """),
+    Case("json_decoded_unknown_default_array_write", """
+        echo $_GET['html']; // expect: xss echo
+        $data = json_decode($_POST['json']);
+        $copy = $data;
+        $copy[0] = 'fixed';
+    """),
+    Case("json_decoded_object_array_cast", """
+        echo $_GET['html']; // expect: xss echo
+        $data = json_decode($_POST['json']);
+        $array = (array) $data;
+    """),
+    Case("json_decoded_boundary_object_array_values", """
+        echo $_GET['html']; // expect: xss echo
+        $data = json_decode($_POST['json']);
+        system(array_values($data)[0]);
+    """),
+    Case("json_decoded_boundary_object_array_keys", """
+        echo $_GET['html']; // expect: xss echo
+        $data = json_decode($_POST['json']);
+        system(array_keys($data)[0]);
+    """),
+    Case("json_decoded_boundary_object_implode", """
+        echo $_GET['html']; // expect: xss echo
+        system(implode('', json_decode($_POST['json'])));
+    """),
+    Case("json_decoded_boundary_object_join", """
+        echo $_GET['html']; // expect: xss echo
+        system(join('', json_decode($_POST['json'])));
+    """),
+    Case("json_decoded_boundary_object_vprintf", """
+        echo $_GET['html']; // expect: xss echo
+        vprintf('%s', json_decode($_POST['json']));
+    """),
+    Case("json_decoded_boundary_object_vsprintf", """
+        echo $_GET['html']; // expect: xss echo
+        system(vsprintf('%s', json_decode($_POST['json'])));
+    """),
+    Case("json_decoded_boundary_associative_array_values", """
+        echo $_GET['html']; // expect: xss echo
+        $data = json_decode($_POST['json'], true);
+        system(array_values($data['commands'])[0]);
+    """),
+    Case("json_decoded_boundary_associative_array_keys", """
+        echo $_GET['html']; // expect: xss echo
+        $data = json_decode($_POST['json'], true);
+        system(array_keys($data['commands'])[0]);
+    """),
+    Case("json_decoded_boundary_associative_implode", """
+        echo $_GET['html']; // expect: xss echo
+        $data = json_decode($_POST['json'], true);
+        system(implode('', $data['commands']));
+    """),
+    Case("json_decoded_boundary_associative_foreach_key", """
+        echo $_GET['html']; // expect: xss echo
+        $data = json_decode($_POST['json'], true);
+        foreach ($data as $key => $value) { system($key); }
+    """),
+    Case("json_decoded_boundary_nested_associative_foreach_key", """
+        echo $_GET['html']; // expect: xss echo
+        $data = json_decode($_POST['json'], true);
+        foreach ($data['commands'] as $key => $value) { system($key); }
+    """),
+    Case("json_decoded_boundary_literal_recursion",
+         "echo $_GET['html']; // expect: xss echo\n"
+         + "json_decode('" + "[" * 1500 + "0" + "]" * 1500 + "', depth: 2000);"),
+)
+
+CASES = (*CASES, *REDIRECT_CASES, *ENVIRONMENT_CASES, *JSON_DECODE_CASES)
 
 
 def identities():
@@ -1285,6 +1585,40 @@ class PHPNativeTests(EvidenceTest):
         source = self.materialize((case,), "redirect-disabled") / case.filename
         self.assertEqual(list(native.scan_file_findings(source, frozenset({RULES['sql']}))), [])
 
+    @unittest.skipUnless(os.environ.get("UBS_PHP_NATIVE") == "1", "set UBS_PHP_NATIVE=1 with php on PATH for native witnesses")
+    def test_json_decoded_native_runtime_contract(self):
+        cases = (
+            ("native-default-object", "$d=json_decode('{\"left\":{\"command\":\"payload\"}}'); echo json_encode($d->left->command);", "payload"),
+            ("native-nested-array", "$d=json_decode('{\"accounts\":[{\"command\":\"payload\"}]}'); echo json_encode($d->accounts[0]->command);", "payload"),
+            ("native-object-alias", "$d=json_decode('{\"command\":\"payload\"}'); $a=$d; $a->command='fixed'; echo json_encode($d->command);", "fixed"),
+            ("native-repeated-child", "$d=json_decode('{\"left\":{\"command\":\"payload\"},\"right\":{\"command\":\"other\"}}'); $a=$d->left; $a->command='fixed'; echo json_encode([$d->left->command,$d->right->command]);", ["fixed", "other"]),
+            ("native-array-copy", "$d=json_decode('{\"command\":\"payload\"}',true); $a=$d; $a['command']='fixed'; echo json_encode([$d['command'],$a['command']]);", ["payload", "fixed"]),
+            ("native-array-nested-object", "$d=json_decode('[{\"command\":\"payload\"}]'); $a=$d; $a[0]->command='fixed'; echo json_encode($d[0]->command);", "fixed"),
+            ("native-array-element-replace", "$d=json_decode('[{\"command\":\"payload\"}]'); $a=$d; $a[0]=json_decode('{\"command\":\"other\"}'); echo json_encode([$d[0]->command,$a[0]->command]);", ["payload", "other"]),
+            ("native-association-false", "$d=json_decode('{\"command\":\"payload\"}',false,512,JSON_OBJECT_AS_ARRAY); echo json_encode($d->command);", "payload"),
+            ("native-association-null", "$d=json_decode('{\"command\":\"payload\"}',null,512,JSON_OBJECT_AS_ARRAY); echo json_encode($d['command']);", "payload"),
+            ("native-named", "$d=json_decode(flags:JSON_THROW_ON_ERROR,json:'{\"command\":\"payload\"}',associative:false); echo json_encode($d->command);", "payload"),
+            ("native-decode-removes-encoding", "$d=json_decode('{\"html\":\"\\u003cscript\\u003e\"}'); echo json_encode($d->html);", "<script>"),
+            ("native-malformed-null", "echo json_encode(json_decode('not json'));", None),
+        )
+        for name, source, expected in cases:
+            with self.subTest(case=name):
+                attempt = self.artifact / name
+                attempt.mkdir()
+                (attempt / "program.php").write_text("<?php\n" + source + "\n", encoding="utf-8")
+                result = subprocess.run(["php", "-n", "-r", source], text=True,
+                                        capture_output=True, timeout=15)
+                (attempt / "receipt.json").write_text(json.dumps({
+                    "command": ["php", "-n", "-r", source], "expected": expected,
+                    "stdout": result.stdout, "stderr": result.stderr, "exit": result.returncode,
+                }, indent=2), encoding="utf-8")
+                self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                try:
+                    actual = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    self.fail("Invalid native PHP JSON output: %r (%s)" % (result.stdout, exc))
+                self.assertEqual(actual, expected, (source, result.stderr))
+
 
 def native_test(case, incomplete=False):
     def run(self):
@@ -1301,6 +1635,8 @@ for _case in NAMED_PARTIAL:
 for _case in REDIRECT_PARTIAL:
     setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
 for _case in ENVIRONMENT_PARTIAL:
+    setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
+for _case in JSON_DECODE_PARTIAL:
     setattr(PHPNativeTests, "test_partial_" + _case.name, native_test(_case, True))
 
 
@@ -1485,6 +1821,48 @@ class PHPPublicTests(EvidenceTest):
             with self.subTest(mode=mode):
                 self.assert_report(*self.execute(partial, mode), mode,
                                    ENVIRONMENT_PARTIAL[:3], partial=True)
+
+    def test_public_json_decoded_formats_selection_and_partial(self):
+        directory = self.materialize(JSON_DECODE_CASES, "json-decoded-formats")
+        for mode in ("module-json", "module-sarif", "json", "sarif"):
+            with self.subTest(mode=mode):
+                self.assert_report(*self.execute(directory, mode), mode, JSON_DECODE_CASES)
+        unsafe = JSON_DECODE_CASES[0]
+        self.assert_report(*self.execute(directory / unsafe.filename), "json", (unsafe,))
+        clean = next(case for case in JSON_DECODE_CASES if case.name == "json_decoded_object_alias_overwrite")
+        selected = self.artifact / "selected-json.nul"
+        selected.write_bytes(os.fsencode(directory / clean.filename) + b"\0")
+        self.assert_report(*self.execute(directory, "module-json", ("--files-from=" + str(selected),)),
+                           "module-json", (clean,))
+        partial = self.materialize(JSON_DECODE_PARTIAL, "json-decoded-partial")
+        for mode in ("module-json", "sarif"):
+            self.assert_report(*self.execute(partial, mode), mode, JSON_DECODE_PARTIAL, partial=True)
+
+    def test_public_json_decoded_cache_suppression_and_policy(self):
+        unsafe = next(case for case in JSON_DECODE_CASES if case.name == "json_decoded_output")
+        directory = self.materialize((unsafe,), "json-decoded-cache")
+        target = directory / unsafe.filename
+        for _ in range(2):
+            self.assert_report(*self.execute(directory, cached=True), "json", (unsafe,))
+        self.assert_report(*self.execute(directory, cached=True, extra=("--skip-php=5",)),
+                           "json", (unsafe,), expected_override=[])
+        self.assert_report(*self.execute(directory, cached=True), "json", (unsafe,))
+        suppressed = Case(unsafe.name, "$data=json_decode($_POST['json']);\necho $data->html; // ubs:ignore["
+                          + RULES['xss'] + "]")
+        target.write_text(suppressed.source, encoding="utf-8")
+        self.assert_report(*self.execute(directory, cached=True), "json", (suppressed,))
+        clean = Case(unsafe.name, "$data=json_decode($_POST['json']);\n$alias=$data;\n$alias->html='fixed';\necho $data->html;")
+        target.write_text(clean.source, encoding="utf-8")
+        self.assert_report(*self.execute(directory, cached=True), "json", (clean,))
+        target.write_text(unsafe.source, encoding="utf-8")
+        self.assert_report(*self.execute(directory, cached=True), "json", (unsafe,))
+        partial = Case(unsafe.name, unsafe.code + "\n$data[0] = 'fixed';")
+        target.write_text(partial.source, encoding="utf-8")
+        for _ in range(2):
+            result, report = self.execute(directory, cached=True)
+            self.assert_report(result, report, "json", (partial,), partial=True)
+            cache = report.get("cache", {})
+            self.assertEqual(cache.get("hits", 0), 0, (result.stdout, result.stderr))
 
     def test_public_budget_failure_is_explicit(self):
         directory = self.materialize((CASES[0],), "budget")

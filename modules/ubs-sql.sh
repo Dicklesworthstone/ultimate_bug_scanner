@@ -4,7 +4,7 @@
 set -Eeuo pipefail
 
 # Bootstrap the same checksum-pinned shared library as the other modules.
-UBS_LIB_CHECKSUM="bbfc26159f822a72f4366542413b596c59c454293c4fd44cd2dcaae5a761c6d0"
+UBS_LIB_CHECKSUM="2604348dc9069ffcc509206ea1708e86e2d40229ee5062fdf5757cc875fccdbe"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then

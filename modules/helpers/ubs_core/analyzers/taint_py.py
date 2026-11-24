@@ -10724,7 +10724,7 @@ class _Analysis:
         self.functions = [node for node in nodes if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
         self.generators = set()
         self.generator_peers = (self,)
-        self.generator_helper_proofs = {}
+        self.generator_helper_escapes = {}
         self.generator_predicate_shapes = {}
         self.generator_predicate_proofs = {}
         self.generator_discard_proofs = {}
@@ -11302,20 +11302,25 @@ class _Analysis:
 
     def generator_helper_identity(self, function):
         """A delayed helper must not escape through an unmodeled metadata writer."""
-        if function not in self.generator_helper_proofs:
-            owner = self.enclosing(function)
-            proven = isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) and owner is not None
-            if proven:
-                for node in _scope_nodes(owner):
-                    self.budget.spend()
-                    if isinstance(node, ast.Name) and node.id == function.name:
-                        parent = self.parents.get(node)
-                        if not (isinstance(node.ctx, ast.Load) and isinstance(parent, ast.Call)
-                                and parent.func is node):
-                            proven = False
-                            break
-            self.generator_helper_proofs[function] = proven
-        return (self.generator_helper_proofs[function]
+        owner = self.enclosing(function)
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)) or owner is None:
+            return False
+        escapes = self.generator_helper_escapes.get(owner)
+        if escapes is None:
+            # All helpers in one lexical owner share this immutable syntax.
+            # Index non-call uses once instead of rescanning the whole scope
+            # for every helper in a forwarding chain. Metadata writes remain
+            # a separate live check across the selected module graph.
+            escapes = set()
+            for node in _scope_nodes(owner):
+                self.budget.spend()
+                if isinstance(node, ast.Name):
+                    parent = self.parents.get(node)
+                    if not (isinstance(node.ctx, ast.Load) and isinstance(parent, ast.Call)
+                            and parent.func is node):
+                        escapes.add(node.id)
+            self.generator_helper_escapes[owner] = escapes
+        return (function.name not in escapes
                 and not any(engine.generator_attribute_writes & {'__code__', '__defaults__', '__kwdefaults__'}
                             for engine in self.generator_peers))
 

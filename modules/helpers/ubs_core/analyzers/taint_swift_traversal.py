@@ -1166,6 +1166,9 @@ def swift_retag(fact, *, add=frozenset(), remove=frozenset()):
     Current tags, origins and field paths remain distinct. When histories
     collapse, retain the same deterministic shortest evidence used by join().
     """
+    if all(not trace.removed_tags and trace.tags.isdisjoint(remove) and add <= trace.tags
+           for trace in fact):
+        return fact
     result = {}
     for trace in fact:
         tags = (trace.tags - remove) | add
@@ -1186,6 +1189,11 @@ def swift_constant(value, kind='literal'):
 
 
 def swift_shape(name, offset=-1):
+    # Nominal type witnesses only select members. References carry their
+    # allocation identities separately, and Request witnesses retain the
+    # source offset used when stored data is consumed.
+    if name.startswith(('instance:', 'dynamic-instance:')):
+        offset = -1
     return frozenset({Trace('shape', (name, offset))})
 
 
@@ -1197,11 +1205,13 @@ def swift_field_path(trace):
 
 def swift_top(value):
     """Nested stored values are not the aggregate's callable/type identity."""
-    return frozenset(trace for trace in value if not swift_field_path(trace))
+    top = frozenset(trace for trace in value if not swift_field_path(trace))
+    return value if len(top) == len(value) else top
 
 
 def swift_has_shape(fact, name):
-    return any(trace.kind == 'shape' and trace.key[0] == name for trace in swift_top(fact))
+    return any(trace.kind == 'shape' and trace.key[0] == name and not swift_field_path(trace)
+               for trace in fact)
 
 
 def swift_request_dependency(fact):
@@ -2312,8 +2322,8 @@ class SwiftEngine:
         # Opaque transformations may extract incoming data from a stored
         # Request. Discarding its nested shape must not turn that result clean.
         requests = [self.source(trace.key[1], 'stored ' + trace.key[0]) for trace in value
-                    if swift_field_path(trace) and trace.kind == 'shape'
-                    and trace.key[0] in {'request', 'request-collection', 'request-content'}]
+                    if trace.kind == 'shape' and trace.key[0] in {'request', 'request-collection', 'request-content'}
+                    and swift_field_path(trace)]
         plain = join(plain, *requests)
         return swift_retag(plain, remove=tags | links)
 

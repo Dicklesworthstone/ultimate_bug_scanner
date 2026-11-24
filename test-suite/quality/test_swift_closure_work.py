@@ -510,6 +510,51 @@ func body(req: Request) {
                     self.assertEqual(set(effects), {source.index(sink)} if unsafe else set())
                     self.assertLess(500_000 - engine.budget.remaining, 2_000)
 
+    def test_equivalent_incoming_receivers_share_nominal_type_contexts(self):
+        sinks = {
+            'path': 'String(contentsOfFile: path)', 'redirect': 'redirect(to: path)',
+            'header': 'HTTPHeaders([("X-Trace", path)])',
+            'outbound': 'URLSession.shared.data(from: URL(string: path)!)',
+        }
+        entries = '\n'.join(f'func entry{index}(req: Request) {{ read() }}' for index in range(30))
+        for policy, sink in sinks.items():
+            for unsafe, value in ((False, '"/fixed"'), (True, 'req.query["file"]!')):
+                path, source = self.fixture('''
+                    final class Box {
+                        var path = "/fixed"
+                        func read() { _ = %s }
+                        %s
+                        func change(req: Request) { path = %s; read() }
+                    }
+                ''' % (sink, entries, value), f'-{policy}-{unsafe}')
+                with self.subTest(policy=policy, unsafe=unsafe):
+                    engine = SwiftEngine(path, source, policy, parser=SwiftParser(source))
+                    effects = engine.analyze()
+                    self.assertEqual(set(effects), {source.index(sink)} if unsafe else set())
+                    if unsafe:
+                        self.assertEqual({trace.key[1] for trace in effects[source.index(sink)]},
+                                         {source.index('req.query["file"]')})
+                    contexts = [function for function in engine.contexts.values() if function.name == 'read']
+                    self.assertLessEqual(len(contexts), 2)
+
+    def test_nominal_type_sharing_keeps_allocated_aliases_and_field_sources_separate(self):
+        self.check('''
+            final class Box { var path = "/fixed" }
+            struct Envelope { let box: Box }
+            func update(_ box: Box, _ value: String) { box.path = value }
+            func handle(req: Request) {
+                let first = Box()
+                let second = Box()
+                let envelope = Envelope(box: first)
+                let alias = envelope.box
+                update(alias, req.query["first"]!)
+                _ = String(contentsOfFile: first.path) // expect-path
+                _ = String(contentsOfFile: second.path)
+                update(second, req.query["second"]!)
+                _ = String(contentsOfFile: second.path) // expect-path
+            }
+        ''', unsafe=True)
+
     def test_current_validation_and_separate_request_origins_survive_history_collapse(self):
         cases = (
             ('path', 'URL(fileURLWithPath: raw).lastPathComponent', 'raw', '',

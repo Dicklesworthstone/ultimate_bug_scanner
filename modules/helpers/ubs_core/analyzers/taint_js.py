@@ -46,6 +46,7 @@ _METHOD_LOOKUP_CONTRACT = ('method-lookup-contract',)
 _HEAP_METADATA = {_ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT}
 _OPAQUE_CALLABLE = ('builtin', 'opaque-callable')
 _ARRAY_FROM = ('builtin', 'Array.from')
+_ARRAY_AT = ('builtin', 'Array.prototype.at')
 
 
 def _collapsed(ref):
@@ -1576,6 +1577,13 @@ class _Flow:
         selected = []
         for ref in _refs(fact):
             slots = state.heap.get(ref, {})
+            if key == 'at' and (ref in state.array_lengths or ref == ('builtin', 'Array.prototype')):
+                prototype = state.heap.get(('builtin', 'Array.prototype'), {})
+                if not any(name in slots or name in prototype for name in (
+                        'at', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')):
+                    state.heap.setdefault(_ARRAY_AT, {})
+                    selected.append(_Fact(refs=(_ARRAY_AT,)))
+                    continue
             if (ref == ('builtin', 'Array') and key == 'from'
                     and not any(name in slots for name in (
                         'from', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__'))):
@@ -1703,7 +1711,7 @@ class _Flow:
                         # must not be mistaken for prototype/method writes.
                         for method in ('push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill',
                                        'splice', 'copyWithin', 'slice', 'concat', 'sort', 'toSorted', 'toReversed',
-                                       'toSpliced', 'with', 'entries', 'flat', 'map', 'flatMap', 'forEach',
+                                       'toSpliced', 'with', 'at', 'entries', 'flat', 'map', 'flatMap', 'forEach',
                                        'reduce', 'reduceRight', 'some', 'every', 'filter',
                                        'find', 'findIndex', 'findLast', 'findLastIndex'):
                             slots[method] = _alternatives(slots.get(method, _ABSENT), present)
@@ -1828,6 +1836,36 @@ class _Flow:
             else:
                 break
         return 'undefined' if skip(cursor) == end else None
+
+    def call_property_reference(self, start, end, state):
+        """Recognize a call-result lvalue before executing its receiver once.
+
+        The ordinary access parser stops at calls. Reuse the destructuring
+        reference evaluator, but do not mistake an assignment nested in a
+        conditional or binary expression for the complete expression's target.
+        """
+        code = self.scope.code
+        if '=' not in code[start:end]:
+            return None
+        _, equals = next(_chunks(code, start, end, '='))
+        if equals == end or code[equals + 1:equals + 2] in {'=', '>'}:
+            return None
+        operator = re.search(r'(?:\+=|\|\|=|&&=|\?\?=|=)$', code[start:equals + 1])
+        if operator is None:
+            return None
+        left_end = start + operator.start()
+        if '(' not in code[start:left_end]:
+            return None
+        cursor = start
+        while cursor < left_end:
+            if code[cursor] in '([{' and cursor in self.pairs:
+                cursor = self.pairs[cursor] + 1
+            elif code[cursor].isalnum() or code[cursor] in '_$. \t\r\n':
+                cursor += 1
+            else:
+                return None
+        reference = self.binding_reference(start, left_end, state)
+        return (left_end, reference) if reference is not None else None
 
     def condition_truth(self, start, end, state):
         """Prove only literal booleans and strict undefined comparisons.
@@ -2608,6 +2646,44 @@ class _Flow:
             definite = known and ordinary and pure and len(refs) == 1 and ref not in state.weak_refs
             self.merge_array_mutation(ref, changed, length, state, definite=definite)
         return receiver
+
+    def array_at(self, receiver, arguments, prepared, state):
+        """Read one live native element without flattening its borrowed identity.
+
+        Arguments have already executed against the captured receiver. Unlike
+        slice's clamped bounds, at returns undefined for an out-of-range index;
+        finite fractional indices truncate toward zero before a negative offset
+        is resolved. Only unknown indices need to traverse the sparse slots.
+        """
+        number, pure = self.array_integer_argument(arguments, prepared, 0, 0)
+        if not pure:
+            self.incomplete.add('Array.at index coercion requires unsupported value semantics')
+        elif number is None:
+            self.incomplete.add('Array.at requires a known native integer index')
+        selected = []
+        for ref in _refs(receiver):
+            self.engine.budget.spend()
+            slots, length = state.heap[ref], state.array_lengths[ref]
+            ordinary = self.array_mutation_contract(ref, state)
+            if not ordinary:
+                self.incomplete.add('Array.at requires ordinary indexed properties')
+            if length is None:
+                self.incomplete.add('Array.at requires a known array extent')
+            if number is not None and pure and ordinary and length is not None:
+                # Reject infinities/huge bounds before int(), but retain -0.9
+                # and -length-0.9: ToIntegerOrInfinity truncates toward zero.
+                if number >= length or number <= -length - 1:
+                    selected.append(_ABSENT)
+                    continue
+                index = int(number)
+                index = length + index if index < 0 else index
+                selected.append(slots.get(str(index), slots.get(None, _ABSENT))
+                                if 0 <= index < length else _ABSENT)
+            else:
+                self.engine.budget.spend(len(slots))
+                selected.append(_alternatives(_ABSENT, *(value for key, value in slots.items()
+                    if key is None or self.array_index(key) is not None)))
+        return _alternatives(*selected)
 
     def array_copy(self, receiver, method, arguments, prepared, state, location, callback=None):
         """Copy native indexed values into a fresh array.
@@ -3628,11 +3704,11 @@ class _Flow:
         refs = _refs(receiver)
         prototype = state.heap.get(('builtin', 'Array.prototype'), {})
         if (method in {'push', 'unshift', 'pop', 'shift', 'reverse', 'join', 'fill', 'splice', 'copyWithin', 'slice', 'concat',
-                       'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'flat', 'flatMap', 'map', 'forEach',
+                       'sort', 'toSorted', 'toReversed', 'toSpliced', 'with', 'at', 'flat', 'flatMap', 'map', 'forEach',
                        'reduce', 'reduceRight', 'some', 'every', 'filter',
                        'find', 'findIndex', 'findLast', 'findLastIndex'}
                 and refs and not frozenset(receiver) and method not in prototype and None not in prototype
-                and not (method in {'flat', 'slice', 'concat'} and getattr(receiver, 'scalar_alternative', False))
+                and not (method in {'flat', 'slice', 'concat', 'at'} and getattr(receiver, 'scalar_alternative', False))
                 and all(ref in state.array_lengths and method not in state.heap[ref] for ref in refs)):
             return 'array', receiver, method
         return None
@@ -3649,7 +3725,7 @@ class _Flow:
                 if unknown:
                     fact = _join(fact, selected)
             cursor = selected_end
-            match = re.match(r'\s*\.\s*(flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with)\s*\(', code[cursor:end])
+            match = re.match(r'\s*\.\s*(flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with|at)\s*\(', code[cursor:end])
             if match is None:
                 break
             opening = cursor + match.end() - 1
@@ -3679,6 +3755,8 @@ class _Flow:
         receiver_name, dot, method = name.rpartition('.')
         if not dot:
             target = self.reference(name, state)
+            if _ARRAY_AT in _refs(target):
+                return 'array-at-unknown', target, 'at'
             if _ARRAY_FROM in _refs(target):
                 proven = (_refs(target) == {_ARRAY_FROM} and not frozenset(target)
                           and not getattr(target, 'absent', False)
@@ -3699,11 +3777,20 @@ class _Flow:
         for key in parts[1:]:
             receiver = self.property(receiver, key, state)
         refs = _refs(receiver)
+        if _ARRAY_AT in refs:
+            return 'array-at-unknown', receiver, 'at'
         if _ARRAY_FROM in refs:
             # Borrowed constructor invocation and bound receiver semantics
             # need a separate proof; the captured native must not vanish.
             return 'array-from-unknown', receiver, method
         target = self.property(receiver, method, state)
+        if _ARRAY_AT in _refs(target):
+            proven = (bool(refs) and all(ref in state.array_lengths for ref in refs)
+                      and not frozenset(receiver) and not getattr(receiver, 'scalar_alternative', False)
+                      and _refs(target) == {_ARRAY_AT} and not frozenset(target)
+                      and not getattr(target, 'absent', False)
+                      and not getattr(target, 'scalar_alternative', False))
+            return ('array' if proven else 'array-at-unknown'), receiver, 'at'
         if _ARRAY_FROM in _refs(target):
             ordinary = (refs == {('builtin', 'Array')} or bool(refs) and all(
                 _function_scope(ref) is None and ref[0] != 'builtin'
@@ -3754,6 +3841,9 @@ class _Flow:
             self.escape_callbacks(values, state)
             self.incomplete.add('Array.from requires a proven native callable and ordinary constructor receiver')
             return self.materialize(_join(*values), state)
+        if kind == 'array-at-unknown':
+            self.incomplete.add('Array.at borrowed callable requires supported native receiver semantics')
+            return self.materialize(_join(*values), state)
         if kind == 'array' and method == 'fill':
             return self.array_fill(receiver, arguments, prepared, state)
         if kind == 'array' and method == 'copyWithin':
@@ -3762,6 +3852,8 @@ class _Flow:
             return self.array_splice(receiver, arguments, prepared, state, location)
         if kind == 'array' and method == 'sort':
             return self.array_sort(receiver, arguments, prepared, state, callback)
+        if kind == 'array' and method == 'at':
+            return self.array_at(receiver, arguments, prepared, state)
         if kind == 'array' and method in {'slice', 'toSorted', 'toReversed', 'toSpliced', 'with'}:
             return self.array_copy(receiver, method, arguments, prepared, state, location, callback)
         if kind == 'array' and method == 'concat':
@@ -4107,7 +4199,7 @@ class _Flow:
                 return None, receiver
             return candidate, receiver
         if (report and key in {'splice', 'copyWithin', 'slice', 'concat', 'sort', 'toSorted', 'toReversed', 'toSpliced',
-                              'with', 'flat', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
+                              'with', 'at', 'flat', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
                               'find', 'findIndex', 'findLast', 'findLastIndex'}
                 and _refs(receiver)
                 and all(ref in state.array_lengths for ref in _refs(receiver))
@@ -4551,6 +4643,10 @@ class _Flow:
                         for name in ((key,) if key is not None else tuple(slots)):
                             if name not in _HEAP_METADATA:
                                 slots[name] = _alternatives(slots.get(name, _ABSENT), _ABSENT)
+                    if ref == ('builtin', 'Array.prototype') and key in {None, 'at'}:
+                        # Implicit native members are not stored initially.
+                        # Their deletion must not make lookup recreate them.
+                        slots['at'] = _ABSENT
                 return frozenset()
         if code[start] in '[{' and start in self.pairs:
             closing = self.pairs[start]
@@ -4566,6 +4662,13 @@ class _Flow:
         access = self.access(start, end)
         assignment = (re.match(r'\s*(=(?!=|>)|\+=|\|\|=|&&=|\?\?=)\s*', code[access[2]:end])
                       if access else None)
+        call_reference = None
+        if assignment is None:
+            evaluated = self.call_property_reference(start, end, state)
+            if evaluated is not None:
+                operator_start, call_reference = evaluated
+                access = ('', (), operator_start)
+                assignment = re.match(r'(=(?!=|>)|\+=|\|\|=|&&=|\?\?=)\s*', code[operator_start:end])
         if assignment:
             target = re.sub(r'\s+', '', text[start:access[2]])
             rhs = access[2] + assignment.end(1)
@@ -4573,8 +4676,9 @@ class _Flow:
                 if any(child.start == rhs for child in self.scope.children):
                     break
                 rhs += 1
-            receiver = None
-            if access[1]:
+            receiver = call_reference[2] if call_reference is not None else None
+            key = call_reference[3] if call_reference is not None else None
+            if call_reference is None and access[1]:
                 receiver = self.read_access((access[0], access[1][:-1], access[2]), state)
                 key, computed = access[1][-1]
                 if computed is not None:
@@ -4695,7 +4799,7 @@ class _Flow:
         cursor = start
         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
         if (primary_end is not None and primary_end < end - 1
-                and re.match(r'\s*\.\s*(?:flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with)\s*\(',
+                and re.match(r'\s*\.\s*(?:flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with|at)\s*\(',
                              code[primary_end + 1:end])):
             primary = self.value(start, primary_end + 1, state)
             primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)

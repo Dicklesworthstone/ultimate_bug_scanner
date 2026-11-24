@@ -1536,6 +1536,257 @@ class HeapTaintTests(unittest.TestCase):
                                              + replacement + f'items.{method}({args}); res.send(items[0]);',
                                              reason=f'Array.{method}')
 
+    def test_at_selects_exact_relative_indices_and_truncates_fractions(self):
+        for index, expected in (('0', 'review-input'), ('-0.9', 'review-input'),
+                                ('-2', 'review-input'), ('-2.9', 'review-input'),
+                                ('1', 'safe'), ('1.9', 'safe'), ('-1', 'safe'),
+                                ('-1.9', 'safe'), ('true', 'safe'), ('false', 'review-input')):
+            with self.subTest(index=index):
+                source = ('const items=[req.query.html,"safe"]; '
+                          f'res.send(items.at({index}));')
+                self.assert_runtime_sends(source, [expected])
+                self.scan_sort(source, *(('xss',) if expected == 'review-input' else ()))
+
+    def test_at_defaults_holes_and_out_of_range_values(self):
+        for index in ('', 'undefined', 'null', 'NaN'):
+            with self.subTest(index=index):
+                source = f'const items=[req.query.html]; res.send(items.at({index}));'
+                self.assert_runtime_sends(source, ['review-input'])
+                self.scan_sort(source, 'xss')
+        for index in ('1', '-2', 'Infinity', '-Infinity', '1e300', '-1e300'):
+            with self.subTest(index=index):
+                source = f'const items=[req.query.html]; res.send(items.at({index}));'
+                self.assert_runtime_sends(source, [None])
+                self.scan_sort(source)
+        source = ('const items=[,req.query.html]; '
+                  'res.send(items.at(0)); res.send(items.at(-1));')
+        self.assert_runtime_sends(source, [None, 'review-input'])
+        self.scan_sort(source, 'xss')
+
+    def test_at_retains_borrowed_element_identity_and_clean_siblings(self):
+        for spelling in ('items.at(0)', 'items.at(-2)', '[box,other].at(0)', '(items).at(0)',
+                         'items["at"](0)'):
+            with self.subTest(spelling=spelling):
+                source = ('const box={html:"safe"}; const other={html:"safe"}; '
+                          'const items=[box,other]; const selected=' + spelling + '; '
+                          'selected.html=req.query.html; res.send(box.html); res.send(other.html);')
+                self.assert_runtime_sends(source, ['review-input', 'safe'])
+                self.scan_sort(source, 'xss')
+        source = ('const box={html:"safe"}; const selected=[box].at(0); '
+                  'box.html=req.query.html; res.send(selected.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, 'xss')
+
+    def test_at_local_helper_results_keep_aliases_and_contexts_separate(self):
+        source = ('function first(items){return items.at(0);}\n'
+                  'function make(value){return [{html:value}];}\n'
+                  'const dirty=first(make(req.query.html));\n'
+                  'const clean=first(make("safe"));\n'
+                  'res.send(dirty.html);\nres.send(clean.html);')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        findings = self.scan_sort(source, 'xss')
+        self.assertEqual([(row['line'], row['col']) for row in findings], [(5, 1)])
+        source = ('function first(items){return items.at(0);}\n'
+                  'const box={html:"safe"}; const selected=first([box]);\n'
+                  'selected.html=req.query.html;\nres.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, 'xss')
+
+    def test_at_returned_object_property_writes_reach_the_original(self):
+        for initial, assigned, expected, rules in (
+            ('"safe"', 'req.query.html', ['review-input'], ('xss',)),
+            ('req.query.html', '"safe"', ['safe'], ()),
+        ):
+            for target in ('items.at(0).html', 'items.at(-1)["html"]',
+                           '[box].at(0).html', '(items.at(0)).html', 'first(items).html'):
+                with self.subTest(initial=initial, assigned=assigned, target=target):
+                    source = ('function first(items){return items.at(0);} '
+                              'const box={html:' + initial + '}; const items=[box]; '
+                              + target + '=' + assigned + '; res.send(box.html);')
+                    self.assert_runtime_sends(source, expected)
+                    self.scan_sort(source, *rules)
+
+    def test_at_returned_property_writes_keep_evaluation_order_and_bypass(self):
+        source = ('const box={html:"safe"}; let items=[box]; const calls=[]; '
+                  'function choose(){calls.push("once");return items.at(0);} '
+                  'choose().html=(items=[{html:"safe"}],req.query.html); '
+                  'res.send(box.html); res.send(items[0].html); res.send(calls.length);')
+        self.assert_runtime_sends(source, ['review-input', 'safe', 1])
+        self.scan_sort(source, 'xss')
+        source = ('const box={html:"safe"}; const items=[box]; '
+                  'items.at(0)[(items[0]={html:"safe"},"html")]=req.query.html; '
+                  'res.send(box.html); res.send(items[0].html);')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        self.scan_sort(source, 'xss')
+        source = ('const box={html:req.query.html}; const items=[box]; '
+                  'false && (items.at(0).html="safe"); res.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, 'xss')
+        source = ('const box={html:req.query.html}; const items=[box]; '
+                  'true ? "unused" : items.at(0).html="safe"; res.send(box.html);')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, 'xss')
+
+    def test_at_returned_property_comparisons_execute_receiver_once(self):
+        for member in ('choose().html', 'choose()["html"]'):
+            for operator in ('==', '===', '!=', '!=='):
+                source = ('const calls = []; function choose() { calls.push(req.query.html); '
+                          'return {html: "safe"}; } '
+                          f'const result = {member} {operator} "safe"; res.send(calls[1]);')
+                with self.subTest(member=member, operator=operator):
+                    self.assert_runtime_sends(source, [None])
+                    self.scan_sort(source)
+
+    def test_at_selected_module_helpers_keep_aliases_and_locations(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-at'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        project = Path(tempfile.mkdtemp(prefix='modules-', dir=artifacts))
+        helper, caller = project / 'helper.mjs', project / 'caller.mjs'
+        helper.write_text('export function first(items){return items.at(0);}\n', encoding='utf-8')
+        caller.write_text('import {first} from "./helper.mjs";\n'
+                          'const box={html:"safe"}; const selected=first([box]);\n'
+                          'selected.html=req.query.html;\nres.send(box.html);\n', encoding='utf-8')
+        findings = list(taint.scan_project_findings([helper, caller]))
+        self.assertEqual([(path.name, rule, line, col) for path, rule, line, col, _ in findings],
+                         [('caller.mjs', 'js.taint.xss', 4, 1)], findings)
+
+    def test_at_receiver_and_native_callee_are_captured_before_arguments(self):
+        source = ('let items=[req.query.html]; const original=items; '
+                  'res.send(items.at(0,(items=["safe"]))); res.send(items.at(0)); '
+                  'res.send(original.at(0,original.at=function(){return "safe";})); '
+                  'res.send(original.at(0));')
+        self.assert_runtime_sends(source, ['review-input', 'safe', 'review-input', 'safe'])
+        self.scan_sort(source, 'xss', 'xss')
+
+    def test_at_observes_argument_element_and_length_mutations(self):
+        for setup, call, expected in (
+            ('const items=["safe"];', 'items.at(0,items[0]=req.query.html)', 'review-input'),
+            ('const items=[];', 'items.at(-1,items.push(req.query.html))', 'review-input'),
+            ('const items=[req.query.html];', 'items.at(0,items.length=0)', None),
+            ('const items=[req.query.html];', 'items.at(0,delete items[0])', None),
+        ):
+            with self.subTest(call=call):
+                source = setup + ' res.send(' + call + ');'
+                self.assert_runtime_sends(source, [expected])
+                self.scan_sort(source, *(('xss',) if expected == 'review-input' else ()))
+
+    def test_at_joined_receivers_cannot_prove_borrowed_cleanup(self):
+        source = ('const box={html:req.query.html}; const other={html:"safe"}; '
+                  'const items=flag?[box]:[other]; const selected=items.at(0); '
+                  'selected.html="safe"; res.send(box.html);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends('const flag=false; ' + source, ['review-input'])
+
+    def test_at_sanitizer_domains_and_nested_postfix_results(self):
+        self.scan_sort('const items=[req.query.html,DOMPurify.sanitize(req.query.html)]; '
+                       'res.send(items.at(-1)); eval(items.at(-1)); res.send(items.at(0));', 'eval', 'xss')
+        source = ('const items=[["safe"],[req.query.html]]; '
+                  'res.send(items.at(-1).at(0)); res.send(items.at(0).at(-1));')
+        self.assert_runtime_sends(source, ['review-input', 'safe'])
+        self.scan_sort(source, 'xss')
+
+    def test_at_native_method_identity_survives_borrowing_and_restoration(self):
+        source = ('const saved=Array.prototype.at; const items=[req.query.html]; '
+                  'items.read=saved; res.send(items.read(0)); '
+                  'items.at=function(){return "safe";}; res.send(items.at(0)); '
+                  'items.at=saved; res.send(items.at(0));')
+        self.assert_runtime_sends(source, ['review-input', 'safe', 'review-input'])
+        self.scan_sort(source, 'xss', 'xss')
+        source = ('const items=[req.query.html]; items.at=function(){return "safe";}; '
+                  'delete items.at; res.send(items.at(0));')
+        self.assert_runtime_sends(source, ['review-input'])
+        self.scan_sort(source, 'xss')
+        for expression in ('saved(0)', 'saved.call(items,0)', 'saved.apply(items,[0])',
+                           'Array.prototype.at.call(items,0)'):
+            with self.subTest(expression=expression):
+                self.scan_sort('const items=[req.query.html]; const saved=items.at; '
+                               + expression + '; res.send(req.query.html);',
+                               'xss', partial='Array.at.*receiver')
+
+    def test_at_unknown_coercion_and_indexed_protocols_remain_incomplete(self):
+        for index in ('external', '{valueOf:external}', '0n', '"0"', '...indices'):
+            with self.subTest(index=index):
+                self.scan_sort('res.send(req.query.html); const items=["safe"]; '
+                               f'items.at({index});', 'xss', partial='Array.at')
+        for setup in ('Object.freeze(items);',
+                      'Object.defineProperty(items,"0",{get(){return req.query.html;}});',
+                      'Array.prototype[0]=req.query.html;',
+                      'Object.setPrototypeOf(items,foreign);',
+                      'items.length=external;'):
+            with self.subTest(setup=setup):
+                self.scan_sort('res.send(req.query.html); const items=["safe"]; '
+                               + setup + 'items.at(0);', 'xss', partial='Array.at')
+
+    def test_at_method_override_and_native_deletion_are_not_bypassed(self):
+        for setup in ('items.at=external;', 'Array.prototype.at=external;',
+                      'items[key]=external;', 'delete Array.prototype.at;',
+                      'delete Array.prototype[key];'):
+            with self.subTest(setup=setup):
+                self.scan_sort('res.send(req.query.html); const items=["safe"]; '
+                               + setup + 'items.at(0);', 'xss', partial='Array.at')
+        self.scan_sort('const target={at:function(){return "safe";}}; '
+                       'res.send(target.at(req.query.html));')
+        self.scan_sort('const target={at:function(){return req.query.html;}}; '
+                       'res.send(target.at(0));', 'xss')
+
+    def test_at_sparse_extent_does_not_expand_holes(self):
+        self.scan_sort('const items=[req.query.html]; items.length=4294967295; '
+                       'res.send(items.at(0)); res.send(items.at(-1)); res.send(items.at(4294967295));',
+                       'xss')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_at_public_json_sarif_selection_and_partial(self):
+        cases = (
+            ('unsafe', 'const box={html:"safe"};\nconst selected=[box].at(-1);\n'
+             'selected.html=req.query.html;\nres.send(box.html);\n',
+             [('javascript.taint.xss', 4, 1)], False),
+            ('clean', 'const items=[req.query.html,"safe"];\nres.send(items.at(-1));\n'
+             'res.send(items.at(2));\n', [], False),
+            ('partial', 'res.send(req.query.html);\nconst items=["safe"];\n'
+             'items.at({valueOf:external});\n', [('javascript.taint.xss', 1, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-at-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Array.at')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_at_public_cache_edits_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-at-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const box={html:"safe"};\nconst selected=[box].at(0);\n'
+                  'selected.html=req.query.html;\nres.send(box.html);\n')
+        clean = unsafe.replace('selected.html=req.query.html;', 'selected.html="safe";')
+        suppressed = unsafe.replace('res.send(box.html);', 'res.send(box.html); // ubs:ignore')
+        partial = 'res.send(req.query.html);\nconst items=["safe"]; items.at(external);\n'
+        expected = [('javascript.taint.xss', 4, 1)]
+        for index, (source, findings, incomplete, cache_hits) in enumerate((
+            (unsafe, expected, False, 0), (unsafe, expected, False, 1), (clean, [], False, 0),
+            # Restoring the original bytes may reuse their valid cached report.
+            (suppressed, [], False, 0), (unsafe, expected, False, 1),
+            (partial, [('javascript.taint.xss', 1, 1)], True, 0),
+            (partial, [('javascript.taint.xss', 1, 1)], True, 0),
+        )):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.sort_public_report(target, scratch / f'cache-{index}', meta=True,
+                                                fmt='json', expected=findings, partial=incomplete,
+                                                cache=True, partial_reason='Array.at')
+                self.assertEqual(report['profile']['cache_hits'], cache_hits, report)
+
     def scan_sort(self, source, *rules, partial=None):
         """Retain independent native-sort inputs and completed/partial evidence."""
         artifacts = ROOT / 'test-suite/artifacts/javascript-sort'

@@ -48,6 +48,7 @@ _OPAQUE_CALLABLE = ('builtin', 'opaque-callable')
 _ARRAY_FROM = ('builtin', 'Array.from')
 _ARRAY_AT = ('builtin', 'Array.prototype.at')
 _ARRAY_FILL = ('builtin', 'Array.prototype.fill')
+_OBJECT_PROJECTIONS = {('builtin', 'Object.' + name): name for name in ('values', 'entries')}
 
 
 def _collapsed(ref):
@@ -721,6 +722,10 @@ class _State(dict):
         self.heap = {ref: dict(slots) for ref, slots in getattr(values, 'heap', {}).items()}
         self.weak_refs = set(getattr(values, 'weak_refs', ()))
         self.array_lengths = dict(getattr(values, 'array_lengths', {}))
+        # Named own properties enumerate in insertion order, independently of
+        # the heap dictionary's order after joins and summary translation.
+        # None records uncertainty; numeric indices are sorted separately.
+        self.own_orders = dict(getattr(values, 'own_orders', {}))
         self.written_cells = set(getattr(values, 'written_cells', ()))
         self.binding_kinds = dict(getattr(values, 'binding_kinds', {}))
 
@@ -732,6 +737,7 @@ class _State(dict):
                 and self.bindings == other.bindings and self.owners == other.owners
                 and self.cells == other.cells and self.heap == other.heap
                 and self.weak_refs == other.weak_refs and self.array_lengths == other.array_lengths
+                and self.own_orders == other.own_orders
                 and self.written_cells == other.written_cells
                 and self.binding_kinds == other.binding_kinds)
 
@@ -789,6 +795,9 @@ def _join_states(*states):
     for ref in set().union(*(state.array_lengths.keys() for state in states)):
         lengths = [state.array_lengths[ref] for state in states if ref in state.array_lengths]
         result.array_lengths[ref] = lengths[0] if all(length == lengths[0] for length in lengths) else None
+    for ref in set().union(*(state.own_orders.keys() for state in states)):
+        orders = [state.own_orders.get(ref) for state in states if ref in state.heap]
+        result.own_orders[ref] = orders[0] if all(order == orders[0] for order in orders) else None
     return result
 
 
@@ -923,6 +932,7 @@ class _HeapOutput:
     weak_refs: set
     array_lengths: dict
     binding_kinds: dict = field(default_factory=dict)
+    own_orders: dict = field(default_factory=dict)
 
 
 def _pairs(code, start=0, end=None):
@@ -1414,6 +1424,7 @@ class _Flow:
         state.heap = incoming.heap
         state.weak_refs = incoming.weak_refs
         state.array_lengths = incoming.array_lengths
+        state.own_orders = incoming.own_orders
         state.written_cells = incoming.written_cells
         state.binding_kinds = dict(incoming.binding_kinds)
 
@@ -1537,6 +1548,27 @@ class _Flow:
             return int(key) if len(key) <= 10 and int(key) < 4294967295 else None
         return None
 
+    def own_property_keys(self, ref, state):
+        """Prove ordinary enumerable own keys without expanding sparse holes."""
+        slots = state.heap.get(ref)
+        if slots is None or ref[0] == 'builtin' or _function_scope(ref) is not None:
+            return None
+        self.engine.budget.spend(1 + len(slots))
+        if ref in state.array_lengths and state.array_lengths[ref] is None:
+            return None
+        if any(key in slots for key in (None, '__proto__', *_HEAP_METADATA)):
+            return None
+        keys = [key for key in slots if not (ref in state.array_lengths and key == 'length')]
+        if any(not isinstance(key, str) or getattr(slots[key], 'absent', False)
+               or _OPAQUE_CALLABLE in _refs(slots[key]) for key in keys):
+            return None
+        indices = sorted((key for key in keys if self.array_index(key) is not None), key=int)
+        named = {key for key in keys if self.array_index(key) is None}
+        order = state.own_orders.get(ref, () if not named else None)
+        if order is None or set(order) != named:
+            return None
+        return (*indices, *order)
+
     def access(self, start, end):
         """A variable and balanced dot/bracket selectors, at real offsets."""
         code, text = self.scope.code, self.engine.text
@@ -1578,6 +1610,18 @@ class _Flow:
         selected = []
         for ref in _refs(fact):
             slots = state.heap.get(ref, {})
+            if ref == ('builtin', 'Object'):
+                if key is None:
+                    # Implicit native members are absent from slots. A
+                    # dynamic read, including an extracted alias, cannot be
+                    # treated as a known clean non-native function.
+                    self.incomplete.add('Object dynamic member projection requires a known native callable')
+                native = ('builtin', 'Object.' + key) if isinstance(key, str) else None
+                if native in _OBJECT_PROJECTIONS and not any(name in slots for name in (
+                        key, None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')):
+                    state.heap.setdefault(native, {})
+                    selected.append(_Fact(refs=(native,)))
+                    continue
             if key in {'at', 'fill'} and (ref in state.array_lengths or ref == ('builtin', 'Array.prototype')):
                 prototype = state.heap.get(('builtin', 'Array.prototype'), {})
                 if not any(name in slots or name in prototype for name in (
@@ -1677,6 +1721,13 @@ class _Flow:
         for ref in refs:
             slots = state.heap.setdefault(ref, {})
             old = slots.get(key, slots.get(None, _ABSENT))
+            if self.engine.has_object_projections:
+                order = state.own_orders.get(ref)
+                if key is None or optional or (getattr(old, 'absent', False) and not strong):
+                    state.own_orders[ref] = None
+                elif (order is not None and isinstance(key, str) and self.array_index(key) is None
+                      and not (ref in state.array_lengths and key == 'length') and key not in order):
+                    state.own_orders[ref] = (*order, key)
             present = _Fact(value, _refs(value))
             if key is None:
                 # An unknown property may override every currently named key.
@@ -1999,6 +2050,16 @@ class _Flow:
                             elif key in excluded:
                                 continue
                             slots[key] = _join(slots.get(key, frozenset()), value)
+                    if self.engine.has_object_projections:
+                        orders = [self.own_property_keys(parent, state) for parent in _refs(fact)]
+                        order = (tuple(key for key in orders[0] if self.array_index(key) is None
+                                       and key not in excluded) if not array and orders
+                                 and orders[0] is not None and not frozenset(fact)
+                                 and not getattr(fact, 'scalar_alternative', False)
+                                 and all(order == orders[0] for order in orders) else () if array else None)
+                        if ref in state.heap and state.own_orders.get(ref) != order:
+                            order = None
+                        state.own_orders[ref] = order
                     if ref in state.heap:
                         previous = state.heap[ref]
                         slots = {key: _join(previous.get(key, frozenset()), slots.get(key, frozenset()))
@@ -2068,6 +2129,7 @@ class _Flow:
         slots = {}
         array = code[start] == '['
         unknown_offset = False
+        known_order = True
         length = 0
         for left, right in _chunks(code, start + 1, end - 1):
             raw = text[left:right].strip()
@@ -2121,7 +2183,16 @@ class _Flow:
                             slots[key] = _Fact(merged, _refs(merged), absent=getattr(old, 'absent', False))
                         slots[None] = _Fact(_join(slots.get(None, frozenset()), wildcard),
                                             _refs(_join(slots.get(None, frozenset()), wildcard)), absent=True)
-                    for key in set().union(*(obj.keys() for obj in objects)) - {None} - _HEAP_METADATA:
+                    keys = set().union(*(obj.keys() for obj in objects)) - {None} - _HEAP_METADATA
+                    if self.engine.has_object_projections:
+                        orders = [self.own_property_keys(parent, state) for parent in refs]
+                        if (orders and orders[0] is not None and not frozenset(spread)
+                                and not getattr(spread, 'scalar_alternative', False)
+                                and all(order == orders[0] for order in orders)):
+                            keys = orders[0]
+                        else:
+                            known_order = False
+                    for key in keys:
                         incoming = self.property(spread, key, state)
                         definite = not frozenset(spread) and all(
                             key in obj and not getattr(obj[key], 'absent', False) for obj in objects)
@@ -2154,6 +2225,12 @@ class _Flow:
         # Repeated visits to a loop allocation site summarize all its objects;
         # do not discard earlier aliases when the site is evaluated again.
         previous = state.heap.get(ref)
+        if self.engine.has_object_projections:
+            order = (tuple(key for key in slots if isinstance(key, str) and self.array_index(key) is None)
+                     if known_order and None not in slots else None)
+            if previous is not None and state.own_orders.get(ref) != order:
+                order = None
+            state.own_orders[ref] = order
         if previous is not None:
             state.weak_refs.add(ref)
             slots = {key: _alternatives(previous.get(key, _ABSENT), slots.get(key, _ABSENT))
@@ -3779,11 +3856,73 @@ class _Flow:
             cursor = closing + 1
         return fact, cursor
 
+    def object_projection(self, method, prepared, state, location):
+        """Copy finite own properties, retaining value aliases and clean keys."""
+        actual, uncertain, _missing, kinds = prepared
+        if uncertain is not None:
+            self.incomplete.add(f'Object.{method} requires known argument positions')
+            return self.materialize(_join(*(value for value, _ in actual)), state)
+        if not actual or kinds.get(0) in {'null', 'undefined'} or re.match(r'new\s+', self.engine.text[location:]):
+            self.throws.append((frozenset(), state.copy()))
+            raise _NoNormalCompletion
+        source = actual[0][0]
+        refs = _refs(source)
+        orders = {ref: self.own_property_keys(ref, state) for ref in refs}
+        if (not refs or frozenset(source) or getattr(source, 'absent', False)
+                or getattr(source, 'scalar_alternative', False) or any(keys is None for keys in orders.values())):
+            self.incomplete.add(f'Object.{method} requires known ordinary enumerable own properties and order')
+            return self.materialize(source, state)
+
+        def install(ref, items, branch):
+            self.engine.budget.spend(1 + len(items))
+            slots, length = {str(index): value for index, value in enumerate(items)}, len(items)
+            previous = branch.heap.get(ref)
+            order = ()
+            if previous is not None:
+                slots = {key: _alternatives(previous.get(key, _ABSENT), slots.get(key, _ABSENT))
+                         for key in previous.keys() | slots.keys()}
+                branch.weak_refs.add(ref)
+                if branch.array_lengths.get(ref) != length:
+                    length = None
+                if branch.own_orders.get(ref) != order:
+                    order = None
+            branch.heap[ref], branch.array_lengths[ref] = slots, length
+            branch.own_orders[ref] = order
+            return _Fact(refs=(ref,))
+
+        result = (self.scope, location, 'object-' + method)
+        branches = []
+        for parent, keys in orders.items():
+            branch, items = state.copy(), []
+            for index, key in enumerate(keys):
+                value = branch.heap[parent][key]
+                if method == 'entries':
+                    value = install((self.scope, location, 'object-entry', index), [frozenset(), value], branch)
+                items.append(value)
+            install(result, items, branch)
+            branches.append(branch)
+        self.replace_state(state, _join_states(*branches))
+        return _Fact(refs=(result,))
+
+    @staticmethod
+    def object_projection_target(value):
+        refs = _refs(value)
+        natives = refs & _OBJECT_PROJECTIONS.keys()
+        if not natives:
+            return None
+        proven = (len(natives) == 1 and refs == natives and not frozenset(value)
+                  and not getattr(value, 'absent', False) and not getattr(value, 'scalar_alternative', False))
+        method = _OBJECT_PROJECTIONS[next(iter(natives))] if len(natives) == 1 else 'projection'
+        return 'object-projection' if proven else 'object-projection-unknown', value, method
+
     def native_target(self, name, state):
         """Capture GetValue(callee) before arguments can replace a method."""
         receiver_name, dot, method = name.rpartition('.')
         if not dot:
             target = self.reference(name, state)
+            projection = self.object_projection_target(target)
+            if projection is not None:
+                return projection
             if _ARRAY_AT in _refs(target):
                 return 'array-at-unknown', target, 'at'
             if _ARRAY_FILL in _refs(target):
@@ -3808,6 +3947,9 @@ class _Flow:
         for key in parts[1:]:
             receiver = self.property(receiver, key, state)
         refs = _refs(receiver)
+        projection = self.object_projection_target(receiver)
+        if projection is not None:
+            return 'object-projection-unknown', receiver, projection[2]
         if _ARRAY_AT in refs:
             return 'array-at-unknown', receiver, 'at'
         if _ARRAY_FILL in refs:
@@ -3828,6 +3970,9 @@ class _Flow:
             # need a separate proof; the captured native must not vanish.
             return 'array-from-unknown', receiver, method
         target = self.property(receiver, method, state)
+        projection = self.object_projection_target(target)
+        if projection is not None:
+            return projection
         if _ARRAY_AT in _refs(target):
             proven = (bool(refs) and all(ref in state.array_lengths for ref in refs)
                       and not frozenset(receiver) and not getattr(receiver, 'scalar_alternative', False)
@@ -3886,6 +4031,11 @@ class _Flow:
         kind, receiver, method = native
         actual, uncertain, missing, kinds = prepared
         values = [value for value, _missing in actual]
+        if kind == 'object-projection':
+            return self.object_projection(method, prepared, state, location)
+        if kind == 'object-projection-unknown':
+            self.incomplete.add(f'Object.{method} requires a proven native callable and invocation')
+            return self.materialize(_join(*values), state)
         if kind == 'array-from':
             return self.array_from(arguments, prepared, state, location, callback)
         if kind == 'array-from-unknown':
@@ -4043,6 +4193,15 @@ class _Flow:
                 if wildcard:
                     self.write_property(target, None, wildcard, state)
                 keys = set().union(*(obj.keys() for obj in objects)) - {None} - _HEAP_METADATA
+                if self.engine.has_object_projections:
+                    orders = [self.own_property_keys(ref, state) for ref in refs]
+                    if (orders and orders[0] is not None and not frozenset(source)
+                            and not getattr(source, 'scalar_alternative', False)
+                            and all(order == orders[0] for order in orders)):
+                        keys = orders[0]
+                    else:
+                        for ref in _refs(target):
+                            state.own_orders[ref] = None
                 for key in keys:
                     incoming = self.property(source, key, state)
                     # Missing keys on an alternative source must retain the
@@ -4290,6 +4449,9 @@ class _Flow:
         if (report and key == 'from' and ('builtin', 'Array') in _refs(receiver)
                 and self.native_target(name, state) is None):
             self.incomplete.add('Array.from requires a known native or selected callable')
+        if (report and key in {'values', 'entries'} and ('builtin', 'Object') in _refs(receiver)
+                and self.native_target(name, state) is None):
+            self.incomplete.add(f'Object.{key} requires a known native or selected callable')
         return None, receiver
 
     def callable(self, start, end, state):
@@ -4487,7 +4649,8 @@ class _Flow:
                 writes = {key: self.substitute(value, callee, bound, incoming)
                           for key, value in store.cells.items()
                           if key[0] is not callee and key in store.written_cells}
-                output = _HeapOutput(store.heap, store.weak_refs, store.array_lengths, store.binding_kinds)
+                output = _HeapOutput(store.heap, store.weak_refs, store.array_lengths,
+                                     store.binding_kinds, store.own_orders)
                 thrown = self.engine.apply_heap_output(
                     incoming, exceptional, output, writes,
                     self.substitute(fact, callee, bound, incoming), call_location)
@@ -4497,7 +4660,7 @@ class _Flow:
                           for key, value in default_state.cells.items()
                           if key[0] is not callee and key in default_state.written_cells}
                 output = _HeapOutput(default_state.heap, default_state.weak_refs, default_state.array_lengths,
-                                     default_state.binding_kinds)
+                                     default_state.binding_kinds, default_state.own_orders)
                 # Initializers and rest bindings execute before the callee's
                 # summary. Give their fresh objects this invocation's history
                 # too, while borrowed aliases keep their incoming identities.
@@ -4533,6 +4696,7 @@ class _Flow:
                     default_state.heap = {ref: dict(slots) for ref, slots in state.heap.items()}
                     default_state.weak_refs = set(state.weak_refs)
                     default_state.array_lengths = dict(state.array_lengths)
+                    default_state.own_orders = dict(state.own_orders)
                     default_state.binding_kinds = dict(state.binding_kinds)
                 default_state.update(bound)
                 for name in bound:
@@ -4719,7 +4883,12 @@ class _Flow:
                              and ref not in state.weak_refs and _ARRAY_WRITE_CONTRACT not in slots)
                     if exact:
                         slots.pop(key, None)
+                        order = state.own_orders.get(ref)
+                        if order is not None:
+                            state.own_orders[ref] = tuple(name for name in order if name != key)
                     else:
+                        if self.engine.has_object_projections:
+                            state.own_orders[ref] = None
                         for name in ((key,) if key is not None else tuple(slots)):
                             if name not in _HEAP_METADATA:
                                 slots[name] = _alternatives(slots.get(name, _ABSENT), _ABSENT)
@@ -4730,6 +4899,9 @@ class _Flow:
                             slots[member] = _ABSENT
                     if ref == ('builtin', 'Function.prototype') and key in {None, 'call', 'apply', 'bind'}:
                         for member in (('call', 'apply', 'bind') if key is None else (key,)):
+                            slots[member] = _ABSENT
+                    if ref == ('builtin', 'Object') and key in {None, 'values', 'entries'}:
+                        for member in (('values', 'entries') if key is None else (key,)):
                             slots[member] = _ABSENT
                 return frozenset()
         if code[start] in '[{' and start in self.pairs:
@@ -5575,6 +5747,7 @@ class _Engine:
                 offset = module.end + 3
             text, code = ''.join(chunks), ''.join(masks)
         self.text, self.code = text, code
+        self.has_object_projections = any(name in text for name in ('values', 'entries'))
         # Allocation-site contexts are finite but their heap shapes can grow
         # exponentially through a small chain of binary factories. Count the
         # actual copied/traversed facts as well as transfers. Larger selected
@@ -5986,6 +6159,8 @@ class _Engine:
                 pending.extend(_refs(value) - state.heap.keys())
             if ref in source.array_lengths:
                 state.array_lengths[ref] = source.array_lengths[ref]
+            if ref in source.own_orders:
+                state.own_orders[ref] = source.own_orders[ref]
         state.weak_refs.update(source.weak_refs & state.heap.keys())
         return fact
 
@@ -6123,6 +6298,8 @@ class _Engine:
                 pending.extend(_refs(fact) - state.heap.keys())
             if ref in incoming.array_lengths:
                 state.array_lengths[ref] = None if recursive else incoming.array_lengths[ref]
+            if ref in incoming.own_orders:
+                state.own_orders[ref] = None if recursive else incoming.own_orders[ref]
         state.weak_refs = incoming.weak_refs & state.heap.keys()
         return state
 
@@ -6167,7 +6344,8 @@ class _Engine:
                          frozenset(incoming.cells.items()), frozenset(incoming.bindings.items()),
                          frozenset(incoming.binding_kinds.items()),
                          frozenset((ref, frozenset(slots.items())) for ref, slots in incoming.heap.items()),
-                         frozenset(incoming.weak_refs), frozenset(incoming.array_lengths.items()))
+                         frozenset(incoming.weak_refs), frozenset(incoming.array_lengths.items()),
+                         frozenset(incoming.own_orders.items()))
             context = self.heap_calls.get(signature)
             if context is None:
                 context = _HeapCall(callee, rule, location, dict(bound), incoming,
@@ -6247,6 +6425,7 @@ class _Engine:
             context = self.widened_calls.get(key)
             if context is None:
                 incoming.array_lengths = dict.fromkeys(incoming.array_lengths)
+                incoming.own_orders = dict.fromkeys(incoming.own_orders)
                 context = _HeapCall(callee, rule, location, dict(bound), incoming, ancestors,
                                     widened=True, root=root, widened_parent=caller)
                 self.widened_calls[key] = context
@@ -6259,6 +6438,7 @@ class _Engine:
         # Lengths that differ become unknown anyway; unknown from the start
         # saves the re-solves of a length counting up through the fixed point.
         joined.array_lengths = dict.fromkeys(joined.array_lengths)
+        joined.own_orders = dict.fromkeys(joined.own_orders)
         # Include heap/cell-only growth, not just changes to visible names.
         if (joined_bound != context.bound or not joined == context.incoming
                 or not ancestors <= context.ancestors):
@@ -6320,6 +6500,12 @@ class _Engine:
             if lengths:
                 state.array_lengths[new] = (lengths[0] if not collapsed
                     and all(length == lengths[0] for length in lengths) else None)
+            orders = [output.own_orders.get(old) for old in originals]
+            if any(old in output.own_orders for old in originals):
+                if collision:
+                    orders.append(state.own_orders.get(new))
+                state.own_orders[new] = (orders[0] if not _collapsed(new)
+                    and all(order == orders[0] for order in orders) else None)
         for key, fact in writes.items():
             value = translate(fact)
             state.cells[key] = value
@@ -6395,7 +6581,8 @@ class _Engine:
                     pending.extend(_refs(fact) - heap.keys())
             return _HeapOutput(heap, store.weak_refs & heap.keys(),
                                {ref: length for ref, length in store.array_lengths.items() if ref in heap},
-                               {key: store.binding_kinds.get(key) for key in changes})
+                               {key: store.binding_kinds.get(key) for key in changes},
+                               {ref: order for ref, order in store.own_orders.items() if ref in heap})
 
         return (returned, flow.effects, normal_writes, escaped_heap(output, returned, normal_writes),
                 thrown, throw_writes, escaped_heap(exceptional, thrown, throw_writes), frozenset(flow.incomplete))

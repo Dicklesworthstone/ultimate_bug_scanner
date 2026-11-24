@@ -4902,6 +4902,223 @@ class HeapTaintTests(unittest.TestCase):
             'items.flatMap((value, index, source) => { source.length = unknown; return [value]; });',
             'xss', reason='flatMap.*length')
 
+    def test_object_projection_preserves_shallow_values_and_entries(self):
+        for expression, selected in (('Object.values({item:box})', 'out[0]'),
+                                     ('Object.entries({item:box})', 'out[0][1]')):
+            for writer, reader in (('box', selected), (selected, 'box')):
+                source = (f'const box={{html:"safe"}}; const out={expression}; '
+                          f'{writer}.html=req.query.html; res.send({reader}.html);')
+                with self.subTest(expression=expression, writer=writer):
+                    self.scan_sort(source, 'xss')
+                    self.assert_runtime_sends(source, ['review-input'])
+
+    def test_object_projection_separates_keys_values_and_siblings(self):
+        source = ('const input={safe:"fixed",dirty:req.query.html}; '
+                  'const values=Object.values(input); const pairs=Object.entries(input); '
+                  'res.send(values[0]); res.send(values[1]); res.send(values.length); '
+                  'res.send(pairs[0][0]); res.send(pairs[0][1]); '
+                  'res.send(pairs[1][0]); res.send(pairs[1][1]);')
+        self.scan_sort(source, 'xss', 'xss')
+        self.assert_runtime_sends(source, ['fixed', 'review-input', 2, 'safe', 'fixed',
+                                           'dirty', 'review-input'])
+
+    def test_object_projection_orders_indices_then_string_insertion(self):
+        source = ('const input={10:req.query.html,2:"fixed",z:req.query.html,a:"last"}; '
+                  'const out=Object.values(input); res.send(out[0]); res.send(out[1]); '
+                  'res.send(out[2]); res.send(out[3]);')
+        self.scan_sort(source, 'xss', 'xss')
+        self.assert_runtime_sends(source, ['fixed', 'review-input', 'review-input', 'last'])
+        source = ('const input={dirty:req.query.html,safe:"fixed"}; '
+                  'delete input.dirty; input.dirty=req.query.html; '
+                  'const out=Object.values(input); res.send(out[0]); res.send(out[1]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['fixed', 'review-input'])
+
+    def test_object_projection_own_slots_ignore_holes_and_preserve_named_fields(self):
+        source = ('const input=[,"fixed",,req.query.html]; input.extra="last"; '
+                  'const out=Object.values(input); res.send(out[0]); res.send(out[1]); '
+                  'res.send(out[2]); res.send(out.length);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['fixed', 'review-input', 'last', 3])
+        self.scan_sort('const input=[req.query.html]; input.length=4294967295; '
+                       'const out=Object.values(input); res.send(out[0]); res.send(out[1]); '
+                       'res.send(out.length);', 'xss')
+
+    def test_object_projection_native_aliases_helpers_and_captured_arguments(self):
+        for prefix, expression in (
+            ('const project=Object.values;', 'project({item:box})'),
+            ('const {values:project}=Object;', 'project({item:box})'),
+            ('function project(input){return Object.values(input);}', 'project({item:box})'),
+            ('function project(fn,input){return fn(input);}', 'project(Object.values,{item:box})'),
+            ('', 'Object["values"]({item:box})'),
+        ):
+            with self.subTest(prefix=prefix):
+                self.scan_sort(prefix + 'const box={html:"safe"}; const out=' + expression
+                               + '; box.html=req.query.html; res.send(out[0].html);', 'xss')
+        self.scan_sort('function project(input){return Object.entries(input);} '
+                       'const out=project({safe:"fixed",dirty:req.query.html}); '
+                       'res.send(out[0][1]); res.send(out[1][0]); res.send(out[1][1]);', 'xss')
+
+    def test_object_projection_result_arrays_are_fresh_and_compose_with_callbacks(self):
+        self.scan_sort('const input={html:req.query.html}; const out=Object.values(input); '
+                       'out[0]="fixed"; res.send(input.html); res.send(out[0]);', 'xss')
+        self.scan_sort('const input={html:req.query.html}; const out=Object.entries(input); '
+                       'out[0][1]="fixed"; res.send(input.html); res.send(out[0][1]);', 'xss')
+        self.scan_sort('const box={html:"safe"}; const out=Object.values({item:box}); '
+                       'out.map(item=>{item.html=req.query.html; return "fixed";}); '
+                       'res.send(box.html);', 'xss')
+        self.scan_sort('const out=Object.entries({html:req.query.html}).map(([key,value])=>key); '
+                       'res.send(out[0]);')
+
+    def test_object_projection_strong_updates_and_sink_specific_sanitizers(self):
+        self.scan_sort('const box={html:req.query.html}; const out=Object.values({item:box}); '
+                       'out[0].html="fixed"; res.send(box.html);')
+        self.scan_sort('const out=Object.values({html:DOMPurify.sanitize(req.query.html)}); '
+                       'res.send(out[0]); eval(out[0]);', 'eval')
+        self.scan_sort('const out=Object.values({html:req.query.html}).map(value=>"fixed"); '
+                       'res.send(out[0]);')
+
+    def test_object_projection_shadowed_and_replaced_native_bodies(self):
+        self.scan_sort('const Object={values:function(input){return [req.query.html];}}; '
+                       'res.send(Object.values({html:"fixed"})[0]);', 'xss')
+        self.scan_sort('Object.values=function(input){return ["fixed"];}; '
+                       'res.send(Object.values({html:req.query.html})[0]);')
+        self.scan_sort('const project=Object.values; Object.values=function(){return [];}; '
+                       'const box={html:"safe"}; const out=project({item:box}); '
+                       'box.html=req.query.html; res.send(out[0].html);', 'xss')
+        self.scan_sort('const box={html:"safe"}; function input(){ '
+                       'Object.values=function(){return [];}; return {item:box};} '
+                       'const out=Object.values(input()); box.html=req.query.html; '
+                       'res.send(out[0].html);', 'xss')
+
+    def test_object_projection_branch_order_and_optional_keys_remain_explicit(self):
+        for setup in (
+            'const input={}; if(flag){input.a="a";input.b="b";} '
+            'else {input.b="b";input.a="a";}',
+            'const input={a:"a"}; if(flag){input.b="b";}',
+            'const input={a:"a",b:"b"}; if(flag){delete input.a;}',
+        ):
+            with self.subTest(setup=setup):
+                self.scan_sort('res.send(req.query.html); ' + setup + ' Object.values(input);',
+                               'xss', partial='Object.values')
+
+    def test_object_projection_protocol_boundaries_keep_prior_findings(self):
+        for operation in (
+            'Object.values(unknown);',
+            'Object.values({get html(){return req.query.html;}});',
+            'const input={}; input[key]="fixed"; Object.values(input);',
+            'const input={}; Object.defineProperty(input,"html",{get:external}); Object.values(input);',
+            'Object.values.call(Object,{html:"fixed"});',
+            'delete Object.values; Object.values({html:"fixed"});',
+            'Object.values({__proto__:external,html:"fixed"});',
+        ):
+            with self.subTest(operation=operation):
+                self.scan_sort('res.send(req.query.html); ' + operation, 'xss', partial='Object.values')
+
+    def test_object_projection_dynamic_native_members_are_explicit(self):
+        for operation in ('const out=Object[key]({item:box});',
+                          'const project=Object[key]; const out=project({item:box});'):
+            source = ('res.send(req.query.html); const key="values"; const box={html:"safe"}; '
+                      + operation + ' box.html=req.query.html; res.send(out[0].html);')
+            with self.subTest(operation=operation):
+                self.scan_sort(source, 'xss', partial='Object.*projection|Object.*member')
+                self.assert_runtime_sends(source, ['review-input', 'review-input'])
+
+    def test_object_projection_nullish_inputs_throw_without_visiting_later_sinks(self):
+        for call in ('Object.values(null)', 'Object.entries(undefined)', 'Object.values()',
+                     'new Object.values({html:"fixed"})'):
+            with self.subTest(call=call):
+                self.scan_sort(call + '; res.send(req.query.html);')
+                self.scan_sort('try {' + call + ';} catch(error){res.send(req.query.html);}', 'xss')
+
+    def test_object_projection_order_survives_spreads_assignments_and_rest(self):
+        for setup in (
+            'const input={...{safe:"fixed",dirty:req.query.html}};',
+            'const input={}; Object.assign(input,{safe:"fixed",dirty:req.query.html});',
+            'const {skip,...input}={skip:0,safe:"fixed",dirty:req.query.html};',
+            'function make(){return {safe:"fixed",dirty:req.query.html};} const input=make();',
+        ):
+            source = setup + 'const out=Object.values(input); res.send(out[0]); res.send(out[1]);'
+            with self.subTest(setup=setup):
+                self.scan_sort(source, 'xss')
+                self.assert_runtime_sends(source, ['fixed', 'review-input'])
+
+    def test_object_projection_joined_objects_and_helper_contexts_stay_distinct(self):
+        self.scan_sort('const input=flag?{item:req.query.html}:{item:"fixed"}; '
+                       'const out=Object.values(input); res.send(out[0]);', 'xss')
+        self.scan_sort('function project(input){return Object.values(input);} '
+                       'const dirty=project({item:req.query.html}); const clean=project({item:"fixed"}); '
+                       'res.send(dirty[0]); res.send(clean[0]);', 'xss')
+
+    def test_object_projection_scalar_copy_alternatives_cannot_prove_order(self):
+        for setup in (
+            'const input={...choice,dirty:req.query.html};',
+            'const input=Object.assign({},choice,{dirty:req.query.html});',
+            'const {skip,...input}=choice; input.dirty=req.query.html;',
+        ):
+            source = ('res.send(req.query.html); const choice=flag?{safe:"fixed"}:"abcd"; '
+                      + setup + ' const out=Object.values(input); res.send(out[4]);')
+            with self.subTest(setup=setup):
+                self.scan_sort(source, 'xss', 'xss', partial='Object.values')
+                self.assert_runtime_sends('const flag=false; ' + source,
+                                          ['review-input', 'review-input'])
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_object_projection_public_json_sarif_selection_and_partial(self):
+        cases = (
+            ('alias', 'const box={html:"safe"};\nconst out=Object.values({item:box});\n'
+             'box.html=req.query.html;\nres.send(out[0].html);\n',
+             [('javascript.taint.xss', 4, 1)], False),
+            ('entries', 'const out=Object.entries({html:req.query.html});\nres.send(out[0][0]);\n'
+             'res.send(out[0][1]);\n', [('javascript.taint.xss', 3, 1)], False),
+            ('clean', 'const out=Object.values({safe:"fixed",dirty:req.query.html});\n'
+             'res.send(out[0]);\n', [], False),
+            ('partial', 'res.send(req.query.html);\n'
+             'Object.values({get html(){return req.query.html;}});\n',
+             [('javascript.taint.xss', 1, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-object-projection-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Object.values')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_object_projection_public_cache_edits_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-object-projection-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const box={html:"safe"};\nconst out=Object.values({item:box});\n'
+                  'box.html=req.query.html;\nres.send(out[0].html);\n')
+        clean = unsafe.replace('box.html=req.query.html;', 'box.html="fixed";')
+        suppressed = unsafe.replace('res.send(out[0].html);', 'res.send(out[0].html); // ubs:ignore')
+        partial = 'res.send(req.query.html);\nObject.values(unknown);\n'
+        expected = [('javascript.taint.xss', 4, 1)]
+        for index, (source, findings, incomplete, cache_hits) in enumerate((
+            (unsafe, expected, False, 0), (unsafe, expected, False, 1), (clean, [], False, 0),
+            (suppressed, [], False, 0), (unsafe, expected, False, 1),
+            (partial, [('javascript.taint.xss', 1, 1)], True, 0),
+            (partial, [('javascript.taint.xss', 1, 1)], True, 0),
+        )):
+            with self.subTest(index=index):
+                if index not in (1, 6):
+                    target.write_text(source, encoding='utf-8')
+                report = self.sort_public_report(target, scratch / f'cache-{index}', meta=True,
+                                                fmt='json', expected=findings, partial=incomplete,
+                                                cache=True, partial_reason='Object.values')
+                self.assertEqual(report['profile']['cache_hits'], cache_hits, report)
+
     def test_array_from_mapper_returns_and_sanitizer_domains(self):
         source = ('const out = Array.from([1], value => req.query.html); '
                   'res.send(out[0]); res.send(out.length);')

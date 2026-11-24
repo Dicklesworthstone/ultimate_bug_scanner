@@ -3025,6 +3025,44 @@ class SQLValueCaptureTests(unittest.TestCase):
                     expected = ((CRITICAL, len(source.splitlines())),) if unsafe else ()
                     self.inspect(name, source, expected)
 
+    def test_natural_order_of_fresh_generator_records(self):
+        for consumer in ('min({records})', 'max({records}, key=None)',
+                         'sorted({records}, reverse=True)[0]'):
+            selected = consumer.format(records='([query] for _ in (1, 2))')
+            for label, query, sink, critical in (
+                    ('static', '"SELECT 1"', 'cursor.execute(selected[0])', False),
+                    ('dynamic', 'f"SELECT {user}"', 'cursor.execute(selected[0])', True),
+                    ('bound', 'f"SELECT {user}"', 'cursor.execute("SELECT ?", (selected[0],))', False)):
+                source = program(f'    query = {query}\n    selected = {selected}\n    {sink}\n')
+                with self.subTest(consumer=consumer, query=query, sink=sink):
+                    self.inspect('natural-order-' + consumer.split('(')[0] + '-' + label, source,
+                                 ((CRITICAL, len(source.splitlines())),) if critical else ())
+
+    def test_natural_order_type_error_keeps_suspended_writes(self):
+        for consumer in ('min', 'max'):
+            source = program('    query = "SELECT 0"\n    try:\n'
+                             f'        {consumer}([item, (query := f"SELECT {{user}}" if item == "x" else "SELECT 0")]\n'
+                             '               for item in (0, "x", 2))\n'
+                             '    except TypeError:\n        return cursor.execute(query).fetchone()[0]\n')
+            name = 'natural-order-type-error-' + consumer
+            with self.subTest(consumer=consumer):
+                self.assertEqual(sqlite_witness(self.artifacts, name, source, value='7')['rows'], 7)
+                self.inspect(name, source, ((CRITICAL, len(source.splitlines())),))
+
+    def test_natural_order_retains_opaque_record_boundaries(self):
+        for consumer in ('min', 'max', 'sorted'):
+            for body in (f'{consumer}([item] for item in rows)',
+                         f'{consumer}(rows for _ in (1, 2))'):
+                source = program('    cursor.execute(f"SELECT {user}")\n    ' + body + '\n')
+                path = self.artifacts / ('natural-order-opaque-' + consumer + '.py')
+                path.write_text(source, encoding='utf-8')
+                hits = []
+                with self.subTest(body=body):
+                    with self.assertRaisesRegex(detector.SQLFlowLimit, 'generator reducer.*incomplete'):
+                        for rule, _, line, _, _ in detector.find([path]):
+                            hits.append((rule, line))
+                    self.assertEqual(hits, [(CRITICAL, 2)])
+
     def test_generator_reducer_keys_keep_lexical_cells(self):
         safe = '"SELECT count(*) FROM users WHERE name = \'alice\'"'
         unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'

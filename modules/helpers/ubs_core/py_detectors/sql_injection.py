@@ -4886,7 +4886,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             # retaining them cannot retain an analyzed program's objects.
             deferred_keys = set() if reducer_name == 'sorted' else None
             facts = self.materialize_generators(
-                arguments[0][1], consumer_can_raise=True, reducer=(key, length_key, deferred_keys))
+                arguments[0][1], consumer_can_raise=True, reducer=(reducer_name, key, length_key, deferred_keys))
             if deferred_keys is not None:
                 for shape in deferred_keys:
                     self.check_generator_reducer_key(shape, key, length_key)
@@ -5321,18 +5321,18 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             cache['generator_builtin_imports'] = closed
         return cache['generator_builtin_imports']
 
-    def check_generator_reducer(self, facts, key, length_key, deferred_keys, *, yielded):
+    def check_generator_reducer(self, facts, reducer_name, key, length_key, deferred_keys, *, yielded):
         """Prove implicit reducer dispatch from each actual yielded value.
 
         A read-only generator can still hand a reducer an object whose
         comparison, arithmetic or key protocols replace an enclosing query.
-        Fresh list records may be keyed without comparing the lists, but
-        neither their contents nor their destruction may dispatch callbacks.
+        Lexicographic ordering of two fresh builtin lists compares their
+        elements. Exact immutable builtin elements can compare or raise
+        without dispatching application code.
         Checking at emission keeps empty/exhausted cursors free of callbacks.
         """
         shape = self.element_shape(self.fact_kinds(facts))
-        has_key = key is not None and not (isinstance(key, ast.Constant) and key.value is None)
-        if (has_key and isinstance(yielded, ast.List)
+        if (reducer_name in {'min', 'max', 'sorted'} and isinstance(yielded, ast.List)
                 and not any(isinstance(item, ast.Starred) for item in yielded.elts)
                 and self.fact_kinds(facts)[0] == 'list'
                 and self.hash_safe_shape(self.fact_kinds(facts)[1])):

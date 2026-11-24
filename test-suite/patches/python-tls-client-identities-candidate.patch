@@ -1,0 +1,1098 @@
+# Inactive Python TLS native-client candidate; no scanner activation or DSR qualification.
+# Base commit: 34fcffa6744c4d15b0fc939b753ff29b31d9e599
+# Native and public tests are authored but have not run in this session.
+diff --git a/modules/helpers/ubs_core/py_detectors/tls_verification.py b/modules/helpers/ubs_core/py_detectors/tls_verification.py
+index d55b6466d72c9ae5602e52f0cbba5ea0572fdc5d..009234f11d8a0c39efb107d917fbb9536757866b 100644
+--- a/modules/helpers/ubs_core/py_detectors/tls_verification.py
++++ b/modules/helpers/ubs_core/py_detectors/tls_verification.py
+@@ -1,251 +1,269 @@
+-"""ubs_core.py_detectors.tls_verification — category 7 TLS verification (bead 0xjg.5).
+-
+-Port of run_tls_verification_checks (modules/ubs-python.sh 8749-9035): an
+-ast.NodeVisitor flagging disabled certificate verification across httpx/
+-requests (verify=False, incl. `from httpx import get` direct imports),
+-aiohttp (TCPConnector(ssl=False), ClientSession(connector=...) with an
+-unsafe connector, session-variable `.get(..., ssl=False)`), urllib3
+-(PoolManager cert_reqs=CERT_NONE / assert_hostname=False), ssl
+-(_create_unverified_context, CERT_NONE verify_mode, check_hostname=False,
+-`ssl._create_default_https_context = ssl._create_unverified_context`).
+-
+-Comment directives use shared statement ownership and rule scopes, with
+-per-file line dedupe preserved.
+-"""
+-from __future__ import annotations
+-
+-import ast
+-from pathlib import Path
+-from typing import Iterable, Sequence
+-
+-from ubs_core.suppression import SourceSuppressions
+-
+-RULE_ID = "py.security.tls-verification"
+-CATEGORY = 7
+-TITLE = "HTTP/TLS client disables certificate verification"
+-SEVERITY = "critical"
+-DESCRIPTION = "Keep certificate and hostname verification enabled; use explicit CA bundles for private trust roots"
+-
+-HTTP_METHODS = {'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'request', 'stream'}
+-
+-
+-def _call_name(node):
+-    if isinstance(node, ast.Name):
+-        return node.id
+-    if isinstance(node, ast.Attribute):
+-        parent = _call_name(node.value)
+-        return f'{parent}.{node.attr}' if parent else node.attr
+-    return ''
+-
+-
+-def _const_value(node):
+-    return node.value if isinstance(node, ast.Constant) else None
+-
+-
+-def _is_false(node):
+-    value = _const_value(node)
+-    return value is False or value == 0 or (isinstance(value, str) and value.strip().lower() in {'0', 'false', 'no', 'off'})
+-
+-
+-def _is_cert_none(node, cert_none_names, ssl_aliases):
+-    value = _const_value(node)
+-    if isinstance(value, str) and value.strip().upper() in {'CERT_NONE', 'NONE'}:
+-        return True
+-    name = _call_name(node)
+-    if name in cert_none_names:
+-        return True
+-    return any(name == f'{alias}.CERT_NONE' for alias in ssl_aliases)
+-
+-
+-def _source_line(lines, line_no):
+-    idx = line_no - 1
+-    if 0 <= idx < len(lines):
+-        return lines[idx].strip()
+-    return ''
+-
+-
+-class _TLSVerificationAnalyzer(ast.NodeVisitor):
+-    def __init__(self, path, lines, suppressions):
+-        self.path = path
+-        self.lines = lines
+-        self.suppressions = suppressions
+-        self.ssl_aliases = {'ssl'}
+-        self.httpx_aliases = {'httpx'}
+-        self.requests_aliases = {'requests'}
+-        self.aiohttp_aliases = {'aiohttp'}
+-        self.urllib3_aliases = {'urllib3'}
+-        self.httpx_direct = set()
+-        self.requests_direct = set()
+-        self.aiohttp_connector_names = set()
+-        self.aiohttp_session_names = set()
+-        self.urllib3_pool_names = set()
+-        self.unverified_context_names = set()
+-        self.cert_none_names = set()
+-        self.client_vars = set()
+-        self.issues = []
+-        self.seen_lines = set()
+-
+-    def remember_issue(self, line_no):
+-        if self.suppressions.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
+-            return
+-        self.seen_lines.add(line_no)
+-        self.issues.append(line_no)
+-
+-    def visit_Import(self, node):
+-        for alias in node.names:
+-            local = alias.asname or alias.name.split('.')[0]
+-            if alias.name == 'ssl':
+-                self.ssl_aliases.add(local)
+-            elif alias.name == 'httpx':
+-                self.httpx_aliases.add(local)
+-            elif alias.name == 'requests':
+-                self.requests_aliases.add(local)
+-            elif alias.name == 'aiohttp':
+-                self.aiohttp_aliases.add(local)
+-            elif alias.name == 'urllib3':
+-                self.urllib3_aliases.add(local)
+-        self.generic_visit(node)
+-
+-    def visit_ImportFrom(self, node):
+-        module = node.module or ''
+-        for alias in node.names:
+-            local = alias.asname or alias.name
+-            if module == 'ssl':
+-                if alias.name == '_create_unverified_context':
+-                    self.unverified_context_names.add(local)
+-                elif alias.name == 'CERT_NONE':
+-                    self.cert_none_names.add(local)
+-            elif module == 'httpx' and alias.name in HTTP_METHODS | {'Client', 'AsyncClient'}:
+-                self.httpx_direct.add(local)
+-            elif module == 'requests' and alias.name in HTTP_METHODS | {'Session'}:
+-                self.requests_direct.add(local)
+-            elif module == 'aiohttp':
+-                if alias.name == 'TCPConnector':
+-                    self.aiohttp_connector_names.add(local)
+-                elif alias.name == 'ClientSession':
+-                    self.aiohttp_session_names.add(local)
+-            elif module == 'urllib3' and alias.name in {'PoolManager', 'ProxyManager'}:
+-                self.urllib3_pool_names.add(local)
+-        self.generic_visit(node)
+-
+-    def keyword(self, call, key):
+-        for keyword in call.keywords:
+-            if keyword.arg == key:
+-                return keyword.value
+-        return None
+-
+-    def target_names(self, targets):
+-        names = []
+-        for target in targets:
+-            if isinstance(target, ast.Name):
+-                names.append(target.id)
+-        return names
+-
+-    def is_ssl_unverified_context(self, node):
+-        name = _call_name(node)
+-        return name in self.unverified_context_names or any(name == f'{alias}._create_unverified_context' for alias in self.ssl_aliases)
+-
+-    def is_httpx_or_requests_call(self, name):
+-        if name in self.httpx_direct or name in self.requests_direct:
+-            return True
+-        if '.' not in name:
+-            return False
+-        prefix, short = name.rsplit('.', 1)
+-        first = prefix.split('.', 1)[0]
+-        return short in HTTP_METHODS | {'Client', 'AsyncClient', 'Session'} and (first in self.httpx_aliases or first in self.requests_aliases)
+-
+-    def is_aiohttp_connector_call(self, name):
+-        if name in self.aiohttp_connector_names:
+-            return True
+-        return any(name == f'{alias}.TCPConnector' for alias in self.aiohttp_aliases)
+-
+-    def is_aiohttp_session_call(self, name):
+-        if name in self.aiohttp_session_names:
+-            return True
+-        return any(name == f'{alias}.ClientSession' for alias in self.aiohttp_aliases)
+-
+-    def is_urllib3_pool_call(self, name):
+-        if name in self.urllib3_pool_names:
+-            return True
+-        return any(name in {f'{alias}.PoolManager', f'{alias}.ProxyManager'} for alias in self.urllib3_aliases)
+-
+-    def has_unsafe_connector(self, node):
+-        for child in ast.walk(node):
+-            if isinstance(child, ast.Call) and self.is_aiohttp_connector_call(_call_name(child.func)):
+-                ssl_value = self.keyword(child, 'ssl')
+-                if ssl_value is not None and _is_false(ssl_value):
+-                    return True
+-        return False
+-
+-    def call_disables_tls(self, node):
+-        name = _call_name(node.func)
+-        if self.is_ssl_unverified_context(node.func):
+-            return True
+-        verify = self.keyword(node, 'verify')
+-        if verify is not None and _is_false(verify) and self.is_httpx_or_requests_call(name):
+-            return True
+-        if self.is_aiohttp_connector_call(name):
+-            ssl_value = self.keyword(node, 'ssl')
+-            if ssl_value is not None and _is_false(ssl_value):
+-                return True
+-        if self.is_aiohttp_session_call(name):
+-            connector = self.keyword(node, 'connector')
+-            if connector is not None and self.has_unsafe_connector(connector):
+-                return True
+-        if self.is_urllib3_pool_call(name):
+-            cert_reqs = self.keyword(node, 'cert_reqs')
+-            assert_hostname = self.keyword(node, 'assert_hostname')
+-            if cert_reqs is not None and _is_cert_none(cert_reqs, self.cert_none_names, self.ssl_aliases):
+-                return True
+-            if assert_hostname is not None and _is_false(assert_hostname):
+-                return True
+-        if '.' in name:
+-            prefix, short = name.rsplit('.', 1)
+-            first = prefix.split('.', 1)[0]
+-            ssl_value = self.keyword(node, 'ssl')
+-            if short in HTTP_METHODS and ssl_value is not None and _is_false(ssl_value):
+-                return first in self.aiohttp_aliases or first in self.client_vars or 'aiohttp' in prefix
+-        return False
+-
+-    def visit_Assign(self, node):
+-        if isinstance(node.value, ast.Call):
+-            name = _call_name(node.value.func)
+-            if self.is_httpx_or_requests_call(name) or self.is_aiohttp_session_call(name) or self.is_urllib3_pool_call(name):
+-                self.client_vars.update(self.target_names(node.targets))
+-            if self.call_disables_tls(node.value):
+-                self.remember_issue(node.lineno)
+-        for target in node.targets:
+-            if isinstance(target, ast.Attribute):
+-                attr = target.attr
+-                target_owner = _call_name(target.value)
+-                if attr == 'verify_mode' and _is_cert_none(node.value, self.cert_none_names, self.ssl_aliases):
+-                    self.remember_issue(node.lineno)
+-                elif attr == 'check_hostname' and _is_false(node.value):
+-                    self.remember_issue(node.lineno)
+-                elif attr == 'verify' and target_owner in self.client_vars and _is_false(node.value):
+-                    self.remember_issue(node.lineno)
+-                elif attr == '_create_default_https_context' and target_owner in self.ssl_aliases and self.is_ssl_unverified_context(node.value):
+-                    self.remember_issue(node.lineno)
+-        self.generic_visit(node)
+-
+-    def visit_Call(self, node):
+-        if self.call_disables_tls(node):
+-            self.remember_issue(node.lineno)
+-        self.generic_visit(node)
+-
+-
+-def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+-    suppressions = SourceSuppressions('python')
+-    for path in files:
+-        if path.suffix.lower() not in {'.py', '.pyi'}:
+-            continue
+-        try:
+-            text = path.read_text(encoding='utf-8', errors='ignore')
+-            tree = ast.parse(text, filename=str(path))
+-        except Exception:
+-            continue
+-        lines = text.splitlines()
+-        analyzer = _TLSVerificationAnalyzer(path, lines, suppressions.index(path, text))
+-        analyzer.visit(tree)
+-        for line_no in analyzer.issues:
+-            yield path, line_no, 1, _source_line(lines, line_no)[:240]
++"""Bounded native Python HTTP/TLS configuration and request identities.
++
++Requests sessions accept per-request verify; aiohttp sessions accept ssl.
++HTTPX configures verification on clients/transports, not client request
++methods. Reuse the timeout detector's lexical native-call visitor for
++imports, captured methods, argument evaluation, branches and scopes,
++while supplying a separate TLS policy. A response or a similar spelling
++never acquires a native client's authority.
++
++This is an explicit configuration check. It does not prove the complete
++TLS policy of an arbitrary helper, subclass or externally configured object.
++"""
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++from typing import Iterable, Sequence
++
++from ubs_core.py_detectors.http_timeout import HttpTimeoutAnalyzer, UNKNOWN, _Value
++from ubs_core.suppression import SourceSuppressions
++
++RULE_ID = "py.security.tls-verification"
++CATEGORY = 7
++TITLE = "HTTP/TLS client disables certificate verification"
++SEVERITY = "critical"
++DESCRIPTION = "Keep certificate and hostname verification enabled; use explicit CA bundles for private trust roots"
++
++REQUEST_METHODS = frozenset({
++    "get", "post", "put", "patch", "delete", "head", "options", "request",
++})
++CLIENT_CONSTRUCTORS = {
++    "requests.Session": "requests",
++    "requests.session": "requests",
++    "requests.sessions.Session": "requests",
++    "httpx.Client": "httpx",
++    "httpx.AsyncClient": "httpx",
++    "aiohttp.ClientSession": "aiohttp",
++    "urllib3.PoolManager": "urllib3",
++    "urllib3.ProxyManager": "urllib3",
++    "ssl.SSLContext": "ssl_context",
++    "ssl.create_default_context": "ssl_context",
++    "ssl._create_unverified_context": "ssl_context",
++    "aiohttp.TCPConnector": "aiohttp_connector",
++    "httpx.HTTPTransport": "httpx_transport",
++    "httpx.AsyncHTTPTransport": "httpx_transport",
++}
++CLIENT_METHODS = {
++    "requests": REQUEST_METHODS | {"send"},
++    "aiohttp": REQUEST_METHODS | {"ws_connect"},
++}
++
++
++def _literal_false(values) -> bool:
++    # Strings such as "false" and "off" can name CA bundles. They are not
++    # Boolean False and must not borrow a different library's coercion.
++    return any(value.kind == "literal" and value.data is False for value in values)
++
++
++def _requests_verify_disabled(values, *, none_disables=False) -> bool:
++    # Request/get inherit the session default for None. Session.send passes
++    # an explicit None through to the adapter, and setting Session.verify
++    # stores None as the default itself; both disable certificate checks.
++    return any(value.kind == "literal"
++               and ((value.data is None and none_disables) or value.data == ""
++                    or isinstance(value.data, (bool, int, float)) and value.data == 0)
++               for value in values)
++
++
++def _cert_none(values, *, string_names=False) -> bool:
++    for value in values:
++        if value.kind == "native" and value.name == "ssl.CERT_NONE":
++            return True
++        if value.kind == "literal":
++            if isinstance(value.data, int) and value.data == 0:
++                return True
++            if string_names and value.data in ("CERT_NONE", "NONE"):
++                return True
++    return False
++
++
++class _TLSVerificationAnalyzer(HttpTimeoutAnalyzer):
++    """Share native binding state; do not execute the timeout policy."""
++
++    def remember_issue(self, line_no):
++        if self.suppression.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
++            return
++        self.seen_lines.add(line_no)
++        self.issues.append(line_no)
++
++    def values(self, node):
++        if isinstance(node, ast.Constant):
++            # False and 0 compare/hash equally in Python, but HTTPX and
++            # aiohttp accept Boolean False and reject numeric substitutes.
++            # Keep that distinction when abstract alternatives are joined.
++            return frozenset({_Value("literal", type(node.value).__name__, node.value)})
++        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
++            result = set()
++            for value in self.values(node.operand):
++                if value.kind == "literal" and isinstance(value.data, (int, float)):
++                    number = -value.data if isinstance(node.op, ast.USub) else +value.data
++                    result.add(_Value("literal", type(number).__name__, number))
++                else:
++                    result.update(UNKNOWN)
++            return frozenset(result) or UNKNOWN
++        if isinstance(node, ast.Attribute):
++            result = set()
++            for owner in self.values(node.value):
++                if owner.kind == "native":
++                    key = f"{owner.name}.{node.attr}"
++                    result.update(self.member_overrides.get(key, frozenset({_Value("native", key)})))
++                elif owner.kind == "client" and node.attr in CLIENT_METHODS.get(owner.name, ()):
++                    key = (owner, node.attr)
++                    result.update(self.member_overrides.get(key, self.member_default(key)))
++                else:
++                    result.update(UNKNOWN)
++            return frozenset(result) or UNKNOWN
++        return super().values(node)
++
++    def keyword_values(self, call, name):
++        # Use the value captured when this argument was evaluated. A later
++        # keyword may rebind the same name. Opaque **kwargs grant no policy
++        # proof; this bounded check retains explicit keyword semantics.
++        for keyword in call.keywords:
++            if keyword.arg == name:
++                return self.argument_values(call, keyword.value)
++        return UNKNOWN
++
++    def call_result(self, node, callees):
++        results = set()
++        for callee in callees:
++            if callee.kind == "method":
++                owner = callee.data
++                if owner.name == "requests" and callee.name in CLIENT_METHODS["requests"]:
++                    if _requests_verify_disabled(self.keyword_values(node, "verify"),
++                                                 none_disables=callee.name == "send"):
++                        self.remember_issue(node.lineno)
++                elif owner.name == "aiohttp" and callee.name in CLIENT_METHODS["aiohttp"]:
++                    if (_literal_false(self.keyword_values(node, "ssl"))
++                            or _literal_false(self.keyword_values(node, "verify_ssl"))):
++                        self.remember_issue(node.lineno)
++                results.update(UNKNOWN)
++                continue
++
++            name = callee.name if callee.kind == "native" else ""
++            family = CLIENT_CONSTRUCTORS.get(name)
++            if family:
++                results.add(_Value("client", family, (node.lineno, node.col_offset)))
++                if family in {"httpx", "httpx_transport"}:
++                    if _literal_false(self.keyword_values(node, "verify")):
++                        self.remember_issue(node.lineno)
++                elif family == "aiohttp_connector":
++                    if (_literal_false(self.keyword_values(node, "ssl"))
++                            or _literal_false(self.keyword_values(node, "verify_ssl"))):
++                        self.remember_issue(node.lineno)
++                elif family == "urllib3":
++                    if (_cert_none(self.keyword_values(node, "cert_reqs"), string_names=True)
++                            or _literal_false(self.keyword_values(node, "assert_hostname"))):
++                        self.remember_issue(node.lineno)
++                elif name == "ssl._create_unverified_context":
++                    self.remember_issue(node.lineno)
++                continue
++
++            module, _, method = name.rpartition(".")
++            if module in {"requests", "requests.api"} and method in REQUEST_METHODS:
++                if _requests_verify_disabled(self.keyword_values(node, "verify")):
++                    self.remember_issue(node.lineno)
++            elif module == "httpx" and method in REQUEST_METHODS | {"stream"}:
++                if _literal_false(self.keyword_values(node, "verify")):
++                    self.remember_issue(node.lineno)
++            elif name == "aiohttp.request":
++                if (_literal_false(self.keyword_values(node, "ssl"))
++                        or _literal_false(self.keyword_values(node, "verify_ssl"))):
++                    self.remember_issue(node.lineno)
++            results.update(UNKNOWN)
++        return frozenset(results) or UNKNOWN
++
++    def bind(self, target, values):
++        if isinstance(target, ast.Attribute):
++            owners = self.values(target.value)
++            for owner in owners:
++                if owner.kind == "client":
++                    if (owner.name == "requests" and target.attr == "verify"
++                            and _requests_verify_disabled(values, none_disables=True)):
++                        self.remember_issue(target.lineno)
++                    elif owner.name == "ssl_context":
++                        if (target.attr == "verify_mode" and _cert_none(values)
++                                or target.attr == "check_hostname" and _literal_false(values)):
++                            self.remember_issue(target.lineno)
++                    if target.attr in CLIENT_METHODS.get(owner.name, ()):
++                        key = (owner, target.attr)
++                        previous = self.member_overrides.get(key, self.member_default(key))
++                        self.member_overrides[key] = values if len(owners) == 1 else previous | values
++                elif owner.kind == "native" and owner.name == "ssl" and target.attr == "_create_default_https_context":
++                    if any(value.kind == "native" and value.name == "ssl._create_unverified_context"
++                           for value in values):
++                        self.remember_issue(target.lineno)
++        super().bind(target, values)
++
++    def visit_ListComp(self, node):
++        # Python evaluates only the first iterable in the enclosing class
++        # namespace. The implicit comprehension function resolves its body
++        # and later iterables through the class's enclosing scope instead.
++        outer, enclosing = self.snapshot(), self.class_enclosing
++        self.visit(node.generators[0].iter)
++        if enclosing is not None:
++            self.restore(enclosing)
++        self.class_enclosing = None
++        for index, generator in enumerate(node.generators):
++            if index:
++                self.visit(generator.iter)
++            self.bind(generator.target, UNKNOWN)
++            for condition in generator.ifs:
++                self.visit(condition)
++        if isinstance(node, ast.DictComp):
++            self.visit(node.key)
++            self.visit(node.value)
++        else:
++            self.visit(node.elt)
++        self.restore(outer)
++        self.class_enclosing = enclosing
++
++    visit_SetComp = visit_ListComp
++    visit_DictComp = visit_ListComp
++    visit_GeneratorExp = visit_ListComp
++
++    def visit_While(self, node):
++        if isinstance(node.test, ast.Constant) and not node.test.value:
++            self.visit(node.test)
++            for statement in node.orelse:
++                self.visit(statement)
++            return
++        super().visit_While(node)
++
++    def visit_Lambda(self, node):
++        # The shared visitor masks positional/keyword-only parameters. TLS
++        # also masks *args/**kwargs before inspecting a lambda body so a
++        # captured client cannot lend identity to an unrelated parameter.
++        for expression in (*node.args.defaults,
++                           *(value for value in node.args.kw_defaults if value is not None)):
++            self.visit(expression)
++        outer, enclosing = self.snapshot(), self.class_enclosing
++        if enclosing is not None:
++            self.restore(enclosing)
++        self.class_enclosing = None
++        for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
++                         *((node.args.vararg,) if node.args.vararg else ()),
++                         *((node.args.kwarg,) if node.args.kwarg else ())):
++            self.bindings[argument.arg] = UNKNOWN
++        self.visit(node.body)
++        self.restore(outer)
++        self.class_enclosing = enclosing
++
++
++def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
++    suppressions = SourceSuppressions("python")
++    for path in files:
++        if path.suffix.lower() not in {".py", ".pyi"}:
++            continue
++        try:
++            text = path.read_text(encoding="utf-8", errors="ignore")
++            tree = ast.parse(text, filename=str(path))
++        except Exception:
++            continue
++        lines = text.splitlines()
++        analyzer = _TLSVerificationAnalyzer(lines, suppressions.index(path, text))
++        analyzer.visit(tree)
++        for line_no in analyzer.issues:
++            code = lines[line_no - 1].strip() if 0 < line_no <= len(lines) else ""
++            yield path, line_no, 1, code[:240]
+diff --git a/test-suite/quality/test_security_precision.py b/test-suite/quality/test_security_precision.py
+index d35e0b8a9acc9ec07edbfb2c91c4457fbf6970ce..0dc8168c93759fac6dfa349bb5f424cd2c835002 100644
+--- a/test-suite/quality/test_security_precision.py
++++ b/test-suite/quality/test_security_precision.py
+@@ -9090,5 +9090,565 @@
+         self.assertTrue(list(cache.glob("*/files/**/*.json")), "public runs must exercise the real file cache")
+ 
+ 
++class PythonTLSReceiverPrecisionTests(unittest.TestCase):
++    """Native TLS options belong to exact client APIs and lexical bindings.
++
++    Reference contracts:
++    https://requests.readthedocs.io/en/stable/api/#requests.Session.request
++    https://www.python-httpx.org/advanced/ssl/
++    https://www.python-httpx.org/api/#client
++    https://docs.aiohttp.org/en/stable/client_reference.html#client-session
++    """
++
++    RULE = "py.security.tls-verification"
++
++    @classmethod
++    def setUpClass(cls):
++        artifacts = REPO_ROOT / "test-suite" / "artifacts"
++        artifacts.mkdir(parents=True, exist_ok=True)
++        cls.root = Path(tempfile.mkdtemp(prefix="python-tls-receivers-", dir=artifacts))
++
++    def check_source(self, name, source, expected):
++        from ubs_core.py_detectors import tls_verification
++
++        path = self.root / (name + ".py")
++        path.write_text(source, encoding="utf-8")
++        started = time.monotonic()
++        records = list(tls_verification.find([path]))
++        (self.root / (name + ".json")).write_text(json.dumps({
++            "source": source, "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
++            "expected_lines": expected, "elapsed_s": time.monotonic() - started,
++            "detector_sha256": hashlib.sha256(Path(tls_verification.__file__).read_bytes()).hexdigest(),
++            "actual": [(str(p), line, col, detail) for p, line, col, detail in records],
++        }, indent=2), encoding="utf-8")
++        self.assertEqual(tls_verification.RULE_ID, self.RULE)
++        self.assertEqual(tls_verification.SEVERITY, "critical")
++        self.assertEqual(sorted((p, line, col) for p, line, col, _ in records),
++                         [(path, line, 1) for line in expected],
++                         {"source": source, "records": records})
++
++    def test_requests_session_constructors_and_saved_methods_have_native_identity(self):
++        constructors = (
++            ("module", "import requests", "requests.Session"),
++            ("factory", "import requests", "requests.session"),
++            ("submodule", "import requests.sessions", "requests.sessions.Session"),
++            ("direct", "from requests import Session as Builder", "Builder"),
++            ("direct-submodule", "from requests.sessions import Session as Builder", "Builder"),
++        )
++        for name, imports, constructor in constructors:
++            with self.subTest(name=name):
++                self.check_source(name, imports + "\nFactory = " + constructor
++                                  + '\nclient = Factory()\nalias = client\nsaved = alias.get\n'
++                                    'saved("https://example.invalid", verify=False, timeout=5)\n', [6])
++
++    def test_requests_per_request_api_methods_preserve_verify_options(self):
++        for method, arguments in (
++            ("get", '"https://example.invalid"'),
++            ("post", '"https://example.invalid"'),
++            ("put", '"https://example.invalid"'),
++            ("patch", '"https://example.invalid"'),
++            ("delete", '"https://example.invalid"'),
++            ("head", '"https://example.invalid"'),
++            ("options", '"https://example.invalid"'),
++            ("request", '"GET", "https://example.invalid"'),
++            ("send", "prepared"),
++        ):
++            with self.subTest(method=method):
++                self.check_source("requests-" + method,
++                                  'import requests\nclient = requests.Session()\n'
++                                  f'client.{method}({arguments}, verify=False, timeout=5)\n', [3])
++        self.check_source("requests-chained-constructor",
++                          'import requests\nrequests.Session().get("https://example.invalid", '
++                          'verify=False, timeout=5)\n', [2])
++
++    def test_requests_send_none_and_default_assignment_differ_from_request_inheritance(self):
++        self.check_source("requests-none-operations",
++                          'import requests\nclient = requests.Session()\n'
++                          'client.get("https://example.invalid", verify=None, timeout=5)\n'
++                          'client.request("GET", "https://example.invalid", verify=None, timeout=5)\n'
++                          'client.send(prepared, verify=None, timeout=5)\n'
++                          'client.verify = None\n', [5, 6])
++        self.check_source("requests-captured-send-none",
++                          'import requests\ndef local(*args, **kwargs): return None\n'
++                          'client = requests.Session()\nsaved = client.send\nclient.send = local\n'
++                          'client.send(prepared, verify=None)\n'
++                          'saved(prepared, verify=None)\n', [7])
++
++    def test_native_context_managers_and_aiohttp_saved_methods_are_scoped(self):
++        self.check_source("requests-with",
++                          'from requests import Session\nwith Session() as client:\n'
++                          '    client.get("https://example.invalid", verify=False, timeout=5)\n', [3])
++        self.check_source("aiohttp-with",
++                          'from aiohttp import ClientSession as Session\nasync def fetch():\n'
++                          '    async with Session() as client:\n'
++                          '        saved = client.get\n'
++                          '        await saved("https://example.invalid", ssl=False)\n', [5])
++        self.check_source("aiohttp-ws",
++                          'import aiohttp\nasync def fetch():\n'
++                          '    async with aiohttp.ClientSession() as client:\n'
++                          '        await client.ws_connect("wss://example.invalid", ssl=False)\n', [4])
++
++    def test_native_client_families_do_not_borrow_another_options_contract(self):
++        self.check_source("native-option-families",
++                          'import requests\nimport httpx\nimport aiohttp\n'
++                          'first = requests.Session()\nsecond = httpx.Client()\n'
++                          'first.get("https://example.invalid", ssl=False, timeout=5)\n'
++                          'second.get("https://example.invalid", verify=False)\n'
++                          'second.verify = False\n'
++                          'async def fetch():\n'
++                          '    async with aiohttp.ClientSession() as third:\n'
++                          '        await third.get("https://example.invalid", verify=False)\n', [])
++        self.check_source("httpx-client-and-transports",
++                          'from httpx import Client, AsyncClient, HTTPTransport, AsyncHTTPTransport\n'
++                          'Client(verify=False)\nAsyncClient(verify=False)\n'
++                          'HTTPTransport(verify=False)\nAsyncHTTPTransport(verify=False)\n',
++                          [2, 3, 4, 5])
++
++    def test_boolean_tls_options_survive_numeric_literal_joins(self):
++        for initial, alternative in (("0", "False"), ("False", "0")):
++            with self.subTest(initial=initial):
++                self.check_source("httpx-joined-" + initial,
++                                  'import httpx\nflag = ' + initial + '\n'
++                                  'if enabled:\n    flag = ' + alternative + '\n'
++                                  'httpx.Client(verify=flag)\n', [5])
++                self.check_source("aiohttp-joined-" + initial,
++                                  'import aiohttp\nasync def fetch():\n'
++                                  '    flag = ' + initial + '\n'
++                                  '    if enabled:\n        flag = ' + alternative + '\n'
++                                  '    async with aiohttp.ClientSession() as client:\n'
++                                  '        await client.get("https://example.invalid", ssl=flag)\n', [7])
++        self.check_source("non-boolean-zero",
++                          'import httpx\nimport aiohttp\nhttpx.Client(verify=0)\n'
++                          'async def fetch():\n    async with aiohttp.ClientSession() as client:\n'
++                          '        await client.get("https://example.invalid", ssl=0)\n', [])
++
++    def test_unary_tls_options_preserve_numeric_types(self):
++        for initial, alternative in (("+0.0", "-0"), ("-0", "+0.0")):
++            with self.subTest(initial=initial):
++                self.check_source("ssl-unary-joined-" + ("float" if initial == "+0.0" else "int"),
++                                  'import ssl\ncontext = ssl.create_default_context()\n'
++                                  'context.check_hostname = False\n'
++                                  'flag = ' + initial + '\n'
++                                  'if enabled:\n    flag = ' + alternative + '\n'
++                                  'context.verify_mode = flag\n', [3, 7])
++        self.check_source("unary-boolean-is-int",
++                          'import httpx\nhttpx.Client(verify=+False)\n'
++                          'httpx.Client(verify=-False)\n', [])
++
++    def test_response_objects_and_arbitrary_receivers_have_no_client_identity(self):
++        self.check_source("responses-and-lookalikes",
++                          'import requests\nimport ssl\n'
++                          'response = requests.get("https://example.invalid", timeout=5)\n'
++                          'response.verify = False\n'
++                          'response.get("key", verify=False)\n'
++                          'other.check_hostname = False\nother.verify_mode = ssl.CERT_NONE\n'
++                          'other.get("key", verify=False)\n', [])
++        self.check_source("unimported-spellings",
++                          'requests.get("https://example.invalid", verify=False)\n'
++                          'httpx.Client(verify=False)\n'
++                          'ssl._create_unverified_context()\n', [])
++        self.check_source("relative-import",
++                          'from . import requests\nrequests.get("key", verify=False)\n', [])
++
++    def test_module_constructor_and_client_overrides_preserve_captured_callables(self):
++        self.check_source("captured-constructor",
++                          'import requests\ndef local(*args, **kwargs): return None\n'
++                          'Factory = requests.Session\nrequests.Session = local\n'
++                          'client = Factory()\nclient.get("https://example.invalid", verify=False)\n'
++                          'other = requests.Session()\nother.get("key", verify=False)\n', [6])
++        self.check_source("captured-method",
++                          'import requests\ndef local(*args, **kwargs): return "cached"\n'
++                          'client = requests.Session()\nsaved = client.get\nalias = client\n'
++                          'alias.get = local\nclient.get("key", verify=False)\n'
++                          'saved("https://example.invalid", verify=False, timeout=5)\n', [8])
++        self.check_source("captured-module-call",
++                          'from requests import get\nimport requests\n'
++                          'def local(*args, **kwargs): return None\n'
++                          'requests.get = local\nrequests.get("key", verify=False)\n'
++                          'get("https://example.invalid", verify=False, timeout=5)\n', [6])
++
++    def test_local_rebindings_and_foreign_imports_remove_native_identity(self):
++        self.check_source("client-rebound",
++                          'import requests\nclient = requests.Session()\n'
++                          'client = local_client\nclient.get("key", verify=False)\n', [])
++        self.check_source("module-rebound",
++                          'import requests\nrequests = local_api\n'
++                          'client = requests.Session()\nclient.get("key", verify=False)\n'
++                          'requests.get("key", verify=False)\n', [])
++        self.check_source("foreign-module",
++                          'import local_api as requests\nclient = requests.Session()\n'
++                          'client.get("key", verify=False)\nrequests.get("key", verify=False)\n', [])
++
++    def test_function_class_and_lambda_bindings_do_not_leak(self):
++        self.check_source("parameter-shadows",
++                          'import requests\nclient = requests.Session()\n'
++                          'def fetch(client, requests):\n'
++                          '    client.get("key", verify=False)\n'
++                          '    requests.get("key", verify=False)\n'
++                          'first = lambda **client: client.get("key", verify=False)\n'
++                          'second = lambda *requests: requests.get("key", verify=False)\n', [])
++        self.check_source("function-local-before-store",
++                          'import requests\ndef fetch():\n'
++                          '    requests.get("key", verify=False)\n'
++                          '    requests = local_api\n', [])
++        self.check_source("separate-functions",
++                          'import requests\ndef fetch():\n'
++                          '    client = requests.Session()\n'
++                          '    client.get("https://example.invalid", verify=False)\n'
++                          'def unrelated(client):\n'
++                          '    client.get("key", verify=False)\n', [4])
++        self.check_source("class-is-not-method-enclosing-scope",
++                          'import requests\nclass Wrapper:\n'
++                          '    client = requests.Session()\n'
++                          '    def fetch(self):\n'
++                          '        client.get("key", verify=False)\n', [])
++
++    def test_class_comprehensions_separate_first_iterable_and_body_scopes(self):
++        expressions = (
++            '[requests.get("https://example.invalid", verify=False) for item in items]',
++            '{requests.get("https://example.invalid", verify=False) for item in items}',
++            '{item: requests.get("https://example.invalid", verify=False) for item in items}',
++            '(requests.get("https://example.invalid", verify=False) for item in items)',
++        )
++        for index, expression in enumerate(expressions):
++            with self.subTest(kind=index):
++                self.check_source("class-only-import-" + str(index),
++                                  'requests = local_api\nclass Scope:\n    import requests\n'
++                                  '    values = ' + expression + '\n', [])
++                self.check_source("module-only-import-" + str(index),
++                                  'import requests\nclass Scope:\n    requests = local_api\n'
++                                  '    values = ' + expression + '\n', [4])
++        self.check_source("class-first-iterable",
++                          'requests = local_api\nclass Scope:\n    import requests\n'
++                          '    values = [item for item in requests.get("https://example.invalid", verify=False)]\n',
++                          [4])
++        self.check_source("class-later-iterable",
++                          'import requests\nclass Scope:\n    requests = local_api\n'
++                          '    values = [value for item in items for value in '
++                          'requests.get("https://example.invalid", verify=False)]\n', [4])
++
++    def test_conditional_native_alternatives_and_literal_unreachable_branch(self):
++        self.check_source("conditional-client",
++                          'import requests\nif enabled:\n    client = requests.Session()\n'
++                          'else:\n    client = local_client\n'
++                          'client.get("https://example.invalid", verify=False)\n', [6])
++        self.check_source("conditional-method",
++                          'import requests\ndef local(*args, **kwargs): return None\n'
++                          'client = requests.Session()\nif enabled:\n    client.get = local\n'
++                          'client.get("https://example.invalid", verify=False)\n', [6])
++        self.check_source("literal-dead-branch",
++                          'import requests\nif False:\n'
++                          '    requests.Session().get("https://example.invalid", verify=False)\n', [])
++        self.check_source("literal-dead-loop",
++                          'import requests\nwhile False:\n'
++                          '    requests.Session().get("https://example.invalid", verify=False)\n', [])
++        self.check_source("literal-dead-loop-else",
++                          'import requests\nwhile False:\n'
++                          '    requests.Session().get("https://example.invalid", verify=False)\n'
++                          'else:\n    requests.Session().get("https://example.invalid", verify=False)\n', [5])
++
++    def test_scalar_options_are_captured_before_later_argument_effects(self):
++        self.check_source("captured-options",
++                          'import requests\nclient = requests.Session()\nflag = False\n'
++                          'client.get("https://example.invalid", verify=flag, '
++                          'allow_redirects=(flag := True), timeout=5)\n'
++                          'client.get("https://example.invalid", verify=flag, '
++                          'allow_redirects=(flag := False), timeout=5)\n', [4])
++        self.check_source("saved-cert-constant",
++                          'import ssl\nfrom ssl import CERT_NONE as disabled\n'
++                          'context = ssl.create_default_context()\n'
++                          'context.check_hostname = False\ncontext.verify_mode = disabled\n', [4, 5])
++
++    def test_context_properties_and_global_factory_overrides_require_native_owners(self):
++        self.check_source("ssl-context-alias",
++                          'import ssl\nFactory = ssl.create_default_context\n'
++                          'context = Factory()\nalias = context\n'
++                          'alias.check_hostname = False\nalias.verify_mode = ssl.CERT_NONE\n',
++                          [5, 6])
++        self.check_source("ssl-factory-alias",
++                          'from ssl import _create_unverified_context as factory\n'
++                          'import ssl\nsaved = factory\nfactory = local_factory\n'
++                          'saved()\nssl._create_default_https_context = saved\n', [5, 6])
++        self.check_source("fake-context",
++                          'import ssl\nssl = local_ssl\ncontext = ssl.SSLContext()\n'
++                          'context.check_hostname = False\ncontext.verify_mode = 0\n'
++                          'ssl._create_default_https_context = ssl._create_unverified_context\n', [])
++
++    def test_cert_names_and_ca_paths_keep_native_types(self):
++        self.check_source("quoted-ca-paths",
++                          'import requests\nimport httpx\nclient = requests.Session()\n'
++                          'client.get("https://example.invalid", verify="false", timeout=5)\n'
++                          'httpx.Client(verify="off")\n', [])
++        self.check_source("requests-false-values",
++                          'import requests\nclient = requests.Session()\n'
++                          'client.get("https://example.invalid", verify=0, timeout=5)\n'
++                          'client.get("https://example.invalid", verify="", timeout=5)\n'
++                          'client.get("https://example.invalid", verify=None, timeout=5)\n', [3, 4])
++        self.check_source("urllib3-cert-names",
++                          'import ssl\nimport urllib3\nfrom urllib3 import PoolManager as Pool\n'
++                          'Pool(cert_reqs="CERT_NONE")\n'
++                          'urllib3.ProxyManager("http://proxy.invalid", cert_reqs=ssl.CERT_NONE)\n'
++                          'Pool(assert_hostname=False)\n', [4, 5, 6])
++        self.check_source("secure-options",
++                          'import ssl\nimport requests\nimport httpx\nimport urllib3\n'
++                          'client = requests.Session()\nclient.verify = True\n'
++                          'client.get("https://example.invalid", verify=True, timeout=5)\n'
++                          'httpx.Client(verify=True)\nurllib3.PoolManager(cert_reqs=ssl.CERT_REQUIRED)\n'
++                          'context = ssl.create_default_context()\ncontext.check_hostname = True\n', [])
++
++    def test_deletion_aliases_and_independent_clients_preserve_ownership(self):
++        self.check_source("separate-client-methods",
++                          'import requests\ndef local(*args, **kwargs): return None\n'
++                          'first = requests.Session()\nsecond = requests.Session()\n'
++                          'first.get = local\nfirst.get("key", verify=False)\n'
++                          'second.get("https://example.invalid", verify=False)\n', [7])
++        self.check_source("deleted-binding",
++                          'import requests\nclient = requests.Session()\nsaved = client.get\n'
++                          'del client\nclient.get("key", verify=False)\n'
++                          'saved("https://example.invalid", verify=False)\n', [6])
++
++    def test_exact_rule_suppression_and_lexical_decoys_remain_independent(self):
++        self.check_source("suppression",
++                          'import requests\nclient = requests.Session()\n'
++                          'client.get("https://example.invalid", verify=False)  # ubs:ignore[py.security.tls-verification]\n'
++                          'client.get("https://example.invalid", verify=False)  # ubs:ignore[py.security.http-timeout]\n',
++                          [4])
++        self.check_source("decoys",
++                          'import requests\n# requests.get("x", verify=False)\n'
++                          'example = \'requests.Session().get("x", verify=False)\'\n', [])
++
++    def test_existing_explicit_tls_fixtures_retain_real_configuration_sites(self):
++        self.check_source("existing-buggy",
++                          (PY_SECURITY / "tls_verification_buggy.py").read_text(encoding="utf-8"),
++                          [12, 13, 16, 18, 19, 20, 22, 23, 25, 26, 27, 28, 29, 36])
++        self.check_source("existing-clean",
++                          (PY_SECURITY / "tls_verification_clean.py").read_text(encoding="utf-8"), [])
++
++    @unittest.skipUnless(importlib.util.find_spec("requests"), "native Requests witness requires requests")
++    def test_native_requests_options_and_saved_method_witness_without_network(self):
++        import requests
++
++        observed = []
++
++        class Capture(requests.adapters.BaseAdapter):
++            def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
++                observed.append(verify)
++                response = requests.Response()
++                response.status_code = 200
++                response._content = b"ok"
++                response.url = request.url
++                response.request = request
++                return response
++
++            def close(self):
++                pass
++
++        with requests.Session() as client:
++            client.trust_env = False
++            client.mount("https://", Capture())
++            flag = False
++            client.get("https://example.invalid", verify=flag,
++                       allow_redirects=(flag := True), timeout=5)
++            client.get("https://example.invalid", verify=flag,
++                       allow_redirects=(flag := False), timeout=5)
++            saved = client.get
++            alias = client
++            alias.get = lambda *args, **kwargs: "local"
++            self.assertEqual(client.get("local-key", verify=False), "local")
++            self.assertEqual(saved("https://example.invalid", verify=False, timeout=5).text, "ok")
++            client.verify = False
++            client.request("GET", "https://example.invalid", timeout=5)
++            client.verify = True
++            client.request("GET", "https://example.invalid", verify=None, timeout=5)
++            prepared = requests.Request("GET", "https://example.invalid").prepare()
++            client.send(prepared, timeout=5)
++            client.send(prepared, verify=None, timeout=5)
++            saved_send = client.send
++            client.send = lambda *args, **kwargs: "local"
++            self.assertEqual(client.send(prepared, verify=None), "local")
++            saved_send(prepared, verify=None, timeout=5)
++            client.send = saved_send
++            client.verify = None
++            client.request("GET", "https://example.invalid", timeout=5)
++        self.assertEqual(observed, [False, True, False, False, True, True, None, None, None])
++        adapter = requests.adapters.HTTPAdapter()
++        for option in (False, 0, "", None):
++            connection = SimpleNamespace()
++            adapter.cert_verify(connection, "https://example.invalid", option, None)
++            self.assertEqual(connection.cert_reqs, "CERT_NONE")
++        adapter.close()
++        (self.root / "requests-native-witness.json").write_text(json.dumps({
++            "version": requests.__version__, "verification_options": observed,
++        }, indent=2), encoding="utf-8")
++
++    @unittest.skipUnless(importlib.util.find_spec("httpx"), "native HTTPX witness requires httpx")
++    def test_native_httpx_verification_is_client_or_transport_configuration(self):
++        import httpx
++        import inspect
++        import ssl
++
++        with httpx.HTTPTransport(verify=False) as transport:
++            context = transport._pool._ssl_context
++            self.assertEqual(context.verify_mode, ssl.CERT_NONE)
++            self.assertIs(context.check_hostname, False)
++        with httpx.Client(verify=False, trust_env=False) as client:
++            context = client._transport._pool._ssl_context
++            self.assertEqual(context.verify_mode, ssl.CERT_NONE)
++            self.assertIs(context.check_hostname, False)
++            self.assertNotIn("verify", inspect.signature(client.get).parameters)
++            with self.assertRaises(TypeError):
++                client.get("https://example.invalid", verify=False)
++        (self.root / "httpx-native-witness.json").write_text(json.dumps({
++            "version": httpx.__version__, "verify_mode": int(ssl.CERT_NONE),
++            "client_request_accepts_verify": False,
++        }, indent=2), encoding="utf-8")
++
++    @unittest.skipUnless(importlib.util.find_spec("aiohttp"), "native aiohttp witness requires aiohttp")
++    def test_native_aiohttp_saved_request_ssl_witness_without_network(self):
++        import aiohttp
++        import asyncio
++
++        class ObservedBeforeNetwork(Exception):
++            pass
++
++        observed = []
++
++        async def witness():
++            async with aiohttp.ClientSession() as client:
++                async def intercept_connection(request, *, traces, timeout):
++                    observed.append(request.ssl)
++                    raise ObservedBeforeNetwork
++
++                client.connector.connect = intercept_connection
++                saved = client.get
++                client.get = lambda *args, **kwargs: "local"
++                self.assertEqual(client.get("local-key", ssl=False), "local")
++                for value in (False, True):
++                    with self.assertRaises(ObservedBeforeNetwork):
++                        await saved("https://example.invalid", ssl=value)
++
++        asyncio.run(witness())
++        self.assertEqual(observed, [False, True])
++        (self.root / "aiohttp-native-witness.json").write_text(json.dumps({
++            "version": aiohttp.__version__, "request_ssl_options": observed,
++        }, indent=2), encoding="utf-8")
++
++    def public_scan(self, source, *, surface, format_, cache, label, skip_security=False, expected_cache=None):
++        output = self.root / label
++        output.mkdir()
++        env = {key: value for key, value in os.environ.items()
++               if not key.startswith(("UBS_", "XDG_"))}
++        env.update({"UBS_KEEP_TEMP": "1", "UBS_NO_AUTO_UPDATE": "1",
++                    "UBS_CACHE_DIR": str(cache), "ENABLE_UV_TOOLS": "0", "UBS_PROFILE": "1",
++                    "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(output),
++                    "UBS_ALLOW_UNVERIFIED_HELPERS": "0", "UBS_ALLOW_PARTIAL": "0"})
++        categories = [str(n) for n in range(1, 26) if n != (1 if skip_security else 7)]
++        entry = REPO_ROOT / ("ubs" if surface == "runner" else "modules/ubs-python.sh")
++        command = [str(entry), "--ci", "--fail-on-warning", "--no-color",
++                   f"--format={format_}", "--skip=" + ",".join(categories)]
++        if surface == "runner":
++            command.append("--only=python")
++        command.append(str(source))
++        started = time.monotonic()
++        proc = subprocess.run(command, text=True, capture_output=True, cwd=self.root,
++                              env=env, timeout=90)
++        (output / "stdout.log").write_text(proc.stdout, encoding="utf-8")
++        (output / "stderr.log").write_text(proc.stderr, encoding="utf-8")
++        (output / "command.json").write_text(json.dumps({
++            "command": command, "elapsed_s": time.monotonic() - started,
++            "exit": proc.returncode, "python": sys.executable, "python_version": sys.version,
++            "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
++            "entry_sha256": hashlib.sha256(entry.read_bytes()).hexdigest(),
++            "detector_sha256": hashlib.sha256((HELPERS_DIR / "ubs_core/py_detectors/tls_verification.py").read_bytes()).hexdigest(),
++            "binding_engine_sha256": hashlib.sha256((HELPERS_DIR / "ubs_core/py_detectors/http_timeout.py").read_bytes()).hexdigest(),
++            "environment": {key: value for key, value in env.items() if key.startswith(("UBS_", "XDG_"))},
++        }, indent=2), encoding="utf-8")
++        context = f"{command!r}\nexit={proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
++        self.assertIn(proc.returncode, (0, 1), context)
++        doc = json.loads(proc.stdout)
++        if format_ == "json":
++            self.assertEqual(doc["status"], "ok", context)
++            rule_key = "rule_id" if surface == "runner" else "rule"
++            target_rows = [row for row in doc.get("findings", []) if row[rule_key] == self.RULE]
++            self.assertTrue(all(row["severity"] == "critical" for row in target_rows), context)
++            if surface == "runner":
++                sites = sorted((Path(row["file"]), row["line"]) for row in target_rows)
++                self.assertTrue(all(row["col"] == 1 for row in target_rows), context)
++                self.assertEqual(doc.get("failed_modules", []), [], context)
++            else:
++                sites = sorted((Path(sample["file"]), sample["line"])
++                               for row in target_rows for sample in row["samples"])
++                self.assertEqual(sum(row["count"] for row in target_rows), len(sites), context)
++            totals = doc["totals"] if surface == "runner" else doc
++            self.assertEqual(totals["critical"], len(sites), context)
++            self.assertEqual(totals["warning"], 0, context)
++            self.assertEqual(totals["files"], 1, context)
++            if expected_cache is not None:
++                scanner = next(s for s in doc["scanners"] if s["language"] == "python") if surface == "runner" else doc
++                profile = scanner["extras"]["profile"]
++                self.assertEqual((profile["cache_hits"], profile["cache_misses"]), expected_cache, context)
++        else:
++            self.assertEqual(doc["version"], "2.1.0", context)
++            rows = [row for run in doc["runs"] for row in run.get("results", [])]
++            sites = []
++            for row in rows:
++                if row["ruleId"] != self.RULE:
++                    continue
++                self.assertEqual(row["level"], "error", context)
++                location = row["locations"][0]["physicalLocation"]
++                self.assertEqual(location["region"]["startColumn"], 1, context)
++                sites.append((sarif_location_path(location["artifactLocation"]["uri"], source.parent),
++                              location["region"]["startLine"]))
++            sites.sort()
++            self.assertEqual(sum(row.get("level") in {"warning", "error"} for row in rows), len(sites), context)
++            for run in doc["runs"]:
++                for invocation in run.get("invocations", []):
++                    self.assertIs(invocation["executionSuccessful"], True, context)
++        self.assertEqual(proc.returncode, int(bool(sites)), context)
++        return sites
++
++    @unittest.skipUnless(os.environ.get("UBS_RUN_TLS_RECEIVER_E2E") == "1",
++                         "set UBS_RUN_TLS_RECEIVER_E2E=1 for real module/runner qualification")
++    def test_public_module_runner_native_tls_locations_formats_and_category_selection(self):
++        for value, expected in (("False", [3]), ("True", [])):
++            source = self.root / ("public-" + value + ".py")
++            source.write_text('from requests import Session\nwith Session() as client:\n'
++                              f'    client.get("https://example.invalid", verify={value}, timeout=5)\n',
++                              encoding="utf-8")
++            for surface in ("module", "runner"):
++                for format_ in ("json", "sarif"):
++                    label = f"tls-receivers-{surface}-{format_}-{value}"
++                    with self.subTest(label=label):
++                        actual = self.public_scan(source, surface=surface, format_=format_,
++                                                  cache=self.root / (label + "-cache"), label=label)
++                        self.assertEqual(actual, [(source, line) for line in expected])
++        source = self.root / "public-False.py"
++        for format_ in ("json", "sarif"):
++            label = "tls-receivers-category-skipped-" + format_
++            self.assertEqual(self.public_scan(source, surface="runner", format_=format_,
++                                             cache=self.root / (label + "-cache"), label=label,
++                                             skip_security=True), [])
++
++    @unittest.skipUnless(os.environ.get("UBS_RUN_TLS_RECEIVER_E2E") == "1",
++                         "set UBS_RUN_TLS_RECEIVER_E2E=1 for real module/runner qualification")
++    def test_public_repeated_edits_and_exact_suppression_preserve_tls_results(self):
++        source = self.root / "public-changing.py"
++        prefix = 'import requests\nclient = requests.Session()\n'
++        cache = self.root / "public-changing-cache"
++        for label, statement, expected in (
++            ("cold", 'client.get("https://example.invalid", verify=False, timeout=5)', [3]),
++            ("repeat", 'client.get("https://example.invalid", verify=False, timeout=5)', [3]),
++            ("repaired", 'client.get("https://example.invalid", verify=True, timeout=5)', []),
++            ("suppressed", 'client.get("https://example.invalid", verify=False, timeout=5)  # ubs:ignore[py.security.tls-verification]', []),
++            ("other-rule", 'client.get("https://example.invalid", verify=False, timeout=5)  # ubs:ignore[py.security.http-timeout]', [3]),
++        ):
++            source.write_text(prefix + statement + "\n", encoding="utf-8")
++            with self.subTest(label=label):
++                actual = self.public_scan(source, surface="runner", format_="json", cache=cache,
++                                          label="tls-receivers-edit-" + label,
++                                          expected_cache=(1, 0) if label == "repeat" else (0, 1))
++                self.assertEqual(actual, [(source, line) for line in expected])
++
++
+ if __name__ == "__main__":
+     unittest.main()

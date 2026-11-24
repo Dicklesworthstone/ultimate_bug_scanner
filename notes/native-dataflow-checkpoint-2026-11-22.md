@@ -415,3 +415,80 @@ witnesses through DSR, run the real report/selection/suppression/partial-result
 matrix and affected Go cohorts, then refresh canonical pins/version and run
 the prescribed lint, full-suite and self-scan gates. Keep D6 and release
 qualification open; text reconstruction is not a substitute for these gates.
+
+## November 24 source review — Python TLS native client identities
+
+Bead: `ultimate_bug_scanner-python-tls-clients`.
+
+The production baseline is `34fcffa6744c4d15b0fc939b753ff29b31d9e599`.
+Its TLS detector misses a native Requests session call such as
+`client = requests.Session(); client.get(url, verify=False)`. Existing
+unscoped module/client sets also conflate response objects, unrelated receivers
+and the different libraries' option contracts. These are source-traced predicted
+accuracy defects; no executed baseline is claimed.
+
+Preserved candidate:
+
+- `test-suite/patches/python-tls-client-identities-candidate.patch`, Git blob
+  `3d3c7433f05c2177c8fa0c095bfa4922075caecb`.
+- Base detector: `modules/helpers/ubs_core/py_detectors/tls_verification.py`,
+  blob `d55b6466d72c9ae5602e52f0cbba5ea0572fdc5d`.
+- Base tests: `test-suite/quality/test_security_precision.py`,
+  blob `d35e0b8a9acc9ec07edbfb2c91c4457fbf6970ce`.
+- Exact reconstructed candidate source:
+  `009234f11d8a0c39efb107d917fbb9536757866b`; full tests:
+  `0dc8168c93759fac6dfa349bb5f424cd2c835002`.
+- Twenty-four new methods: 19 source regressions, three optional native-library
+  witnesses that stop before network activity, and two public methods specifying
+  15 real CLI calls. The public methods use `UBS_RUN_TLS_RECEIVER_E2E=1`.
+  No method or witness has run.
+
+The implementation reuses the established `HttpTimeoutAnalyzer` native-binding
+visitor and supplies separate TLS policies; the donor source is unchanged.
+Native constructors create client identities, response values do not, and saved
+bound methods retain their original identity after rebinding. The policy covers
+Requests session calls/defaults, aiohttp request options, HTTPX client/transport
+configuration, urllib3 certificate options, and native SSL contexts/factories.
+Foreign imports, lexical shadows and arbitrary lookalikes do not gain a native
+library's TLS contract.
+
+Independent review corrected Python literal equality collapsing Boolean False
+with numeric zero, including unary operations and both branch orders. Requests
+`send(..., verify=None)` and `session.verify = None` preserve a disabling None
+value, while ordinary `get/request(..., verify=None)` inherits the session
+default. Those operation-specific paths have source and no-network adapter
+controls. The Requests Session and HTTPAdapter implementations were inspected
+to check this distinction. Class comprehensions now separate their first
+iterable's class namespace from the body/later iterables; lambda varargs/kwargs
+mask outer identities; literal-false while bodies are excluded while else
+suites are retained.
+
+The public tests assert actual module/runner JSON/SARIF sites and severity,
+exit/status, category selection, file totals, cold/warm/edit cache counters and
+exact rule suppression. Existing tests and fixtures are unchanged; new fixture
+assertions require only real native configuration sites, excluding a previously
+borrowed global receiver inside an unrelated function parameter.
+
+Remaining bounds are explicit. Opaque `**kwargs`, arbitrary helpers/subclasses
+and external TLS policy are unproved. Loop analysis is one pass, so native client
+identity carried into a later iteration may be missed. Deferred/generator
+consumption is not fully modeled. Later comprehension target names are not all
+prebound before iterable analysis; for example, a later
+`for requests in requests.get(..., verify=False)` can borrow the outer import
+even though Python treats the target as a local and raises UnboundLocalError.
+These issues remain open; the candidate is not whole-program TLS verification.
+
+Root independently inspected the final source and tests, reconstructed both
+patch hunks forward and backward against the immutable originals, and matched
+the exact candidate blobs. Independent peers reviewed callable/argument capture,
+library semantics, scope corrections and the public harness. This verifies
+review and text reconstruction only. No Python syntax check, native witness,
+scanner/public CLI, cache test, DSR gate, lint or full-suite execution completed.
+
+Before activation, reproduce the misses and controls, run all new source/native
+and public methods through DSR with dependencies available, and run the affected
+TLS/timeout/security suites and prescribed full checks. Optional dependency
+skips must not be counted as native evidence. Refresh canonical helper pins and
+the development version for the qualified production edit. Until then the
+production detector, timeout engine, version and integrity pins remain unchanged,
+and the detector-quality and release umbrellas remain open.

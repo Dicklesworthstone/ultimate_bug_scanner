@@ -2390,6 +2390,35 @@ class SummarySubstitutionTests(unittest.TestCase):
 class LargeModuleBudgetTests(unittest.TestCase):
     """An unrelated definition writer cannot starve late security findings."""
 
+    def test_nested_schema_dependencies_are_collected_in_one_walk(self):
+        lines = ['def factory(parameter):']
+        for depth in range(1, 13):
+            lines.append('    ' * depth + f'class Level{depth}:')
+        indent = '    ' * 13
+        lines.extend([indent + '@decorate',
+                      indent + 'def member(value: Annotation = (lambda key=default: key)):',
+                      indent + '    return dependency(value)',
+                      '    def sibling(value=header):',
+                      '        return deferred_body',
+                      '    return Level1'])
+        scope = ast.parse('\n'.join(lines)).body[0]
+        walk = ast.walk
+        total_nodes = sum(1 for _ in walk(scope))
+        visits = 0
+
+        def counted_walk(root):
+            nonlocal visits
+            for node in walk(root):
+                visits += 1
+                yield node
+
+        with patch.object(ast, 'walk', counted_walk):
+            names = taint_py._used_names(scope)
+        self.assertEqual(names, {*(f'Level{depth}' for depth in range(1, 13)),
+                                 'parameter', 'member', 'decorate', 'Annotation', 'default',
+                                 'key', 'dependency', 'value', 'sibling', 'header'})
+        self.assertLessEqual(visits, total_nodes)
+
     def test_nested_writer_does_not_replay_module_once_per_dependency(self):
         for count in (32, 96):
             for unsafe in (True, False):
@@ -3992,6 +4021,18 @@ class PythonInputAdmissionTests(unittest.TestCase):
             findings.extend(project.findings())
         self.assertIn('incomplete', str(raised.exception))
         return findings, str(raised.exception)
+
+    def test_suppression_indexes_follow_sink_files_only(self):
+        clean = self.source('clean.py', '# noqa\nvalue = 1\n')
+        left = self.source('left.py', 'eval(input())  # noqa\neval(input())\n')
+        right = self.source('right.py', 'eval(input())\neval(input())  # ubs:ignore[py.taint.eval]\n')
+        with patch.object(taint_py, 'build_index', wraps=taint_py.build_index) as build:
+            self.assertEqual(list(taint_py.scan_file_findings(clean)), [])
+            findings = self.sites(taint_py._Project([left, clean, right], self.root).findings())
+        self.assertEqual(findings, [('left.py', 'py.taint.eval', 2, 1),
+                                    ('right.py', 'py.taint.eval', 1, 1)])
+        self.assertEqual([call.args[0] for call in build.call_args_list],
+                         [self.contents[path].decode() for path in (left, right)])
 
     def test_encodings_keep_real_taint_safe_values_and_suppressions(self):
         for name, prefix, line in (

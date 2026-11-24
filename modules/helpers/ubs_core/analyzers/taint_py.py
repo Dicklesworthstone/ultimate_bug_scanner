@@ -1931,18 +1931,15 @@ def _direct_global_reads_only(scope):
 def _used_names(scope, scope_nodes=None) -> set[str]:
     names = set()
     if scope_nodes is None:
-        scope_nodes = list(_scope_nodes(scope))
-    nodes = list(scope_nodes)
-    idx = 0
-    while idx < len(nodes):
-        node = nodes[idx]
-        idx += 1
-        if isinstance(node, ast.Name):
-            names.add(node.id)
-        elif isinstance(node, (ast.Global, ast.Nonlocal)):
-            names.update(node.names)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            names.add(node.name)
+        scope_nodes = _scope_nodes(scope)
+    nodes = []
+    # _scope_nodes stops at child definitions. Include their eager headers
+    # and full class subtrees. Each ast.walk already includes every
+    # descendant; expanding definitions inside those walks duplicates work
+    # exponentially for nested classes and defaults.
+    for node in scope_nodes:
+        nodes.append(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             for child in (*node.decorator_list, *node.args.defaults,
                           *(d for d in node.args.kw_defaults if d is not None)):
                 nodes.extend(ast.walk(child))
@@ -1956,9 +1953,15 @@ def _used_names(scope, scope_nodes=None) -> set[str]:
             for child in (*node.args.defaults, *(d for d in node.args.kw_defaults if d is not None)):
                 nodes.extend(ast.walk(child))
         elif isinstance(node, ast.ClassDef):
-            names.add(node.name)
             for child in ast.iter_child_nodes(node):
                 nodes.extend(ast.walk(child))
+    for node in nodes:
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
         elif isinstance(node, ast.ExceptHandler) and node.name:
             names.add(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -13089,12 +13092,17 @@ class _Project:
                 unresolved_predicates.append(engine.scope_diagnostic(engine.tree, str(exc)))
         diagnostics.extend(unresolved_predicates)
         starts = [offset for _, _, _, offset in self.sources]
-        indexes = {path: build_index(text, lang='python') for path, text, _, _ in self.sources}
+        # Traces are in virtual line order, so only the current sink's file
+        # needs a suppression index. Use the already-decoded source snapshot.
+        indexed_offset = None
         for (kind, line, column, label), trace in _sink_traces(effects):
-            path, _, _, offset = self.sources[bisect_right(starts, line - 1) - 1]
+            path, text, _, offset = self.sources[bisect_right(starts, line - 1) - 1]
+            if offset != indexed_offset:
+                index = build_index(text, lang='python')
+                indexed_offset = offset
             line -= offset
             rule = f'py.taint.{kind}'
-            if indexes[path].is_suppressed(line, rule) or indexes[path].is_suppressed(line, f'python.taint.{kind}'):
+            if index.is_suppressed(line, rule) or index.is_suppressed(line, f'python.taint.{kind}'):
                 continue
             yield path, rule, line, column, ' -> '.join((*trace.path, label))
         problems = []
@@ -13204,7 +13212,6 @@ _MESSAGE = {
 def scan_file_findings(path: Path):
     """Yield each reachable source-to-sink flow once at its sink location."""
     text, tree = _parse_source(path)
-    suppressions = build_index(text, lang='python')
     engine = _Analysis(tree)
     engine.source_path = path
     incomplete = None
@@ -13212,7 +13219,10 @@ def scan_file_findings(path: Path):
         effects = engine.analyze()
     except AnalysisLimit as exc:
         effects, incomplete = exc.effects, exc
-    for (kind, line, column, label), trace in _sink_traces(effects):
+    traces = _sink_traces(effects)
+    if traces:
+        suppressions = build_index(text, lang='python')
+    for (kind, line, column, label), trace in traces:
         rule = f'py.taint.{kind}'
         if suppressions.is_suppressed(line, rule) or suppressions.is_suppressed(line, f'python.taint.{kind}'):
             continue

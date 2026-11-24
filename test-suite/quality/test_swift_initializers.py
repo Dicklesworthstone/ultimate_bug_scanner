@@ -689,6 +689,105 @@ class SwiftInitializerTests(unittest.TestCase):
                 ''' % call, reason, '-' + label)
                 self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal' for row in findings))
 
+    def test_declaration_attributes_leave_stored_property_flow_intact(self):
+        self.check('''
+            import Foundation
+            final class Model: NSObject {
+                @available(iOS 15, *)
+                @MainActor @objc private(set) var path = ""
+                @MainActor func handle(req: Request) {
+                    path = req.query["path"]!
+                    _ = try? String(contentsOfFile: self.path) // unsafe
+                }
+            }
+        ''')
+
+    def test_custom_and_observed_setters_still_require_analysis_on_literal_writes(self):
+        cases = (
+            ('local-State', '''
+                import SwiftUI
+                @propertyWrapper struct State {
+                    var wrappedValue: String {
+                        get { return "" }
+                        set { record(newValue) }
+                    }
+                }
+                final class Model {
+                    @MainActor @State var path: String
+                    @MainActor func start(req: Request) {
+                        path = "/fixed"
+                        _ = try? String(contentsOfFile: req.query["other"]!)
+                    }
+                }
+            ''', 'wrapped stored property'),
+            ('generic-local', '''
+                @propertyWrapper struct Local<Value> {
+                    var wrappedValue: Value { didSet { record(wrappedValue) } }
+                }
+                final class Model {
+                    @Local<String> var path = ""
+                    func start(req: Request) {
+                        path = "/fixed"
+                        _ = try? String(contentsOfFile: req.query["other"]!)
+                    }
+                }
+            ''', 'wrapped stored property'),
+            ('observed-Published', '''
+                import Combine
+                final class Model {
+                    @Published var path = "" { didSet { record(path) } }
+                    func start(req: Request) {
+                        path = "/fixed"
+                        _ = try? String(contentsOfFile: req.query["other"]!)
+                    }
+                }
+            ''', 'property observer'),
+        )
+        for label, source, reason in cases:
+            with self.subTest(case=label):
+                findings = self.unsupported(source, reason, '-' + label)
+                self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal'
+                                    for row in findings), findings)
+
+    def test_framework_wrapper_identity_respects_the_import_and_qualifier(self):
+        source = '''
+            import %s
+            final class Model {
+                @%s private var path = ""
+                func handle(req: Request) {
+                    path = req.query["path"]!
+                    _ = try? String(contentsOfFile: path) // unsafe
+                }
+            }
+        '''
+        for module, wrapper in (('SwiftUI', 'SwiftUI.State'), ('SwiftUI', 'SwiftUI.State<String>'),
+                                ('Combine', 'Published<String>')):
+            with self.subTest(wrapper=wrapper):
+                self.check(source % (module, wrapper), suffix='-' + wrapper.replace('<String>', '-String'))
+        self.unsupported(source % ('VendorKit', 'State'), 'wrapped stored property', '-vendor')
+
+    def test_framework_wrapper_writes_that_need_accessor_analysis(self):
+        for wrapper, declaration, assignment in (
+            ('Binding', '@Binding var path: String', '= req.query["path"]!'),
+            ('AppStorage', '@AppStorage("path") var path = ""', '= req.query["path"]!'),
+            ('State', '@State var path = ""', '+= "/fixed"'),
+        ):
+            with self.subTest(wrapper=wrapper):
+                findings = self.unsupported('''
+                    import SwiftUI
+                    struct Model {
+                        %s
+                        func handle(req: Request) {
+                            path %s
+                            _ = try? String(contentsOfFile: req.query["other"]!)
+                        }
+                    }
+                ''' % (declaration, assignment), 'wrapped stored property', '-' + wrapper)
+                self.assertTrue(any(row['rule'] == 'swift.taint.analysis-limited' and row['line'] == 5
+                                    for row in findings), findings)
+                self.assertTrue(any(row['rule'] == 'swift.taint.request_path_traversal' and row['line'] == 6
+                                    for row in findings), findings)
+
     def test_many_independent_fields_remain_within_the_default_budget(self):
         declarations = '\n'.join('let field%d: String' % index for index in range(48))
         arguments = ', '.join('field%d: %s' % (index, 'req.query["path"]!' if index == 47 else '"/fixed"')

@@ -282,6 +282,76 @@ class SwiftFunction:
     generic: bool = False
 
 
+SWIFT_NONSTORAGE_ATTRIBUTES = frozenset({
+    'MainActor', '_Concurrency.MainActor', 'available', 'objc', 'nonobjc', 'IBOutlet',
+})
+SWIFT_FRAMEWORK_WRAPPERS = {
+    'SwiftUI.State': 'State', 'Combine.Published': 'Published',
+    'SwiftUI.Binding': 'Binding', 'SwiftUI.AppStorage': 'AppStorage',
+}
+SWIFT_WRAPPED_PROPERTY_REASON = 'Swift wrapped stored property needs initialization/accessor analysis'
+
+
+def swift_wrapper_scope(tokens):
+    """Resolve framework wrapper names using imports and same-file declarations."""
+    shadows, imports = set(), set()
+    type_kinds = {'struct', 'class', 'enum', 'actor', 'protocol', 'typealias', 'associatedtype', 'macro'}
+    cursor, conditional_depth = 0, 0
+    while cursor + 1 < len(tokens):
+        kind = tokens[cursor].value
+        cursor += 1
+        if kind == '#' and tokens[cursor].value == 'if':
+            conditional_depth += 1
+        elif kind == '#' and tokens[cursor].value == 'endif':
+            conditional_depth = max(0, conditional_depth - 1)
+        elif kind in type_kinds:
+            shadows.add(tokens[cursor].value)
+        if kind != 'import':
+            continue
+        scoped = tokens[cursor].value in type_kinds | {'func', 'let', 'var'}
+        if scoped:
+            cursor += 1
+        start = cursor
+        while cursor + 2 < len(tokens) and tokens[cursor + 1].value == '.':
+            cursor += 2
+        path = swift_text(tokens[start:cursor + 1])
+        if not conditional_depth:
+            imports.add(path)
+        if scoped and path not in SWIFT_FRAMEWORK_WRAPPERS and path not in SWIFT_NONSTORAGE_ATTRIBUTES:
+            shadows.add(path.rsplit('.', 1)[-1])
+        cursor += 1
+    visible = dict(SWIFT_FRAMEWORK_WRAPPERS)
+    for path, name in SWIFT_FRAMEWORK_WRAPPERS.items():
+        if path in imports or path.split('.')[0] in imports or (name == 'Published' and 'SwiftUI' in imports):
+            visible[name] = name
+    return shadows, visible
+
+
+def swift_attribute_name(tokens, start):
+    """Read the qualified name and consume its optional type specialization."""
+    cursor = start + 1
+    while True:
+        name_end = cursor
+        if cursor < len(tokens) and tokens[cursor].value == '<':
+            depth = 1
+            cursor += 1
+            while cursor < len(tokens) and depth:
+                token = tokens[cursor]
+                if token.kind == 'code':
+                    if token.value == '<':
+                        depth += 1
+                    elif token.value == '>':
+                        depth -= 1
+                cursor += 1
+            if depth:
+                raise ValueError('Unterminated Swift attribute generic arguments; analysis is incomplete')
+        if cursor + 1 >= len(tokens) or tokens[cursor].value != '.':
+            # Only the final component's type arguments specialize the wrapper
+            # itself. Keep a generic qualifier as part of its nominal identity.
+            return swift_text(tokens[start:name_end]), cursor
+        cursor += 2
+
+
 class SwiftParser:
     def __init__(self, text, tokens=None, suppressed=frozenset(), obligation=None, *, recover=False):
         self.tokens = swift_validated_tokens(text) if tokens is None else tokens
@@ -292,6 +362,9 @@ class SwiftParser:
                                   if left.value in {'typealias', 'associatedtype'}}
         self.type_alias_names = {right.value for left, right in zip(code, code[1:])
                                 if left.value == 'typealias'}
+        # A local declaration or alias can shadow a framework attribute (or
+        # its module qualifier), even when it occurs after the property.
+        self.attribute_type_names, self.visible_wrappers = swift_wrapper_scope(code)
         self.suppressed = suppressed
         self.obligation = obligation
         self.recover, self.diagnostics = recover, []
@@ -300,6 +373,7 @@ class SwiftParser:
         self.fields, self.field_functions = {}, {}
         self.opaque_fields = {}
         self.stored_fields, self.type_declarations = {}, {}
+        self.framework_wrapped_fields = {}
         self.initialization_limits = {}
         self.generic_types = set()
         self.enum_cases = {}
@@ -380,19 +454,22 @@ class SwiftParser:
                 continue
             start = cursor
             modifiers = {'public', 'private', 'fileprivate', 'internal', 'open', 'final', 'static', 'class', 'mutating', 'nonmutating', 'override', 'nonisolated', 'indirect', 'required', 'convenience', 'lazy', 'weak', 'unowned'}
-            head = cursor
-            while head < len(tokens) and tokens[head].value == '@':
-                head += 2
+            head, attributes, prefix = cursor, [], set()
+            while head < len(tokens):
+                if tokens[head].value == '@' and head + 1 < len(tokens):
+                    attribute, head = swift_attribute_name(tokens, head + 1)
+                    attributes.append(attribute)
+                elif tokens[head].value in modifiers:
+                    if tokens[head].value == 'class' and head + 1 < len(tokens) and tokens[head + 1].value != 'func':
+                        break
+                    prefix.add(tokens[head].value)
+                    head += 1
+                else:
+                    break
                 if head < len(tokens) and tokens[head].value == '(':
                     head = swift_close(tokens, head) + 1
                 while head < len(tokens) and tokens[head].value == '\n':
                     head += 1
-            while head < len(tokens) and tokens[head].value in modifiers:
-                if tokens[head].value == 'class' and head + 1 < len(tokens) and tokens[head + 1].value != 'func':
-                    break
-                head += 1
-                if head < len(tokens) and tokens[head].value == '(':
-                    head = swift_close(tokens, head) + 1
             constructor = (declarations and owner and head < len(tokens)
                            and tokens[head].value in {'init', 'deinit'})
             if head < len(tokens) and (tokens[head].value == 'func' or constructor):
@@ -464,7 +541,7 @@ class SwiftParser:
                 finish = swift_close(tokens, body_start)
                 key = tokens[head].start
                 function = SwiftFunction(key, name, owner, scope, tuple(parameters),
-                                         static=any(token.value in {'static', 'class'} for token in tokens[start:head]),
+                                         static=bool(prefix & {'static', 'class'}),
                                          parameter_attributes=tuple(parameter_attributes), generic=generic)
                 result_type = swift_parts(tokens[close + 1:body_start], {'->'})
                 if len(result_type) == 2:
@@ -495,7 +572,7 @@ class SwiftParser:
                         base = name.split('<', 1)[0]
                         self.generic_types.update((base, '.'.join((*owner, base))))
                         self.types.update((base, '.'.join((*owner, base))))
-                if kind in {'struct', 'enum'} or any(token.value == 'final' for token in tokens[start:head]):
+                if kind in {'struct', 'enum'} or 'final' in prefix:
                     self.final_types.add(name)
                     self.final_types.add('.'.join((*owner, name)))
                 if kind in {'struct', 'enum'}:
@@ -601,7 +678,10 @@ class SwiftParser:
                 statements.append(SwiftStatement('closure', tuple(tokens[start:finish + 1])))
                 cursor = finish + 1
                 continue
-            finish = self.statement_end(tokens, start)
+            # Attributes and modifiers may occupy their own lines. Keep the
+            # entire field declaration attached to its prefix in that case.
+            field_declaration = declarations and owner and head < len(tokens) and tokens[head].value in {'let', 'var'}
+            finish = self.statement_end(tokens, head if field_declaration else start)
             part = tuple(tokens[start:finish])
             cursor = finish + 1
             if not part:
@@ -634,12 +714,17 @@ class SwiftParser:
                     field_name = tokens[head + 1].value
                     declaration = swift_parts(tuple(tokens[head + 2:finish]), {'='})
                     field_type = swift_text(declaration[0][1:]) if declaration[0] and declaration[0][0].value == ':' else ''
-                    self.fields.setdefault(owner, {})[field_name] = field_type
+                    owner_fields = self.fields.setdefault(owner, {})
+                    duplicate = field_name in owner_fields
+                    if duplicate:
+                        # Conditional declarations can select different setters.
+                        self.framework_wrapped_fields.pop((owner, field_name), None)
+                    owner_fields[field_name] = field_type
                     stored = len(declaration) == 2 or not any(t.value == '{' and t.kind == 'code' for t in declaration[0])
-                    if stored and not any(t.value in {'static', 'class'} for t in tokens[start:head]):
-                        prefix = {t.value for t in tokens[start:head]}
-                        reason = ('Swift wrapped stored property needs initialization/accessor analysis'
-                                  if '@' in prefix else
+                    if stored and not prefix & {'static', 'class'}:
+                        wrappers = [attr for attr in attributes if attr not in SWIFT_NONSTORAGE_ATTRIBUTES
+                                    or attr.split('.')[0] in self.attribute_type_names]
+                        reason = (SWIFT_WRAPPED_PROPERTY_REASON if wrappers else
                                   'Swift lazy stored property needs deferred initialization analysis'
                                   if 'lazy' in prefix else '')
                         if len(declaration) > 2:
@@ -649,6 +734,13 @@ class SwiftParser:
                             reason = 'Swift property observer needs assignment binding analysis'
                         if len(declaration) == 2 and any(t.value == 'self' and t.kind == 'code' for t in declaration[1]):
                             reason = 'Swift stored initializer with self needs initialization-order analysis'
+                        if duplicate and not reason:
+                            previous = self.stored_fields.get(owner, {}).get(field_name)
+                            reason = previous[4] if previous else 'Swift conditional stored property needs assignment binding analysis'
+                        if (not duplicate and reason == SWIFT_WRAPPED_PROPERTY_REASON and len(wrappers) == 1
+                                and wrappers[0] in self.visible_wrappers
+                                and wrappers[0].split('.')[0] not in self.attribute_type_names):
+                            self.framework_wrapped_fields[owner, field_name] = self.visible_wrappers[wrappers[0]]
                         self.stored_fields.setdefault(owner, {})[field_name] = (
                             field_type, declaration[1] if len(declaration) == 2 else (),
                             tokens[head].value == 'var', tokens[head + 1], reason)
@@ -658,7 +750,7 @@ class SwiftParser:
                         field_key = tokens[head].start
                         initializer = SwiftFunction(field_key, '<field:' + field_name + '>', owner, scope, (),
                                                     (SwiftStatement('return', declaration[1]),),
-                                                    static=any(token.value in {'static', 'class'} for token in tokens[start:head]))
+                                                    static=bool(prefix & {'static', 'class'}))
                         self.functions[field_key] = initializer
                         self.field_functions[(owner, field_name)] = field_key
                         statements.append(SwiftStatement('definition', part, extra=(field_key,)))
@@ -700,7 +792,7 @@ class SwiftParser:
                         continue
                     accessor_key = tokens[start].start
                     accessor = SwiftFunction(accessor_key, tokens[head + 1].value, owner, scope, (),
-                                             static=any(token.value in {'static', 'class'} for token in tokens[start:head]))
+                                             static=bool(prefix & {'static', 'class'}))
                     self.functions[accessor_key] = accessor
                     self.field_functions[(owner, tokens[head + 1].value)] = accessor_key
                     accessor.body = self.block(body_tokens, owner, (*scope, accessor_key), depth=depth + 1)
@@ -1841,6 +1933,14 @@ class SwiftEngine:
         for owner in owners:
             reason = self.parser.stored_fields[owner][name][4]
             if reason:
+                wrapper = self.parser.framework_wrapped_fields.get((owner, name))
+                # State and Published expose the assigned value through the
+                # wrapped property. Keep its provenance in the ordinary weak
+                # field update. Binding and AppStorage can forward a write to
+                # other storage, so retain the refusal for incoming data there.
+                if operator == '=' and wrapper and (
+                        wrapper in {'State', 'Published'} or not swift_request_dependency(value)):
+                    continue
                 value = join(value, self.limitation(reason, offset, state))
         if operator != '=':
             value = self.forget(join(value, self.project_field(name, receiver) or CLEAN))
@@ -2561,21 +2661,25 @@ class SwiftEngine:
             if projected is not None:
                 if any(trace.kind == 'unknown-layout' for trace in swift_top(receiver)):
                     shadowed = self.parser.types | self.parser.shadow_type_names
-                    plain_strings = True
+                    plain_scalars = True
                     for owner in owners:
                         declaration, default, _, _, reason = self.parser.stored_fields[owner][name]
                         selected = declaration.rstrip('?!')
-                        if not selected and len(default) == 1 and default[0].kind in {'literal', 'template'}:
-                            selected = 'String'
-                        native = (selected == 'String' and 'String' not in shadowed
-                                  or selected == 'Swift.String' and 'Swift' not in shadowed)
-                        if reason or not native:
-                            plain_strings = False
+                        if not selected and len(default) == 1:
+                            if default[0].kind in {'literal', 'template'}:
+                                selected = 'String'
+                            elif default[0].kind == 'code' and default[0].value in {'true', 'false'}:
+                                selected = 'Bool'
+                        native = (selected in {'String', 'Bool'} and selected not in shadowed
+                                  or selected in {'Swift.String', 'Swift.Bool'} and 'Swift' not in shadowed)
+                        wrapper = self.parser.framework_wrapped_fields.get((owner, name))
+                        if (reason and wrapper not in {'State', 'Published'}) or not native:
+                            plain_scalars = False
                             break
-                    if not plain_strings:
-                        # Native String writes retain their source alternatives
-                        # through the ordinary weak field/alias update. Other
-                        # unknown fields can hide dispatch or Request shapes.
+                    if not plain_scalars:
+                        # String and Bool keep their source alternatives through
+                        # a weak field update. Other incoming fields may hide
+                        # callable dispatch or Request shapes.
                         projected = join(projected, frozenset({Trace('opaque-value', ())}), self.limitation(
                             'Swift mixed incoming stored property needs value binding analysis', token.start))
                 if not projected:

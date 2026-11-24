@@ -373,6 +373,67 @@ class SwiftProductionCompletenessTests(unittest.TestCase):
                 self.assertTrue(diagnostics, payload)
                 self.assertTrue(all(item['severity'] == 'warning' for item in diagnostics), diagnostics)
 
+    def test_swiftui_loader_and_published_flag_complete_with_local_request(self):
+        project = self.artifacts / 'swiftui-loader'
+        project.mkdir()
+        (project / 'Screen.swift').write_text(textwrap.dedent('''
+            import SwiftUI
+            struct Screen: View {
+                @State private var busy = false
+                var body: some View { Text(busy ? "Loading" : "Idle") }
+                func load(_ url: URL) async {
+                    busy = true
+                    if busy { print("Loading") }
+                    let request = URLRequest(url: url)
+                    _ = try? await URLSession.shared.data(for: request)
+                    busy = false
+                }
+            }
+        ''').lstrip('\n'), encoding='utf-8')
+        (project / 'Model.swift').write_text(textwrap.dedent('''
+            import Foundation
+            import Combine
+            final class Model: ObservableObject {
+                @Published var busy: Bool = false
+                func start() {
+                    self.busy = true
+                    if self.busy { print("Loading") }
+                    let request = 1
+                    _ = request
+                    _ = FileManager.default
+                }
+            }
+        ''').lstrip('\n'), encoding='utf-8')
+        result, payload = self.scan(project, 'json', 'swiftui-loader-report')
+        self.assert_complete(payload, 'json', 2)
+        self.assertEqual(result.returncode, 0, payload)
+        self.assertFalse(any(item['rule'].startswith('swift.taint.')
+                             for item in payload['scanners'][0]['findings']), payload)
+
+    def test_request_written_to_published_field_reports_critical_with_complete_receipt(self):
+        project = self.artifacts / 'published-path'
+        project.mkdir()
+        source = textwrap.dedent('''
+            import Foundation
+            import Combine
+            import Vapor
+            final class Model: ObservableObject {
+                @Published var path = ""
+                func handle(req: Request) -> String? {
+                    path = req.query["path"]!
+                    return try? String(contentsOfFile: path)
+                }
+            }
+        ''').lstrip('\n')
+        (project / 'Model.swift').write_text(source, encoding='utf-8')
+        result, payload = self.scan(project, 'json', 'published-path-report')
+        self.assert_complete(payload, 'json', 1)
+        self.assertEqual(result.returncode, 1, payload)
+        self.assertEqual([(item['rule'], item['line'], item['severity'])
+                          for item in payload['scanners'][0]['findings']
+                          if item['rule'].startswith('swift.taint.')],
+                         [('swift.taint.request_path_traversal', 8, 'critical')])
+
     def test_unknown_callback_input_is_diagnosed_without_hiding_known_following_flow(self):
         project = self.artifacts / 'opaque-callback'
         project.mkdir()

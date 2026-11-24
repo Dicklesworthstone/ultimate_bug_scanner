@@ -10181,6 +10181,10 @@ class _Flow:
             self.write_name(state, node.name, CLEAN, node, frozenset({node}))
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for alias in node.names:
+                # Loading a module or resolving a from-import can raise before
+                # this name is bound. Earlier names in a multi-import have
+                # already been assigned on this exceptional edge.
+                self.possible_exception(state)
                 local = alias.asname or alias.name.split('.')[0]
                 imported = (self.engine.project.imported(self.engine, node, alias, state)
                             if self.engine.project is not None else None)
@@ -10950,6 +10954,25 @@ class _Analysis:
             child, parent = parent, self.parents.get(parent)
         return None
 
+    def optional_import_initializer(self, binders):
+        """Return the top-level try that binds a name on both continuing edges."""
+        if len(binders) != 2:
+            return None
+        imported = next((node for node in binders if isinstance(node, (ast.Import, ast.ImportFrom))), None)
+        fallback = next((node for node in binders if isinstance(node, ast.Name)), None)
+        block = self.parents.get(imported)
+        if (not isinstance(block, ast.Try) or block not in self.tree.body or block.body != [imported]
+                or len(imported.names) != 1 or block.orelse or block.finalbody or len(block.handlers) != 1):
+            return None
+        handler = block.handlers[0]
+        assignment = self.parents.get(fallback)
+        if (handler.name or not isinstance(handler.type, ast.Name) or handler.type.id != 'ImportError'
+                or handler.body != [assignment] or not isinstance(assignment, ast.Assign)
+                or assignment.targets != [fallback] or not isinstance(assignment.value, ast.Constant)
+                or assignment.value.value is not None):
+            return None
+        return block
+
     def generator_stable_binding(self, name, scope, creation=None, *, immediate=False):
         """Prove a delayed read cannot observe a later lexical rebinding."""
         if name in self.generator_external_writers:
@@ -10961,7 +10984,7 @@ class _Analysis:
         if not binders:
             return False
         if owner is self.tree:
-            if self.generator_namespace_exposed or len(binders) != 1 or creation is None:
+            if self.generator_namespace_exposed or creation is None:
                 return False
             engines = ((engine for _path, _text, engine, _offset in self.project.sources)
                        if self.project is not None else (self,))
@@ -10974,14 +10997,22 @@ class _Analysis:
                    and self in self.project.import_dependencies.get(engine, ())
                    for engine in engines):
                 return False
-            binder = binders[0]
-            statement = binder if isinstance(binder, ast.stmt) else self.parents.get(binder)
-            # A single top-level initialization is stable; a conditional or
-            # repeated binding is not certified by mere source ordering.
-            if (statement not in self.tree.body or isinstance(binder, ast.Name)
-                    and (not isinstance(statement, (ast.Assign, ast.AnnAssign))
-                         or not isinstance(binder.ctx, ast.Store))):
-                return False
+            if len(binders) == 1:
+                binder = binders[0]
+                statement = binder if isinstance(binder, ast.stmt) else self.parents.get(binder)
+                if (statement not in self.tree.body or isinstance(binder, ast.Name)
+                        and (not isinstance(statement, (ast.Assign, ast.AnnAssign))
+                             or statement.value is None or not isinstance(binder.ctx, ast.Store))):
+                    return False
+            else:
+                # The import and its None fallback are mutually exclusive.
+                # A later generator can observe either joined value, but the
+                # slot cannot change between yields after this try finishes.
+                statement = self.optional_import_initializer(binders)
+                if statement is None or any(engine.generator_execution_capabilities
+                                            or engine.generator_literal_authority_exposed
+                                            for engine in self.generator_peers):
+                    return False
             # The original AST owns the execution position; normalized call
             # views are not independent allocation/initialization evidence.
             original = self.original_calls.get(creation, creation)

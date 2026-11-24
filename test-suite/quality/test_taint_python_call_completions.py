@@ -219,6 +219,22 @@ class CoroutineProcessIntegrationTests(SourceTest):
 
 
 class CallCompletionTests(SourceTest):
+    def test_import_failure_continues_through_the_handler(self):
+        for statement in ('import optional_backend', 'from optional_backend import renderer'):
+            for fallback, expected in (('input()', ('xss',)), ("'fixed'", ())):
+                with self.subTest(statement=statement, fallback=fallback):
+                    self.assert_rules(f"try:\n    {statement}\n    text='normal'\n"
+                                      f"except ImportError:\n    text={fallback}\nHttpResponse(text)\n",
+                                      *expected)
+
+    def test_later_import_failure_preserves_previously_imported_value(self):
+        for imports, expected in (('environ as settings, missing', ('xss',)),
+                                  ('environ as settings', ())):
+            with self.subTest(imports=imports):
+                self.assert_rules("settings = {}\ntry:\n    from os import " + imports
+                                  + "\nexcept ImportError:\n    HttpResponse(settings.get('KEY'))\n",
+                                  *expected)
+
     def test_exception_prefix_keeps_global_before_later_clean_write(self):
         for incoming, expected in (('input()', [10]), ("'fixed'", [])):
             with self.subTest(incoming=incoming):
@@ -822,6 +838,21 @@ except ValueError as error:
 
 
 class GeneratorResumeTests(SourceTest):
+    def test_generator_observes_a_completed_optional_import(self):
+        for source, expected in (("backend.getenv('KEY')", ('xss',)), ("'fixed'", ())):
+            with self.subTest(source=source):
+                self.assert_rules("try:\n    import os as backend\nexcept ImportError:\n    backend=None\n"
+                                  f"def values():\n    yield {source}\n    yield 'fixed' if backend else ''\n"
+                                  "for value in values():\n    HttpResponse(value)\n", *expected)
+
+    def test_optional_import_can_still_be_replaced_after_generator_creation(self):
+        for replacement in ('backend = another_module', 'namespace = globals()'):
+            with self.subTest(replacement=replacement), self.assertRaisesRegex(
+                    taint_py.AnalysisLimit, 'generator live global reads'):
+                self.scan("try:\n    import os as backend\nexcept ImportError:\n    backend=None\n"
+                          "def values():\n    yield backend.getenv('KEY')\n    yield 'fixed'\n"
+                          f"cursor = values()\n{replacement}\nfor value in cursor:\n    HttpResponse(value)\n")
+
     def assert_sites(self, source, *lines):
         findings = self.scan(source)
         self.assertEqual(sorted((item['rule'], item['line']) for item in findings),

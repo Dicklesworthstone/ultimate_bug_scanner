@@ -1190,16 +1190,62 @@ class KeepTempCliTests(unittest.TestCase):
                                     isinstance(doc.get("findings"), list) for doc in documents),
                                 "JSON findings report was not retained\n" + context)
 
-    def test_unsupported_swift_refuses_before_module_execution(self) -> None:
-        source = self.source("Unsupported.swift", 'struct Unsupported {}\n')
+    def test_swift_retains_guard_findings_and_source_list(self) -> None:
+        source = self.source("Measurement.swift",
+            'func measure(value: String?) {\n    if value == nil { log() }\n    show(value!)\n}\n')
+        for direct in (False, True):
+            with self.subTest(direct_module=direct):
+                if direct:
+                    result, observations, run = self.run_scan(
+                        "swift", source, "--format=json", "--fail-on-warning", str(source),
+                        command_mode="--keep-temp", direct_module=True,
+                        environment={"UBS_KEEP_TEMP": "0"})
+                else:
+                    result, observations, run = self.run_scan("swift", source)
+                context = f"{run}\n{result.stdout}\n{result.stderr}"
+                self.assertEqual(result.returncode, 1, context)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["status"], "ok", context)
+                key = "rule" if direct else "rule_id"
+                self.assertTrue(any(row.get(key) == "swift.narrowing.negative_nil_guard"
+                                    and row["line"] == 3 and row["severity"] == "warning"
+                                    for row in report["findings"]), context)
+                retained = [path for path in (run / "tmp").rglob("*") if path.is_file()]
+                self.assertTrue(any(path.read_bytes() == os.fsencode(source) + b"\0"
+                                    for path in retained), context)
+                self.assertTrue(observations["created_paths"], context)
+
+    def test_swift_text_retains_core_results_when_external_tool_would_run(self) -> None:
+        source = self.source("Optional.swift", "if value == nil { log() }\nshow(value!)\n")
+        tool = self.root / "swiftlint"
+        marker = self.root / "optional-launched"
+        tool.write_text(f'#!/bin/sh\ntouch "{marker}"\n', encoding="utf-8")
+        tool.chmod(0o755)
+        summary = self.root / "summary.json"
+        result, _, run = self.run_scan(
+            "swift", source, "--format=text", f"--summary-json={summary}", str(source),
+            command_mode="--ci", direct_module=True,
+            environment={"PATH": str(self.root) + os.pathsep + os.environ["PATH"]})
+        context = f"{run}\n{result.stdout}\n{result.stderr}"
+        self.assertEqual(result.returncode, 2, context)
+        self.assertFalse(marker.exists(), context)
+        report = json.loads(summary.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "partial", context)
+        self.assertIn("swiftlint", report["message"], context)
+        self.assertIn("SCAN INCOMPLETE", result.stdout, context)
+        self.assertTrue(any(row.get("rule") == "swift.narrowing.negative_nil_guard"
+                            and row["line"] == 2 for row in report["findings"]), context)
+
+    def test_unsupported_elixir_refuses_before_module_execution(self) -> None:
+        source = self.source("unsupported.ex", 'defmodule Unsupported do\nend\n')
         (source.parent / "supported.py").write_text(CASES["python"][3], encoding="utf-8")
-        for languages, target in (("swift", source), ("python,swift", source.parent)):
+        for languages, target in (("elixir", source), ("python,elixir", source.parent)):
             with self.subTest(languages=languages):
                 result, observations, run = self.run_scan(languages, target)
                 context = f"{run}\n{result.stdout}\n{result.stderr}"
                 self.assertEqual(result.returncode, 2, context)
                 self.assertIn("UBS_KEEP_TEMP", result.stderr + result.stdout, context)
-                self.assertIn("swift", (result.stderr + result.stdout).lower(), context)
+                self.assertIn("elixir", (result.stderr + result.stdout).lower(), context)
                 self.assertEqual(json.loads(result.stdout)["reason"],
                                  "retention-unsupported-language", context)
                 self.assertFalse(any(re.search(r"ubs-[a-z]+\.sh", line)

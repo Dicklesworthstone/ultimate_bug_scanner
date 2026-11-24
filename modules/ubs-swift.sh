@@ -60,7 +60,7 @@ shopt -s lastpipe 2>/dev/null || true
 # Centralized cleanup & robust error handler
 KEEP_TEMP=${UBS_KEEP_TEMP:-0}
 TEMP_PATHS=()
-cleanup_add() { [[ -n "${1:-}" ]] && TEMP_PATHS+=("$1"); }
+cleanup_add() { TEMP_PATHS+=("$@"); }
 
 # Invoked by the EXIT trap below; ShellCheck does not count trap callbacks.
 # shellcheck disable=SC2329
@@ -194,7 +194,8 @@ Options:
   --list-rules               Print embedded ast-grep rule IDs and exit
   --dump-rules=DIR           Write the merged ast-grep rules to DIR and exit
   --explain-rule=ID          Print YAML for a rule id and exit
-  --keep-temp                Keep temporary files (debugging)
+  --keep-temp                Retain scanner scratch. In text mode, installed
+                             optional tools with unretained scratch report partial coverage.
 
   --timeout-seconds=N        Global per-tool timeout budget
   --baseline=FILE            Compare against a previous run's summary JSON
@@ -285,6 +286,10 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$KEEP_TEMP" == 1 ]]; then
+  export UBS_KEEP_TEMP=1 PYTHONDONTWRITEBYTECODE=1
+fi
 
 if [[ "${UBS_PROFILE:-}" == "loose" ]]; then
   SKIP_CATEGORIES="$(csv_add_unique "$SKIP_CATEGORIES" "11")"
@@ -536,17 +541,31 @@ run_xcodebuild_analyze(){
   fi
 }
 
+swift_retention_blockers(){
+  local tool
+  for tool in swiftlint swiftformat; do
+    if command -v "$tool" >/dev/null 2>&1; then printf '%s\n' "$tool"; fi
+  done
+  if [[ -d "$PROJECT_DIR" ]] && command -v periphery >/dev/null 2>&1; then
+    printf '%s\n' periphery
+  fi
+  if command -v xcodebuild >/dev/null 2>&1 &&
+     [[ -n "$(find "$PROJECT_DIR" -maxdepth 6 \( -name '*.xcworkspace' -o -name '*.xcodeproj' \) -print -quit 2>/dev/null)" ]]; then
+    printf '%s\n' xcodebuild
+  fi
+}
+
 validate_v2_completion_swift(){
   local sink="$1" list_file="$2" scan_exit="$3" completion_out="$4" json_out="$5" text_out="$6"
   local files_n
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
   python3 - "$sink" "$files_n" "$scan_exit" "$completion_out" "$json_out" "$text_out" \
-    "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" "$VERSION" <<'PYCOMPLETE'
+    "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}" "$VERSION" "${7:-}" <<'PYCOMPLETE'
 import json
 import sys
 from pathlib import Path
 
-sink, files_raw, exit_raw, completion, json_out, text_out, project, version = sys.argv[1:]
+sink, files_raw, exit_raw, completion, json_out, text_out, project, version, blocked = sys.argv[1:]
 files_n = int(files_raw)
 incomplete = int(exit_raw) not in (0, 1)
 records = []
@@ -581,9 +600,9 @@ try:
                         for key, value in expected.items()))
 except (OSError, ValueError, RecursionError):
     complete = False
-incomplete = incomplete or not complete
+incomplete = incomplete or not complete or bool(blocked)
 if incomplete:
-    message = receipt.get("message", "") if isinstance(receipt, dict) else ""
+    message = blocked or (receipt.get("message", "") if isinstance(receipt, dict) else "")
     if not isinstance(message, str) or not message:
         message = f"Swift analysis did not complete (analyzer exit {exit_raw}); no valid complete report"
     sys.stderr.write("ubs-swift: analysis incomplete: " + message + "\n")
@@ -690,8 +709,15 @@ generate(Path('$ast_rule_dir'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' else 
   PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core.swift_scan \
     "${scan_args[@]}" --max-detailed "$MAX_DETAILED" --version "$VERSION" || exit_code=$?
 
+  local blocked="" tools=""
+  if [[ "$FORMAT" == text && "$KEEP_TEMP" == 1 && "$exit_code" -le 1 ]]; then
+    tools="$(swift_retention_blockers | paste -sd, -)"
+    if [[ -n "$tools" ]]; then
+      blocked="UBS_KEEP_TEMP=1 cannot retain external Swift analyzer scratch: $tools"
+    fi
+  fi
   validate_v2_completion_swift "$sink" "$list_file" "$exit_code" "$completion_out" \
-    "$v2_json_out" "$text_out" || exit_code=2
+    "$v2_json_out" "$text_out" "$blocked" || exit_code=2
 
   if [[ -n "$text_out" && "$FORMAT" == "text" ]]; then
     cat "$text_out" 2>/dev/null || true

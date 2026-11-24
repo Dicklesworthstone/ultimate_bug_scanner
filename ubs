@@ -101,7 +101,7 @@ if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
   unset _ubs_arg
 fi
 
-UBS_VERSION="5.5.135"
+UBS_VERSION="5.5.136"
 # Installed releases prepare a complete, version-bound cache before publication.
 # This literal marker is parsed as data by the updater, never evaluated remotely.
 UBS_RELEASE_GENERATIONS=1
@@ -229,7 +229,7 @@ declare -A MODULE_CHECKSUMS=(
   [ruby]='472cb0a52522cc2c9681dffd77775c7d23abc50797a4c6ecf049d50e492047fa'
   [rust]='2e63dcd8164bed5d2f124f6d280002884acf38b8f7650498125657007aaf8fda'
   [sql]='318f324e491bae0b3a52e49a5890e24ec95c06daaab31d5c0c798d720d0c0b7d'
-  [swift]='e6ea2b22f893047fe051eda9b488b1732201f1608a354c34be052f927406595d'
+  [swift]='84ea3ad4a3d9370c03f8cb2c742cc9aeccd36c7f3b8ce3024a42c268a3483d85'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -2259,7 +2259,7 @@ Environment Variables:
   CI=true                     Disable the opt-in auto-update check (like --ci)
   UBS_ENABLE_AUTO_UPDATE=1    Opt in to the 24h auto-update check
   UBS_NO_AUTO_UPDATE=1        Force-disable auto-update (like --no-auto-update)
-  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go/Java scans;
+  UBS_KEEP_TEMP=1             Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go/Java/Swift scans;
                               unsupported languages and update/service modes exit 2.
                               Use TMPDIR to choose storage. Caller removes retained files.
   FORCE_SELF_UPDATE=1         Force an immediate verified self-update check
@@ -2428,7 +2428,7 @@ cat <<'JSON'
     {"name": "UBS_SKIP_TYPE_NARROWING", "value": "1", "description": "Skip the type-narrowing helpers."},
     {"name": "UBS_ENABLE_AUTO_UPDATE", "value": "1", "description": "Opt in to the 24h auto-update check."},
     {"name": "UBS_NO_AUTO_UPDATE", "value": "1", "description": "Force-disable auto-update."},
-    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go/Java; unsupported languages and update/service modes refuse with exit 2. Requested external tools that cannot retain scratch report incomplete coverage. Go's compiled lifecycle helper requires --skip=17 for a complete static scan. Use TMPDIR to choose storage."},
+    {"name": "UBS_KEEP_TEMP", "value": "1", "description": "Retain scanner scratch for Rust/Python/JS/Bash/HCL/C#/Kotlin/C++/SQL/Ruby/PHP/Go/Java/Swift; unsupported languages and update/service modes refuse with exit 2. Requested external tools that cannot retain scratch report incomplete coverage. Go's compiled lifecycle helper requires --skip=17 for a complete static scan. Use TMPDIR to choose storage."},
     {"name": "UBS_RULES", "value": "DIR[:DIR...]", "description": "Custom rule directories (':'-separated, like PATH) used when no --rules is given; empty entries are ignored."},
     {"name": "UBS_NO_CACHE", "value": "1", "description": "Disable scan caching (like --no-cache)."},
     {"name": "UBS_CACHE_DIR", "value": "PATH", "description": "Override root directory for scan cache (like --cache-dir)."},
@@ -10812,11 +10812,11 @@ if [[ ${#langs[@]} -eq 0 ]]; then emit_no_langs_result; fi
 if [[ "$UBS_KEEP_TEMP" == "1" ]]; then
   for L in "${langs[@]}"; do
     case "$L" in
-      rust|python|js|bash|hcl|csharp|kotlin|cpp|sql|ruby|php|golang|java) ;;
+      rust|python|js|bash|hcl|csharp|kotlin|cpp|sql|ruby|php|golang|java|swift) ;;
       *)
-        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang, java."
+        say_err "ERROR: UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang, java, swift."
         emit_error_envelope "environment" "error" "retention-unsupported-language" \
-          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang, java" \
+          "UBS_KEEP_TEMP=1 does not support $L; supported languages: rust, python, js, bash, hcl, csharp, kotlin, cpp, sql, ruby, php, golang, java, swift" \
           '"failed_modules":[]'
         exit 2 ;;
     esac

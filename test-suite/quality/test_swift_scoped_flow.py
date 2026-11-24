@@ -2964,5 +2964,691 @@ class SwiftStoredRequestReceiverTests(unittest.TestCase):
                         self.assertNotIn('swift: partial', result.stderr)
 
 
+class SwiftTypedAggregateFlowTests(unittest.TestCase):
+    """Native array carriers and custom literal conversion are distinct semantics."""
+
+    POLICIES = {
+        'path': ('swift.taint.request_path_traversal', '_ = try String(contentsOfFile: value)'),
+        'redirect': ('swift.taint.request_open_redirect', '_ = Response.redirect(to: value)'),
+        'header': ('swift.taint.header-injection', 'response.headers.add(name: "X-Trace", value: value)'),
+        'outbound': ('swift.taint.outbound-url', '_ = URLSession.shared.dataTask(with: URL(string: value)!)'),
+    }
+    ENVELOPE = '''struct Envelope {
+    let incoming: Request
+}
+'''
+    WRAPPED = '''@propertyWrapper struct Opaque<Value> {
+    var wrappedValue: Value
+}
+struct Envelope {
+    @Opaque var incoming: Request
+}
+'''
+    TRANSFORM = '''struct Envelope {
+    let incoming: Request
+    let path: String
+}
+struct Batch: ExpressibleByArrayLiteral {
+    typealias ArrayLiteralElement = Envelope
+    let first: Envelope
+    init(arrayLiteral items: Envelope...) {
+        let item = items[0]
+        first = Envelope(incoming: item.incoming, path: item.incoming.query["value"] ?? "")
+    }
+}
+'''
+    SEEDED_TRANSFORM = TRANSFORM.replace(
+        '    init(arrayLiteral items: Envelope...) {',
+        '    init(seed: Envelope) { first = seed }\n    init(arrayLiteral items: Envelope...) {')
+    MARKERS = {
+        'swift.taint.request_path_traversal': '// path-sink',
+        'swift.taint.request_open_redirect': '// redirect-sink',
+        'swift.taint.header-injection': '// header-sink',
+        'swift.taint.outbound-url': '// outbound-sink',
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        cls.artifacts = ROOT / 'test-suite/artifacts' / ('swift-typed-aggregate-' + uuid.uuid4().hex)
+        cls.artifacts.mkdir(parents=True)
+
+    @classmethod
+    def oracle_source(cls, case, sink):
+        # These 68 source programs and expectations were frozen before the fix.
+        # Keep the original spacing so their source hashes match the independent
+        # oracle, including its otherwise harmless unused response variable.
+        prefix = 'import Foundation\nimport Vapor\n'
+        if case in {'custom-init-sink', 'custom-field-transform', 'native-literal-control'}:
+            if case == 'custom-init-sink':
+                init_sink = sink.replace('try String', 'try? String')
+                return prefix + cls.ENVELOPE + '''struct Batch: ExpressibleByArrayLiteral {
+    typealias ArrayLiteralElement = Envelope
+    init(arrayLiteral items: Envelope...) {
+        var response = Response()
+        let value = items[0].incoming.query["value"] ?? ""
+        ''' + init_sink + ''' // sink
+    }
+}
+func handle(req: Request) {
+    let batch: Batch = [Envelope(incoming: req)]
+}
+'''
+            declaration = 'Batch' if case == 'custom-field-transform' else '[Envelope]'
+            return prefix + cls.TRANSFORM + '''func handle(req: Request) throws {
+    let batch: ''' + declaration + ''' = [Envelope(incoming: req, path: "/srv/fixed")]
+    var response = Response()
+    let value = batch.first''' + ('!' if case == 'native-literal-control' else '') + '''.path
+    ''' + sink + ''' // sink
+}
+'''
+        envelope = cls.WRAPPED if case.startswith('wrapper-') else cls.ENVELOPE
+        shadow = ''
+        parameters = '_ batch: [Envelope]'
+        read = 'envelope.incoming.query["value"] ?? ""'
+        opening, closing = '    for envelope in batch {\n', '    }\n'
+        owner = False
+        safe = False
+        if case in {'direct', 'wrapper-direct'}:
+            parameters, opening, closing = '_ envelope: Envelope', '', ''
+        elif case in {'index', 'wrapper-index'}:
+            opening, closing = '', ''
+            read = 'batch[0].incoming.query["value"] ?? ""'
+        elif case in {'callback', 'shadow-array', 'shadow-swift'}:
+            opening, closing = '    try batch.forEach { envelope in\n', '    }\n'
+        elif case == 'generic-array':
+            parameters = '_ batch: Array<Envelope>'
+        elif case == 'qualified-array':
+            parameters = '_ batch: Swift.Array<Envelope>'
+        elif case == 'typealias-array':
+            shadow = 'typealias Batch = [Envelope]\n'
+            parameters = '_ batch: Batch'
+        elif case == 'forced-entry':
+            parameters = 'req: Request, batch: [Envelope]'
+        elif case == 'container-field':
+            owner = True
+        elif case == 'clean-overwrite':
+            safe = True
+        elif case != 'loop':
+            raise ValueError(case)
+        if case == 'shadow-array':
+            shadow = '''struct Array<Element> {
+    func forEach(_ body: (Element) throws -> Void) rethrows {}
+}
+'''
+            parameters = '_ batch: Array<Envelope>'
+        if case == 'shadow-swift':
+            shadow = '''enum Swift {
+    struct Array<Element> {
+        func forEach(_ body: (Element) throws -> Void) rethrows {}
+    }
+}
+'''
+            parameters = '_ batch: Swift.Array<Envelope>'
+        body = '    var response = Response()\n' + opening
+        body += '        var value = ' + read + '\n'
+        if safe:
+            body += '        value = "/srv/fixed"\n'
+        body += '        ' + sink + ' // sink\n' + closing
+        if owner:
+            function = 'struct Batch {\n    let batch: [Envelope]\n    func handle() throws {\n' + body + '    }\n}\n'
+        else:
+            function = 'func handle(' + parameters + ') throws {\n' + body + '}\n'
+        return prefix + envelope + shadow + function
+
+    def findings(self, source, policy, label):
+        path = self.artifacts / (label + '.swift')
+        path.write_text(source, encoding='utf-8')
+        findings = flow_findings(path, source, policy, recover=True)
+        path.with_suffix('.json').write_text(json.dumps(findings, indent=2), encoding='utf-8')
+        return findings
+
+    def assert_witness(self, finding):
+        route = finding.get('extras', {}).get('taint_path', [])
+        self.assertTrue(route, finding)
+        self.assertEqual(route[0]['kind'], 'source', finding)
+        self.assertEqual((route[-1]['kind'], route[-1]['line']), ('sink', finding['line']), finding)
+
+    def test_typed_array_carriers_and_native_conversion_boundaries(self):
+        cases = (
+            ('direct', 'unsafe'), ('loop', 'unsafe'), ('index', 'unsafe'),
+            ('callback', 'unsafe'), ('generic-array', 'unsafe'), ('qualified-array', 'unsafe'),
+            ('typealias-array', 'unsafe'), ('container-field', 'unsafe'), ('forced-entry', 'unsafe'),
+            ('clean-overwrite', 'clean'), ('wrapper-direct', 'unsupported'),
+            ('wrapper-index', 'unsupported'), ('shadow-array', 'clean'), ('shadow-swift', 'clean'),
+            ('custom-init-sink', 'unsafe-or-incomplete'),
+            ('custom-field-transform', 'unsafe-or-incomplete'), ('native-literal-control', 'clean'),
+        )
+        for policy, (rule, sink) in self.POLICIES.items():
+            for case, expected in cases:
+                with self.subTest(policy=policy, case=case):
+                    source = self.oracle_source(case, sink)
+                    findings = self.findings(source, policy, 'oracle-' + policy + '-' + case)
+                    line = next(i for i, row in enumerate(source.splitlines(), 1) if '// sink' in row)
+                    limits = [row for row in findings if row['rule'] == 'swift.taint.analysis-limited']
+                    critical = [row for row in findings if row['rule'] != 'swift.taint.analysis-limited']
+                    actual = [(row['rule'], row['line'], row['severity']) for row in critical]
+                    if expected == 'clean':
+                        self.assertEqual(findings, [])
+                    elif expected == 'unsafe-or-incomplete':
+                        self.assertIn(actual, ([], [(rule, line, 'critical')]), findings)
+                        self.assertTrue(critical or limits, findings)
+                    else:
+                        self.assertEqual(actual, [(rule, line, 'critical')], findings)
+                        self.assertEqual(bool(limits), expected == 'unsupported', findings)
+                    self.assertTrue(all(row['severity'] == 'warning' for row in limits), findings)
+                    for finding in critical:
+                        self.assert_witness(finding)
+
+    @classmethod
+    def contextual_source(cls, case, native):
+        kind = '[Envelope]' if native else 'Batch'
+        literal = '[Envelope(incoming: req, path: "/srv/fixed")]'
+        field = '.first!.path' if native else '.first.path'
+        declaration = cls.TRANSFORM
+        parameters = 'req: Request'
+        value = 'selected' + field
+        if case == 'annotated-local':
+            body = 'let selected: ' + kind + ' = ' + literal
+        elif case == 'later-assignment':
+            body = 'var selected: ' + kind + '\nselected = ' + literal
+        elif case == 'inferred-reassignment':
+            declaration = cls.SEEDED_TRANSFORM
+            initial = literal if native else 'Batch(seed: Envelope(incoming: req, path: "/srv/fixed"))'
+            body = 'var selected = ' + initial + '\nselected = ' + literal
+        elif case == 'field-write':
+            declaration += 'struct Holder { var selected: ' + kind + ' }\n'
+            parameters += ', holder: Holder'
+            body = 'var mutable = holder\nmutable.selected = ' + literal + '\nlet selected = mutable.selected'
+        elif case == 'getter':
+            declaration += ('struct Holder {\n    let incoming: Request\n    var selected: ' + kind
+                            + ' {\n        [Envelope(incoming: incoming, path: "/srv/fixed")]\n    }\n}\n')
+            body = 'let holder = Holder(incoming: req)\nlet selected = holder.selected'
+        elif case == 'function-argument':
+            declaration += 'func consume(_ selected: ' + kind + ') -> String { selected' + field + ' }\n'
+            body, value = '', 'consume(' + literal + ')'
+        elif case == 'function-return':
+            declaration += ('func make(_ input: Request) -> ' + kind
+                            + ' { [Envelope(incoming: input, path: "/srv/fixed")] }\n')
+            body = 'let selected = make(req)'
+        elif case == 'closure-return':
+            body = 'let make = { () -> ' + kind + ' in ' + literal + ' }\nlet selected = make()'
+        elif case == 'closure-declaration':
+            body = 'let make: () -> ' + kind + ' = { ' + literal + ' }\nlet selected = make()'
+        elif case == 'closure-argument':
+            declaration += 'func invoke(_ make: () -> ' + kind + ') -> ' + kind + ' { make() }\n'
+            body = 'let selected = invoke { ' + literal + ' }'
+        elif case == 'typed-closure-parameter':
+            body = 'let consume = { (selected: ' + kind + ') in selected' + field + ' }'
+            value = 'consume(' + literal + ')'
+        elif case == 'nested':
+            body = 'let nested: [' + kind + '] = [' + literal + ']\nlet selected = nested[0]'
+        elif case == 'cast':
+            body = 'let selected = ' + literal + ' as ' + kind
+        elif case == 'branch':
+            body = ('var selected: ' + kind + '\nif req.query["flag"] == "a" {\n    selected = '
+                    + literal + '\n} else {\n    selected = ' + literal + '\n}')
+        elif case == 'ternary':
+            body = 'let selected: ' + kind + ' = req.query["flag"] == "a" ? ' + literal + ' : ' + literal
+        elif case == 'coalescing':
+            body = 'let supplied: ' + kind + '? = nil\nlet selected: ' + kind + ' = supplied ?? ' + literal
+        elif case in {'field-default', 'function-default'}:
+            # A property/default argument cannot capture the handler's req.
+            # Scalar elements keep these valid Swift and isolate conversion.
+            declaration = '''struct ScalarBatch: ExpressibleByArrayLiteral {
+    typealias ArrayLiteralElement = String
+    let first: String
+    init(arrayLiteral items: String...) { first = items[0] }
+}
+'''
+            kind = '[String]' if native else 'ScalarBatch'
+            field = '.first!' if native else '.first'
+            if case == 'field-default':
+                declaration += 'struct Holder { let selected: ' + kind + ' = ["/srv/fixed"] }\n'
+                body, value = 'let holder = Holder()', 'holder.selected' + field
+            else:
+                declaration += ('func consume(_ selected: ' + kind + ' = ["/srv/fixed"]) -> String { selected'
+                                + field + ' }\n')
+                body, value = '', 'consume()'
+        else:
+            raise ValueError(case)
+        independent = '"/srv/fixed"' if native else 'req.query["independent"] ?? ""'
+        return ('import Foundation\nimport Vapor\n' + declaration
+                + 'func handle(' + parameters + ') throws {\n'
+                + textwrap.indent(body + '\n', '    ')
+                + '    let value = ' + value + '\n'
+                + '    _ = try String(contentsOfFile: value) // checked\n'
+                + '    let independent = ' + independent + '\n'
+                + '    _ = try String(contentsOfFile: independent) // independent\n}\n')
+
+    def test_contextual_array_conversions_preserve_limits_and_independent_flows(self):
+        cases = ('annotated-local', 'later-assignment', 'inferred-reassignment', 'field-write',
+                 'getter', 'function-argument', 'function-return', 'closure-return',
+                 'closure-declaration', 'closure-argument', 'typed-closure-parameter', 'nested',
+                 'cast', 'branch', 'ternary', 'coalescing', 'field-default', 'function-default')
+        for case in cases:
+            for native in (False, True):
+                with self.subTest(case=case, native=native):
+                    source = self.contextual_source(case, native)
+                    findings = self.findings(source, 'path', 'context-' + case + ('-native' if native else '-custom'))
+                    if native:
+                        self.assertEqual(findings, [])
+                        continue
+                    limits = [row for row in findings if row['rule'] == 'swift.taint.analysis-limited']
+                    critical = [row for row in findings if row['rule'] != 'swift.taint.analysis-limited']
+                    self.assertTrue(limits, findings)
+                    self.assertTrue(all(row['severity'] == 'warning' for row in limits), findings)
+                    independent = next(i for i, row in enumerate(source.splitlines(), 1) if '// independent' in row)
+                    allowed = {i for i, row in enumerate(source.splitlines(), 1)
+                               if '// checked' in row or '// independent' in row}
+                    self.assertIn(independent, [row['line'] for row in critical], findings)
+                    for finding in critical:
+                        self.assertEqual((finding['rule'], finding['severity']),
+                                         (self.POLICIES['path'][0], 'critical'), finding)
+                        self.assertIn(finding['line'], allowed, finding)
+                        self.assert_witness(finding)
+
+    def test_typed_array_inputs_preserve_concrete_values_and_lexical_shadowing(self):
+        sources = {
+            'request-index': ('unsafe', '''import Foundation
+import Vapor
+func handle(_ incoming: [Request]) throws {
+    let value = incoming[0].query["value"] ?? ""
+    _ = try String(contentsOfFile: value) // sink
+}
+'''),
+            'bracket-sugar-with-array-shadow': ('unsafe', 'import Foundation\nimport Vapor\n' + self.ENVELOPE + '''struct Array<Element> {
+    func forEach(_ body: (Element) throws -> Void) rethrows {}
+}
+func handle(_ incoming: [Envelope]) throws {
+    let value = incoming[0].incoming.query["value"] ?? ""
+    _ = try String(contentsOfFile: value) // sink
+}
+'''),
+            'concrete-clean-callee-input': ('clean', 'import Foundation\nimport Vapor\n' + self.TRANSFORM + '''func consume(_ batch: [Envelope]) throws {
+    _ = try String(contentsOfFile: batch[0].path) // sink
+}
+func handle(req: Request) throws {
+    let batch = [Envelope(incoming: req, path: "/srv/fixed")]
+    try consume(batch)
+}
+'''),
+            'inferred-custom-seed-clean': ('clean', 'import Foundation\nimport Vapor\n' + self.SEEDED_TRANSFORM + '''func handle(req: Request) throws {
+    let selected = Batch(seed: Envelope(incoming: req, path: "/srv/fixed"))
+    _ = try String(contentsOfFile: selected.first.path) // sink
+}
+'''),
+            'lexical-type-shadow': ('clean', 'import Foundation\nimport Vapor\n' + self.TRANSFORM + '''func helper(batch: Batch, req: Request) throws {
+    do {
+        let batch = [Envelope(incoming: req, path: "/srv/fixed")]
+        _ = try String(contentsOfFile: batch.first!.path) // sink
+    }
+}
+'''),
+        }
+        for case, (expected, source) in sources.items():
+            with self.subTest(case=case):
+                findings = self.findings(source, 'path', 'identity-' + case)
+                if expected == 'clean':
+                    self.assertEqual(findings, [])
+                else:
+                    line = next(i for i, row in enumerate(source.splitlines(), 1) if '// sink' in row)
+                    self.assertEqual([(row['rule'], row['line'], row['severity']) for row in findings],
+                                     [(self.POLICIES['path'][0], line, 'critical')], findings)
+                    self.assert_witness(findings[0])
+
+    def test_request_array_alias_suppression_and_nested_index_effects(self):
+        sources = {
+            'direct-request-suppression': '''import Foundation
+import Vapor
+func handle(
+    _ incoming: [Request], // ubs:ignore[taint-source] trusted local adapter
+    req: Request
+) throws {
+    _ = try String(contentsOfFile: incoming[0].query["value"] ?? "") // suppressed
+    _ = try String(contentsOfFile: req.query["independent"] ?? "") // unsafe
+}
+''',
+            'nested-typed-elements': 'import Foundation\nimport Vapor\n' + self.ENVELOPE + '''func handle(_ nested: [[Envelope]]) throws {
+    let value = nested[0][0].incoming.query["value"] ?? ""
+    _ = try String(contentsOfFile: value) // unsafe
+}
+''',
+            'nested-index-effects': 'import Foundation\nimport Vapor\n' + self.TRANSFORM + '''func handle(req: Request) throws {
+    func selectedIndex() -> Int {
+        _ = try? String(contentsOfFile: req.query["index"] ?? "") // blocked-body
+        return 0
+    }
+    let nested: [[Envelope]] = [[Envelope(incoming: req, path: "/srv/fixed")]]
+    let value = nested[selectedIndex()][0].path // unsupported-call
+    _ = try String(contentsOfFile: value) // clean
+    _ = try String(contentsOfFile: req.query["independent"] ?? "") // unsafe
+}
+''',
+            'stored-closure-index-effects': 'import Foundation\nimport Vapor\n' + self.TRANSFORM + '''func handle(req: Request) throws {
+    let selectedIndex = { () -> Int in
+        _ = try? String(contentsOfFile: req.query["index"] ?? "") // unsafe
+        return 0
+    }
+    let nested: [[Envelope]] = [[Envelope(incoming: req, path: "/srv/fixed")]]
+    let value = nested[selectedIndex()][0].path
+    _ = try String(contentsOfFile: value) // clean
+}
+''',
+            'nested-carrier-capture': 'import Foundation\nimport Vapor\n' + self.ENVELOPE + '''func handle(req: Request) throws {
+    let carried = [Envelope(incoming: req)]
+    func selectedIndex() -> Int {
+        _ = try? String(contentsOfFile: carried[0].incoming.query["index"] ?? "") // blocked-body
+        return 0
+    }
+    let nested = [["/srv/fixed"]]
+    let value = nested[selectedIndex()][0] // unsupported-call
+    _ = try String(contentsOfFile: value) // clean
+    _ = try String(contentsOfFile: req.query["independent"] ?? "") // unsafe
+}
+''',
+        }
+        for suppressed in (False, True):
+            directive = ' // ubs:ignore[taint-source] trusted local adapter' if suppressed else ''
+            source = ('import Foundation\nimport Vapor\ntypealias Requests = [Request]' + directive + '\n'
+                      + 'struct Carrier {\n    let incoming: Requests\n'
+                      + '    func handle(req: Request) throws {\n'
+                      + '        _ = try String(contentsOfFile: incoming[0].query["value"] ?? "")'
+                      + (' // suppressed\n' if suppressed else ' // unsafe\n')
+                      + '        _ = try String(contentsOfFile: req.query["independent"] ?? "") // unsafe\n'
+                      + '    }\n}\n')
+            sources['stored-request-alias-' + ('suppressed' if suppressed else 'active')] = source
+        for case, source in sources.items():
+            with self.subTest(case=case):
+                findings = self.findings(source, 'path', 'request-array-' + case)
+                expected = [(self.POLICIES['path'][0], i, 'critical')
+                            for i, row in enumerate(source.splitlines(), 1) if '// unsafe' in row]
+                limits = [row for row in findings if row['rule'] == 'swift.taint.analysis-limited']
+                critical = [row for row in findings if row['rule'] != 'swift.taint.analysis-limited']
+                if case in {'nested-index-effects', 'nested-carrier-capture'}:
+                    # The existing named-capture contract refuses this call;
+                    # evaluating an index must preserve that truthful receipt.
+                    call_line = next(i for i, row in enumerate(source.splitlines(), 1) if '// unsupported-call' in row)
+                    self.assertTrue(any(row['line'] == call_line and 'nested capture' in row['extras']['reason']
+                                        for row in limits), findings)
+                    self.assertTrue(all(row['severity'] == 'warning' for row in limits), findings)
+                else:
+                    self.assertEqual(limits, [], findings)
+                self.assertEqual([(row['rule'], row['line'], row['severity']) for row in critical],
+                                 expected, findings)
+                for finding in critical:
+                    self.assert_witness(finding)
+
+    def test_request_derived_named_optional_captures_stay_explicitly_incomplete(self):
+        for native in (False, True):
+            with self.subTest(native=native):
+                kind = '[Envelope]' if native else 'Batch'
+                selected = 'selected!.first!.path' if native else 'selected!.first.path'
+                source = ('import Foundation\nimport Vapor\n' + self.TRANSFORM
+                          + 'func handle(req: Request) throws {\n'
+                          + '    var selected: ' + kind + '? = nil\n'
+                          + '    func assign() {\n'
+                          + '        selected = [Envelope(incoming: req, path: "/srv/fixed")]\n'
+                          + '    }\n    assign() // unsupported-call\n'
+                          + '    _ = try String(contentsOfFile: ' + selected + ') // checked\n'
+                          + '    let independent = req.query["independent"] ?? ""\n'
+                          + '    _ = try String(contentsOfFile: independent) // independent\n}\n')
+                findings = self.findings(source, 'path', 'named-optional-' + ('native' if native else 'custom'))
+                limits = [row for row in findings if row['rule'] == 'swift.taint.analysis-limited']
+                critical = [row for row in findings if row['rule'] != 'swift.taint.analysis-limited']
+                call_line = next(i for i, row in enumerate(source.splitlines(), 1) if '// unsupported-call' in row)
+                self.assertTrue(any(row['line'] == call_line and 'nested capture' in row['extras']['reason']
+                                    for row in limits), findings)
+                self.assertTrue(all(row['severity'] == 'warning' for row in limits), findings)
+                independent_line = next(i for i, row in enumerate(source.splitlines(), 1) if '// independent' in row)
+                allowed = {i for i, row in enumerate(source.splitlines(), 1)
+                           if '// checked' in row or '// independent' in row}
+                self.assertIn(independent_line, [row['line'] for row in critical], findings)
+                for finding in critical:
+                    self.assertEqual((finding['rule'], finding['severity']),
+                                     (self.POLICIES['path'][0], 'critical'), finding)
+                    self.assertIn(finding['line'], allowed, finding)
+                    self.assert_witness(finding)
+
+    def test_named_nested_helper_keeps_scalar_conversion_context(self):
+        declaration = '''struct ScalarBatch: ExpressibleByArrayLiteral {
+    typealias ArrayLiteralElement = String
+    let first: String
+    init(arrayLiteral items: String...) { first = items[0] }
+}
+'''
+        for native in (False, True):
+            with self.subTest(native=native):
+                kind = '[String]' if native else 'ScalarBatch'
+                selected = 'selected!.first!' if native else 'selected!.first'
+                independent = '"/srv/fixed"' if native else 'req.query["independent"] ?? ""'
+                source = ('import Foundation\nimport Vapor\n' + declaration
+                          + 'func handle(req: Request) throws {\n'
+                          + '    var selected: ' + kind + '? = nil\n'
+                          + '    func assign() {\n'
+                          + '        selected = ["/srv/fixed"] // conversion\n'
+                          + '    }\n    assign()\n'
+                          + '    _ = try String(contentsOfFile: ' + selected + ') // checked\n'
+                          + '    let independent = ' + independent + '\n'
+                          + '    _ = try String(contentsOfFile: independent) // independent\n}\n')
+                findings = self.findings(source, 'path', 'named-scalar-' + ('native' if native else 'custom'))
+                if native:
+                    self.assertEqual(findings, [])
+                    continue
+                limits = [row for row in findings if row['rule'] == 'swift.taint.analysis-limited']
+                critical = [row for row in findings if row['rule'] != 'swift.taint.analysis-limited']
+                conversion = next(i for i, row in enumerate(source.splitlines(), 1) if '// conversion' in row)
+                self.assertTrue(any(row['line'] == conversion and 'contextual array literal' in row['extras']['reason']
+                                    for row in limits), findings)
+                self.assertTrue(all(row['severity'] == 'warning' for row in limits), findings)
+                independent_line = next(i for i, row in enumerate(source.splitlines(), 1) if '// independent' in row)
+                self.assertEqual([(row['rule'], row['line'], row['severity']) for row in critical],
+                                 [(self.POLICIES['path'][0], independent_line, 'critical')], findings)
+                self.assert_witness(critical[0])
+
+    def test_named_captures_distinguish_unknown_incoming_and_clean_constructor_layouts(self):
+        sources = {
+            'unknown-direct': '''import Foundation
+import Vapor
+struct Envelope { let incoming: Request }
+func handle(_ envelope: Envelope, req: Request) throws {
+    func path() -> String { envelope.incoming.query["value"] ?? "" }
+    _ = try String(contentsOfFile: path()) // unsupported-call
+    _ = try String(contentsOfFile: req.query["independent"] ?? "") // independent
+}
+''',
+            'unknown-array': '''import Foundation
+import Vapor
+struct Envelope { let incoming: Request }
+func handle(_ batch: [Envelope], req: Request) throws {
+    func path() -> String { batch[0].incoming.query["value"] ?? "" }
+    _ = try String(contentsOfFile: path()) // unsupported-call
+    _ = try String(contentsOfFile: req.query["independent"] ?? "") // independent
+}
+''',
+            'known-clean-constructor': '''import Foundation
+import Vapor
+struct Envelope {
+    let incoming: Request?
+    let path: String
+    init(path: String) {
+        incoming = nil
+        self.path = path
+    }
+}
+func handle(req: Request) throws {
+    let envelope = Envelope(path: "/srv/fixed")
+    func path() -> String { envelope.path }
+    _ = try String(contentsOfFile: path()) // clean
+    _ = try String(contentsOfFile: req.query["independent"] ?? "") // independent
+}
+''',
+        }
+        for case, source in sources.items():
+            with self.subTest(case=case):
+                findings = self.findings(source, 'path', 'incoming-capture-' + case)
+                limits = [row for row in findings if row['rule'] == 'swift.taint.analysis-limited']
+                critical = [row for row in findings if row['rule'] != 'swift.taint.analysis-limited']
+                independent = next(i for i, row in enumerate(source.splitlines(), 1) if '// independent' in row)
+                required = (self.POLICIES['path'][0], independent, 'critical')
+                actual = [(row['rule'], row['line'], row['severity']) for row in critical]
+                if case == 'known-clean-constructor':
+                    self.assertEqual(limits, [], findings)
+                    self.assertEqual(actual, [required], findings)
+                else:
+                    call_line = next(i for i, row in enumerate(source.splitlines(), 1) if '// unsupported-call' in row)
+                    self.assertTrue(any(row['line'] == call_line and 'capture' in row['extras']['reason']
+                                        for row in limits), findings)
+                    self.assertTrue(all(row['severity'] == 'warning' for row in limits), findings)
+                    self.assertIn(required, actual, findings)
+                    # A partial summary may additionally retain the genuine
+                    # captured-source sink; the independent finding is required.
+                    allowed = {required, (self.POLICIES['path'][0], call_line, 'critical')}
+                    self.assertTrue(all(row in allowed for row in actual), findings)
+                for finding in critical:
+                    self.assert_witness(finding)
+
+    @classmethod
+    def public_source(cls, case):
+        prefix = 'import Foundation\nimport Vapor\n'
+        sinks = '''        _ = try? String(contentsOfFile: target) // path-sink
+        _ = Response.redirect(to: target) // redirect-sink
+        _ = HTTPHeaders([("X-Test", target)]) // header-sink
+        if let address = URL(string: target) {
+            _ = try? await URLSession.shared.data(from: address) // outbound-sink
+        }
+'''
+        if case == 'custom-unsupported':
+            return (prefix + cls.TRANSFORM + 'func handle(req: Request) async {\n'
+                    + '    let selected: Batch = [Envelope(incoming: req, path: "/srv/fixed")] // custom-limit\n'
+                    + '    let target = req.query["value"] ?? ""\n' + sinks + '}\n')
+        return (prefix + cls.ENVELOPE + 'func handle(_ batch: [Envelope]) async {\n'
+                + '    for envelope in batch {\n'
+                + '        var target = envelope.incoming.query["value"] ?? ""\n'
+                + ('        target = "https://api.example.com/fixed"\n' if case == 'native-clean' else '')
+                + sinks + '    }\n}\n')
+
+    def public_scan(self, path, mode, fmt, label, *, cache_dir=None):
+        evidence = self.artifacts / label
+        evidence.mkdir()
+        command = ([str(ROOT / 'modules/ubs-swift.sh'), '--ci', '--no-color', '--format=' + fmt, str(path)]
+                   if mode == 'module' else
+                   [str(ROOT / 'ubs'), '--module-dir=' + str(ROOT / 'modules'), '--ci',
+                    '--no-auto-update', '--only=swift', '--format=' + fmt,
+                    *(['--no-cache'] if cache_dir is None else []), str(path)])
+        environment = {
+            **os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
+            'UBS_NO_CACHE': '1' if cache_dir is None else '0',
+            'UBS_CACHE_DIR': str(cache_dir or evidence / 'cache'),
+            'PYTHONDONTWRITEBYTECODE': '1', 'NO_COLOR': '1',
+        }
+        for name in ('UBS_ALLOW_UNVERIFIED_HELPERS', 'UBS_VERIFIED_ASSET_DIR',
+                     'UBS_ALLOW_PARTIAL', 'UBS_SKIP_TYPE_NARROWING'):
+            environment.pop(name, None)
+        result = subprocess.run(command, cwd=self.artifacts, env=environment,
+                                text=True, capture_output=True, timeout=90, check=False)
+        (evidence / 'stdout.log').write_text(result.stdout, encoding='utf-8')
+        (evidence / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+        (evidence / 'command.json').write_text(json.dumps({
+            'command': command, 'cwd': str(self.artifacts), 'exit': result.returncode,
+        }, indent=2), encoding='utf-8')
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            self.fail('Invalid scanner JSON for %s: %s\nexit=%s\nstderr=%s' %
+                      (label, error, result.returncode, result.stderr))
+        return result, payload
+
+    def assert_public_json(self, result, payload, mode, source, case, *, suppressed=False):
+        incomplete, clean = case == 'custom-unsupported', case == 'native-clean'
+        self.assertEqual(result.returncode, 2 if incomplete else int(not clean), (payload, result.stderr))
+        self.assertEqual(payload['status'], 'partial' if incomplete else 'ok', payload)
+        scanner = payload if mode == 'module' else payload['scanners'][0]
+        self.assertEqual(scanner['status'], payload['status'], payload)
+        self.assertEqual(scanner['files'], 1, scanner)
+        if incomplete:
+            self.assertEqual(scanner['module_error'], 'ANALYZER_ERROR', scanner)
+            self.assertIn('analysis is incomplete', scanner['message'], scanner)
+            if mode == 'runner':
+                self.assertTrue(payload['failed_modules'], payload)
+        else:
+            self.assertNotIn('module_error', scanner)
+            if mode == 'runner':
+                self.assertEqual(payload['failed_modules'], [], payload)
+        key = 'rule' if mode == 'module' else 'rule_id'
+        rows = [row for row in payload['findings'] if row[key].startswith('swift.taint.')]
+        limits = [row for row in rows if row[key] == 'swift.taint.analysis-limited']
+        critical = [row for row in rows if row[key] != 'swift.taint.analysis-limited']
+        expected = sorted((rule, i) for rule, marker in self.MARKERS.items()
+                          for i, row in enumerate(source.splitlines(), 1) if marker in row) if not clean else []
+        self.assertEqual(sorted((row[key], row['line']) for row in critical), expected, rows)
+        self.assertTrue(all(row['severity'] == 'critical' for row in critical), rows)
+        self.assertEqual(bool(limits), incomplete and not suppressed, rows)
+        self.assertTrue(all(row['severity'] == 'warning' for row in limits), rows)
+        totals = payload if mode == 'module' else payload['totals']
+        self.assertEqual(totals['critical'], len(expected), payload)
+
+    def test_typed_array_receivers_through_module_and_cli_json_and_sarif(self):
+        for case in ('native-unsafe', 'native-clean', 'custom-unsupported'):
+            source = self.public_source(case)
+            project = self.artifacts / ('public-' + case)
+            project.mkdir()
+            path = project / 'Download.swift'
+            path.write_text(source, encoding='utf-8')
+            for mode in ('module', 'runner'):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=case, mode=mode, format=fmt):
+                        result, payload = self.public_scan(project, mode, fmt, case + '-' + mode + '-' + fmt)
+                        if fmt == 'json':
+                            self.assert_public_json(result, payload, mode, source, case)
+                            continue
+                        incomplete, clean = case == 'custom-unsupported', case == 'native-clean'
+                        self.assertEqual(result.returncode, 2 if incomplete else int(not clean),
+                                         (payload, result.stderr))
+                        rows = [row for run in payload['runs'] for row in run.get('results', [])
+                                if row['ruleId'].startswith('swift.taint.')]
+                        limits = [row for row in rows if row['ruleId'] == 'swift.taint.analysis-limited']
+                        critical = [row for row in rows if row['ruleId'] != 'swift.taint.analysis-limited']
+                        expected = sorted((rule, i) for rule, marker in self.MARKERS.items()
+                                          for i, row in enumerate(source.splitlines(), 1)
+                                          if marker in row) if not clean else []
+                        actual = sorted((row['ruleId'],
+                                         row['locations'][0]['physicalLocation']['region']['startLine'])
+                                        for row in critical)
+                        self.assertEqual(actual, expected, rows)
+                        self.assertTrue(all(row['level'] == 'error' for row in critical), rows)
+                        self.assertEqual(bool(limits), incomplete, rows)
+                        self.assertTrue(all(row['level'] == 'warning' for row in limits), rows)
+                        invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                        if incomplete:
+                            self.assertTrue(invocations, payload)
+                            self.assertTrue(all(item.get('executionSuccessful') is False for item in invocations), payload)
+                            self.assertTrue(all(item.get('exitCode') == 2 for item in invocations), payload)
+                        else:
+                            self.assertTrue(all(item.get('executionSuccessful', True) for item in invocations), payload)
+
+    def test_custom_array_partial_suppression_and_cache_invalidation(self):
+        project = self.artifacts / 'cache-project'
+        project.mkdir()
+        path = project / 'Download.swift'
+        clean = self.public_source('native-clean')
+        path.write_text(clean, encoding='utf-8')
+        cache = self.artifacts / 'typed-array-cache'
+        for attempt in range(2):
+            result, payload = self.public_scan(path, 'runner', 'json', 'cache-clean-' + str(attempt), cache_dir=cache)
+            self.assert_public_json(result, payload, 'runner', clean, 'native-clean')
+            self.assertEqual(payload['scanners'][0]['extras']['profile']['cache_hits'], attempt, payload)
+        unsupported = self.public_source('custom-unsupported').replace(
+            '// custom-limit', '// ubs:ignore[swift.taint.analysis-limited] custom conversion remains unsupported')
+        path.write_text(unsupported, encoding='utf-8')
+        for attempt in range(2):
+            result, payload = self.public_scan(path, 'runner', 'json', 'cache-partial-' + str(attempt), cache_dir=cache)
+            self.assert_public_json(result, payload, 'runner', unsupported, 'custom-unsupported', suppressed=True)
+            self.assertEqual(payload['scanners'][0]['extras']['profile']['cache_hits'], 0, payload)
+        path.write_text(clean, encoding='utf-8')
+        result, payload = self.public_scan(path, 'runner', 'json', 'cache-restored', cache_dir=cache)
+        self.assert_public_json(result, payload, 'runner', clean, 'native-clean')
+        self.assertEqual(payload['scanners'][0]['extras']['profile']['cache_hits'], 1, payload)
+
+
 if __name__ == '__main__':
     unittest.main()

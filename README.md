@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.148-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.149-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1668,9 +1668,15 @@ same-file receiver aliases, helpers, getters and array callbacks. Such a
 field does not have to be named `request` or `req`. This bounded discovery
 respects lexical bindings, type shadows and source-activation directives;
 an unrelated method on the same owner is not activated merely because that
-owner stores a request. Literal array elements keep their receiver identities
-through supported reads and iteration. The ordinary interpreter establishes
-each source-to-sink flow and reports unsupported effects as incomplete analysis.
+owner stores a request. Native array declarations (`[Element]`, unshadowed
+`Array<Element>` / `Swift.Array<Element>` and supported same-file aliases) also
+retain their element identities through supported reads and iteration. Known
+actual elements keep their selected field values, so a request-bearing sibling
+does not make a clean field unsafe. A contextual array literal can invoke a
+custom `init(arrayLiteral:)`; unsupported conversions report incomplete analysis
+and cannot reuse the literal's original layout as proof of the resulting value.
+The ordinary interpreter establishes each source-to-sink flow and retains known
+findings when it encounters such a limitation.
 
 **Python coverage limitations.** A bounded native analysis that cannot prove
 complete coverage reports `module_error: "ANALYSIS_INCOMPLETE"`, with

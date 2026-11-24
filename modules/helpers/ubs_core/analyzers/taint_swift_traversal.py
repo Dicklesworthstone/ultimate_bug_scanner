@@ -280,6 +280,8 @@ class SwiftFunction:
     return_type: str = ''
     parameter_attributes: tuple = ()
     generic: bool = False
+    binding_types: dict = field(default_factory=dict)
+    return_owner: tuple | None = None
 
 
 SWIFT_NONSTORAGE_ATTRIBUTES = frozenset({
@@ -388,6 +390,18 @@ class SwiftParser:
         self.fields, self.field_functions = {}, {}
         self.opaque_fields = {}
         self.stored_fields, self.type_declarations = {}, {}
+        self.array_type_aliases, self.array_alias_witnesses = {}, {}
+        self.parameter_type_witnesses, self.field_type_witnesses = {}, {}
+        self.conditional_aliases, conditional_depth = set(), 0
+        for index, token in enumerate(code):
+            if token.value == '#' and index + 1 < len(code):
+                directive = code[index + 1].value
+                if directive == 'if':
+                    conditional_depth += 1
+                elif directive == 'endif':
+                    conditional_depth = max(0, conditional_depth - 1)
+            elif token.value == 'typealias' and conditional_depth:
+                self.conditional_aliases.add(token.start)
         self.framework_wrapped_fields = {}
         self.field_attributes, self.field_modifiers, self.type_attributes = {}, {}, {}
         self.initialization_limits = {}
@@ -424,6 +438,122 @@ class SwiftParser:
         if base.startswith('Swift.') and base[6:] in SWIFT_NATIVE_SCALARS and 'Swift' not in shadows:
             return selected[6:]
         return ''
+
+    def array_element_type(self, declaration, owner=()) -> str | None:
+        return self.array_type_info(declaration, owner)[0]
+
+    def array_type_info(self, declaration, owner=()):
+        """Resolve a native array's element without trusting a type's spelling.
+
+        Bracket sugar is native even when Array is shadowed. Named arrays and
+        bounded same-file aliases require an unambiguous declaration identity;
+        local, conditional, generic and cyclic aliases cannot prove one. Alias
+        targets resolve in their declaration owner, not in the caller's scope.
+        Request witnesses follow the same resolution so an alias neither hides
+        a real source declaration nor revives a suppressed declaration.
+        """
+        shadows = self.types | self.shadow_type_names | self.attribute_type_names
+        witnesses = set()
+
+        def normalize(value):
+            value = value.replace('\n', '').strip()
+            for modifier in ('inout', 'borrowing', 'consuming', 'sending'):
+                if value.startswith(modifier) and value[len(modifier):].startswith(('[', '(')):
+                    value = value[len(modifier):]
+                elif value.startswith(modifier + ' '):
+                    value = value[len(modifier):].lstrip()
+            return value.replace(' ', '')
+
+        def names(value, context):
+            if not re.fullmatch(r'[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*', value):
+                return ()
+            parts = tuple(value.split('.'))
+            return tuple((*context[:index], *parts) for index in range(len(context), -1, -1))
+
+        def single_element(value):
+            depth = 0
+            for index, char in enumerate(value):
+                if char in '[(<':
+                    depth += 1
+                elif char in '])>' and not (char == '>' and index and value[index - 1] == '-'):
+                    depth -= 1
+                    if depth < 0:
+                        return False
+                elif not depth and char in ':,':
+                    return False
+            return bool(value) and depth == 0
+
+        def resolve(value, context, seen):
+            if len(seen) > 16:
+                return None
+            value = normalize(value).rstrip('?!')
+            if value.startswith('[') and value.endswith(']'):
+                element = value[1:-1]
+            elif (value.startswith('Array<') and value.endswith('>') and 'Array' not in shadows
+                  and not self.generic_type_parameter(context, 'Array')):
+                element = value[6:-1]
+            elif (value.startswith('Swift.Array<') and value.endswith('>') and 'Swift' not in shadows
+                  and not self.generic_type_parameter(context, 'Swift')):
+                element = value[12:-1]
+            else:
+                for candidate in names(value, context):
+                    if candidate in self.type_declarations:
+                        return None
+                    aliases = self.array_type_aliases.get(candidate)
+                    if aliases is None:
+                        continue
+                    if candidate in seen or len(aliases) != 1:
+                        return None
+                    position, target = next(iter(aliases.items()))
+                    if target is None:
+                        return None
+                    witnesses.update(self.array_alias_witnesses.get(candidate, {}).get(position, ()))
+                    return resolve(target, candidate[:-1], seen | {candidate})
+                return None
+            if not single_element(element):
+                return None
+            suffix = element[len(element.rstrip('?!')):]
+            selected = element.rstrip('?!')
+            # Canonicalize nested arrays and lexical nominal/alias references
+            # so a top-level caller does not reinterpret a nested alias target.
+            nested = resolve(selected, context, seen | {('array', value, context)})
+            if nested is not None:
+                return '[' + nested + ']' + suffix
+            for candidate in names(selected, context):
+                if candidate in self.type_declarations or candidate in self.array_type_aliases:
+                    if self.generic_type_parameter(context, selected.split('.')[0]):
+                        return element
+                    return '.'.join(candidate) + suffix
+            return element
+
+        context = tuple('.'.join(owner).split('.')) if owner else ()
+        element = resolve(declaration, context, frozenset())
+        return element, frozenset(witnesses) if element is not None else frozenset()
+
+    def generic_type_parameter(self, owner, name):
+        for length in range(1, len(owner) + 1):
+            declaration = self.type_declarations.get(owner[:length])
+            header = tuple(token for token in declaration[2]
+                           if token.kind == 'code' and token.value != '\n') if declaration else ()
+            if not header or header[0].value != '<':
+                continue
+            depth, binder = 0, False
+            for token in header:
+                if token.value == '<':
+                    depth += 1
+                    if depth == 1:
+                        binder = True
+                elif token.value == '>':
+                    depth -= 1
+                    if not depth:
+                        break
+                elif depth == 1 and token.value == ',':
+                    binder = True
+                elif depth == 1 and binder and token.value != 'each':
+                    if token.value == name:
+                        return True
+                    binder = False
+        return False
 
     def native_scalar_field(self, owner, name):
         declaration, default, _, _, _ = self.stored_fields[owner][name]
@@ -630,6 +760,8 @@ class SwiftParser:
                         raise ValueError('Unsupported Swift parameter labels; analysis is incomplete')
                     default = swift_parts(pieces[1], {'='})
                     declaration = swift_text(default[0])
+                    self.parameter_type_witnesses[tokens[head].start, len(parameters)] = frozenset(
+                        item.start for item in default[0] if item.kind == 'code' and item.value == 'Request')
                     parameters.append((names[-1], '' if names[0] == '_' else names[0], declaration,
                                        default[1] if len(default) == 2 else ()))
                     parameter_attributes.append(attributes)
@@ -687,6 +819,24 @@ class SwiftParser:
                     self.protocols.add(name)
                 self.block(tokens[position + 1:finish], (*owner, name), scope, declarations=True, depth=depth + 1)
                 statements.append(SwiftStatement('definition', tuple(tokens[start:finish + 1])))
+                cursor = finish + 1
+                continue
+            if head + 1 < len(tokens) and tokens[head].value == 'typealias':
+                finish = self.statement_end(tokens, head)
+                name, target = tokens[head + 1].value, None
+                alias = tuple('.'.join((*owner, name)).split('.'))
+                if (head + 2 < finish and tokens[head + 2].value == '='
+                        and not scope and not attributes
+                        and tokens[head].start not in self.conditional_aliases
+                        and not any('<' in part for part in owner)):
+                    target = swift_text(tokens[head + 3:finish])
+                self.array_type_aliases.setdefault(alias, {})[tokens[head].start] = target or None
+                self.array_alias_witnesses.setdefault(alias, {})[tokens[head].start] = frozenset(
+                    item.start for item in tokens[head + 3:finish]
+                    if item.kind == 'code' and item.value == 'Request')
+                if not owner:
+                    self.types.add(name)
+                statements.append(SwiftStatement('definition', tuple(tokens[start:finish])))
                 cursor = finish + 1
                 continue
             first = tokens[start].value
@@ -817,6 +967,9 @@ class SwiftParser:
                     field_name = tokens[head + 1].value
                     declaration = swift_parts(tuple(tokens[head + 2:finish]), {'='})
                     field_type = swift_text(declaration[0][1:]) if declaration[0] and declaration[0][0].value == ':' else ''
+                    self.field_type_witnesses[owner, field_name] = frozenset(
+                        item.start for item in declaration[0][1:]
+                        if item.kind == 'code' and item.value == 'Request')
                     owner_fields = self.fields.setdefault(owner, {})
                     duplicate = field_name in owner_fields
                     if duplicate:
@@ -856,7 +1009,8 @@ class SwiftParser:
                         field_key = tokens[head].start
                         initializer = SwiftFunction(field_key, '<field:' + field_name + '>', owner, scope, (),
                                                     (SwiftStatement('return', declaration[1]),),
-                                                    static=bool(prefix & {'static', 'class'}))
+                                                    static=bool(prefix & {'static', 'class'}),
+                                                    return_type=field_type)
                         self.functions[field_key] = initializer
                         self.field_functions[(owner, field_name)] = field_key
                         statements.append(SwiftStatement('definition', part, extra=(field_key,)))
@@ -897,8 +1051,11 @@ class SwiftParser:
                             self.limitation(reason, part, owner)
                         continue
                     accessor_key = tokens[start].start
+                    result_type = swift_parts(tokens[head + 2:accessor_brace], {':'})
                     accessor = SwiftFunction(accessor_key, tokens[head + 1].value, owner, scope, (),
-                                             static=bool(prefix & {'static', 'class'}))
+                                             static=bool(prefix & {'static', 'class'}),
+                                             return_type=swift_text(swift_ungroup(result_type[1]))
+                                             if len(result_type) == 2 else '')
                     self.functions[accessor_key] = accessor
                     self.field_functions[(owner, tokens[head + 1].value)] = accessor_key
                     accessor.body = self.block(body_tokens, owner, (*scope, accessor_key), depth=depth + 1)
@@ -1714,34 +1871,24 @@ class SwiftEngine:
                          if (*owner[:index], *parts) in parser.type_declarations), ())
 
         def generic_binding(owner, name):
-            # Owner spellings stop at a constraint colon. The full declaration
-            # header retains later parameters and nested constraint arguments.
-            for length in range(1, len(owner) + 1):
-                declaration = parser.type_declarations.get(owner[:length])
-                header = tuple(token for token in declaration[2]
-                               if token.kind == 'code' and token.value != '\n') if declaration else ()
-                if not header or header[0].value != '<':
-                    continue
-                depth, binder = 0, False
-                for token in header:
-                    if token.value == '<':
-                        depth += 1
-                        if depth == 1:
-                            binder = True
-                    elif token.value == '>':
-                        depth -= 1
-                        if not depth:
-                            break
-                    elif depth == 1 and token.value == ',':
-                        binder = True
-                    elif depth == 1 and binder and token.value != 'each':
-                        if token.value == name:
-                            return True
-                        binder = False
-            return False
+            return parser.generic_type_parameter(owner, name)
 
-        code = tuple(token for token in parser.tokens if token.kind == 'code' and token.value != '\n')
-        positions = {token.start: index for index, token in enumerate(code)}
+        def array_leaf(declaration, owner):
+            for _depth in range(16):
+                element = parser.array_element_type(declaration, owner)
+                if element is None:
+                    return declaration
+                declaration = element
+            raise AnalysisLimit('Swift collection receiver nesting limit exceeded; analysis is incomplete')
+
+        def request_type(declaration, owner):
+            if not re.fullmatch(r'(?:Vapor\.)?Request[?!]?', declaration):
+                return False
+            return not ('Vapor' in parser.attribute_type_names or generic_binding(owner, 'Vapor')
+                        if declaration.startswith('Vapor.') else
+                        'Request' in parser.aliased_types or generic_binding(owner, 'Request')
+                        or bool(nominal('Request', owner)))
+
         fields = {}
         for owner, declarations in parser.fields.items():
             fields.setdefault(owner_id(owner), {}).update(declarations)
@@ -1749,22 +1896,24 @@ class SwiftEngine:
         for owner, declarations in parser.stored_fields.items():
             for name, (declaration, _default, _mutable, token, _reason) in declarations.items():
                 self.budget.spend()
-                declaration = declaration.replace('\n', '')
-                if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
-                    qualified = declaration.startswith('Vapor.')
-                    shadowed = ('Vapor' in parser.attribute_type_names or generic_binding(owner, 'Vapor') if qualified else
-                                'Request' in parser.aliased_types or generic_binding(owner, 'Request')
-                                or bool(nominal('Request', owner)))
-                    following = code[positions[token.start] + 1:positions[token.start] + 7]
-                    request = next((item for item in following if item.value == 'Request'), None)
-                    if not shadowed and request is not None and request.start not in parser.suppressed:
+                _element, witnesses = parser.array_type_info(declaration, owner)
+                witnesses |= parser.field_type_witnesses.get((owner, name), frozenset())
+                declaration = array_leaf(declaration.replace('\n', ''), owner)
+                if request_type(declaration, owner):
+                    if witnesses - parser.suppressed:
                         source_fields.add((owner_id(owner), name))
                 else:
                     target = nominal(declaration, owner)
                     if target:
                         contained[owner_id(owner), name] = target
+        request_arrays = frozenset(function.key for function in parser.functions.values()
+            if not function.scope and any(parser.array_element_type(declaration, function.owner) is not None
+                and request_type(array_leaf(declaration, function.owner), function.owner)
+                and (parser.array_type_info(declaration, function.owner)[1]
+                     | self.parameter_type_sources(function, index)) - parser.suppressed
+                for index, (_name, _label, declaration, _default) in enumerate(function.parameters)))
         if not source_fields:
-            return frozenset()
+            return request_arrays
 
         owners = {owner for owner, _name in source_fields}
         parents = {}
@@ -1787,7 +1936,7 @@ class SwiftEngine:
         parser = discovery.parser
         parser.recover = True
         functions = tuple(parser.functions.values())
-        dependencies, selected = {}, set()
+        dependencies, selected = {}, set(request_arrays)
         jobs, inputs, graphs = {}, {}, {}
         pending, queued = deque(), set()
         definitions, uses = {}, {}
@@ -1809,15 +1958,29 @@ class SwiftEngine:
                     if owner else CLEAN)
 
         def collection(values):
-            # Selection needs possible element identities, not collection
-            # contents or an ever-growing nesting path.
-            elements = frozenset(trace if trace.kind == 'entry-element' else
-                Trace('entry-element', (trace.kind, trace.key))
-                for trace in values if trace.kind != 'entry-collection')
-            return join(elements, frozenset({Trace('entry-collection', ())}))
+            # Preserve nested collection bindings, but never grow an unbounded
+            # receiver path through a recursive aggregate construction.
+            result = []
+            for trace in values:
+                depth, selected_trace = 0, trace
+                while selected_trace.kind == 'entry-element':
+                    depth += 1
+                    if depth >= 16:
+                        raise AnalysisLimit('Swift collection receiver nesting limit exceeded; analysis is incomplete')
+                    selected_trace = Trace(*selected_trace.key)
+                result.append(Trace('entry-element', (trace.kind, trace.key)))
+            return join(frozenset(result), frozenset({Trace('entry-collection', ())}))
 
         def elements(values):
             return frozenset(Trace(*trace.key) for trace in values if trace.kind == 'entry-element')
+
+        def typed_identity(declaration, owner, depth=0):
+            if depth >= 16:
+                raise AnalysisLimit('Swift collection receiver nesting limit exceeded; analysis is incomplete')
+            element = parser.array_element_type(declaration, owner)
+            if element is not None:
+                return collection(typed_identity(element, owner, depth + 1))
+            return identity(nominal(declaration, owner))
 
         def static_context(function):
             return function.static or any(parser.functions[key].static
@@ -1829,7 +1992,7 @@ class SwiftEngine:
             initial['self'] = identity(function.owner, static_context(function))
             for index, (name, _label, declaration, _default) in enumerate(function.parameters):
                 scope[name] = 'parameter:' + name
-                initial[scope[name]] = join(identity(nominal(declaration, function.owner)),
+                initial[scope[name]] = join(typed_identity(declaration, function.owner),
                                            arguments[index] if arguments is not None else CLEAN)
             key = root, function.key, tuple(sorted(scope.items()))
             previous = inputs.get(key)
@@ -1857,7 +2020,7 @@ class SwiftEngine:
 
         for function in functions:
             if (function.owner and owner_id(function.owner) in owners or any(
-                    nominal(declaration, function.owner) in owners
+                    nominal(array_leaf(declaration, function.owner), function.owner) in owners
                     for _name, _label, declaration, _default in function.parameters)):
                 if not function.scope:
                     schedule(function, {}, {}, function.key)
@@ -1904,7 +2067,7 @@ class SwiftEngine:
                 for index, (parameter, declaration) in enumerate(parameters):
                     slot = 'entry-argument:' + str(parameter.start)
                     scope[parameter.value] = slot
-                    initial[slot] = identity(nominal(declaration, function.owner))
+                    initial[slot] = typed_identity(declaration, function.owner)
                     slots.append((index, slot))
                 if not parameters and not _explicit:
                     def implicit_names(tokens):
@@ -1987,7 +2150,7 @@ class SwiftEngine:
                                 dependencies[root].add(candidate.key)
                                 if any(values):
                                     schedule(candidate, {}, {}, root, values)
-                            result = join(result, identity(nominal(candidate.return_type, candidate.owner)))
+                            result = join(result, typed_identity(candidate.return_type, candidate.owner))
                 if not known:
                     for _label, argument in arguments:
                         if any(trace.kind in {'entry-callable', 'entry-closure'} for trace in argument):
@@ -2016,7 +2179,7 @@ class SwiftEngine:
                         getter = getters.get((receiver_owner, name))
                         if getter is not None and not parser.functions[getter].static:
                             dependencies[root].add(getter)
-                        result = join(result, identity(nominal(fields[receiver_owner][name], receiver_owner)))
+                        result = join(result, typed_identity(fields[receiver_owner][name], receiver_owner))
                     else:
                         result = join(result, methods(receiver_owner, name, static, bindings, state))
                 return result
@@ -2354,6 +2517,59 @@ class SwiftEngine:
                             and trace.key[0] in {'request', 'request-collection', 'request-content'})
         return join(self.forget(value), requests)
 
+    def parameter_type_sources(self, function, index):
+        witnesses = self.parser.parameter_type_witnesses.get((function.key, index), frozenset())
+        if function.key in self.parser.synthetic_initializers:
+            witnesses |= self.parser.field_type_witnesses.get(
+                (function.owner, function.parameters[index][0]), frozenset())
+        return witnesses
+
+    def declared_array_value(self, declaration, owner, offset, depth=0, witnesses=None):
+        """Describe an unknown incoming native array, never a known argument.
+
+        Callers must distinguish an absent incoming layout from a present
+        field/element marker and from a pending callee's bottom. Declared
+        element identities supply possible receiver fields, not value proofs.
+        """
+        element, alias_witnesses = self.parser.array_type_info(declaration, owner)
+        if element is None:
+            return None
+        if witnesses is not None:
+            witnesses |= alias_witnesses
+        if depth >= 16:
+            raise AnalysisLimit('Swift collection receiver nesting limit exceeded; analysis is incomplete')
+        value = self.declared_array_value(element, owner, offset, depth + 1, witnesses)
+        if value is None:
+            selected = element.rstrip('?!')
+            parts = tuple(selected.split('.'))
+            generic = (self.function.generic or self.parser.generic_type_parameter(owner, parts[0])
+                       or any(self.parser.functions[key].generic for key in self.function.scope
+                              if key in self.parser.functions))
+            nominal = next(((*owner[:index], *parts) for index in range(len(owner), -1, -1)
+                            if (*owner[:index], *parts) in self.parser.type_declarations), ())
+            request = re.fullmatch(r'(?:Vapor\.)?Request', selected)
+            request_shadow = ('Vapor' in self.parser.attribute_type_names if selected.startswith('Vapor.')
+                              else 'Request' in self.parser.aliased_types or bool(nominal))
+            if request and not generic and not request_shadow:
+                value = (swift_shape('request', offset)
+                         if witnesses is None or witnesses - self.parser.suppressed else CLEAN)
+            elif nominal and not generic and not any('<' in part for part in nominal):
+                object_type = '.'.join(nominal)
+                kind = 'instance:' if object_type in self.parser.final_types else 'dynamic-instance:'
+                value = join(swift_shape(kind + object_type, offset),
+                             frozenset({Trace('unknown-layout', (object_type,))}))
+                if object_type not in self.parser.value_types:
+                    value = join(value, swift_shape('reference:' + object_type))
+                if object_type not in self.parser.final_types:
+                    value = join(value, self.limitation(
+                        'Swift incoming polymorphic references need subtype alias analysis', offset))
+            elif not generic and self.parser.native_scalar_type(selected):
+                value = CLEAN
+            else:
+                value = join(frozenset({Trace('opaque-value', ())}), self.limitation(
+                    'Swift incoming array element needs type and value binding analysis', offset))
+        return join(self.stored_value('<element>', value, offset), swift_shape('literal-array', offset))
+
     def record(self, offset, value, file_leaf=False):
         if self.policy == 'redirect':
             unsafe = frozenset(trace for trace in swift_tainted(value)
@@ -2458,22 +2674,114 @@ class SwiftEngine:
             visible = [function for function in visible if len(function.scope) == innermost]
         return visible
 
+    def contextual_array(self, tokens, value, declaration, state, bindings=None, *, owner=None, depth=0):
+        """Keep native array layout only after its contextual conversion is known.
+
+        A bracket literal can invoke an arbitrary init(arrayLiteral:) when a
+        declaration, argument or return supplies its type. Reusing its original
+        elements would skip that initializer's transformations and sink effects.
+        Check the already evaluated value: argument expressions must not execute
+        twice, and a refusal must retain their established request dependencies.
+        """
+        if not declaration or not tokens:
+            return value
+        if not any(token.kind == 'code' and token.value in {'[', '{'} for token in tokens):
+            return value
+        if depth > 64:
+            raise AnalysisLimit('Swift contextual array nesting limit exceeded; analysis is incomplete')
+        self.budget.spend()
+        owner = self.function.owner if owner is None else owner
+        tokens = swift_ungroup(tokens)
+        while tokens and tokens[0].value in {'try', 'await', '?', '!'}:
+            tokens = swift_ungroup(tokens[1:])
+        if not tokens:
+            return value
+        ternary = swift_parts(tokens, {'?'})
+        if len(ternary) == 2:
+            branches = swift_parts(ternary[1], {':'})
+            if len(branches) == 2:
+                selector = swift_text(ternary[0])
+                selected = (branches[0],) if selector == 'true' else (branches[1],) if selector == 'false' else branches
+                for branch in selected:
+                    value = self.contextual_array(branch, value, declaration, state, bindings,
+                                                  owner=owner, depth=depth + 1)
+                return value
+        alternatives = swift_parts(tokens, {'??'})
+        if len(alternatives) > 1:
+            for alternative in alternatives:
+                value = self.contextual_array(alternative, value, declaration, state, bindings,
+                                              owner=owner, depth=depth + 1)
+            return value
+        casts = swift_parts(tokens, {'as'})
+        if len(casts) == 2:
+            # An explicit cast supplies the literal's context before the outer
+            # value is assigned or erased to another type.
+            return self.contextual_array(casts[0], value, swift_text(casts[1]).lstrip('?!'),
+                                         state, bindings, owner=owner, depth=depth + 1)
+        if tokens[0].value == '{' and swift_close(tokens, 0) == len(tokens) - 1:
+            signature = declaration
+            while signature.startswith(('@escaping', '@Sendable', '@autoclosure')):
+                signature = re.sub(r'^@(escaping|Sendable|autoclosure)', '', signature, count=1)
+            result_type = swift_parts(swift_ungroup(SwiftLexer(signature.rstrip('?!')).scan()), {'->'})
+            if len(result_type) == 2:
+                result = swift_text(swift_ungroup(result_type[1]))
+                inputs = tuple(swift_text(part) for part in swift_parts(swift_ungroup(result_type[0]), {','}) if part)
+                # A supplied closure literal inherits the selected parameter's
+                # result context too. Keep it with this closure value rather
+                # than changing another use of the same allocation site.
+                return frozenset(replace(trace, key=(trace.key[0], result, owner, inputs))
+                                 if trace.kind == 'closure' else trace for trace in value)
+            return value
+        if tokens[0].value != '[' or swift_close(tokens, 0) != len(tokens) - 1:
+            return value
+        elements = swift_parts(tokens[1:-1], {','})
+        if any(len(swift_parts(element, {':'})) == 2
+               and len(swift_parts(element, {'?'})) == 1 for element in elements):
+            # Dictionary literals have their own conversion semantics. Do not
+            # infer an Array certificate from their bracket spelling.
+            return value
+        element_type = self.parser.array_element_type(declaration, owner)
+        if element_type is None:
+            return join(self.forget(value), self.limitation(
+                'Swift contextual array literal needs selected initializer analysis',
+                tokens[0].start, state, bindings))
+        for element in elements:
+            value = self.contextual_array(element, value, element_type, state, bindings,
+                                          owner=owner, depth=depth + 1)
+        return value
+
     def bind(self, function, arguments, state, bindings):
-        position, values = 0, []
-        for name, label, declaration, default in function.parameters:
+        position, selected = 0, []
+        for index, (name, label, declaration, default) in enumerate(function.parameters):
             if '...' in declaration:
+                if (position < len(arguments) and arguments[position][0] != label
+                        and not any(later[1] == arguments[position][0]
+                                    for later in function.parameters[index + 1:])):
+                    # This label cannot select the variadic overload, even
+                    # with zero variadic elements before a later parameter.
+                    # A viable variadic call still needs its binding analysis.
+                    return None
                 raise SwiftUnsupported('Swift variadic parameters need call binding analysis; analysis is incomplete', function.key)
             if position < len(arguments) and arguments[position][0] == label:
-                value = arguments[position][1]
+                selected.append((name, declaration, arguments[position][1], arguments[position][2]))
                 position += 1
             elif default:
-                value = self.default_argument(function, name, default)
+                selected.append((name, declaration, None, default))
             else:
                 return None
+        if position != len(arguments):
+            return None
+        values = []
+        for name, declaration, value, tokens in selected:
+            if value is not None:
+                value = self.contextual_array(tokens, value, declaration, state, bindings,
+                                              owner=function.owner)
+            else:
+                value = self.default_argument(function, name, tokens, declaration)
             values.append(value)
-        return tuple(values) if position == len(arguments) else None
+        return tuple(values)
 
-    def default_argument(self, function, name, tokens):
+    def default_argument(self, function, name, tokens, declaration=''):
         """Default arguments execute in the declaration's lexical context."""
         identity = function.key, name
         if identity not in self.default_functions:
@@ -2483,7 +2791,8 @@ class SwiftEngine:
             else:
                 key = -2 - tokens[0].start
                 default = SwiftFunction(key, '<default:' + name + '>', function.owner,
-                                        function.scope, (), (SwiftStatement('return', tuple(tokens)),), static=True)
+                                        function.scope, (), (SwiftStatement('return', tuple(tokens)),),
+                                        static=True, return_type=declaration)
                 self.parser.functions[key] = default
             self.default_functions[identity] = default
         summary = self.summaries[self.context(self.default_functions[identity], ())]
@@ -2569,14 +2878,16 @@ class SwiftEngine:
         # An explicitly opaque aggregate may still mutate any stored field.
         return join(frozenset(result), self.forget(swift_top(receiver)))
 
-    def write_field(self, receiver, name, value, state, binding, offset, operator='=', field_path=()):
+    def write_field(self, receiver, name, value, state, binding, offset, operator='=', field_path=(),
+                    *, tokens=(), bindings=None):
         owners = {tuple(trace.key[0].split(':', 1)[1].split('.'))
                   for trace in swift_top(receiver) if trace.kind == 'shape'
                   and trace.key[0].startswith(('instance:', 'dynamic-instance:'))}
         if not owners or any(name not in self.parser.stored_fields.get(owner, {}) for owner in owners):
             return False
         for owner in owners:
-            reason = self.parser.stored_fields[owner][name][4]
+            declaration, _default, _mutable, _token, reason = self.parser.stored_fields[owner][name]
+            value = self.contextual_array(tokens, value, declaration, state, bindings, owner=owner)
             native_write = (reason == SWIFT_WRAPPED_PROPERTY_REASON
                 and operator == '=' and bool(value)
                 and all(not swift_field_path(trace) and (
@@ -3018,7 +3329,9 @@ class SwiftEngine:
                 states.append(branch)
             for closure in stored:
                 branch = dict(state)
-                results.append(self.invoke_stored(closure, tuple(fact for _, fact, _ in arguments), branch))
+                results.append(self.invoke_stored(closure, tuple(fact for _, fact, _ in arguments), branch,
+                                                 argument_tokens=tuple(part for _, _, part in arguments),
+                                                 caller_bindings=bindings))
                 states.append(branch)
             for method in http_methods:
                 branch = dict(state)
@@ -3168,9 +3481,18 @@ class SwiftEngine:
                 names = set(identifiers(function.body)) - {item[0] for item in function.parameters}
                 for captured in names.intersection(bindings):
                     fact = branch.get(bindings[captured], CLEAN)
-                    if swift_tainted(fact) or swift_has_shape(fact, 'request'):
+                    # A captured carrier can hold an unqueried Request inside
+                    # a field or array element. Its source dependency still
+                    # needs the same explicit capture-analysis boundary.
+                    if swift_request_dependency(fact):
                         return join(self.forget(value), self.limitation(
                             'Swift request-derived nested capture needs capture analysis', token.start, state, bindings))
+                    # Incoming layouts may hide a Request until a member is
+                    # read. Named helpers do not receive captured value facts,
+                    # so those layouts need the same conservative boundary.
+                    if any(trace.kind == 'unknown-layout' for trace in fact):
+                        return join(self.forget(value), self.limitation(
+                            'Swift incoming object nested capture needs value binding analysis', token.start, state, bindings))
             if any(item[2].startswith('inout') for item in function.parameters) and any(item[3] for item in function.parameters):
                 raise SwiftUnsupported('Swift defaulted inout arguments need mutation binding analysis; analysis is incomplete', token.start)
             matched = True
@@ -3307,11 +3629,23 @@ class SwiftEngine:
             if projected is not None:
                 if any(trace.kind == 'unknown-layout' for trace in swift_top(receiver)):
                     shadowed = self.parser.types | self.parser.shadow_type_names
-                    plain_scalars = True
+                    bounded_fields = True
                     for owner in owners:
                         declaration, default, _, _, reason = self.parser.stored_fields[owner][name]
                         if reason == SWIFT_WRAPPED_PROPERTY_REASON and self.parser.framework_value_field(owner, name):
                             continue
+                        array = self.declared_array_value(declaration, owner, token.start,
+                            witnesses=self.parser.field_type_witnesses.get((owner, name), frozenset()))
+                        if array is not None:
+                            # The parent's unknown fields are represented by
+                            # the declared element alternatives below. They do
+                            # not make a proved native array a second, opaque
+                            # collection kind; keep nested element layouts.
+                            projected = frozenset(trace for trace in projected
+                                if trace.kind != 'unknown-layout' or swift_field_path(trace))
+                            projected = join(projected, array)
+                            if not reason:
+                                continue
                         selected = declaration.rstrip('?!')
                         if not selected and len(default) == 1:
                             if default[0].kind in {'literal', 'template'}:
@@ -3321,11 +3655,11 @@ class SwiftEngine:
                         native = (selected in {'String', 'Bool'} and selected not in shadowed
                                   or selected in {'Swift.String', 'Swift.Bool'} and 'Swift' not in shadowed)
                         if reason or not native:
-                            plain_scalars = False
+                            bounded_fields = False
                             break
-                    if not plain_scalars:
-                        # String and Bool keep their source alternatives through
-                        # a weak field update. Other incoming fields may hide
+                    if not bounded_fields:
+                        # Scalar sources and declared native-array elements
+                        # survive a weak update. Other incoming fields may hide
                         # callable dispatch or Request shapes.
                         projected = join(projected, frozenset({Trace('opaque-value', ())}), self.limitation(
                             'Swift mixed incoming stored property needs value binding analysis', token.start))
@@ -3368,6 +3702,14 @@ class SwiftEngine:
             if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
                 resolved.append(swift_shape('request', token.start))
                 continue
+            if stored and self.project_field(name, receiver) is None:
+                array = self.declared_array_value(declaration, owner, token.start,
+                    witnesses=self.parser.field_type_witnesses.get((owner, name), frozenset()))
+                if array is not None:
+                    dependency = frozenset(trace for trace in self.forget(swift_top(receiver))
+                                           if trace.kind != 'unknown-layout')
+                    resolved.append(join(dependency, array))
+                    continue
             selected_type = declaration.rstrip('?')
             if stored and not selected_type and stored[1] and stored[1][0].value in self.parser.types:
                 selected_type = stored[1][0].value
@@ -3504,7 +3846,7 @@ class SwiftEngine:
                                                 dict(state), dict(snapshots), self.active_context)
         return frozenset({Trace('closure', (self.closure_keys[key],))})
 
-    def invoke_stored(self, closure, arguments, state):
+    def invoke_stored(self, closure, arguments, state, *, argument_tokens=(), caller_bindings=None):
         self.enable_callbacks()
         tokens, function, bindings, captured, snapshots, context = self.stored_closures[closure.key[0]]
         if closure.key[0] in self.active_closures:
@@ -3512,6 +3854,19 @@ class SwiftEngine:
                                    tokens[0].start, state, bindings)
         if len(self.active_closures) >= 64:
             raise AnalysisLimit('Swift stored closure nesting limit exceeded; analysis is incomplete')
+        if argument_tokens:
+            inner = SwiftLexer(self.text).scan(tokens[0].end, tokens[-1].start)
+            _captures, parameters, _body, _explicit = self.parser.closure_signature(inner)
+            contextual = closure.key[3] if len(closure.key) > 3 else ()
+            checked = []
+            for index, value in enumerate(arguments):
+                declaration = parameters[index][1] if index < len(parameters) else ''
+                declaration_owner = function.owner
+                if not declaration and index < len(contextual):
+                    declaration, declaration_owner = contextual[index], closure.key[2]
+                checked.append(self.contextual_array(argument_tokens[index], value, declaration,
+                                                     state, caller_bindings, owner=declaration_owner))
+            arguments = tuple(checked)
         parent, active = self.function, self.active_context
         visible = {binding: fact for binding, fact in state.items()
                    if self.capture_visible(context, binding)}
@@ -3522,7 +3877,10 @@ class SwiftEngine:
             self.function, self.active_context = function, context
             value = self.inline_closure(tokens, join(*arguments), environment, bindings, 0,
                                         capture_values=snapshots, argument_values=arguments,
-                                        capture_writes=writes)
+                                        capture_writes=writes,
+                                        result_context=closure.key[1] if len(closure.key) > 1 else '',
+                                        result_owner=closure.key[2] if len(closure.key) > 2 else None,
+                                        parameter_context=closure.key[3] if len(closure.key) > 3 else ())
             self.apply_captures({(context, binding): fact for binding, fact in writes.items()},
                                 state, context=active)
             return value
@@ -3541,7 +3899,8 @@ class SwiftEngine:
             self.invoke_stored(closure, (unknown,), state)
 
     def inline_closure(self, tokens, argument, state, bindings, depth, *, catches_errors=False,
-                       capture_values=None, argument_values=None, capture_writes=None):
+                       capture_values=None, argument_values=None, capture_writes=None,
+                       result_context='', result_owner=None, parameter_context=()):
         """Evaluate a collection callback with lexical captures and a loop join.
 
         A method name does not establish nonescaping execution. Captures also
@@ -3558,6 +3917,17 @@ class SwiftEngine:
         # range so separate callback statements retain their control flow.
         inner = SwiftLexer(self.text).scan(tokens[0].end, tokens[-1].start)
         captures, parameters, body_tokens, explicit = self.parser.closure_signature(inner)
+        return_type = result_context
+        if explicit:
+            body_start = body_tokens[0].start if body_tokens else tokens[-1].start
+            header = tuple(token for token in inner if token.start < body_start)
+            header = tuple(token for token in header if token.kind != 'code' or token.value != '\n')
+            if header and header[-1].value == 'in':
+                header = header[:-1]
+            result_type = swift_parts(header, {'->'})
+            if len(result_type) == 2:
+                return_type = swift_text(swift_ungroup(result_type[1]))
+                result_owner = None
         if not explicit:
             # A stored closure can read just $2, or only mention it inside
             # interpolation. Bind all supplied slots before any extra names
@@ -3571,7 +3941,9 @@ class SwiftEngine:
         body = self.parser.block(body_tokens, parent.owner, (*parent.scope, parent.key))
         body = self.parser.result_body(body) or body
         function = SwiftFunction(tokens[0].start, '<closure>', parent.owner,
-                                 (*parent.scope, parent.key), (), body)
+                                 (*parent.scope, parent.key), (), body,
+                                 return_type=return_type, binding_types=dict(parent.binding_types),
+                                 return_owner=result_owner)
         scope = dict(bindings)
         initial = dict(state)
         initial.pop('@result', None)
@@ -3585,14 +3957,23 @@ class SwiftEngine:
                      else self.expression(expression, state, bindings, depth + 1))
             scope[capture.value] = 'capture:' + str(capture.start)
             initial[scope[capture.value]] = value
+            selected = swift_ungroup(expression)
+            if len(selected) == 1:
+                declaration = parent.binding_types.get(bindings.get(selected[0].value, selected[0].value))
+                if declaration:
+                    function.binding_types[scope[capture.value]] = declaration
         for index, (parameter, declaration) in enumerate(parameters):
             if parameter.value == '_':
                 continue
+            if not declaration and index < len(parameter_context):
+                declaration = parameter_context[index]
             scope[parameter.value] = 'closure-argument:' + str(parameter.start) + ':' + parameter.value
             value = argument if argument_values is None or index >= len(argument_values) else argument_values[index]
             if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
                 value = join(value, swift_shape('request', parameter.start))
             initial[scope[parameter.value]] = value
+            if declaration:
+                function.binding_types[scope[parameter.value]] = declaration
         initial['@reachable'] = swift_constant('true', 'code')
         entry, actions, edges = self.graph(function, scope)
         returned, mutations, context, thrown = self.returned, self.mutations, self.active_context, self.thrown
@@ -3641,6 +4022,24 @@ class SwiftEngine:
     def callback(self, name, receiver, tokens, state, bindings, depth, member_call=False):
         self.enable_callbacks()
         leaf = name.rsplit('.', 1)[-1]
+        if not member_call and receiver and all(trace.kind == 'function' for trace in receiver):
+            candidates = self.candidates(name, receiver, state, bindings)
+            if candidates and all(len(function.parameters) == 1 for function in candidates):
+                # A resolved single-parameter helper receives this closure as
+                # its actual argument. Its declared result context and body
+                # effects belong to ordinary call binding, not unknown callback
+                # dispatch. Swift omits this argument's label in trailing form.
+                closure = self.store_closure(tokens, state, bindings, depth + 1)
+                results, states = [], []
+                for function in candidates:
+                    branch = dict(state)
+                    selected = frozenset({Trace('function', (function.key,))})
+                    argument = (function.parameters[0][1], closure, tokens)
+                    results.append(self.call(name, selected, [argument], CallSite(tokens[0]), branch, bindings))
+                    states.append(branch)
+                state.clear()
+                state.update(join_states(*states))
+                return join(*results)
         if name in {'#expect', '#require'}:
             argument = CLEAN
         elif (member_call and leaf in {'map', 'compactMap', 'flatMap', 'filter', 'forEach', 'contains', 'first'}
@@ -3732,7 +4131,13 @@ class SwiftEngine:
                     state.update(join_states(before, state))
             value = join(*values)
             if set(operators) <= {'??'}:
-                return value
+                # A nil left operand selects the next operand; it is not an
+                # alternative element of the resulting native collection.
+                # Keep a possible nil in the final fallback and all nested
+                # field values. Operand effects were already evaluated above.
+                return join(*(frozenset(trace for trace in item
+                    if not (trace.kind == 'constant' and trace.key == ('code', 'nil')
+                            and not swift_field_path(trace))) for item in values[:-1]), values[-1])
             if self.policy == 'header' and set(operators) <= {'+'}:
                 return self.header_text(values)
             return self.forget(value)
@@ -3894,12 +4299,16 @@ class SwiftEngine:
                 continue
             if token.value == '[':
                 close = swift_close(tokens, cursor)
+                index = self.expression(tokens[cursor + 1:close], state, bindings, depth + 1)
                 if swift_has_shape(value, 'request-collection'):
                     value = self.source(tokens[0].start, self.text[tokens[0].start:tokens[close].end])
+                elif swift_has_shape(value, 'literal-array'):
+                    # Native indexing selects an existing element. The index
+                    # is evaluated for effects, but its scalar value is not
+                    # another element or an alternative collection receiver.
+                    value = self.iteration_value(value, token.start, 'request collection element')
                 else:
-                    if swift_has_shape(value, 'literal-array'):
-                        value = self.iteration_value(value, token.start, 'request collection element')
-                    value = join(value, self.expression(tokens[cursor + 1:close], state, bindings, depth + 1))
+                    value = join(value, index)
                 cursor = close + 1
                 continue
             if token.value == '{':
@@ -3910,9 +4319,15 @@ class SwiftEngine:
                 value = self.callback(name, value, tokens[cursor:close + 1], state, bindings, depth)
                 cursor = close + 1
                 continue
-            if token.value == 'as' and self.reference_ids(value):
+            if token.value == 'as':
                 target = swift_text(tokens[cursor + 1:]).lstrip('?!')
-                if target in self.parser.types or target in {'Any', 'AnyObject'}:
+                value = self.contextual_array(tokens[:cursor], value, target, state, bindings)
+                if (self.parser.array_element_type(target, self.function.owner) is not None
+                        and swift_has_shape(value, 'literal-array')):
+                    # A known native array cast changes its static view; it
+                    # does not rerun arbitrary array-literal initialization.
+                    return value
+                if self.reference_ids(value) and (target in self.parser.types or target in {'Any', 'AnyObject'}):
                     identities = frozenset(trace for trace in value if trace.kind == 'shape'
                         and trace.key[0].startswith(('instance:', 'dynamic-instance:', 'reference:')))
                     # A checked/forced reference cast changes the static view,
@@ -4150,11 +4565,20 @@ class SwiftEngine:
 
     def _graph(self, function, outer_scope, opaque):
         actions, edges = {}, {}
-        scope = dict(outer_scope or {})
-        scope.update({name: 'parameter:' + name for name, _, _, _ in function.parameters})
-        binding_types = {'parameter:' + name: declaration
-                         for name, _, declaration, _ in function.parameters}
         enclosing = [self.parser.functions[key] for key in function.scope if key in self.parser.functions]
+        # Named local helpers retain the lexical bindings visible at their
+        # definition, just as inline closures do. The original local IDs keep
+        # sibling scopes distinct; this is type context, not a capture value.
+        scope = dict(getattr(function, 'lexical_bindings', {}))
+        scope.update(outer_scope or {})
+        scope.update({name: 'parameter:' + name for name, _, _, _ in function.parameters})
+        binding_types = {}
+        for parent in enclosing:
+            binding_types.update(parent.binding_types)
+        binding_types.update(function.binding_types)
+        binding_types.update({'parameter:' + name: declaration
+                              for name, _, declaration, _ in function.parameters})
+        function.binding_types = binding_types
         generic_context = function.generic or any(parent.generic for parent in enclosing) or any(
             '.'.join(function.owner[:index]) in self.parser.generic_types
             for index in range(1, len(function.owner) + 1))
@@ -4199,6 +4623,10 @@ class SwiftEngine:
             self.budget.spend()
             key = len(actions)
             local = {} if bindings is None else dict(bindings)
+            if kind in {'simple', 'optional'} and extra is None:
+                assignment = self.parser.assignment(tokens)
+                if assignment and assignment[0]:
+                    extra = binding_types.get(local.get(assignment[0], assignment[0]), '')
             actions[key], edges[key] = (kind, tokens, local, extra, local if reads is None else dict(reads)), tuple(targets)
             return key
 
@@ -4281,6 +4709,9 @@ class SwiftEngine:
                 assignment = self.parser.assignment(part)
                 if assignment and assignment[-1] and assignment[0]:
                     local[assignment[0]] = assignment[0] + '@' + str(assignment[1][0].start)
+                    annotation = swift_parts(swift_parts(part, {'='})[0], {':'})
+                    if len(annotation) == 2:
+                        binding_types[local[assignment[0]]] = swift_text(annotation[1])
                 elif len(part) == 2 and part[0].value in {'let', 'var'}:
                     local[part[1].value] = part[1].value + '@' + str(part[1].start)
             return local
@@ -4466,10 +4897,22 @@ class SwiftEngine:
                         register_arm_declarations(statement, local); continue
                     assignment = self.parser.assignment(statement.tokens) if statement.kind == 'simple' else None
                     if assignment and assignment[-1] and assignment[0]:
+                        previous = binding_types.get(local.get(assignment[0], ''), '')
                         local[assignment[0]] = assignment[0] + '@' + str(assignment[1][0].start)
+                        annotation = swift_parts(swift_parts(statement.tokens, {'='})[0], {':'})
+                        if len(annotation) == 2:
+                            declaration = swift_text(annotation[1])
+                            binding_types[local[assignment[0]]] = (
+                                '<conditional>' if previous and previous != declaration else declaration)
                     declaration = self.parser.uninitialized(statement.tokens) if statement.kind == 'simple' else None
                     if declaration:
+                        previous = binding_types.get(local.get(declaration.value, ''), '')
                         local[declaration.value] = declaration.value + '@' + str(declaration.start)
+                        annotation = swift_parts(statement.tokens, {':'})
+                        if len(annotation) == 2:
+                            selected = swift_text(annotation[1])
+                            binding_types[local[declaration.value]] = (
+                                '<conditional>' if previous and previous != selected else selected)
 
         def block(statements, following, bindings, break_to=None, continue_to=None, exit_to=None,
                   fallthrough_to=None):
@@ -4487,6 +4930,13 @@ class SwiftEngine:
 
             for statement in statements:
                 before = dict(local)
+                if statement.kind == 'definition':
+                    for key in statement.extra:
+                        nested = self.parser.functions.get(key)
+                        if nested is not None and nested.scope and nested.scope[-1] == function.key:
+                            nested.lexical_bindings = dict(local)
+                            nested.binding_types.update({binding: binding_types[binding]
+                                                         for binding in local.values() if binding in binding_types})
                 opaque_defer = any(statement.tokens and statement.tokens[0].start <= offset < statement.tokens[-1].end
                                    for offset in opaque)
                 if is_defer(statement) and not opaque_defer:
@@ -4823,8 +5273,15 @@ class SwiftEngine:
         if kind == 'optional' and not assignment:
             raise SwiftUnsupported('Unsupported Swift optional binding; analysis is incomplete', tokens[0].start)
         if assignment:
-            name, lhs, rhs, operator, _ = assignment
+            name, lhs, rhs, operator, declared = assignment
             value = self.expression(rhs, state, reads)
+            if name and name in bindings:
+                declarations = {extra} if extra else set() if declared else {
+                    trace.key[0].split(':', 1)[1]
+                    for trace in swift_top(state.get(reads.get(name, name), CLEAN))
+                    if trace.kind == 'shape' and trace.key[0].startswith(('instance:', 'dynamic-instance:'))}
+                for declaration in sorted(declarations):
+                    value = self.contextual_array(rhs, value, declaration, state, reads)
             if not name:
                 header = swift_text(lhs)
                 header_assignment = re.fullmatch(r'(?:[A-Za-z_]\w*\.)?headers\[([\'\"])([^\'\"]+)\1\]', header, re.IGNORECASE)
@@ -4855,7 +5312,8 @@ class SwiftEngine:
                         if (owner, field_name) in self.parser.opaque_fields:
                             self.limitation(self.parser.opaque_fields[(owner, field_name)],
                                             lhs[0].start, state, bindings)
-                    if self.write_field(previous, field_name, value, state, binding, lhs[0].start, operator, field_path):
+                    if self.write_field(previous, field_name, value, state, binding, lhs[0].start, operator, field_path,
+                                        tokens=rhs, bindings=reads):
                         return state
                     if field_path:
                         self.limitation('Swift nested stored property write needs binding analysis',
@@ -4890,7 +5348,8 @@ class SwiftEngine:
                 if (self.function.owner, name) in self.parser.opaque_fields:
                     self.limitation(self.parser.opaque_fields[(self.function.owner, name)],
                                     lhs[0].start, state, bindings)
-                if self.write_field(state.get('self', CLEAN), name, value, state, 'self', lhs[0].start, operator):
+                if self.write_field(state.get('self', CLEAN), name, value, state, 'self', lhs[0].start, operator,
+                                    tokens=rhs, bindings=reads):
                     return state
                 self.escape_closures(value, state)
                 if re.fullmatch(r'(?:Vapor\.)?Request\??', self.parser.fields[self.function.owner][name]):
@@ -4915,6 +5374,8 @@ class SwiftEngine:
             return state
         value = self.expression(tokens, state, bindings)
         if kind == 'return':
+            value = self.contextual_array(tokens, value, self.function.return_type, state, bindings,
+                                          owner=self.function.return_owner)
             # A stored-property initializer is represented as a synthetic
             # return so member() can reuse its summary. Merely creating that
             # property does not invoke its callback with an unknown argument.
@@ -4988,7 +5449,15 @@ class SwiftEngine:
                 for index, (name, _, declaration, _) in enumerate(function.parameters):
                     value = arguments[index]
                     object_type = parameter_types[index]
-                    if re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
+                    array = self.parser.array_element_type(declaration, function.owner)
+                    if array is not None:
+                        opaque = any(trace.kind == 'opaque-value' or 'unknown-provenance' in trace.tags
+                                     or trace.kind == 'shape' and trace.key[0] == 'unknown'
+                                     for trace in swift_top(value))
+                        if key[2] or opaque:
+                            value = join(value, self.declared_array_value(declaration, function.owner, function.key,
+                                witnesses=self.parameter_type_sources(function, index)))
+                    elif re.fullmatch(r'(?:Vapor\.)?Request\??', declaration):
                         value = join(value, swift_shape('request', function.key))
                     elif re.fullmatch(r'(?:inout)?(?:Swift\.)?String\??', declaration):
                         value = swift_retag(value, add=frozenset({'swift-string'}))
@@ -5024,6 +5493,7 @@ class SwiftEngine:
                             and not self.reference_ids(initial['self'])):
                         initial['self'] = join(initial['self'], swift_shape('reference:' + owner))
                 if key[2] and any(object_type in self.parser.types
+                        and self.parser.array_element_type(function.parameters[index][2], function.owner) is None
                         and object_type not in self.parser.final_types
                         and not self.reference_ids(arguments[index])
                         for index, object_type in enumerate(parameter_types)):

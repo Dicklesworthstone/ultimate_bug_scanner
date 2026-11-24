@@ -3843,6 +3843,11 @@ class _Flow:
                 return captured[name]
             if name not in self.engine.global_names:
                 return _implicit_identity(name)
+            if native_callback:
+                # The ownership proof itself reads this module slot. Keep
+                # that dependency in selected caller contexts, including
+                # callers with a same-spelled local variable.
+                self.capture_globals.add((self.engine.tree, name))
             contents = self.global_contents(name, state)
             if contents.bound is False and name not in self.engine.global_names:
                 return _implicit_identity(name)
@@ -3919,6 +3924,12 @@ class _Flow:
             return primitive(expression)
 
         def raised(expression):
+            if isinstance(expression, ast.Name):
+                # Native filter/map catches this exact exception and may
+                # resume its input later. Other bare exception classes can
+                # require constructor arguments, so keep their old boundary.
+                return (lookup(expression.id) == 'builtins.StopIteration'
+                        and self.generator_builtins_stable())
             if isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name):
                 identity = lookup(expression.func.id)
                 if (not expression.keywords and all(primitive(argument) for argument in expression.args)
@@ -5023,6 +5034,10 @@ class _Flow:
             return CLEAN
         known = [value for value in choices if self.stdin_identity(value) in _STDIN_STREAMS]
         if not known:
+            if any(isinstance(value, (_ArgumentVector, _LiteralString))
+                   or isinstance(value, ast.Constant) and type(value.value) in {str, bytes}
+                   for value in choices):
+                return self.finite_filter_value(node, state, positions)
             return None
         predicates = _binding_choices(predicate)
         symbolic = {value.parameter for value in (*choices, *predicates)
@@ -5046,6 +5061,193 @@ class _Flow:
         return self.install_zip_iterator(node, state, _ZipIterator(
             (row,), None, optional=True, repeating=True, fallible=True, fallible_at_end=True,
             native_kind='filter', native_streams=tuple(sorted({self.stdin_identity(value) for value in known}))))
+
+    def finite_filter_value(self, node, state, positions):
+        """Capture a finite native input and predicate without invoking it.
+
+        Accepted predicates use the same selected callback/frame proof as
+        map. Their return controls selection, never the yielded item's value
+        or sanitizer domain. Mutable backing inputs retain their identity so
+        later writes cannot silently reuse this snapshot.
+        """
+        predicate_node, _fact, predicate, predicate_refs = positions[0]
+        expression, fact, binding, references = positions[1]
+        symbolic = {value.parameter for value in (*_binding_choices(predicate), *_binding_choices(binding))
+                    if isinstance(value, _SymbolicValue)}
+        if symbolic:
+            self.filter_parameters.update(symbolic)
+            return CLEAN
+        if len(_binding_choices(binding)) != 1:
+            # A joined input snapshot cannot share one cursor without losing
+            # the relation between skipped items and its remaining elements.
+            raise AnalysisLimit('native filter input alternatives are unresolved; analysis is incomplete')
+        predicates = _binding_choices(predicate)
+        fresh_lambda = (predicate_node,) if isinstance(predicate_node, ast.Lambda) else ()
+        if not self.stdin_parser_stable(node, members={'filter', '__iter__', '__next__', '__bool__', '__len__'},
+                                        deferred_lambdas=fresh_lambda):
+            value = next(iter(_binding_choices(binding)))
+            if (predicates and all(isinstance(part, ast.Constant) and part.value is None for part in predicates)
+                    and isinstance(value, _ArgumentVector) and value.operands
+                    and len(value.operands) <= _MAX_VECTOR_CONTEXT
+                    and not references & state.mutated
+                    and not any(trace.parameter is None for trace in fact)
+                    and all(isinstance(operand, ast.Attribute)
+                        or isinstance(operand, ast.Call) and any(
+                            isinstance(target, str) and '.' in target and '<' not in target
+                            or isinstance(target, _BoundCallable) and target.namespace_proven
+                            for target in _binding_choices(self.expression_bindings.get(operand.func)))
+                        for operand, _incoming in value.operands)):
+                elements = [(operand if isinstance(operand, (_LiteralString, _GeneratorString, ast.Constant))
+                             else self.expression_bindings.get(operand),
+                             value.references_at(index) | self.expression_references.get(operand, NO_REFERENCES))
+                            for index, (operand, _incoming) in enumerate(value.operands)]
+                protected = any(
+                    self.unproved_producer(element)
+                    or isinstance(element, _BoundCallable) and element.producer_unproved
+                    or refs & state.mutated
+                    or any(isinstance(ref, ast.Call) and any(
+                        isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef,
+                                            _FunctionValue, _ClosureValue))
+                        for target in _binding_choices(self.expression_bindings.get(ref.func))) for ref in refs)
+                    for element, refs in elements)
+                if not protected and not all(self.materialized_generator_binding(element, refs, state)
+                                             for element, refs in elements):
+                    # Without native callable authority or primitive input
+                    # authority, preserve the existing opaque None-filter's
+                    # aggregate transfer for library fields/foreign values.
+                    # This creates no native handle or clean row snapshot;
+                    # source facts, known owners and revoked producers above
+                    # cannot use it to evade their explicit obligations.
+                    return None
+            raise AnalysisLimit('native filter callable identity is unresolved; analysis is incomplete')
+        if not predicates:
+            return CLEAN
+        if len(predicates) != 1:
+            raise AnalysisLimit('native filter predicate alternatives are unresolved; analysis is incomplete')
+        mapper = next(iter(predicates))
+        if isinstance(mapper, ast.Constant) and mapper.value is None:
+            mapper = None
+        else:
+            function = mapper.value if isinstance(mapper, _ClosureValue) else mapper
+            function = function.function if isinstance(function, _FunctionValue) else function
+            native = (mapper if isinstance(mapper, str) else mapper.name
+                      if isinstance(mapper, _BoundCallable) and mapper.namespace_proven else None)
+            if (native not in _NATIVE_MAP_SANITIZERS
+                    and not isinstance(function, (ast.FunctionDef, ast.Lambda))
+                    or isinstance(function, (ast.FunctionDef, ast.Lambda)) and function in self.engine.generators
+                    or isinstance(mapper, _BoundCallable) and (
+                        mapper.producer_unproved or mapper.references & state.mutated)):
+                raise AnalysisLimit('native filter predicate identity or protocol is unresolved; analysis is incomplete')
+        if (predicate_refs & state.mutated or any(isinstance(ref, ast.Call) for ref in predicate_refs)
+                or not self.filter_predicate_inert(mapper, state)):
+            # A callable factory can release unrelated locals before handing
+            # us its result. Its returned function alone proves no lifetime.
+            raise AnalysisLimit('native filter predicate ownership is unresolved; analysis is incomplete')
+        key = (node, 'native-filter-predicate')
+        call = self.engine.method_calls.get(key)
+        if mapper is not None and call is None:
+            call = ast.copy_location(ast.Call(
+                func=ast.copy_location(ast.Name(id='@filter:predicate', ctx=ast.Load()), predicate_node),
+                args=[ast.copy_location(ast.Name(id='@filter:item', ctx=ast.Load()), predicate_node)],
+                keywords=[]), predicate_node)
+            self.engine.method_calls[key] = call
+            self.engine.original_calls[call] = self.engine.original_calls.get(node, node)
+        try:
+            iterator = self.native_iterator_rows(((expression, fact, binding, references),), state)
+        except AnalysisLimit as exc:
+            raise AnalysisLimit('native filter input protocol is unresolved: ' + str(exc)) from exc
+        if iterator.repeating or iterator.optional or iterator.fallible:
+            raise AnalysisLimit('native filter input is not finite; analysis is incomplete')
+        return self.install_zip_iterator(node, state, replace(
+            iterator, native_kind='filter', mapper=mapper, mapper_call=call,
+            references=iterator.references | predicate_refs))
+
+    def filter_predicate_inert(self, mapper, state):
+        """Check retained callable objects even when no predicate will run.
+
+        Discarding an empty filter still releases its callback's defaults and
+        closure cells. This proves ownership only; the frame proof stays at
+        invocation so unused predicate bodies do not execute speculatively.
+        """
+        if mapper is None:
+            return True
+        if any(engine.generator_attribute_writes for engine in self.engine.generator_peers):
+            # Function objects can retain user-owned values in arbitrary
+            # attributes, beyond their defaults and lexical closure cells.
+            return False
+        native = (mapper if isinstance(mapper, str) else mapper.name
+                  if isinstance(mapper, _BoundCallable) and mapper.namespace_proven else None)
+        if native in _NATIVE_MAP_SANITIZERS:
+            return not isinstance(mapper, _BoundCallable) or not (
+                mapper.producer_unproved or mapper.references & state.mutated)
+        closure = mapper if isinstance(mapper, _ClosureValue) else None
+        function = closure.value if closure is not None else mapper
+        defaults = function if isinstance(function, _FunctionValue) else None
+        function = defaults.function if defaults is not None else function
+        if (not isinstance(function, (ast.FunctionDef, ast.Lambda))
+                or self.engine.owner(function) is not self.engine
+                or getattr(function, 'decorator_list', ()) or getattr(function, 'returns', None) is not None
+                or function.args.vararg or function.args.kwarg
+                or any(argument.annotation is not None for argument in (
+                    *function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs))):
+            return False
+        values = (dict(defaults.values) if defaults is not None
+                  else self.definition_table('default_bindings', function))
+        references = (dict(defaults.references) if defaults is not None
+                      else self.definition_table('default_references', function))
+        expected = len(function.args.defaults) + sum(value is not None for value in function.args.kw_defaults)
+        if len(values) != expected or not all(
+                   self.materialized_generator_binding(value, references.get(name, NO_REFERENCES), state)
+                   for name, value in values.items()):
+            return False
+        for _name, ref in closure.cells if closure is not None else ():
+            contents = self.cell_contents(ref, state)
+            if (contents.bound is not True or not self.materialized_generator_binding(
+                    contents.binding, contents.references, state)):
+                return False
+        return True
+
+    def filter_step(self, state, iterator):
+        """Run predicates until the first accepted item or actual exhaustion.
+
+        Rejected items retain their callback writes. A predicate raising
+        StopIteration ends this consume, but the shared cursor can resume at
+        the next input item, matching native filter rather than a generator.
+        """
+        if not self.filter_predicate_inert(iterator.mapper, state):
+            raise AnalysisLimit('native filter predicate ownership changed; analysis is incomplete')
+        pending, yielded, exhausted = [state], [], []
+        raw = replace(iterator, native_kind='zip')
+        while pending:
+            current = pending.pop()
+            self.engine.budget.spend()
+            rows, ended = self.zip_step(current, raw)
+            exhausted.append(ended)
+            for branch, _fact, row in rows:
+                element, fact = row.operands[0]
+                if iterator.mapper is None:
+                    predicates, stopped = [(branch, fact, element)], None
+                else:
+                    predicates, stopped = self.map_step(branch, iterator, row)
+                exhausted.append(stopped)
+                for tested, _predicate_fact, binding in predicates:
+                    truth = set()
+                    for value in _binding_choices(binding):
+                        if isinstance(value, _GeneratorString) and value.format_safe:
+                            truth.update((False, True))
+                        elif isinstance(value, _LiteralString) and value.format_safe:
+                            truth.add(bool(value.value))
+                        elif (isinstance(value, ast.Constant) and type(value.value)
+                              in {str, bytes, int, float, complex, bool, type(None)}):
+                            truth.add(bool(value.value))
+                        else:
+                            raise AnalysisLimit('native filter predicate truth protocol is unresolved; '
+                                                'analysis is incomplete')
+                    if True in truth:
+                        yielded.append((tested.copy() if False in truth else tested, fact, element))
+                    if False in truth:
+                        pending.append(tested)
+        return yielded, _join_states(*exhausted)
 
     def enumerate_value(self, node, state, inputs):
         """Expose native stdin rows while keeping the generated index clean.
@@ -5271,13 +5473,12 @@ class _Flow:
             self.possible_exception(state)
             result = _sanitize(arguments[0], SANITIZERS[native]) if native in SANITIZERS else arguments[0]
             return [(state, result, _GeneratorString())], None
-        if not self.materialized_generator_call(call, mapper, state, native_callback=True):
-            raise AnalysisLimit('native map callback frame lifetime is unresolved; analysis is incomplete')
         outer_pending, self.pending = self.pending, []
         self.expression_bindings.pop(call, None)
         self.expression_references.pop(call, None)
         try:
-            fact = self.invoke(call, state, _CallTarget(mapper), _CallInputs(arguments, {}, {}))
+            fact = self.invoke(call, state, _CallTarget(mapper), _CallInputs(arguments, {}, {}),
+                               native_callback=True)
         finally:
             callback_pending, self.pending = self.pending, outer_pending
         stopped = []
@@ -5289,6 +5490,18 @@ class _Flow:
         yielded = []
         if state.reachable:
             binding = self.expression_bindings.get(call)
+            if iterator.native_kind == 'filter' and binding is None:
+                function = mapper.value if isinstance(mapper, _ClosureValue) else mapper
+                function = function.function if isinstance(function, _FunctionValue) else function
+                if isinstance(function, ast.FunctionDef):
+                    terminal = next((statement for statement in function.body
+                                     if isinstance(statement, (ast.Return, ast.Raise))), None)
+                    if terminal is None or isinstance(terminal, ast.Return) and terminal.value is None:
+                        # The frame proof admitted only a straight-line body.
+                        # Its first bare return or fallthrough is native None,
+                        # not an opaque return value. This transient predicate
+                        # marker never becomes the yielded original item.
+                        binding = ast.Constant(value=None)
             if not all(isinstance(value, (_LiteralString, _GeneratorString))
                        or isinstance(value, ast.Constant) and type(value.value)
                        in {str, bytes, int, float, complex, bool, type(None)}
@@ -5369,6 +5582,8 @@ class _Flow:
         return CLEAN
 
     def zip_step(self, state, iterator):
+        if iterator.native_kind == 'filter' and not iterator.repeating:
+            return self.filter_step(state, iterator)
         if (state.cells is None or iterator.cursor not in state.cells.contents
                 or iterator.cursor in state.cells.multiple or iterator.references & state.mutated):
             raise AnalysisLimit('native zip cursor or backing mutation is unresolved; analysis is incomplete')
@@ -5438,8 +5653,10 @@ class _Flow:
         return join_facts(*facts)
 
     def zip_materialize(self, node, state, iterators):
-        if any(iterator.native_kind == 'map' for iterator in iterators):
-            if not all(iterator.native_kind == 'map' for iterator in iterators):
+        if any(iterator.native_kind == 'map' or iterator.native_kind == 'filter' and not iterator.repeating
+               for iterator in iterators):
+            if not all(iterator.native_kind == 'map' or iterator.native_kind == 'filter' and not iterator.repeating
+                       for iterator in iterators):
                 raise AnalysisLimit('native map materialization alternatives are unresolved; analysis is incomplete')
             return self.map_materialize(node, state, iterators)
         outputs, branches, scalar_facts = [], [], []
@@ -6295,10 +6512,14 @@ class _Flow:
             # binary stream, and bytes cannot consume a text stream.
             original_bindings = _binding_choices(binding)
             mapped = [value for value in original_bindings
-                      if isinstance(value, _ZipIterator) and value.native_kind == 'map']
+                      if isinstance(value, _ZipIterator) and (value.native_kind == 'map'
+                          or value.native_kind == 'filter' and not value.repeating)]
             if mapped:
                 if len(mapped) != len(original_bindings):
                     raise AnalysisLimit('native map join alternatives are unresolved; analysis is incomplete')
+                if isinstance(target, _BoundCallable) and target.producer_unproved:
+                    raise AnalysisLimit('native map/filter join receiver producer effects are unresolved; '
+                                        'analysis is incomplete')
                 if keywords or len(positions) != 1:
                     self.possible_exception(state)
                     return CLEAN
@@ -8135,7 +8356,7 @@ class _Flow:
         self.possible_exception(state)
         return CLEAN
 
-    def invoke(self, node, state, callee, inputs, *, resumed=None):
+    def invoke(self, node, state, callee, inputs, *, resumed=None, native_callback=False):
         target, fallback_name = callee.binding, callee.fallback_name
         receiver, receiver_refs = callee.receiver, callee.references
         arguments, keywords, keyword_nodes = inputs.arguments, inputs.keywords, inputs.keyword_nodes
@@ -8209,8 +8430,10 @@ class _Flow:
             # native callable. Opaque fallback only propagates argument data
             # and would miss a replacement that returns a fresh source.
             raise AnalysisLimit('generator next consumer identity is unresolved; analysis is incomplete')
-        if self.materialized_generator_depth and not self.materialized_generator_call(node, target, state):
-            raise AnalysisLimit('generator materialization helper frame lifetime is unresolved; analysis is incomplete')
+        if (self.materialized_generator_depth or native_callback) and not self.materialized_generator_call(
+                node, target, state, native_callback=native_callback):
+            description = 'native map callback' if native_callback else 'generator materialization helper'
+            raise AnalysisLimit(description + ' frame lifetime is unresolved; analysis is incomplete')
         if isinstance(target, _GeneratorNext):
             if node.args or node.keywords:
                 raise AnalysisLimit('generator __next__ argument binding; analysis is incomplete')
@@ -8475,6 +8698,21 @@ class _Flow:
                     if shadowed_vals:
                         values.update(shadowed_vals)
                         non_base_keys.extend(shadowed_vals)
+                        if native_callback:
+                            # Its frame proof already read these actual module
+                            # slots. A same-spelled caller local must not turn
+                            # their identities back into opaque placeholders.
+                            # Keep the existing symbolic facts/references so
+                            # caller substitution still carries global data.
+                            for gname in owner.active_globals.get(function, ()):
+                                gkey = f'@global:{gname}'
+                                if gkey not in shadowed_vals:
+                                    continue
+                                contents = self.global_contents(gname, state)
+                                value = contents.binding
+                                if contents.references & state.mutated:
+                                    value = _without_object_contract(value)
+                                values[gkey] = value
                     for gname in owner.active_globals.get(self.scope, ()):
                         gkey = f'@global:{gname}'
                         bound[gkey] = state.value(gname)
@@ -8723,11 +8961,12 @@ class _Flow:
             if not summary.can_return and function not in self.engine.generators:
                 state.reachable = False
                 return CLEAN
-            # Materialized calls already proved their frame at invoke entry.
+            # Materialized calls and native callbacks already proved their
+            # frame at invoke entry.
             # For captured results, prove it before applying effects. Do not
             # substitute returned handles yet: apply_cells first allocates
             # the caller's distinct generator/closure cells.
-            format_frame_inert = (bool(self.materialized_generator_depth) or not any(
+            format_frame_inert = (bool(self.materialized_generator_depth) or native_callback or not any(
                 isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _LiteralMethodInstance,
                                    _ArgumentVector, _LiteralMapping, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer,
                                    _SymbolicValue, ast.Constant))
@@ -9922,6 +10161,16 @@ class _Flow:
             raise AnalysisLimit('comprehension consumes a resumable generator; analysis is incomplete')
         if not state.reachable:
             return CLEAN
+        choices = _binding_choices(self.expression_bindings.get(first.iter))
+        if (isinstance(node, ast.ListComp) and len(node.generators) == 1
+                and not first.is_async and not first.ifs
+                and isinstance(first.target, ast.Name) and isinstance(node.elt, ast.Name)
+                and node.elt.id == first.target.id and choices
+                and all(isinstance(value, _ZipIterator) and value.native_kind == 'filter'
+                        and not value.repeating for value in choices)):
+            # This identity comprehension copies only primitive selected
+            # elements; its iteration target never escapes the local scope.
+            return self.map_materialize(node, state, choices)
         original = state.copy()
         local_names = self.engine.locals[node]
         nested = state.copy()
@@ -11901,7 +12150,15 @@ class _Analysis:
         # this call's context includes the captures it actually reads. Each
         # read participates in the existing fixed point and every expansion
         # adds a finite, module-qualified dependency.
-        required = frozenset()
+        owner = self.owner(function)
+        base = self.summaries.get(function)
+        required = frozenset((module, name) for module, name in base.capture_globals
+                             if module is owner.tree and name in owner.locals[function]) if base is not None else frozenset()
+        if required and self.reads is not None:
+            # A known module capture must keep its value before the first
+            # contextual solve. Normalizing it as a same-spelled local would
+            # discard the ownership evidence and fail that solve permanently.
+            self.reads[('summaries', function)] = base
         required_values = frozenset()
         while True:
             contextual, keys = cell_context(required) if cell_context is not None else (values, candidate_keys)

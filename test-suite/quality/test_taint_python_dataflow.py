@@ -1488,6 +1488,272 @@ print(json.dumps({"first":first,"rest":rest,"events":events}))
                          {'first': 'first', 'rest': ['second'], 'events': ['first\n', 'second\n']})
 
 
+class FiniteFilterTests(SourceTest):
+    def test_predicate_writes_survive_rejected_items(self):
+        prefix = ('value="SELECT 1"\ndef remember(row):\n'
+                  ' global value\n value=row\n return False\n'
+                  'rows=filter(remember,["SELECT 1",input()])\n')
+        for consume in ('next(rows,"SELECT 1")', 'list(rows)', 'tuple(rows)',
+                        'for row in rows:\n pass'):
+            with self.subTest(consume=consume):
+                self.assert_rules(prefix + consume + '\ncursor.execute(value)\n', 'sql')
+
+    def test_native_none_predicate_retains_selected_positions_and_shared_cursor(self):
+        source = ('rows=filter(None,[0,"",False,None,"SELECT 1",input()])\n'
+                  'alias=rows\nfirst=next(alias)\nsecond=next(rows)\n'
+                  'cursor.execute(first)\ncursor.execute(second)\n')
+        findings = self.assert_rules(source, 'sql')
+        self.assertEqual([(finding['line'], finding['col']) for finding in findings], [(6, 1)])
+
+    def test_false_predicate_drops_source_without_changing_original_item(self):
+        self.assert_rules('value=next(filter(lambda row:False,[input()]),"SELECT 1")\n'
+                          'cursor.execute(value)\n')
+        self.assert_rules('value=next(filter(lambda row:"SELECT 1",[input()]))\n'
+                          'cursor.execute(value)\n', 'sql')
+        self.assert_rules('import html\nvalue=next(filter(html.escape,[input()]))\n'
+                          'HttpResponse(value)\n', 'xss')
+
+    def test_predicate_effects_are_lazy_and_observe_consumption_order(self):
+        prefix = ('value=input()\ndef clear(row):\n global value\n'
+                  ' value="SELECT 1"\n return True\nrows=filter(clear,["ignored"])\n')
+        self.assert_rules(prefix + 'cursor.execute(value)\n', 'sql')
+        self.assert_rules(prefix + 'next(rows)\ncursor.execute(value)\n')
+        source = ('value="SELECT 1"\ndef remember(row):\n global value\n'
+                  ' value=row\n return True\nrows=filter(remember,["SELECT 1",input()])\n'
+                  'next(rows)\nfirst=value\nnext(rows)\nsecond=value\n'
+                  'cursor.execute(first)\ncursor.execute(second)\n')
+        findings = self.assert_rules(source, 'sql')
+        self.assertEqual([finding['line'] for finding in findings], [12])
+
+    def test_callback_identity_is_captured_before_rebinding(self):
+        source = ('value="SELECT 1"\ndef remember(row):\n global value\n'
+                  ' value=row\n return True\nselect=filter\n'
+                  'rows=select(remember,[input()])\n'
+                  'remember=lambda row:False\nfilter=lambda predicate,rows:[]\n'
+                  'next(rows)\ncursor.execute(value)\n')
+        self.assert_rules(source, 'sql')
+
+    def test_empty_inputs_and_exhausted_aliases_never_replay_callbacks(self):
+        prefix = ('value="SELECT 1"\ndef remember(row):\n global value\n'
+                  ' value=row\n return True\n')
+        self.assert_rules(prefix + 'rows=filter(remember,[])\nlist(rows)\ncursor.execute(value)\n')
+        self.assert_rules(prefix + 'rows=filter(remember,[input()])\nlist(rows)\n'
+                          'value="SELECT 1"\nalias=rows\n'
+                          'next(alias,"SELECT 1")\ncursor.execute(value)\n')
+
+    def test_collection_consumers_preserve_filtered_slots_and_source_domains(self):
+        for consume in ('list(rows)', 'tuple(rows)', '[row for row in rows]'):
+            with self.subTest(consume=consume):
+                findings = self.assert_rules('rows=filter(None,["", "SELECT 1", input()])\n'
+                    f'values={consume}\ncursor.execute(values[0])\ncursor.execute(values[1])\n', 'sql')
+                self.assertEqual([finding['line'] for finding in findings], [4])
+        for sink, rule in (('eval(value)', 'eval'), ('os.system(value)', 'command'),
+                           ('cursor.execute(value)', 'sql'), ('HttpResponse(value)', 'xss'),
+                           ('requests.get(value)', 'ssrf')):
+            with self.subTest(sink=sink):
+                self.assert_rules('import os,requests\n'
+                                  'value=next(filter(lambda row:True,[input()]))\n' + sink + '\n', rule)
+
+    def test_callback_stop_iteration_preserves_writes_and_later_resume(self):
+        source = ('value="SELECT 1"\ndef stop(row):\n global value\n'
+                  ' value=row\n raise StopIteration\n'
+                  'rows=filter(stop,[input(),"SELECT 1"])\n'
+                  'next(rows,"default")\nfirst=value\nnext(rows,"default")\n'
+                  'second=value\ncursor.execute(first)\ncursor.execute(second)\n')
+        findings = self.assert_rules(source, 'sql')
+        self.assertEqual([finding['line'] for finding in findings], [11])
+
+    def test_unsupported_filter_protocols_remain_explicit(self):
+        cases = ('rows=filter(unknown,[input()])\nnext(rows)\n',
+                 'rows=filter(lambda row:Owner(),[input()])\nnext(rows)\n',
+                 'items=["safe"]\nrows=filter(None,items)\nitems[0]=input()\nnext(rows)\n')
+        for source in cases:
+            with self.subTest(source=source), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan(source)
+
+    def test_exact_literal_predicates_select_original_values(self):
+        for predicate, expected in (('True', ('sql',)), ('False', ()), ('None', ()),
+                                    ('""', ()), ('"keep"', ('sql',)), ('0', ()),
+                                    ('1', ('sql',)), ('b""', ()), ('b"keep"', ('sql',))):
+            with self.subTest(predicate=predicate):
+                self.assert_rules(f'value=next(filter(lambda row:{predicate},[input()]),"safe")\n'
+                                  'cursor.execute(value)\n', *expected)
+
+    def test_implicit_none_and_bare_return_predicates_preserve_rejected_writes(self):
+        for ending in ('', ' return\n'):
+            prefix = ('value="safe"\ndef remember(row):\n global value\n value=row\n'
+                      + ending + 'rows=filter(remember,["safe",input()])\n')
+            for consume in ('next(rows,"safe")', 'list(rows)', 'tuple(rows)', '"".join(rows)',
+                            'for row in rows:\n pass'):
+                with self.subTest(ending=ending, consume=consume):
+                    self.assert_rules(prefix + consume + '\ncursor.execute(value)\n', 'sql')
+            with self.subTest(ending=ending, cleanup=True):
+                self.assert_rules('value=input()\ndef clear(row):\n global value\n value="safe"\n'
+                                  + ending + 'result=next(filter(clear,[input()]),"safe")\n'
+                                  'cursor.execute(result)\ncursor.execute(value)\n')
+
+    def test_captured_predicates_observe_live_values_and_writes(self):
+        for selected, expected in (('True', ('sql',)), ('False', ())):
+            with self.subTest(selected=selected, scope='global'):
+                self.assert_rules('flag=False\ndef predicate(row):\n return flag\n'
+                                  'rows=filter(predicate,[input()])\n'
+                                  f'flag={selected}\ncursor.execute(next(rows,"safe"))\n', *expected)
+            with self.subTest(selected=selected, scope='closure'):
+                self.assert_rules('def run():\n flag=False\n def predicate(row):\n  return flag\n'
+                                  ' rows=filter(predicate,[input()])\n'
+                                  f' flag={selected}\n return next(rows,"safe")\n'
+                                  'cursor.execute(run())\n', *expected)
+        self.assert_rules('def run():\n value="safe"\n def predicate(row):\n'
+                          '  nonlocal value\n  value=row\n  return False\n'
+                          ' list(filter(predicate,[input()]))\n return value\n'
+                          'cursor.execute(run())\n', 'sql')
+        self.assert_rules('value="safe"\ndef remember(row):\n global value\n value=row\n return False\n'
+                          'def run():\n value="safe"\n list(filter(remember,[input()]))\n'
+                          ' cursor.execute(value)\nrun()\ncursor.execute(value)\n', 'sql')
+        for module, local, expected in (('True', 'False', ('sql',)), ('False', 'True', ())):
+            with self.subTest(module=module, local=local):
+                self.assert_rules(f'flag={module}\ndef predicate(row):\n return flag\n'
+                                  f'def run():\n flag={local}\n return next(filter(predicate,[input()]),"safe")\n'
+                                  'cursor.execute(run())\n', *expected)
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'callback frame lifetime'):
+            self.scan('class Owner:\n def __del__(self):\n  global query\n  query=input()\n'
+                      'query="safe"\nheld=Owner()\ndef predicate(row):\n global held\n'
+                      ' held="safe"\n return False\ndef run():\n held="safe"\n'
+                      ' list(filter(predicate,["fixed"]))\nrun()\ncursor.execute(query)\n')
+
+    def test_selected_helpers_keep_values_and_unproved_factories_stay_partial(self):
+        self.assert_rules('def select(values):\n return filter(None,values)\n'
+                          'rows=select(["",input()])\ncursor.execute(next(rows))\n', 'sql')
+        self.assert_rules('def read(values):\n return next(filter(None,values),"safe")\n'
+                          'cursor.execute(read([input()]))\n', 'sql')
+        for predicate, expected in (('True', ('sql',)), ('False', ())):
+            with self.subTest(predicate=predicate):
+                self.assert_rules('def read(predicate,values):\n return next(filter(predicate,values),"safe")\n'
+                                  f'cursor.execute(read(lambda row:{predicate},[input()]))\n', *expected)
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'producer effects'):
+            self.scan('def select(values):\n return filter(lambda row:True,values)\n'
+                      'rows=select([input()])\ncursor.execute(next(rows))\n')
+
+    def test_shared_cursor_branches_preserve_possible_sources(self):
+        findings = self.assert_rules('rows=filter(None,["safe",input()])\nalias=rows\n'
+            'if flag:\n next(alias)\nfirst=next(rows,"safe")\nsecond=next(alias,"safe")\n'
+            'cursor.execute(first)\ncursor.execute(second)\n', 'sql', 'sql')
+        self.assertEqual([finding['line'] for finding in findings], [7, 8])
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter input alternatives'):
+            self.scan('if flag:\n items=["",input()]\nelse:\n items=["safe"]\n'
+                      'rows=filter(None,items)\nfirst=next(rows,"safe")\nsecond=next(rows,"safe")\n'
+                      'cursor.execute(first)\ncursor.execute(second)\n')
+
+    def test_native_join_preserves_items_and_rejected_callback_effects(self):
+        self.assert_rules('cursor.execute("".join(filter(None,["",input()])))\n', 'sql')
+        self.assert_rules('cursor.execute("".join(filter(lambda row:False,[input()])))\n')
+        self.assert_rules('value=b"".join(filter(None,[b"",b"safe"]))\neval(value)\n')
+        findings = self.assert_rules('value="safe"\ndef remember(row):\n global value\n'
+            ' value=row\n return False\ntext="".join(filter(remember,[input()]))\n'
+            'cursor.execute(text)\ncursor.execute(value)\n', 'sql')
+        self.assertEqual([finding['line'] for finding in findings], [8])
+
+    def test_backing_mutation_never_reuses_a_stale_input_snapshot(self):
+        for initial in ('"safe"', 'input()'):
+            for mutation in ('items[0]=input()', 'items[0]="safe"',
+                             'items.append(input())', 'items.pop()', 'items.clear()'):
+                with self.subTest(initial=initial, mutation=mutation), self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(f'items=[{initial}]\nrows=filter(None,items)\n{mutation}\n'
+                              'cursor.execute(next(rows,"safe"))\n')
+
+    def test_callback_owned_finalizers_remain_partial_even_for_empty_inputs(self):
+        prefix = ('class Owner:\n def __del__(self):\n  global value\n  value=input()\nvalue="safe"\n')
+        cases = (
+            'list(filter(lambda row,held=Owner():True,[]))\n',
+            'def factory():\n held=Owner()\n def predicate(row):\n  unused=held\n'
+            '  return True\n return predicate\nlist(filter(factory(),[]))\n',
+            'def factory():\n held=Owner()\n return lambda row:True\n'
+            'predicate=factory()\nlist(filter(predicate,[]))\n',
+            'def run():\n held="safe"\n def predicate(row):\n  unused=held\n  return True\n'
+            ' rows=filter(predicate,[])\n held=Owner()\n list(rows)\nrun()\n',
+            'def run():\n def predicate(row):\n  return True\n predicate.held=Owner()\n'
+            ' list(filter(predicate,[]))\nrun()\n',
+        )
+        for body in cases:
+            with self.subTest(body=body), self.assertRaisesRegex(taint_py.AnalysisLimit, 'filter predicate ownership'):
+                self.scan(prefix + body + 'cursor.execute(value)\n')
+
+    def test_bare_stop_iteration_proof_does_not_authorize_other_exception_classes(self):
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'callback frame lifetime'):
+            self.scan('def fail(row):\n raise UnicodeDecodeError\n'
+                      'rows=filter(fail,[input()])\nnext(rows)\n')
+        self.assert_rules('value="safe"\ndef fail(row):\n global value\n value=row\n'
+                          ' raise ValueError()\nrows=filter(fail,[input()])\n'
+                          'try:\n next(rows,"safe")\nexcept ValueError:\n cursor.execute(value)\n', 'sql')
+
+    def test_unproved_none_filter_rows_keep_protocol_and_source_boundaries(self):
+        owner = ('class Owner:\n def __bool__(self):\n  global value\n  value=input()\n'
+                 '  return False\nvalue="safe"\n')
+        for prefix in ('', 'exec("pass")\n'):
+            for construction in ('[Owner()]', '[unknown]'):
+                with self.subTest(prefix=prefix, construction=construction), self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(prefix + owner + f'list(filter(None,{construction}))\ncursor.execute(value)\n')
+            with self.subTest(prefix=prefix, source=True), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan(prefix + 'list(filter(None,[unknown,input()]))\n')
+        with self.assertRaises(taint_py.AnalysisLimit):
+            self.scan('exec("pass")\n' + owner + 'def produce():\n held=Owner()\n return "fixed"\n'
+                      'list(filter(None,[produce()]))\ncursor.execute(value)\n')
+
+    def test_native_empty_filter_witness_releases_default_and_closure_owners(self):
+        source = '''
+import json
+seen=[]
+class Owner:
+    def __init__(self, name):
+        self.name=name
+    def __del__(self):
+        seen.append(self.name)
+assert list(filter(lambda row,held=Owner("default"): True, [])) == []
+def factory():
+    held=Owner("closure")
+    def predicate(row):
+        unused=held
+        return True
+    return predicate
+assert list(filter(factory(), [])) == []
+print(json.dumps(seen))
+'''
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', source],
+                                text=True, capture_output=True, timeout=20, check=False)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(json.loads(result.stdout), ['default', 'closure'])
+
+    def test_native_filter_witnesses_pin_laziness_rejection_and_resumption(self):
+        source = '''
+import json
+seen=[]
+def remember(value):
+    seen.append(value)
+    return bool(value)
+rows=filter(remember,[0,"first","", "second"])
+assert seen == []
+alias=rows
+first=next(alias)
+assert seen == [0,"first"]
+rest=list(rows)
+assert seen == [0,"first","", "second"]
+assert next(alias,"default") == "default"
+def stop(value):
+    seen.append(value)
+    raise StopIteration
+stopping=filter(stop,["one","two"])
+assert next(stopping,"default") == "default"
+assert next(stopping,"default") == "default"
+assert list(filter(lambda value:"replacement",["original"])) == ["original"]
+print(json.dumps({"first":first,"rest":rest,"seen":seen}))
+'''
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', source],
+                                text=True, capture_output=True, timeout=20, check=False)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(json.loads(result.stdout), {'first': 'first', 'rest': ['second'],
+                         'seen': [0, 'first', '', 'second', 'one', 'two']})
+
+
 class FilteredStdinTests(SourceTest):
     def test_native_filter_payload_reaches_each_sink_domain(self):
         for stream, convert in (('sys.stdin', ''), ('sys.__stdin__', ''),
@@ -2562,6 +2828,67 @@ class RunnerIntegrationTests(unittest.TestCase):
                                        expected=[(2, 1)], partial=True, cache=True, partial_label='map')
                 self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
                                  'An incomplete native map scan must not enter the completed cache')
+
+    def test_finite_filter_module_and_runner_reports_keep_sites_and_selection(self):
+        cases = (
+            ('predicate-write', 'value="safe"\ndef remember(row):\n global value\n value=row\n'
+             ' return False\nlist(filter(remember,[input()]))\ncursor.execute(value)\n', [(7, 1)], False),
+            ('rejected', 'value=next(filter(lambda row:False,[input()]),"safe")\n'
+             'cursor.execute(value)\n', [], False),
+            ('slots', 'rows=filter(None,["","safe",input()])\nvalues=list(rows)\n'
+             'cursor.execute(values[0])\ncursor.execute(values[1])\n', [(4, 1)], False),
+            ('stop-resume', 'value="safe"\ndef stop(row):\n global value\n value=row\n'
+             ' raise StopIteration\nrows=filter(stop,[input(),"safe"])\n'
+             'next(rows,"safe")\nfirst=value\nnext(rows,"safe")\nsecond=value\n'
+             'cursor.execute(first)\ncursor.execute(second)\n', [(11, 1)], False),
+            ('partial-owner', 'cursor.execute(input())\nclass Owner:\n def __del__(self):\n'
+             '  global value\n  value=input()\nvalue="safe"\n'
+             'list(filter(lambda row,held=Owner():True,[]))\ncursor.execute(value)\n', [(1, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/python-finite-filter-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'view.py'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.py').write_text('cursor.execute(input())\n', encoding='utf-8')
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=name, meta=meta, output=output):
+                        self.zip_public_report(target, project / f'{meta}-{output}', meta=meta,
+                                               output=output, expected=expected, partial=partial,
+                                               partial_label='filter')
+
+    def test_finite_filter_cache_invalidation_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/python-finite-filter-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'view.py'
+        prefix = ('query="safe"\ndef remember(row):\n global query\n query=row\n return False\n'
+                  'list(filter(remember,[input()]))\n')
+        unsafe = prefix + 'cursor.execute(query)\n'
+        clean = prefix + 'cursor.execute("safe")\n'
+        suppressed = prefix + 'cursor.execute(query)  # ubs:ignore[python.taint.sql]\n'
+        for index, (source, expected, hits) in enumerate((
+                (unsafe, [(7, 1)], 0), (unsafe, [(7, 1)], 1),
+                (clean, [], 0), (suppressed, [], 0), (unsafe, [(7, 1)], 1))):
+            with self.subTest(index=index):
+                target.write_text(source, encoding='utf-8')
+                report = self.zip_public_report(target, scratch / f'cache-{index}', meta=True, output='json',
+                                               expected=expected, cache=True, partial_label='filter')
+                self.assertEqual(report['profile']['cache_hits'], hits, report)
+        entries = set((scratch / 'cache').glob('*/files/**/*.json'))
+        self.assertTrue(entries, 'Completed finite filter scans must create reusable cache entries')
+        target.write_text('cursor.execute(input())\nrows=filter(unknown,[input()])\nnext(rows)\n',
+                          encoding='utf-8')
+        for index in range(2):
+            with self.subTest(partial=index):
+                self.zip_public_report(target, scratch / f'partial-{index}', meta=True, output='json',
+                                       expected=[(1, 1)], partial=True, cache=True, partial_label='filter')
+                self.assertEqual(set((scratch / 'cache').glob('*/files/**/*.json')), entries,
+                                 'An incomplete finite filter scan must not enter the completed cache')
 
     def test_filtered_stdin_module_and_runner_reports_keep_sites_and_selection(self):
         cases = (

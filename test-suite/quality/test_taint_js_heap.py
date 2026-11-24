@@ -5910,5 +5910,70 @@ class HeapTaintTests(unittest.TestCase):
                 self.scan(source, *expected)
 
 
+
+class BorrowedArrayFillTests(unittest.TestCase):
+    def scan_file(self, body: str):
+        from ubs_core.analyzers import taint_js
+        with tempfile.TemporaryDirectory(prefix='ubs-js-borrowed-fill-') as tmp:
+            path = Path(tmp) / 'case.js'
+            path.write_text('function handler(req, res, obj) {\n' + body + '\n}\n', encoding='utf-8')
+            return list(taint_js.scan_file_findings(path))
+
+    def test_borrowed_array_fill_call_matches_node_runtime_witness(self):
+        cases = [
+            ('proto-fill-call-unsafe', True,
+             'const a = ["safe"]; Array.prototype.fill.call(a, req.query.html); res.send(a[0]);'),
+            ('proto-fill-call-range-hit', True,
+             'const a = ["safe", "safe"]; Array.prototype.fill.call(a, req.query.html, 1, 2); res.send(a[1]);'),
+            ('proto-fill-call-range-miss', False,
+             'const a = ["safe", "safe"]; Array.prototype.fill.call(a, req.query.html, 1, 2); res.send(a[0]);'),
+            ('proto-fill-call-clean-overwrite', False,
+             'const a = [req.query.html, "safe"]; Array.prototype.fill.call(a, "clean", 0, 1); res.send(a[0]);'),
+            ('saved-proto-fill-call-unsafe', True,
+             'const a = ["safe"]; const fn = Array.prototype.fill; fn.call(a, req.query.html); res.send(a[0]);'),
+            ('borrowed-instance-fill-call-unsafe', True,
+             'const a = ["safe"]; const b = ["x"]; const fn = b.fill; fn.call(a, req.query.html); res.send(a[0]);'),
+            ('literal-empty-fill-call-unsafe', True,
+             'const a = ["safe"]; [].fill.call(a, req.query.html); res.send(a[0]);'),
+            ('literal-array-direct-fill-unsafe', True,
+             'res.send(["safe"].fill(req.query.html)[0]);'),
+        ]
+        prefix = (
+            'const req = {query:{html:"<UNTRUSTED>"}}; const outputs = []; '
+            'const res = {send: value => outputs.push(value)}; '
+        )
+        node_bin = shutil.which('node')
+        for name, expected_unsafe, body in cases:
+            with self.subTest(case=name):
+                if node_bin is not None:
+                    node = subprocess.run(
+                        [node_bin, '-e', prefix + body + ' console.log(JSON.stringify(outputs));'],
+                        capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertEqual(node.returncode, 0, node.stdout + node.stderr)
+                    self.assertEqual('<UNTRUSTED>' in node.stdout, expected_unsafe, (name, node.stdout))
+                findings = self.scan_file(body)
+                rules = [f[0] for f in findings]
+                if expected_unsafe:
+                    self.assertEqual(rules, ['js.taint.xss'], (name, findings))
+                else:
+                    self.assertEqual(rules, [], (name, findings))
+
+    def test_borrowed_array_fill_unsupported_invocations_report_incomplete(self):
+        from ubs_core.analyzers import taint_js
+        for name, body in [
+            ('proto-fill-apply',
+             'const a = ["safe"]; Array.prototype.fill.apply(a, [req.query.html]); res.send(a[0]);'),
+            ('reflect-apply-fill',
+             'const a = ["safe"]; Reflect.apply(Array.prototype.fill, a, [req.query.html]); res.send(a[0]);'),
+            ('non-array-receiver-call',
+             'Array.prototype.fill.call(obj, req.query.html); res.send(obj[0]);'),
+            ('bare-fill-call',
+             'const fn = Array.prototype.fill; fn(req.query.html); res.send("ok");'),
+        ]:
+            with self.subTest(case=name):
+                with self.assertRaises(taint_js.AnalysisLimit, msg=name):
+                    self.scan_file(body)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -45,7 +45,7 @@ _NATIVE_PACKAGES = {'encoding/json': 'json', 'encoding/xml': 'xml',
                     'fmt': 'fmt', 'strings': 'strings', 'bytes': 'bytes', 'bufio': 'bufio'}
 _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'Unmarshal'},
                    'io': {'ReadAll', 'ReadFull', 'ReadAtLeast'}, 'ioutil': {'ReadAll'},
-                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString'},
+                   'html': {'EscapeString'}, 'template': {'HTMLEscapeString', 'HTMLEscaper'},
                    'os': {'Getenv', 'LookupEnv', 'Stdin'},
                    'exec': {'Command', 'CommandContext'},
                    'fmt': {'Scan', 'Scanln', 'Scanf', 'Fscan', 'Fscanln', 'Fscanf',
@@ -53,6 +53,7 @@ _NATIVE_MEMBERS = {'json': {'NewDecoder', 'Unmarshal'}, 'xml': {'NewDecoder', 'U
                    'strings': {'NewReader'}, 'bytes': {'NewReader', 'NewBuffer', 'NewBufferString'},
                    'bufio': {'NewReader', 'NewReaderSize', 'NewScanner',
                              'ScanLines', 'ScanWords', 'ScanBytes', 'ScanRunes'}}
+_HTML_SANITIZERS = frozenset({('html', 'EscapeString'), ('template', 'HTMLEscapeString'), ('template', 'HTMLEscaper')})
 _ENVIRONMENT_OPERATIONS = frozenset({('os', 'Getenv'), ('os', 'LookupEnv')})
 _COMMAND_OPERATIONS = frozenset({('exec', 'Command'), ('exec', 'CommandContext')})
 _READ_INTO_OPERATIONS = frozenset({('io', 'ReadFull'), ('io', 'ReadAtLeast')})
@@ -182,7 +183,8 @@ def _call_code(code: str) -> str:
     the argument's native authority.
     """
     transitions = list(re.finditer(r'\)\s*\(', code))
-    if not transitions:
+    member_chains = list(re.finditer(r'\)\s*\.\s*[A-Za-z_]\w*\s*\(', code))
+    if not transitions and not member_chains:
         return code
     pairs = _pairs(code)
     opening = {end: start for start, end in pairs.items()}
@@ -221,6 +223,34 @@ def _call_code(code: str) -> str:
             continue
         for left, right in groups:
             out[left] = out[right] = ' '
+    if member_chains:
+        updated = ''.join(out)
+        pairs = _pairs(updated)
+        opening = {end: start for start, end in pairs.items()}
+        for transition in re.finditer(r'\)\s*\.\s*[A-Za-z_]\w*\s*\(', updated):
+            end = transition.start()
+            start = opening.get(end)
+            if start is None or updated[start] != '(':
+                continue
+            prefix = updated[:start].rstrip()
+            if (prefix and (prefix[-1].isalnum() or prefix[-1] in '_.)]}')
+                    and not re.search(r'(?<![\w.])(?:go|defer)\s+$', updated[:start])):
+                continue
+            left, right = start, end
+            groups = []
+            while left < right and updated[left] == '(' and pairs.get(left) == right:
+                groups.append((left, right))
+                left += 1
+                right -= 1
+                while left < right and updated[left].isspace():
+                    left += 1
+                while left < right and updated[right].isspace():
+                    right -= 1
+            inner_call = re.match(r'[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?\s*\(', updated[left:right + 1])
+            if not inner_call or pairs.get(left + inner_call.end() - 1) != right:
+                continue
+            for g_left, g_right in groups:
+                out[g_left] = out[g_right] = ' '
     return ''.join(out)
 
 
@@ -944,9 +974,11 @@ class _Analysis:
         self.returns: tuple[_Fact, ...] = ()
         self.value_returns: tuple[_ValueInfo | None, ...] = ()
         self.call_results: dict[int, tuple[_ValueInfo | None, ...]] = {}
+        self.chained_call_results: dict[tuple[int, int], tuple[_ValueInfo | None, ...]] = {}
         self.decoder_callees: dict[int, _DecoderInfo] = {}
         self.value_results: dict[int, tuple[_ValueInfo | None, ...]] = {}
         self.closure_results: dict[int, tuple[tuple[_Fact, ...], tuple[_ValueInfo | None, ...]]] = {}
+        self.chained_value_results: dict[int, tuple[tuple[_Fact, ...], tuple[_ValueInfo | None, ...]]] = {}
         self.named_returns = ()
         self.writes: dict[tuple[int, tuple[str, ...]], _Fact] = {}
         self.native_writes: dict[tuple[int, tuple[str, ...]], _NativeInfo | None] = {}
@@ -1282,6 +1314,9 @@ class _Analysis:
         closure = self.closure_results.get(offset)
         if closure is not None:
             return closure[1][0] if closure[1] else _ValueInfo()
+        chained = self.chained_value_results.get(offset)
+        if chained is not None:
+            return chained[1][0] if chained[1] else _ValueInfo()
         code = _call_code(_masked_source(expr))
         name = re.fullmatch(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?', code)
         if name:
@@ -1305,10 +1340,17 @@ class _Analysis:
             return _ValueInfo(native, decoder, self.pointers(expr, state, scope), reader, buffer)
         call = re.match(r'\s*([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
         if call:
-            end = _pairs(code).get(call.end() - 1)
+            call_pairs = _pairs(code)
+            end = call_pairs.get(call.end() - 1)
             results = self.call_results.get(offset + call.start(1))
             if results and end == len(expr) - 1:
                 return results[0]
+            if end is not None:
+                chain = re.match(r'\s*\.\s*([A-Za-z_]\w*)\s*\(', code[end + 1:])
+                if chain and call_pairs.get(end + chain.end()) == len(expr) - 1:
+                    chained_results = self.chained_call_results.get((offset + call.start(1), offset + len(expr) - 1))
+                    if chained_results:
+                        return chained_results[0]
             selection = re.fullmatch(r'\s*\.\s*([A-Za-z_]\w*)\s*', code[end + 1:]) if end is not None else None
             if (selection and selection.group(1) in _DECODER_METHODS and results and results[0] is not None
                     and results[0].decoder is not None and results[0].decoder.methods == {''}):
@@ -1416,7 +1458,7 @@ class _Analysis:
         call = re.fullmatch(r'([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\(.*\)', expr, re.DOTALL)
         if call:
             identity = self.native_identity(call.group(1), call.group(2), offset, scope)
-            if identity in _ENVIRONMENT_OPERATIONS | {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}:
+            if identity in _ENVIRONMENT_OPERATIONS | _HTML_SANITIZERS:
                 return 'text'
         return ''
 
@@ -1674,7 +1716,7 @@ class _Analysis:
         constructor = bool(operations) and operations <= {('json', 'NewDecoder'), ('xml', 'NewDecoder')}
         unmarshal = bool(operations) and operations <= {('json', 'Unmarshal'), ('xml', 'Unmarshal')}
         readall = bool(operations) and operations <= {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
-        sanitizer = bool(operations) and operations <= {('html', 'EscapeString'), ('template', 'HTMLEscapeString')}
+        sanitizer = bool(operations) and operations <= _HTML_SANITIZERS
         environment = operations & _ENVIRONMENT_OPERATIONS
         scanning = operations & _SCAN_OPERATIONS
         reading_into = operations & _READ_INTO_OPERATIONS
@@ -1711,23 +1753,20 @@ class _Analysis:
         if sanitizer and re.match(r'\s*[.\[]', code[end + 1:]):
             return None
 
+        if chain is not None:
+            self.chained_call_results.pop((result_offset, offset + outer_end), None)
+
         def finish(stop, facts, decoder=None, reader=None):
-            self.call_results[result_offset] = tuple(
+            result_infos = tuple(
                 _ValueInfo(decoder=decoder if index == 0 else None, reader=reader if index == 0 else None)
                 for index in range(len(facts)))
+            self.call_results[result_offset] = result_infos
+            if chain is not None:
+                self.chained_call_results[(result_offset, offset + stop)] = result_infos
             return stop, facts
 
         def arguments(start, stop):
-            values, targets = [], []
-            for left, right in _parts(code[start:stop]):
-                value = expr[start + left:start + right]
-                origin = offset + start + left
-                values.append(self.value(value, origin, state, scope))
-                info = self.value_info(value, origin, state, scope)
-                # A slice value is not a Go output pointer. Read-into uses
-                # its separate backing capability; Decode/Unmarshal still
-                # require an actual address, such as &buffer.
-                targets.append(info.pointers if info is not None and info.buffer is None else frozenset())
+            values, targets, _raw = self._eval_call_args(expr, code, offset, start, stop, state, scope)
             return values, targets
 
         values, targets = arguments(match.end(), end)
@@ -1868,8 +1907,32 @@ class _Analysis:
         if sanitizer:
             # Only a definite native escaper grants HTML sanitization; unknown
             # alternatives retain argument effects and captured source data.
-            clean = self.rule == 'go.taint.xss' and not native.unknown and len(values) == 1
+            # EscapeString and HTMLEscapeString take one string; HTMLEscaper is
+            # variadic (...any) and escapes the formatted result of all args.
+            arity_ok = len(values) == 1 or operations == {('template', 'HTMLEscaper')}
+            clean = self.rule == 'go.taint.xss' and not native.unknown and arity_ok
             return finish(end, (_CLEAN if clean else fallback,))
+        extra_fallback = _join(callable_source, state.get(scope.bindings.get(root, root), _CLEAN))
+        result, buffered_reader = self._apply_decoder_method(
+            receiver, method, values, targets, result_offset, state, callable_source, extra_fallback)
+        return finish(outer_end, result, reader=buffered_reader)
+
+    def _eval_call_args(self, expr, code, offset, start, stop, state, scope):
+        values, targets, raw_arguments = [], [], []
+        for left, right in _parts(code[start:stop]):
+            value = expr[start + left:start + right]
+            origin = offset + start + left
+            raw_arguments.append((value, origin))
+            values.append(self.value(value, origin, state, scope))
+            info = self.value_info(value, origin, state, scope)
+            # A slice value is not a Go output pointer. Read-into uses
+            # its separate backing capability; Decode/Unmarshal still
+            # require an actual address, such as &buffer.
+            targets.append(info.pointers if info is not None and info.buffer is None else frozenset())
+        return values, targets, raw_arguments
+
+    def _apply_decoder_method(self, receiver, method, values, targets, result_offset, state,
+                              callable_source=_CLEAN, extra_fallback=_CLEAN):
         if method in {'Decode', 'DecodeElement'}:
             if targets:
                 source = (_join(receiver.source, callable_source)
@@ -1885,17 +1948,80 @@ class _Analysis:
             result = (receiver.source, _CLEAN)
         elif method == 'Buffered':
             if receiver.definite:
-                return finish(outer_end, (_CLEAN,), reader=_ReaderInfo(
+                return (_CLEAN,), _ReaderInfo(
                     receiver.source, frozenset({'decoder-buffer'}),
-                    frozenset({_ReaderOrigin((result_offset, result_offset))})))
+                    frozenset({_ReaderOrigin((result_offset, result_offset))}))
             result = (receiver.source,)
         else:
             result = (_CLEAN,)
         if not receiver.definite:
             # A join may also contain a different, unknown implementation.
-            result = (_join(*result, *values, callable_source,
-                            state.get(scope.bindings.get(root, root), _CLEAN)),)
-        return finish(outer_end, result)
+            result = (_join(*result, *values, extra_fallback),)
+        return result, None
+
+    def helper_chained_call(self, expression, match, state, scope):
+        """Execute a chained decoder/reader method directly on a package-helper result."""
+        if match.group(2) is not None:
+            return None
+        expr, code, pairs, offset = expression.text, expression.code, expression.pairs, expression.offset
+        name = match.group(1)
+        if name not in self.summaries or name in scope.bindings:
+            return None
+        if code[:match.start()].rstrip().endswith('.'):
+            return None
+        end = pairs.get(match.end() - 1)
+        if end is None:
+            return None
+        chain = re.match(r'\s*\.\s*([A-Za-z_]\w*)\s*\(', code[end + 1:])
+        if not chain:
+            return None
+        outer_end = pairs.get(end + chain.end())
+        if outer_end is None:
+            return None
+        call_offset = offset + match.start(1)
+        self.chained_call_results.pop((call_offset, offset + outer_end), None)
+        helper_facts = self.call(name, expr[match.end():end], offset + match.end(), call_offset, state, scope)
+        result_infos = self.call_results.get(call_offset, ())
+        primary = result_infos[0] if result_infos else None
+        method = chain.group(1)
+        arg_start = end + chain.end() + 1
+        whole_expr = not code[:match.start()].strip() and not code[outer_end + 1:].strip()
+        if primary is not None and primary.decoder is not None:
+            if primary.decoder.methods != {''}:
+                raise AnalysisLimit('Go decoder method alternative is unsupported; analysis is incomplete')
+            if method not in _DECODER_METHODS:
+                raise AnalysisLimit('Go decoder ' + method + ' method is unsupported; analysis is incomplete')
+            chain_values, chain_targets, _raw = self._eval_call_args(
+                expr, code, offset, arg_start, outer_end, state, scope)
+            result_facts, buffered_reader = self._apply_decoder_method(
+                primary.decoder, method, chain_values, chain_targets, call_offset, state)
+            chained_infos = tuple(
+                _ValueInfo(reader=buffered_reader if index == 0 else None)
+                for index in range(len(result_facts)))
+            self.chained_call_results[(call_offset, offset + outer_end)] = chained_infos
+            if whole_expr:
+                self.chained_value_results[offset] = (result_facts, chained_infos)
+            return outer_end, result_facts
+        if primary is not None and primary.reader is not None:
+            if primary.reader.methods != {''}:
+                raise AnalysisLimit('Go reader method alternatives are unsupported; analysis is incomplete')
+            chain_values, _targets, raw_arguments = self._eval_call_args(
+                expr, code, offset, arg_start, outer_end, state, scope)
+            result_facts = self.reader_method(primary.reader, method, raw_arguments, chain_values, state, scope)
+            chained_infos = tuple(_ValueInfo() for _ in result_facts)
+            self.chained_call_results[(call_offset, offset + outer_end)] = chained_infos
+            if whole_expr:
+                self.chained_value_results[offset] = (result_facts, chained_infos)
+            return outer_end, result_facts
+        if primary is None or primary.native is None:
+            # Fixed-point bottom: helper metadata has not converged yet.
+            # Preserve bottom so enclosing reader_payload waits for the next
+            # iteration instead of treating the chained call as a custom Reader.
+            self.chained_call_results[(call_offset, offset + outer_end)] = (None,)
+            if whole_expr:
+                self.chained_value_results[offset] = (helper_facts, (None,))
+            return end, helper_facts
+        return end, helper_facts
 
     def effect(self, offset: int, label: str, fact: _Fact):
         if fact:
@@ -2097,12 +2223,17 @@ class _Analysis:
         if closure is not None:
             self.value_results[offset] = closure[1]
             return closure[0]
+        chained = self.chained_value_results.get(offset)
+        if chained is not None:
+            self.value_results[offset] = chained[1]
+            return chained[0]
         self.value_results[offset] = (self.value_info(expr, offset, state, scope),)
         return (value,)
 
     def value(self, expr: str, offset: int, state, scope) -> _Fact:
         expr, offset = self.unparenthesize(expr, offset)
         self.closure_results.pop(offset, None)
+        self.chained_value_results.pop(offset, None)
         code = _call_code(_masked_source(expr))
         pairs = _pairs(code)
         whole_call = pairs.get(code.find('(')) == len(code) - 1
@@ -2300,6 +2431,12 @@ class _Analysis:
                                 # address escape. Existing or newly escaped
                                 # pointers still keep the cell uncertain.
                                 self.native_escapes.discard(cell)
+                                if _PointerKey(cell) in closure_flow.normal:
+                                    state[_PointerKey(cell)] = frozenset(
+                                        target for target in closure_flow.normal[_PointerKey(cell)]
+                                        if target.cell in state)
+                                else:
+                                    state.pop(_PointerKey(cell), None)
                             self.native_cell_writes[cell] = _join_native(
                                 self.native_cell_writes.get(cell), native)
                         if cell in nested.reader_cell_writes:
@@ -2401,6 +2538,12 @@ class _Analysis:
             result = self.native_call(_CallExpression(expr, code, pairs, offset), match, state, scope)
             if result is not None:
                 end, values = result
+                facts.extend(values)
+                cover(match.start(), end + 1)
+                continue
+            chained_helper = self.helper_chained_call(_CallExpression(expr, code, pairs, offset), match, state, scope)
+            if chained_helper is not None:
+                end, values = chained_helper
                 facts.extend(values)
                 cover(match.start(), end + 1)
             else:

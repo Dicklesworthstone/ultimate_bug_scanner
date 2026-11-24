@@ -9,6 +9,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -4105,6 +4106,191 @@ class DecodingRunnerTests(unittest.TestCase):
                                                 for invocation in run.get('invocations', [])), report)
                         print('GO_NATIVE_BUDGET_E2E_PASS', entrypoint, format_name, attempt, flush=True)
 
+
+
+
+class ComputedFactoryChainTests(unittest.TestCase):
+    def analyze(self, source: str):
+        with temporary_directory(prefix='ubs-go-factory-chain-') as tmp:
+            path = Path(tmp) / 'handler.go'
+            path.write_text(textwrap.dedent(source), encoding='utf-8')
+            return list(packages.taint_go.run(packages.taint_go.RunContext(lang='go', files=[path])))
+
+    def test_factory_chained_decoder_and_reader_calls_preserve_provenance_and_error_separation(self):
+        source = r"""
+            package app
+            import (
+                "bufio"
+                "database/sql"
+                j "encoding/json"
+                x "encoding/xml"
+                "fmt"
+                "io"
+                "net/http"
+                "strings"
+            )
+            func mkJSON(r io.Reader) *j.Decoder { return j.NewDecoder(r) }
+            func mkXML(r io.Reader) *x.Decoder { return x.NewDecoder(r) }
+            func mkCleanJSON(r io.Reader) *j.Decoder { return j.NewDecoder(strings.NewReader(`"safe"`)) }
+            func mkBufReader(r io.Reader) *bufio.Reader { return bufio.NewReader(r) }
+            func mkScanned(r io.Reader) *bufio.Scanner {
+                sc := bufio.NewScanner(r)
+                sc.Scan()
+                return sc
+            }
+            func mkUnscanned(r io.Reader) *bufio.Scanner { return bufio.NewScanner(r) }
+            func handler(db *sql.DB, req *http.Request) {
+                var a, b, c, d, clean string
+                if err := mkJSON(req.Body).Decode(&a); err != nil {
+                    db.Query("SELECT * FROM logs WHERE err = " + err.Error())
+                }
+                db.Query("SELECT * FROM u WHERE a = " + a) // json-factory-sql
+
+                _ = mkXML(req.Body).Decode(&b)
+                db.Query("SELECT * FROM u WHERE b = " + b) // xml-factory-sql
+
+                _ = (mkJSON(req.Body)).Decode(&c)
+                db.Query("SELECT * FROM u WHERE c = " + c) // paren-factory-sql
+
+                _ = (j.NewDecoder(req.Body)).Decode(&d)
+                db.Query("SELECT * FROM u WHERE d = " + d) // paren-native-sql
+
+                _ = mkCleanJSON(req.Body).Decode(&clean)
+                db.Query("SELECT * FROM u WHERE clean = " + clean)
+                db.Query("SELECT * FROM u WHERE bound = $1", a)
+
+                tok, terr := mkJSON(req.Body).Token()
+                if terr != nil {
+                    db.Query("SELECT * FROM logs WHERE err = " + terr.Error())
+                }
+                db.Query("SELECT * FROM u WHERE tok = " + fmt.Sprint(tok)) // token-factory-sql
+
+                bufBytes, berr := io.ReadAll(mkJSON(req.Body).Buffered())
+                if berr != nil {
+                    db.Query("SELECT * FROM logs WHERE err = " + berr.Error())
+                }
+                db.Query("SELECT * FROM u WHERE buf = " + string(bufBytes)) // buffered-factory-sql
+
+                inlineBuf, _ := io.ReadAll(j.NewDecoder(req.Body).Buffered())
+                db.Query("SELECT * FROM u WHERE ibuf = " + string(inlineBuf)) // buffered-native-sql
+
+                line, rerr := mkBufReader(req.Body).ReadString('\n')
+                if rerr != nil {
+                    db.Query("SELECT * FROM logs WHERE err = " + rerr.Error())
+                }
+                db.Query("SELECT * FROM u WHERE line = " + line) // reader-factory-sql
+
+                db.Query("SELECT * FROM u WHERE scanned = " + mkScanned(req.Body).Text()) // scanned-factory-sql
+                db.Query("SELECT * FROM u WHERE unscanned = " + mkUnscanned(req.Body).Text())
+            }
+        """
+        findings = self.analyze(source)
+        expected = {
+            (number, 'go.taint.sql')
+            for number, line in enumerate(textwrap.dedent(source).splitlines(), 1)
+            if any(tag in line for tag in (
+                '// json-factory-sql', '// xml-factory-sql', '// paren-factory-sql',
+                '// paren-native-sql', '// token-factory-sql', '// buffered-factory-sql',
+                '// buffered-native-sql', '// reader-factory-sql', '// scanned-factory-sql',
+            ))
+        }
+        actual = {(row['line'], row['rule']) for row in findings}
+        self.assertEqual(actual, expected, findings)
+
+    def test_factory_chained_unsupported_reader_method_remains_incomplete(self):
+        source = r"""
+            package app
+            import ("bufio"; "io"; "net/http")
+            func mkBufReader(r io.Reader) *bufio.Reader { return bufio.NewReader(r) }
+            func handler(req *http.Request) {
+                buf := make([]byte, 16)
+                _, _ = mkBufReader(req.Body).Read(buf)
+            }
+        """
+        with self.assertRaises(packages.taint_go.AnalysisLimit):
+            self.analyze(source)
+
+    def test_compiled_go_witness_for_factory_chained_decoding_and_reading(self):
+        handler_source = textwrap.dedent(r"""
+            package main
+            import (
+                "bufio"
+                "encoding/json"
+                "encoding/xml"
+                "io"
+                "net/http"
+                "strings"
+            )
+            type database struct{ Queries []string }
+            func (d *database) Query(q string, args ...any) { d.Queries = append(d.Queries, q) }
+            func mkJSON(r io.Reader) *json.Decoder { return json.NewDecoder(r) }
+            func mkXML(r io.Reader) *xml.Decoder { return xml.NewDecoder(r) }
+            func mkCleanJSON(r io.Reader) *json.Decoder { return json.NewDecoder(strings.NewReader(`"fixed"`)) }
+            func mkBuf(r io.Reader) *bufio.Reader { return bufio.NewReader(r) }
+            func mkScanned(r io.Reader) *bufio.Scanner { sc := bufio.NewScanner(r); sc.Scan(); return sc }
+            func mkUnscanned(r io.Reader) *bufio.Scanner { return bufio.NewScanner(r) }
+            func runJSON(db *database, req *http.Request) {
+                var s, clean string
+                _ = (mkJSON(req.Body)).Decode(&s)
+                db.Query("J:" + s) // json-sql
+                _ = mkCleanJSON(req.Body).Decode(&clean)
+                db.Query("C:" + clean)
+            }
+            func runXML(db *database, req *http.Request) {
+                var s string
+                _ = mkXML(req.Body).Decode(&s)
+                db.Query("X:" + s) // xml-sql
+            }
+            func runReader(db *database, req *http.Request) {
+                line, _ := mkBuf(req.Body).ReadString('\n')
+                db.Query("R:" + line) // reader-sql
+            }
+            func runScanner(db *database, req *http.Request) {
+                db.Query("S:" + mkScanned(req.Body).Text()) // scanned-sql
+                db.Query("U:" + mkUnscanned(req.Body).Text())
+            }
+        """)
+        driver_source = textwrap.dedent(r"""
+            package main
+            import (
+                "encoding/json"
+                "net/http/httptest"
+                "os"
+                "strings"
+            )
+            func main() {
+                db := &database{}
+                runJSON(db, httptest.NewRequest("POST", "/", strings.NewReader(`"atk-j"`)))
+                runXML(db, httptest.NewRequest("POST", "/", strings.NewReader(`<v>atk-x</v>`)))
+                runReader(db, httptest.NewRequest("POST", "/", strings.NewReader("atk-r\n")))
+                runScanner(db, httptest.NewRequest("POST", "/", strings.NewReader("atk-s\n")))
+                if err := json.NewEncoder(os.Stdout).Encode(db.Queries); err != nil { panic(err) }
+            }
+        """)
+        with temporary_directory(prefix='ubs-go-factory-native-') as tmp:
+            handler_path = Path(tmp) / 'handler.go'
+            driver_path = Path(tmp) / 'main.go'
+            handler_path.write_text(handler_source, encoding='utf-8')
+            driver_path.write_text(driver_source, encoding='utf-8')
+            go_bin = shutil.which('go')
+            if go_bin is not None:
+                native = subprocess.run(
+                    [go_bin, 'run', str(handler_path), str(driver_path)],
+                    cwd=tmp, text=True, capture_output=True, timeout=180,
+                    env=dict(os.environ, GOWORK='off', GO111MODULE='off', GOTOOLCHAIN='local'),
+                )
+                self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+                self.assertEqual(
+                    json.loads(native.stdout),
+                    ['J:atk-j', 'C:fixed', 'X:atk-x', 'R:atk-r\n', 'S:atk-s', 'U:'],
+                )
+            findings = list(packages.taint_go.run(packages.taint_go.RunContext(lang='go', files=[handler_path])))
+            expected = {
+                (number, 'go.taint.sql')
+                for number, line in enumerate(handler_source.splitlines(), 1)
+                if any(tag in line for tag in ('// json-sql', '// xml-sql', '// reader-sql', '// scanned-sql'))
+            }
+            self.assertEqual({(row['line'], row['rule']) for row in findings}, expected, findings)
 
 if __name__ == '__main__':
     unittest.main()

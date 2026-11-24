@@ -1735,7 +1735,7 @@ SMOKE
     warn "JS smoke test skipped: ast-grep was explicitly skipped and is unavailable"
   elif [ -n "$ubs_cmd" ]; then
     local smoke_status=0
-    safe_timeout 10 "$ubs_cmd" --fail-on-warning --ci --only=js "$test_dir" >/dev/null 2>&1 || smoke_status=$?
+    UBS_NO_CACHE=1 safe_timeout 10 "$ubs_cmd" --fail-on-warning --ci --only=js "$test_dir" >/dev/null 2>&1 || smoke_status=$?
     case "$smoke_status" in
       0) warn "Smoke test FAILED - scanner did not flag known bugs (exit 0)" ;;
       1) success "Smoke test PASSED - scanner detects bugs (exit 1)" ;;
@@ -2602,7 +2602,7 @@ uninstall_ubs() {
     fi
   fi
 
-  # 7. Module cache, config and session log.
+  # 7. Module cache, scan cache, config and session log.
   echo ""
   if [ "$NON_INTERACTIVE" -eq 1 ] || ask "Remove cached modules?"; then
     local module_dir="${XDG_DATA_HOME:-$HOME/.local/share}/ubs"
@@ -2612,6 +2612,15 @@ uninstall_ubs() {
         success "Removed module cache: $module_dir"
       else
         warn "Refusing to remove module cache path: $module_dir"
+      fi
+    fi
+    local scan_cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ubs"
+    if [ -d "$scan_cache_dir" ]; then
+      if [[ -n "$scan_cache_dir" && "$scan_cache_dir" != "/" ]]; then
+        rm -rf -- "$scan_cache_dir"
+        success "Removed scan cache: $scan_cache_dir"
+      else
+        warn "Refusing to remove scan cache path: $scan_cache_dir"
       fi
     fi
   fi

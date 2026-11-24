@@ -47,6 +47,7 @@ _HEAP_METADATA = {_ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT}
 _OPAQUE_CALLABLE = ('builtin', 'opaque-callable')
 _ARRAY_FROM = ('builtin', 'Array.from')
 _ARRAY_AT = ('builtin', 'Array.prototype.at')
+_ARRAY_FILL = ('builtin', 'Array.prototype.fill')
 
 
 def _collapsed(ref):
@@ -1577,12 +1578,13 @@ class _Flow:
         selected = []
         for ref in _refs(fact):
             slots = state.heap.get(ref, {})
-            if key == 'at' and (ref in state.array_lengths or ref == ('builtin', 'Array.prototype')):
+            if key in {'at', 'fill'} and (ref in state.array_lengths or ref == ('builtin', 'Array.prototype')):
                 prototype = state.heap.get(('builtin', 'Array.prototype'), {})
                 if not any(name in slots or name in prototype for name in (
-                        'at', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')):
-                    state.heap.setdefault(_ARRAY_AT, {})
-                    selected.append(_Fact(refs=(_ARRAY_AT,)))
+                        key, None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')):
+                    builtin_ref = _ARRAY_AT if key == 'at' else _ARRAY_FILL
+                    state.heap.setdefault(builtin_ref, {})
+                    selected.append(_Fact(refs=(builtin_ref,)))
                     continue
             if (ref == ('builtin', 'Array') and key == 'from'
                     and not any(name in slots for name in (
@@ -3725,7 +3727,30 @@ class _Flow:
                 if unknown:
                     fact = _join(fact, selected)
             cursor = selected_end
-            match = re.match(r'\s*\.\s*(flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with|at)\s*\(', code[cursor:end])
+            if _ARRAY_FILL in _refs(fact):
+                borrowed = re.match(r'\s*\.\s*(call|apply|bind)\s*\(', code[cursor:end])
+                if borrowed is not None:
+                    opening = cursor + borrowed.end() - 1
+                    closing = self.pairs.get(opening)
+                    if closing is None or closing >= end:
+                        self.incomplete.add('Array.fill borrowed callable is incomplete')
+                        break
+                    bmethod = borrowed.group(1)
+                    fill_slots = state.heap.get(_ARRAY_FILL, {})
+                    proven_call = (
+                        bmethod == 'call' and _refs(fact) == {_ARRAY_FILL} and not frozenset(fact)
+                        and not getattr(fact, 'absent', False)
+                        and not getattr(fact, 'scalar_alternative', False)
+                        and not any(k in fill_slots for k in (
+                            'call', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')))
+                    arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
+                                 if self.engine.code[left:right].strip()]
+                    values, prepared = self.evaluate_arguments(arguments, state)
+                    native = (('array-fill-call' if proven_call else 'array-fill-unknown'), fact, bmethod)
+                    fact = self.mutation_call(native, arguments, values, state, prepared, location=cursor)
+                    cursor = closing + 1
+                    continue
+            match = re.match(r'\s*\.\s*(flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with|at|fill)\s*\(', code[cursor:end])
             if match is None:
                 break
             opening = cursor + match.end() - 1
@@ -3757,6 +3782,8 @@ class _Flow:
             target = self.reference(name, state)
             if _ARRAY_AT in _refs(target):
                 return 'array-at-unknown', target, 'at'
+            if _ARRAY_FILL in _refs(target):
+                return 'array-fill-unknown', target, 'fill'
             if _ARRAY_FROM in _refs(target):
                 proven = (_refs(target) == {_ARRAY_FROM} and not frozenset(target)
                           and not getattr(target, 'absent', False)
@@ -3779,6 +3806,15 @@ class _Flow:
         refs = _refs(receiver)
         if _ARRAY_AT in refs:
             return 'array-at-unknown', receiver, 'at'
+        if _ARRAY_FILL in refs:
+            fill_slots = state.heap.get(_ARRAY_FILL, {})
+            proven_call = (
+                method == 'call' and refs == {_ARRAY_FILL} and not frozenset(receiver)
+                and not getattr(receiver, 'absent', False)
+                and not getattr(receiver, 'scalar_alternative', False)
+                and not any(k in fill_slots for k in (
+                    'call', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')))
+            return ('array-fill-call' if proven_call else 'array-fill-unknown'), receiver, method
         if _ARRAY_FROM in refs:
             # Borrowed constructor invocation and bound receiver semantics
             # need a separate proof; the captured native must not vanish.
@@ -3791,6 +3827,13 @@ class _Flow:
                       and not getattr(target, 'absent', False)
                       and not getattr(target, 'scalar_alternative', False))
             return ('array' if proven else 'array-at-unknown'), receiver, 'at'
+        if _ARRAY_FILL in _refs(target):
+            proven = (bool(refs) and all(ref in state.array_lengths for ref in refs)
+                      and not frozenset(receiver) and not getattr(receiver, 'scalar_alternative', False)
+                      and _refs(target) == {_ARRAY_FILL} and not frozenset(target)
+                      and not getattr(target, 'absent', False)
+                      and not getattr(target, 'scalar_alternative', False))
+            return ('array' if proven else 'array-fill-unknown'), receiver, 'fill'
         if _ARRAY_FROM in _refs(target):
             ordinary = (refs == {('builtin', 'Array')} or bool(refs) and all(
                 _function_scope(ref) is None and ref[0] != 'builtin'
@@ -3819,7 +3862,7 @@ class _Flow:
         reflect_native = (refs == {('builtin', 'Reflect')} and not frozenset(receiver)
                           and method not in state.heap.get(('builtin', 'Reflect'), {})
                           and None not in state.heap.get(('builtin', 'Reflect'), {}))
-        if reflect_native and method in {'defineProperty', 'preventExtensions', 'setPrototypeOf'}:
+        if reflect_native and method in {'defineProperty', 'preventExtensions', 'setPrototypeOf', 'apply'}:
             return 'reflect', receiver, method
         return self.native_array_target(receiver, method, state)
 
@@ -3833,7 +3876,7 @@ class _Flow:
         if native is None:
             return None
         kind, receiver, method = native
-        actual, uncertain, _missing, _kinds = prepared
+        actual, uncertain, missing, kinds = prepared
         values = [value for value, _missing in actual]
         if kind == 'array-from':
             return self.array_from(arguments, prepared, state, location, callback)
@@ -3844,6 +3887,35 @@ class _Flow:
         if kind == 'array-at-unknown':
             self.incomplete.add('Array.at borrowed callable requires supported native receiver semantics')
             return self.materialize(_join(*values), state)
+        if kind == 'array-fill-unknown':
+            self.incomplete.add('Array.fill borrowed callable requires supported native receiver semantics')
+            return self.materialize(_join(*values), state)
+        if kind == 'array-fill-call':
+            if not values or (uncertain is not None and uncertain == 0):
+                self.incomplete.add('Array.fill borrowed callable requires supported native receiver semantics')
+                return self.materialize(_join(*values), state)
+            target = values[0]
+            target_refs = _refs(target)
+            proven_target = (
+                bool(target_refs) and all(ref in state.array_lengths for ref in target_refs)
+                and not frozenset(target)
+                and not getattr(target, 'absent', False)
+                and not getattr(target, 'scalar_alternative', False))
+            if not proven_target:
+                self.incomplete.add('Array.fill borrowed callable requires supported native receiver semantics')
+                return self.materialize(_join(*values), state)
+            shifted_prepared = (
+                actual[1:],
+                None if uncertain is None else uncertain - 1,
+                {index - 1 for index in missing if index > 0},
+                {index - 1: item_kind for index, item_kind in kinds.items() if index > 0},
+            )
+            return self.array_fill(target, arguments[1:], shifted_prepared, state)
+        if kind == 'reflect' and method == 'apply':
+            if values and _ARRAY_FILL in _refs(values[0]):
+                self.incomplete.add('Array.fill borrowed callable requires supported native receiver semantics')
+                return self.materialize(_join(*values), state)
+            return None
         if kind == 'array' and method == 'fill':
             return self.array_fill(receiver, arguments, prepared, state)
         if kind == 'array' and method == 'copyWithin':
@@ -4643,10 +4715,11 @@ class _Flow:
                         for name in ((key,) if key is not None else tuple(slots)):
                             if name not in _HEAP_METADATA:
                                 slots[name] = _alternatives(slots.get(name, _ABSENT), _ABSENT)
-                    if ref == ('builtin', 'Array.prototype') and key in {None, 'at'}:
+                    if ref == ('builtin', 'Array.prototype') and key in {None, 'at', 'fill'}:
                         # Implicit native members are not stored initially.
                         # Their deletion must not make lookup recreate them.
-                        slots['at'] = _ABSENT
+                        for member in (('at', 'fill') if key is None else (key,)):
+                            slots[member] = _ABSENT
                 return frozenset()
         if code[start] in '[{' and start in self.pairs:
             closing = self.pairs[start]
@@ -4799,7 +4872,7 @@ class _Flow:
         cursor = start
         primary_end = self.pairs.get(start) if code[start:start + 1] in {'[', '('} else None
         if (primary_end is not None and primary_end < end - 1
-                and re.match(r'\s*\.\s*(?:flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with|at)\s*\(',
+                and re.match(r'\s*\.\s*(?:flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with|at|fill(?:\s*\.\s*(?:call|apply|bind))?)\s*\(',
                              code[primary_end + 1:end])):
             primary = self.value(start, primary_end + 1, state)
             primary, cursor = self.array_postfix(primary, primary_end + 1, end, state)

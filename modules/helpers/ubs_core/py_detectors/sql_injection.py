@@ -55,6 +55,15 @@ RULE_CRITICAL, RULE_WARNING = RULES[0][0], RULES[1][0]
 
 SQL_RE = re.compile(r'\b(?:select|insert|update|delete|with|merge|call|exec|create|drop|alter|truncate)\b', re.IGNORECASE)
 EXECUTE_METHODS = {'execute', 'executemany', 'executescript', 'exec_driver_sql', 'raw', 'read_sql', 'read_sql_query', 'scalar', 'scalars'}
+SET_ITERABLE_HASH_METHODS = frozenset({
+    'update', 'difference_update', 'intersection_update', 'symmetric_difference_update',
+    'union', 'intersection', 'difference', 'symmetric_difference',
+    'issubset', 'issuperset', 'isdisjoint',
+})
+SET_ELEMENT_HASH_METHODS = frozenset({'add', 'discard', 'remove', '__contains__'})
+DICT_KEY_HASH_METHODS = frozenset({
+    'get', 'pop', 'setdefault', '__contains__', '__getitem__', '__setitem__', '__delitem__',
+})
 LIST_MUTATORS = frozenset({'append', 'extend', 'insert', 'clear', 'pop', 'remove', 'reverse', 'sort',
                            '__setitem__', '__delitem__', '__iadd__', '__imul__', '__init__'})
 # Bind the SQL slot, never params/parameters: bound values may themselves
@@ -2762,6 +2771,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         self._sink_risks = {}
         self._suppression_index = None
         self._literal_statement_scopes = None
+        self._deferred_key_callback_limit = None
         self._sql_callable_escape_sites = None
         self.remaining_steps = max_steps
         self._budget = [max_steps] if budget is None else budget
@@ -2904,8 +2914,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         Keeping these in the value lattice preserves saved aliases across
         loop/finally re-evaluation and kills them on definite overwrites.
         """
-        if kind == 'set':
+        if kind in {'set', 'frozenset'}:
             return frozenset({'receiver'})
+        if kind == 'dict':
+            return frozenset({'dict-receiver'})
         return kind if isinstance(kind, frozenset) else frozenset()
 
     @staticmethod
@@ -3738,11 +3750,29 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def visit_Attribute(self, node):
         self.generic_visit(node)
         if (isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
-                and node.attr == 'update'):
+                and node.attr in (SET_ITERABLE_HASH_METHODS | SET_ELEMENT_HASH_METHODS | DICT_KEY_HASH_METHODS)):
             capabilities = self.set_update_capabilities(self.value_kind(node.value)[0])
-            methods = ({'bound'} if 'receiver' in capabilities else set())
-            if 'constructor' in capabilities:
-                methods.add('unbound')
+            methods = set()
+            if node.attr in SET_ITERABLE_HASH_METHODS:
+                if 'receiver' in capabilities:
+                    methods.add('bound')
+                if 'constructor' in capabilities:
+                    methods.add('unbound')
+            if node.attr in SET_ELEMENT_HASH_METHODS:
+                if 'receiver' in capabilities:
+                    methods.add('bound-element')
+                if 'constructor' in capabilities:
+                    methods.add('unbound-element')
+            if node.attr == 'update':
+                if 'dict-receiver' in capabilities:
+                    methods.add('dict-bound-update')
+                if 'dict-constructor' in capabilities:
+                    methods.add('dict-unbound-update')
+            if node.attr in DICT_KEY_HASH_METHODS:
+                if 'dict-receiver' in capabilities:
+                    methods.add('dict-bound-key')
+                if 'dict-constructor' in capabilities:
+                    methods.add('dict-unbound-key')
             if methods:
                 # Capture the receiver now. Later argument or alias writes
                 # cannot redirect an already loaded bound method.
@@ -3804,6 +3834,19 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         if (self._short_circuiting and self.fact_kinds(receiver)[0] == 'dict'
                 and not self.hash_safe_shape(self.element_shape(self.value_kind(node.slice)))):
             raise SQLFlowLimit('SQL generator lookup callbacks are unresolved; analysis is incomplete')
+        if (not self._short_circuiting and not isinstance(node.slice, ast.Slice)
+                and self.has_collection_key_callbacks()
+                and self.collection_key_effects_unmodeled()
+                and 'dict-receiver' in self.set_update_capabilities(self.fact_kinds(receiver)[0])):
+            if (isinstance(node.ctx, ast.Load) and isinstance(node.value, ast.Dict)
+                    and self.ownership_bindings().dynamic_namespace):
+                try:
+                    self.check_collection_keys([self.value_facts(node.slice)])
+                except SQLFlowLimit as exc:
+                    if self._deferred_key_callback_limit is None:
+                        self._deferred_key_callback_limit = exc
+            else:
+                self.check_collection_keys([self.value_facts(node.slice)])
         if (self._short_circuiting and self.fact_kinds(receiver)[0]
                 not in {'list', 'tuple', 'str', 'range'}
                 and (self.has_collection_key_callbacks()
@@ -3897,6 +3940,14 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def visit_Compare(self, node):
         if not self._short_circuiting:
             self.visit_Attribute(node)
+            if self.has_collection_key_callbacks() and self.collection_key_effects_unmodeled():
+                left_node = node.left
+                for operator, right_node in zip(node.ops, node.comparators):
+                    if isinstance(operator, (ast.In, ast.NotIn)):
+                        right_caps = self.set_update_capabilities(self.value_kind(right_node)[0])
+                        if right_caps.intersection({'receiver', 'dict-receiver'}):
+                            self.check_collection_keys([self.value_facts(left_node)])
+                    left_node = right_node
             if len(node.ops) == 1 and isinstance(node.ops[0], (ast.Is, ast.IsNot)):
                 # Identity returns an exact bool, regardless of operand SQL
                 # provenance. Visiting both operands above retains effects.
@@ -4096,7 +4147,11 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
     def check_set_update_keys(self, node):
         """Check actual possible emissions without advancing a real cursor."""
         capabilities = self.set_update_capabilities(self.value_kind(node.func)[0])
-        if (not capabilities.intersection({'bound', 'unbound'})
+        active = capabilities.intersection({
+            'bound', 'unbound', 'bound-element', 'unbound-element',
+            'dict-bound-key', 'dict-unbound-key', 'dict-bound-update', 'dict-unbound-update',
+        })
+        if (not active
                 or not self.has_collection_key_callbacks()
                 or not self.collection_key_effects_unmodeled()):
             return
@@ -4111,7 +4166,31 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 pending.extend(reversed(argument.value.elts))
             else:
                 arguments.append(argument)
-        offset = 0 if 'bound' in capabilities else 1
+        if active.intersection({'bound-element', 'unbound-element'}):
+            offset = 0 if 'bound-element' in active else 1
+            for argument in [*arguments[offset:], *(keyword.value for keyword in node.keywords)]:
+                self.step()
+                self.check_collection_keys([self.value_facts(argument)])
+        if active.intersection({'dict-bound-key', 'dict-unbound-key'}):
+            offset = 0 if 'dict-bound-key' in active else 1
+            if offset < len(arguments):
+                self.check_collection_keys([self.value_facts(arguments[offset])])
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    self.check_collection_keys([(None, None, None, False, 'unknown')])
+                elif keyword.arg == 'key':
+                    self.check_collection_keys([self.value_facts(keyword.value)])
+        if active.intersection({'dict-bound-update', 'dict-unbound-update'}):
+            offset = 0 if 'dict-bound-update' in active else 1
+            for argument in arguments[offset:]:
+                self.step()
+                self.check_collection_keys(self.collection_key_facts(argument, mapping=True))
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    self.check_collection_keys(self.collection_key_facts(keyword.value, mapping=True))
+        if not active.intersection({'bound', 'unbound'}):
+            return
+        offset = 0 if 'bound' in active else 1
         # An unbound method's receiver is not a newly hashed input iterable.
         for argument in [*arguments[offset:], *(keyword.value for keyword in node.keywords)]:
             self.step()
@@ -4171,7 +4250,9 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                 cells.update(node.names)
             elif isinstance(node, (ast.Name, ast.Attribute)) and isinstance(node.ctx, ast.Load):
                 target = bindings.resolve(node)
-                if target in {('unbound', 'set'), ('import', 'builtins.set')}:
+                if target in {('unbound', 'set'), ('import', 'builtins.set'),
+                              ('unbound', 'frozenset'), ('import', 'builtins.frozenset'),
+                              ('unbound', 'dict'), ('import', 'builtins.dict')}:
                     structural = True
                 if isinstance(node, ast.Name):
                     cell = bindings.sql_binding_cell(node.id, bindings.scope_of.get(node))
@@ -4179,7 +4260,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     if (cell is not None and cell['node'] is not function
                             and (isinstance(parent, ast.Call) and parent.func is node and target is None
                                  or isinstance(parent, ast.Attribute) and parent.value is node
-                                 and parent.attr == 'update')):
+                                 and parent.attr in (SET_ITERABLE_HASH_METHODS | SET_ELEMENT_HASH_METHODS | DICT_KEY_HASH_METHODS))):
                         structural = True
         cache[function] = structural, frozenset(cells)
         return self.set_update_helper(function)
@@ -4191,7 +4272,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         kind = self.fact_kinds(facts)[0]
         # Refusal-only capability sets may also contain a list/unknown arm.
         # They select the boundary above but cannot prove non-aliasing here.
-        if kind in {'set', 'inert-callable'} and not self.generator_refs(facts):
+        if kind in {'set', 'frozenset', 'dict', 'inert-callable'} and not self.generator_refs(facts):
             return True
         # A setter that never reads its old cell may replace a list receiver.
         # This gives the helper no authority to mutate that old list's heap.
@@ -6240,15 +6321,21 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             if (pair[0] == 'list' and pair[1] != ''
                     and value.id not in self.exclusive_lists):
                 return 'list', ''
-            if (value.id not in self.value_risks
-                    and self.ownership_bindings().resolve(value) in {
-                        ('unbound', 'set'), ('import', 'builtins.set')}):
-                return frozenset({'constructor'}), ''
+            if value.id not in self.value_risks:
+                resolved = self.ownership_bindings().resolve(value)
+                if resolved in {('unbound', 'set'), ('import', 'builtins.set'),
+                                ('unbound', 'frozenset'), ('import', 'builtins.frozenset')}:
+                    return frozenset({'constructor'}), ''
+                if resolved in {('unbound', 'dict'), ('import', 'builtins.dict')}:
+                    return frozenset({'dict-constructor'}), ''
             return pair
-        if (isinstance(value, ast.Attribute)
-                and self.ownership_bindings().resolve(value) in {
-                    ('unbound', 'set'), ('import', 'builtins.set')}):
-            return frozenset({'constructor'}), ''
+        if isinstance(value, ast.Attribute):
+            resolved = self.ownership_bindings().resolve(value)
+            if resolved in {('unbound', 'set'), ('import', 'builtins.set'),
+                            ('unbound', 'frozenset'), ('import', 'builtins.frozenset')}:
+                return frozenset({'constructor'}), ''
+            if resolved in {('unbound', 'dict'), ('import', 'builtins.dict')}:
+                return frozenset({'dict-constructor'}), ''
         if isinstance(value, ast.Constant):
             if value.value is None:
                 return 'none', ''
@@ -6267,6 +6354,8 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             # an exact builtin primitive. Unknown operands retain that refusal.
             # The visitor still evaluates every formatter and its SQL effects.
             return 'str', 'str'
+        if isinstance(value, ast.Dict):
+            return 'dict', ''
         if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
             element = self.join_element_shapes(*(self.element_shape(self.value_kind(item)) for item in value.elts))
             return ('list' if isinstance(value, ast.List) else
@@ -7029,19 +7118,34 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     and not any(isinstance(argument, ast.Starred) for argument in node.args)):
                 facts = self.value_facts(node.args[0]) if node.args else (None, None, None, False, 'static')
                 self._evaluated_values[node] = self.with_kinds(facts, 'list', self.fact_kinds(facts)[1])
-            if 'constructor' in self.set_update_capabilities(self.value_kind(node.func)[0]):
+            func_caps = self.set_update_capabilities(self.value_kind(node.func)[0])
+            if 'constructor' in func_caps:
                 facts = self.value_facts(node)
-                if self.fact_kinds(facts)[0] != 'set':
-                    native = (self.ownership_call_target(node) in {
-                                  ('unbound', 'set'), ('import', 'builtins.set')}
-                              and len(node.args) <= 1 and not node.keywords
-                              and not any(isinstance(argument, ast.Starred) for argument in node.args)
-                              and self.closed_generator_builtin_binding('set'))
+                if self.fact_kinds(facts)[0] not in {'set', 'frozenset'}:
+                    call_target = self.ownership_call_target(node)
+                    native_set = (call_target in {('unbound', 'set'), ('import', 'builtins.set')}
+                                  and len(node.args) <= 1 and not node.keywords
+                                  and not any(isinstance(argument, ast.Starred) for argument in node.args)
+                                  and self.closed_generator_builtin_binding('set'))
+                    native_frozenset = (call_target in {('unbound', 'frozenset'), ('import', 'builtins.frozenset')}
+                                        and len(node.args) <= 1 and not node.keywords
+                                        and not any(isinstance(argument, ast.Starred) for argument in node.args)
+                                        and self.closed_generator_builtin_binding('frozenset'))
                     # Construction proves a receiver, never mutable element
                     # shapes. Mixed callable joins retain refusal capability
                     # only, without claiming that a native call took place.
+                    kind = 'set' if native_set else 'frozenset' if native_frozenset else frozenset({'receiver'})
+                    self._evaluated_values[node] = self.with_kinds(facts, kind)
+            if 'dict-constructor' in func_caps:
+                facts = self.value_facts(node)
+                if self.fact_kinds(facts)[0] != 'dict':
+                    call_target = self.ownership_call_target(node)
+                    native_dict = (call_target in {('unbound', 'dict'), ('import', 'builtins.dict')}
+                                   and len(node.args) <= 1
+                                   and not any(isinstance(argument, ast.Starred) for argument in node.args)
+                                   and self.closed_generator_builtin_binding('dict'))
                     self._evaluated_values[node] = self.with_kinds(
-                        facts, 'set' if native else frozenset({'receiver'}))
+                        facts, 'dict' if native_dict else frozenset({'dict-receiver'}))
             if self.intrinsic_range_call(node):
                 # range either raises or yields integers; its bounds are not
                 # SQL values. Their eager side effects have already run.
@@ -8637,6 +8741,8 @@ def _find_file(path: Path, *, max_steps=None) -> Iterable[tuple[str, Path, int, 
         # fails. Preserve the evidence discovered before the unsupported
         # flow, then propagate the original incomplete-analysis error.
         failure = exc
+    if failure is None and analyzer._deferred_key_callback_limit is not None:
+        failure = analyzer._deferred_key_callback_limit
     suppressions = build_index(text, "python") if may_have_markers(text) else SuppressionIndex()
     for line_no, code in analyzer.issues:
         if not suppressions.is_suppressed(line_no, RULE_CRITICAL):

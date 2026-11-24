@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import re
 import subprocess
 import sys
@@ -2397,6 +2398,131 @@ class NativeCallableRuntimeTests(unittest.TestCase):
             self.assertEqual({(row['line'], row['rule']) for row in findings}, expected, findings)
             self.assertEqual(len(findings), len(expected), findings)
 
+
+
+class GoHTMLEscaperIdentityTests(unittest.TestCase):
+    def check(self, imports_block: str, body: str, expected_rules: set[str], extra: str = ''):
+        source = (
+            'package app\n'
+            + imports_block + '\n'
+            + extra
+            + 'func handler(w http.ResponseWriter, r *http.Request, db *sql.DB) {\n'
+            + body + '\n'
+            + '}\n'
+        )
+        with temporary_directory(prefix='ubs-go-htmlescaper-') as tmp:
+            path = Path(tmp) / 'handler.go'
+            path.write_text(source, encoding='utf-8')
+            findings = list(taint_go.run(RunContext(lang='go', files=[path])))
+            actual = {row['rule'] for row in findings}
+            self.assertEqual(actual, expected_rules, findings)
+
+    def test_stdlib_htmlescaper_sanitizes_xss_including_variadic_and_aliases(self):
+        for imp, call in [
+            ('import ("database/sql"; "fmt"; "html/template"; "net/http")',
+             'fmt.Fprint(w, template.HTMLEscaper(r.FormValue("q")))'),
+            ('import ("database/sql"; "fmt"; "text/template"; "net/http")',
+             'fmt.Fprint(w, template.HTMLEscaper(r.FormValue("q"), r.URL.Query().Get("b"), "lit"))'),
+            ('import ("database/sql"; "fmt"; safe "html/template"; "net/http")',
+             'fmt.Fprint(w, safe.HTMLEscaper(r.FormValue("q")))'),
+            ('import ("database/sql"; "fmt"; . "text/template"; "net/http")',
+             'fmt.Fprint(w, HTMLEscaper(r.FormValue("q"), "tail"))'),
+            ('import ("database/sql"; "fmt"; "html/template"; "net/http")',
+             'esc := template.HTMLEscaper\nfmt.Fprint(w, esc(r.FormValue("q"), "tail"))'),
+        ]:
+            with self.subTest(call=call):
+                self.check(imp, call, set())
+
+    def test_htmlescaper_rejects_lookalikes_shadows_unknown_joins_and_preserves_sql_cmd_and_effects(self):
+        self.check(
+            'import ("database/sql"; "fmt"; template "example.com/fake/template"; "net/http")',
+            'fmt.Fprint(w, template.HTMLEscaper(r.FormValue("q")))',
+            {'go.taint.xss'},
+        )
+        self.check(
+            'import ("database/sql"; "fmt"; . "html/template"; "net/http")',
+            'HTMLEscaper := func(v string) string { return v }\nfmt.Fprint(w, HTMLEscaper(r.FormValue("q")))',
+            {'go.taint.xss'},
+        )
+        self.check(
+            'import ("database/sql"; "fmt"; "html/template"; "net/http")',
+            'esc := template.HTMLEscaper\nif r.Method == "POST" { esc = rawPass }\nfmt.Fprint(w, esc(r.FormValue("q")))',
+            {'go.taint.xss'},
+            extra='func rawPass(args ...any) string { return fmt.Sprint(args...) }\n',
+        )
+        self.check(
+            'import ("database/sql"; "html/template"; "net/http")',
+            'db.Query("SELECT * FROM u WHERE a = " + template.HTMLEscaper(r.FormValue("q")))',
+            {'go.taint.sql'},
+        )
+        self.check(
+            'import ("database/sql"; "html/template"; "net/http"; "os/exec")',
+            'exec.Command("sh", "-c", template.HTMLEscaper(r.FormValue("q")))',
+            {'go.taint.command'},
+        )
+        self.check(
+            'import ("database/sql"; "fmt"; "html/template"; "net/http")',
+            'fmt.Fprint(w, template.HTMLEscaper(r.FormValue("q")) + r.FormValue("raw"))',
+            {'go.taint.xss'},
+        )
+        self.check(
+            'import ("database/sql"; "fmt"; "html/template"; "net/http")',
+            'fmt.Fprint(w, template.HTMLEscaper(leakAndReturn(w, r.FormValue("q"))))',
+            {'go.taint.xss'},
+            extra='func leakAndReturn(w http.ResponseWriter, s string) string { fmt.Fprint(w, s); return s }\n',
+        )
+
+    def test_compiled_go_witness_for_htmlescaper_identity(self):
+        source = textwrap.dedent('''
+            package main
+            import (
+                "encoding/json"
+                "fmt"
+                htmltmpl "html/template"
+                "net/http"
+                "net/http/httptest"
+                "net/url"
+                "os"
+                texttmpl "text/template"
+            )
+            func fakeEscaper(args ...any) string { return fmt.Sprint(args...) }
+            func applyVariadic(fn func(...any) string, a, b string) string { return fn(a, b) }
+            func render(w http.ResponseWriter, r *http.Request) {
+                q := r.URL.Query().Get("q")
+                fmt.Fprint(w, htmltmpl.HTMLEscaper(q))
+                fmt.Fprint(w, texttmpl.HTMLEscaper(q, "!"))
+                fmt.Fprint(w, applyVariadic(htmltmpl.HTMLEscaper, q, "?"))
+                fmt.Fprint(w, fakeEscaper(q)) // raw-fake
+            }
+            func main() {
+                payload := "<script>x</script>"
+                rec := httptest.NewRecorder()
+                req := httptest.NewRequest("GET", "/?q="+url.QueryEscape(payload), nil)
+                render(rec, req)
+                if err := json.NewEncoder(os.Stdout).Encode(rec.Body.String()); err != nil { panic(err) }
+            }
+        ''')
+        with temporary_directory(prefix='ubs-go-htmlescaper-native-') as tmp:
+            path = Path(tmp) / 'main.go'
+            path.write_text(source, encoding='utf-8')
+            go_bin = shutil.which('go')
+            if go_bin is not None:
+                native = subprocess.run(
+                    [go_bin, 'run', str(path)], cwd=tmp, text=True, capture_output=True, timeout=180,
+                    env=dict(os.environ, GOWORK='off', GO111MODULE='off', GOTOOLCHAIN='local'),
+                )
+                self.assertEqual(native.returncode, 0, native.stdout + native.stderr)
+                self.assertEqual(
+                    json.loads(native.stdout),
+                    '&lt;script&gt;x&lt;/script&gt;&lt;script&gt;x&lt;/script&gt;!&lt;script&gt;x&lt;/script&gt;?<script>x</script>',
+                )
+            findings = list(taint_go.run(RunContext(lang='go', files=[path])))
+            expected = {
+                (number, 'go.taint.xss')
+                for number, line in enumerate(source.splitlines(), 1)
+                if '// raw-fake' in line
+            }
+            self.assertEqual({(row['line'], row['rule']) for row in findings}, expected, findings)
 
 if __name__ == "__main__":
     unittest.main()

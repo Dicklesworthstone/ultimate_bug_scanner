@@ -6987,5 +6987,102 @@ class SQLValidationBindings(unittest.TestCase):
                         self.assertEqual(sorted(actual), sorted(expected), folder)
 
 
+
+class SetAndDictHashCallbackRefusalTests(unittest.TestCase):
+    """Verify set/frozenset/dict hashing operations refuse unresolved __hash__ callbacks.
+
+    Every unsafe case is independently witnessed against an in-memory sqlite3
+    database returning 2 rows on injection, while every clean control returns 1
+    row and scans complete-clean.
+    """
+
+    @staticmethod
+    def _build_source(stmt: str, *, inert: bool = False) -> str:
+        if inert:
+            key_body = '            return 0\n'
+        else:
+            key_body = (
+                '            nonlocal query\n'
+                '            query = f"SELECT count(*) FROM users WHERE name = \'{user}\'"\n'
+                '            return 0\n'
+            )
+        return (
+            'def run(cursor, user):\n'
+            '    query = "SELECT count(*) FROM users WHERE name = \'alice\'"\n'
+            '    class Key:\n'
+            '        def __hash__(self):\n'
+            + key_body +
+            f'    {stmt}\n'
+            '    return cursor.execute(query).fetchone()[0]\n'
+        )
+
+    @staticmethod
+    def _run_sqlite_witness(source: str, user: str) -> int:
+        ns = {}
+        exec(compile(source, '<hash-witness>', 'exec'), ns)
+        con = sqlite3.connect(':memory:')
+        try:
+            con.execute('CREATE TABLE users (name TEXT)')
+            con.executemany('INSERT INTO users VALUES (?)', [('alice',), ('bob',)])
+            return ns['run'](con.cursor(), user)
+        finally:
+            con.close()
+
+    def test_unsafe_set_and_dict_hash_callbacks_refuse_and_exploit_sqlite(self):
+        injected = "' OR '1'='1"
+        cases = (
+            ('set-update-exact', 'seen = set()\n    seen.update(Key() for _ in (1,))'),
+            ('set-add', 'seen = set()\n    seen.add(Key())'),
+            ('set-discard', 'seen = set()\n    seen.discard(Key())'),
+            ('set-remove-guarded', 'seen = set()\n    try:\n        seen.remove(Key())\n    except KeyError:\n        pass'),
+            ('set-unbound-add', 'seen = set()\n    set.add(seen, Key())'),
+            ('set-saved-add', 'seen = set()\n    fn = seen.add\n    fn(Key())'),
+            ('set-difference-update', 'seen = set()\n    seen.difference_update(Key() for _ in (1,))'),
+            ('set-intersection-update', 'seen = set()\n    seen.intersection_update([Key()])'),
+            ('set-symmetric-difference-update', 'seen = set()\n    seen.symmetric_difference_update([Key()])'),
+            ('set-union', 'seen = set()\n    seen.union([Key()])'),
+            ('set-isdisjoint', 'seen = set()\n    seen.isdisjoint([Key()])'),
+            ('set-in', 'seen = set()\n    _ = Key() in seen'),
+            ('frozenset-in', 'seen = frozenset()\n    _ = Key() in seen'),
+            ('dict-setitem', 'd = {}\n    d[Key()] = 1'),
+            ('dict-ctor-setitem', 'd = dict()\n    d[Key()] = 1'),
+            ('dict-get', 'd = {}\n    _ = d.get(Key(), 0)'),
+            ('dict-setdefault', 'd = {}\n    _ = d.setdefault(Key(), 1)'),
+            ('dict-pop', 'd = {"x": 1}\n    _ = d.pop(Key(), None)'),
+            ('dict-update-pairs', 'd = {}\n    d.update([(Key(), 1)])'),
+            ('dict-in', 'd = {}\n    _ = Key() in d'),
+        )
+        for name, stmt in cases:
+            with self.subTest(case=name):
+                source = self._build_source(stmt)
+                self.assertEqual(self._run_sqlite_witness(source, injected), 2, name)
+                with tempfile.TemporaryDirectory(prefix='ubs-hash-unsafe-') as tmp:
+                    path = Path(tmp) / f'{name.replace("-", "_")}.py'
+                    path.write_text(source, encoding='utf-8')
+                    with self.assertRaises(detector.SQLFlowLimit, msg=name):
+                        list(detector.find([path]))
+
+    def test_clean_primitive_and_inert_hash_controls_remain_clean(self):
+        injected = "' OR '1'='1"
+        controls = (
+            ('primitive-set-add', 'seen = set()\n    seen.add("alice")', False),
+            ('primitive-set-discard', 'seen = set()\n    seen.discard(1)', False),
+            ('primitive-set-diff-update', 'seen = set()\n    seen.difference_update(["a", "b"])', False),
+            ('primitive-set-in', 'seen = set()\n    _ = "alice" in seen', False),
+            ('primitive-dict-setitem', 'd = {}\n    d["alice"] = 1', False),
+            ('primitive-dict-get-safe-key-custom-default', 'd = {}\n    _ = d.get("alice", Key())', False),
+            ('primitive-dict-in', 'd = {}\n    _ = "alice" in d', False),
+            ('literal-set-update-generator', 'seen = set()\n    seen.update(x for x in ("a", "b"))', False),
+            ('inert-hash-set-and-dict', 'seen = set()\n    seen.add(Key())\n    d = {}\n    d[Key()] = 1', True),
+        )
+        for name, stmt, inert in controls:
+            with self.subTest(case=name):
+                source = self._build_source(stmt, inert=inert)
+                self.assertEqual(self._run_sqlite_witness(source, injected), 1, name)
+                with tempfile.TemporaryDirectory(prefix='ubs-hash-clean-') as tmp:
+                    path = Path(tmp) / f'{name.replace("-", "_")}.py'
+                    path.write_text(source, encoding='utf-8')
+                    self.assertEqual(list(detector.find([path])), [], name)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

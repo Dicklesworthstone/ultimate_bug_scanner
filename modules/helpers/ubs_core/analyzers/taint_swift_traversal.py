@@ -3688,8 +3688,22 @@ class SwiftEngine:
             if len(tokens) == 2 and tokens[0].value in {'let', 'var'}:
                 return node('optional-shorthand', tokens, bindings, (yes, no), reads=reads)
             text = swift_text(tokens)
-            positive = node('proof', tokens, bindings, (yes,), True)
-            negative = node('proof', tokens, bindings, (no,), False)
+            # Ordinary conditions must evaluate their calls and take both
+            # control-flow edges, but neither edge changes a value proof.
+            # Avoid two identity transfers (and their state joins) for those
+            # conditions. Prefix/membership tests can refine either arm;
+            # comparisons refine only equality, against a literal or path.
+            positive, negative = yes, no
+            if '.hasPrefix(' in text or '.contains(' in text:
+                positive = node('proof', tokens, bindings, (yes,), True)
+                negative = node('proof', tokens, bindings, (no,), False)
+            elif '.path==' in text or any(token.kind == 'literal' for token in tokens):
+                comparison = swift_parts(tokens, {'==', '!='})
+                if len(comparison) == 2:
+                    if tokens[len(comparison[0])].value == '==':
+                        positive = node('proof', tokens, bindings, (yes,), True)
+                    else:
+                        negative = node('proof', tokens, bindings, (no,), False)
             targets = (positive,) if text == 'true' else (negative,) if text in {'false', 'nil'} else (positive, negative)
             return node('eval', tokens, bindings, targets + exceptional)
 

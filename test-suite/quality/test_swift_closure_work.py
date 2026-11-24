@@ -481,6 +481,35 @@ func body(req: Request) {
                                      runs[1]['processed_traces'] * 2 + 64)
         (self.artifacts / 'url-metadata-work.json').write_text(json.dumps(receipts, indent=2), encoding='utf-8')
 
+    def test_plain_callback_conditions_evaluate_writes_without_identity_proof_work(self):
+        sinks = {
+            'path': 'serveFile(value)', 'redirect': 'req.redirect(to: value)',
+            'header': 'HTTPHeaders([("X-Trace", value)])',
+            'outbound': 'URLSession.shared.data(from: URL(string: value)!)',
+        }
+        checks = '\n'.join('if enabled && ready(&value, next) { mark() }' for _ in range(30))
+        for policy, sink in sinks.items():
+            for unsafe, argument in ((True, 'req.query["file"]!'), (False, '"/fixed"')):
+                path, source = self.fixture('''
+                    func ready(_ target: inout String, _ replacement: String) -> Bool {
+                        target = replacement
+                        return true
+                    }
+                    func handle(req: Request, enabled: Bool) {
+                        var value = "/initial"
+                        let next = %s
+                        Task {
+                            %s
+                            _ = %s
+                        }
+                    }
+                ''' % (argument, checks, sink), f'-{policy}-{unsafe}')
+                with self.subTest(policy=policy, unsafe=unsafe):
+                    engine = SwiftEngine(path, source, policy, parser=SwiftParser(source))
+                    effects = engine.analyze()
+                    self.assertEqual(set(effects), {source.index(sink)} if unsafe else set())
+                    self.assertLess(500_000 - engine.budget.remaining, 2_000)
+
     def test_current_validation_and_separate_request_origins_survive_history_collapse(self):
         cases = (
             ('path', 'URL(fileURLWithPath: raw).lastPathComponent', 'raw', '',

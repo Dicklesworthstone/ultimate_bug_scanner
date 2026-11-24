@@ -35,10 +35,10 @@ SKIP_DIRS = {
 RUBY_SUFFIXES = frozenset({".rb", ".rake", ".ru", ".gemspec"})
 
 IDENT = re.compile(r"(?:@@?|\$)?[A-Za-z_]\w*[!?]?")
-FACTORIES = {"File.open": "file_handle", "Net::HTTP.start": "http_session",
+FACTORIES = {"File.open": "file_handle", "File.new": "file_handle", "Net::HTTP.start": "http_session",
              "Thread.new": "thread_join", "Thread.start": "thread_join",
              "Thread.fork": "thread_join"}
-ACQUISITION = re.compile(r"\b(?:File\s*\.\s*open|Net\s*::\s*HTTP\s*\.\s*start|Thread\s*\.\s*(?:new|start|fork))\b")
+ACQUISITION = re.compile(r"\b(?:File\s*\.\s*(?:new|open)|Net\s*::\s*HTTP\s*\.\s*start|Thread\s*\.\s*(?:new|start|fork))\b")
 CONSTANT = re.compile(r"[A-Z]\w*(?:::[A-Z]\w*)*")
 CONSTANT_ALIAS = re.compile(r"\b([A-Z]\w*)\s*=\s*([A-Z]\w*(?:\s*::\s*[A-Z]\w*)*)\b")
 
@@ -47,7 +47,7 @@ def may_acquire(code):
     """Lexical admission includes transitive factory aliases, never literals."""
     if ACQUISITION.search(code):
         return True
-    aliases = {"File": {"open"}, "Thread": {"new", "start", "fork"}, "Net::HTTP": {"start"}}
+    aliases = {"File": {"open", "new"}, "Thread": {"new", "start", "fork"}, "Net::HTTP": {"start"}}
     definitions = [(name, re.sub(r"\s+", "", target)) for name, target in CONSTANT_ALIAS.findall(code)]
     for _ in range(len(definitions)):
         changed = False
@@ -158,6 +158,10 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         self.calls = ()
         self.choices = None
         self.constants = {}
+        self.namespaces = {}
+        for fn in self.parser.functions.values():
+            if fn.scope and fn.owner:
+                self.namespaces.setdefault(fn.owner[:-1], {})[fn.owner[-1]] = Value("constant", "::".join(fn.owner))
         definitions = {}
         for function in self.parser.functions.values():
             if not function.scope:
@@ -193,11 +197,15 @@ is an explicit incomplete-analysis error, never a truncated clean result.
     def constant_bindings(self, owner):
         bindings = {}
         for length in range(len(owner) + 1):
+            bindings.update(self.namespaces.get(owner[:length], {}))
             bindings.update({name: value for (scope, name), value in self.constants.items()
                              if scope == owner[:length]})
         return bindings
 
     def lookup(self, name, state):
+        if name.startswith("::"):
+            absolute = name[2:]
+            return self.constants.get(((), absolute), Value("constant", absolute))
         if name in state.bindings:
             return state.bindings[name]
         if CONSTANT.fullmatch(name):
@@ -358,9 +366,9 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         self.serial += 1
         return self.serial
 
-    def acquire(self, name, token, state, label="", position=None):
+    def acquire(self, kind, token, state, site):
         identity = self.identity()
-        self.resources[identity] = (token.start if position is None else position, FACTORIES[name], label)
+        self.resources[identity] = (token.start if site.position is None else site.position, kind, site.label)
         state.live.add(identity)
         return Value("resource", identity)
 
@@ -495,10 +503,19 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         if factory in FACTORIES:
             if FACTORIES[factory] == "thread_join" and any(self.references(value, state) for value in arguments):
                 raise ValueError("Ruby resource passed into a Thread needs cross-thread ownership; analysis is incomplete")
-            return self.acquire(factory, token, state, site.label, site.position)
+            return self.acquire(FACTORIES[factory], token, state, site)
         self.release(receiver, state, method, arguments, token.start)
         if receiver.kind == "resource":
             kind = self.resources[receiver.key][1]
+            if kind == "file_handle" and method in {"dup", "clone"}:
+                # IO#initialize_copy duplicates the descriptor. Closing one
+                # Ruby object leaves the other open, even inside File.open.
+                if method == "clone" and arguments:
+                    raise ValueError("Ruby File#clone options need argument binding; analysis is incomplete")
+                if arguments or receiver.key in state.closed:
+                    state.flow = "raise"
+                    return UNKNOWN
+                return self.acquire(kind, token, state, site)
             if kind == "thread_join" and method == "join" and len(arguments) == 1 and receiver.key in state.live:
                 # A finite join can time out with nil, or return the completed
                 # Thread. Only the latter path observes this exact handle.
@@ -661,6 +678,8 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                 cursor = end + 1
             elif IDENT.fullmatch(token.value):
                 name, cursor = token.value, cursor + 1
+                if cursor == 2 and tokens[0].value == "::":
+                    name = "::" + name
                 while cursor + 1 < len(tokens) and tokens[cursor].value == "::":
                     name += "::" + tokens[cursor + 1].value
                     cursor += 2
@@ -688,6 +707,7 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                     cursor = end + 1
                 elif tokens[cursor].value in {".", "&."} and cursor + 1 < len(tokens):
                     member = tokens[cursor + 1]
+                    ignores_block = result == Value("constant", "File") and member.value == "new"
                     name = name + "." + member.value if name else member.value
                     cursor += 2
                     args = ()
@@ -699,6 +719,8 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                         args = self.arguments(tokens[cursor:], state, depth + 1)
                         cursor = len(tokens)
                     result = self.call(name, result, args, token, state, site)
+                    if ignores_block and cursor < len(tokens) and tokens[cursor].value == "{":
+                        cursor = self.closing(tokens, cursor) + 1
                 elif tokens[cursor].value == "{" and result.kind == "resource":
                     # Thread.new {...}.join attaches a block before evaluating
                     # the suffix. The block cannot release creator bindings.
@@ -794,7 +816,7 @@ is an explicit incomplete-analysis error, never a truncated clean result.
         if len(factory_parts) == 2 and factory_parts[1]:
             # A leading `::` names the top-level constant, as expressions
             # already read `::File.open`; `::Thread.new { }` is core Thread.
-            receiver = self.lookup(re.sub(r"^::\s*", "", self.text(factory_parts[0])), state)
+            receiver = self.lookup(self.text(factory_parts[0]), state)
             if receiver.kind == "constant":
                 factory = str(receiver.key) + "." + factory_parts[1][0].value
         if factory in {"Thread.new", "Thread.start", "Thread.fork"}:
@@ -807,6 +829,9 @@ is an explicit incomplete-analysis error, never a truncated clean result.
                 child.result = UNKNOWN
                 self.finish(self.scoped_block(statement, child, ()))
             return outputs
+        if factory == "File.new":
+            # File.new ignores a supplied block and returns the open handle.
+            return self.simple(statement.tokens, state)
         if factory in {"File.open", "Net::HTTP.start"}:
             outputs = []
             for current in self.evaluate(expression, state):
@@ -1022,6 +1047,9 @@ is an explicit incomplete-analysis error, never a truncated clean result.
             state = State()
             if not function.scope:
                 state.bindings.update(self.constant_bindings(function.owner))
+            else:
+                for length in range(len(function.owner) + 1):
+                    state.bindings.update(self.namespaces.get(function.owner[:length], {}))
             inputs = [state]
             for index, name in enumerate(function.parameters):
                 default = function.defaults[index] if index < len(function.defaults) else ()

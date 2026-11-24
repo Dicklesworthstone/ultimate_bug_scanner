@@ -51,6 +51,22 @@ class Case:
 
 
 CASES = (
+    Case("file_new_requires_close", "handle = File.new('data')\nhandle.read", ((FILE, 1),)),
+    Case("file_new_alias_closed_in_ensure", "Files = File\nhandle = Files.new('data')\nbegin\n  handle.read\nensure\n  handle.close\nend", ()),
+    Case("file_new_block_does_not_close", "File.new('data') { |handle| handle.close }", ((FILE, 1),)),
+    Case("file_new_ignores_block_side_effects", "first = File.open('a')\nsecond = File.new('b') do\n  first.close\nend\nsecond.close", ((FILE, 1),)),
+    Case("file_new_chained_close_after_block", "File.new('data') { |ignored| work }.close", ()),
+    Case("file_new_shadowed_constant", "File = Factory\nhandle = File.new('data')", ()),
+    Case("namespace_file_class_is_not_core", "module Records\n  class File\n  end\n  def self.build\n    handle = File.new('data')\n    nil\n  end\nend", ()),
+    Case("absolute_file_inside_shadowing_namespace", "module Records\n  class File\n  end\n  def self.build\n    handle = ::File.new('data')\n    nil\n  end\nend", ((FILE, 5),)),
+    Case("file_new_return_transfers", "def acquire\n  File.new('data')\nend\nacquire.close", ()),
+    Case("file_dup_has_own_descriptor", "handle = File.open('data')\ncopy = handle.dup\nhandle.close", ((FILE, 2),)),
+    Case("file_clone_leaves_original_open", "handle = File.open('data')\ncopy = handle.clone\ncopy.close", ((FILE, 1),)),
+    Case("file_dup_closed_independently", "handle = File.open('data')\ncopy = handle.dup\nalias_copy = copy\nhandle.close\nalias_copy.close", ()),
+    Case("file_duplicate_escapes_managed_block", "copy = File.open('data') { |handle| handle.dup }\ncopy.read", ((FILE, 1),)),
+    Case("file_duplicate_returned_from_block_closed", "copy = File.open('data') { |handle| handle.dup }\ncopy.close", ()),
+    Case("closed_file_dup_raises", "handle = File.new('data')\nhandle.close\ncopy = handle.dup\nFile.open('never')", ()),
+    Case("non_file_duplicate_has_no_obligation", "handle = File.new('data')\ncopy = [handle].dup\ncopy.first.close", ()),
     Case("direct_thread_leak", "worker = Thread.new { work }", ((THREAD, 1),)),
     Case("direct_thread_join", "worker = Thread.new { work }\nworker.join", ()),
     Case("thread_value_observes_result", "worker = Thread.new { work }\nworker.value", ()),

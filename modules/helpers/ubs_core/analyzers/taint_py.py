@@ -10829,7 +10829,14 @@ class _Analysis:
                          min(250_000, max(20_000, 64 * len(body), 8 * len(nodes))))
                 self.scope_limits[scope] = limit
                 self.scope_remaining[scope] = limit
-                if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda))
+                # A lambda without defaults publishes only empty default
+                # tables. Those values cannot depend on the creating frame,
+                # so its presence need not prevent dependency ordering for
+                # every function in this module. Captured lexical cells stay
+                # in the ordinary per-call value and summary channels.
+                if any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                       or isinstance(node, ast.Lambda) and (
+                           node.args.defaults or any(value is not None for value in node.args.kw_defaults))
                        for node in body):
                     self.definition_writers.add(scope)
                 raw_used[scope] = _used_names(scope, body)

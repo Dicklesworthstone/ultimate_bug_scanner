@@ -2390,6 +2390,40 @@ class SummarySubstitutionTests(unittest.TestCase):
 class LargeModuleBudgetTests(unittest.TestCase):
     """An unrelated definition writer cannot starve late security findings."""
 
+    def test_plain_lambdas_do_not_exhaust_release_generation_scopes(self):
+        source = (ROOT / 'scripts/release_generation.py').read_text(encoding='utf-8')
+        engine = taint_py._Analysis(ast.parse(source))
+        try:
+            engine.analyze()
+        except AnalysisLimit as error:
+            # Other constructs still have explicit modeling boundaries. The
+            # actual release source must nevertheless finish these two bodies
+            # within their ordinary per-function work allowances.
+            self.assertTrue(error.components)
+            self.assertFalse(any('work limit exceeded' in item['reason']
+                                 for item in error.components), error.components)
+        failed = {getattr(scope, 'name', '') for scope in engine.failed_scopes}
+        self.assertFalse({'prepare_manifest', 'main'} & failed, failed)
+
+    def test_plain_lambda_closures_keep_distinct_factory_values(self):
+        source = '''
+def make(value):
+    return lambda: late(value)
+def late(value):
+    return identity(value)
+def identity(value):
+    return value
+def invoke(callback):
+    return callback()
+clean = make('fixed')
+unsafe = make(input())
+HttpResponse(invoke(clean))
+HttpResponse(invoke(unsafe))
+'''
+        engine = taint_py._Analysis(ast.parse(source))
+        effects = engine.analyze()
+        self.assertEqual({key[:3] for key in effects}, {('xss', 13, 1)})
+
     def test_nested_schema_dependencies_are_collected_in_one_walk(self):
         lines = ['def factory(parameter):']
         for depth in range(1, 13):

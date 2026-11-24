@@ -307,6 +307,37 @@ class ReportDeliveryTests(unittest.TestCase):
         self.assertEqual(output.read_text(encoding="utf-8"), result.stdout)
         self.assertEqual(source.read_text(encoding="utf-8"), UNSAFE + 'eval "$user_command"\n')
 
+    def test_new_only_refresh_saves_full_current_ledger(self):
+        first = "  local first=$(printf first)\n"
+        second = "  local second=$(printf second)\n"
+        header, footer = "#!/bin/bash\nexample() {\n", "}\n"
+        source = self.source("example.sh", header + first + footer)
+        baseline = self.work / "baseline.json"
+        initial = self.invoke("--fail-on-warning", f"--save-baseline={baseline}", source)
+        self.assertEqual(initial.returncode, 1, initial.stdout + initial.stderr)
+        source.write_text(header + first + second + footer, encoding="utf-8")
+        flags = ("--new-only", "--fail-on-warning", f"--baseline={baseline}")
+        refreshed = self.invoke(*flags, f"--save-baseline={baseline}", source)
+        self.assertEqual(refreshed.returncode, 1, refreshed.stdout + refreshed.stderr)
+        filtered = json.loads(refreshed.stdout)
+        complete = json.loads(baseline.read_bytes())
+        self.assertEqual(filtered["totals"]["warning"], 1)
+        self.assertEqual(complete["totals"]["warning"], 2)
+        rule = "bash.variable.local_command_subst"
+        self.assertEqual([(f["rule_id"], f["line"]) for f in filtered["findings"]], [(rule, 4)])
+        self.assertEqual([(f["rule_id"], f["line"]) for f in complete["findings"]], [(rule, 3), (rule, 4)])
+        repeated = self.invoke(*flags, f"--save-baseline={baseline}", source)
+        self.assertEqual(repeated.returncode, 0, repeated.stdout + repeated.stderr)
+        self.assertEqual(json.loads(repeated.stdout)["findings"], [])
+        self.assertEqual(json.loads(baseline.read_bytes())["findings"], complete["findings"])
+        saved = baseline.read_bytes()
+        blocked = self.work / "not-a-directory"
+        blocked.write_text("ordinary file\n", encoding="utf-8")
+        failed = self.invoke(*flags, f"--save-baseline={baseline}",
+                             f"--also=json:{blocked / 'report.json'}", source)
+        self.assertEqual(failed.returncode, 2, failed.stdout + failed.stderr)
+        self.assertEqual(baseline.read_bytes(), saved)
+
     def test_complete_partial_report_is_delivered_with_failure_exit(self):
         source = self.source()
         baseline = self.work / "incomplete-baseline.json"

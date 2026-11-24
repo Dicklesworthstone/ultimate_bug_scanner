@@ -84,6 +84,44 @@ class FindingsIntegrityTests(unittest.TestCase):
         self.summary(critical=1)
         self.assert_refused("python reports 1 critical.*accounts for 0")
 
+    def test_refresh_preserves_aggregate_weights_and_report_only_ast(self) -> None:
+        snapshot = self.root / "full.json"
+        aggregate = self.finding(rule="py.project.style", path="", line=0,
+                                 scope="project_aggregate", count=2, severity="warning")
+        ast_row = self.finding(rule="py.style.assignment", severity="info", message="assignment")
+        for weight in (2, 5):
+            doc = self.summary(warning=weight)
+            doc["scanners"][0]["extras"] = {"ast_findings": [ast_row]}
+            self.combined.write_text(json.dumps(doc), encoding="utf-8")
+            self.sink([aggregate | {"count": weight}])
+            if weight == 2:
+                merge(self.root, self.combined)
+                self.baseline.write_bytes(self.combined.read_bytes())
+        merge(self.root, self.combined, baseline_path=self.baseline, new_only=True,
+              full_snapshot=snapshot)
+        shown = json.loads(self.combined.read_bytes())
+        saved = json.loads(snapshot.read_bytes())
+        self.assertEqual((shown["findings"][0]["count"], shown["totals"]["warning"]), (3, 3))
+        self.assertEqual((saved["findings"][0]["count"], saved["totals"]["warning"]), (5, 5))
+        self.assertEqual(shown["scanners"][0]["extras"]["ast_findings"], [])
+        ast_findings = saved["scanners"][0]["extras"]["ast_findings"]
+        self.assertEqual([row["rule_id"] for row in ast_findings], ["py.style.assignment"])
+        self.assertTrue(ast_findings[0]["fingerprint"])
+
+    def test_refresh_rejects_unreadable_report_only_finding(self) -> None:
+        snapshot = self.root / "full.json"
+        snapshot.write_bytes(b"previous snapshot")
+        doc = self.summary()
+        doc["scanners"][0]["extras"] = {"ast_findings": [{"rule_id": "py.style.assignment",
+                                                          "file": "app.py", "severity": "info"}]}
+        self.combined.write_text(json.dumps(doc), encoding="utf-8")
+        before = self.combined.read_bytes()
+        with self.assertRaisesRegex(ValueError, "fingerprint"):
+            merge(self.root, self.combined, baseline_path=self.baseline, new_only=True,
+                  full_snapshot=snapshot)
+        self.assertEqual(snapshot.read_bytes(), b"previous snapshot")
+        self.assertEqual(self.combined.read_bytes(), before)
+
     def test_empty_sink_cannot_erase_critical_summary(self) -> None:
         self.summary(critical=1)
         self.sink([])

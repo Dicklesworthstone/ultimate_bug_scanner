@@ -83,6 +83,7 @@ def _build_parser() -> argparse.ArgumentParser:
     fm.add_argument("--source-root", default="", help="source snapshot used to scan the reported project paths")
     fm.add_argument("--baseline", default="", help="baseline JSON document to compare against")
     fm.add_argument("--new-only", action="store_true", help="report only findings absent from baseline")
+    fm.add_argument("--full-snapshot", type=Path, help="stage the unfiltered report while comparing a baseline")
     fs = sub.add_parser(
         "findings-sarif",
         help="generate SARIF 2.1.0 document from combined summary findings (bead K2)",
@@ -260,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_root=args.source_root,
                 baseline_path=args.baseline,
                 new_only=args.new_only,
+                full_snapshot=args.full_snapshot,
             )
         except ValueError as exc:
             print(f"findings-merge: {exc}", file=sys.stderr)

@@ -19,6 +19,8 @@ import os
 import re
 import sqlite3
 from collections.abc import Callable, Iterator
+from contextlib import nullcontext
+from copy import deepcopy
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -731,6 +733,25 @@ def _normalize(
     return normalized
 
 
+def _write_combined(path, doc, findings):
+    """Serialize summary metadata and the spooled canonical ledger."""
+    with path.open("w", encoding="utf-8") as output:
+        output.write("{")
+        for key, value in doc.items():
+            if key == "findings":
+                continue
+            output.write(json.dumps(key) + ": ")
+            json.dump(value, output)
+            output.write(", ")
+        output.write('"findings": [')
+        findings.seek(0)
+        for index, line in enumerate(findings):
+            if index:
+                output.write(", ")
+            output.write(line.rstrip("\n"))
+        output.write("]}")
+
+
 def merge(
     tmp_dir: Path,
     combined_path: Path,
@@ -739,6 +760,7 @@ def merge(
     source_root: str | Path = "",
     baseline_path: str | Path = "",
     new_only: bool = False,
+    full_snapshot: Path | None = None,
 ) -> int:
     """Merge every ``<lang>.findings.json`` NDJSON sink into combined findings[].
 
@@ -755,6 +777,10 @@ def merge(
         raise ValueError("combined summary is not a JSON object")
     if new_only and not baseline_path:
         raise ValueError("new-only filtering requires a baseline path")
+    if full_snapshot is not None and (
+        not new_only or full_snapshot.resolve() in {combined_path.resolve(), Path(baseline_path).resolve()}
+    ):
+        raise ValueError("full snapshot requires new-only mode and a separate staging file")
 
     # A monolith may contribute thousands of findings. Decode and split it
     # once, rather than once per finding. Keep only eight recent source files,
@@ -773,7 +799,9 @@ def merge(
         # The normalized ledger can be much larger than its source tree. Keep
         # it on disk throughout: neither raw records, normalized records nor
         # the final serialized document need a whole-report in-memory copy.
-        with temporary_file(mode="w+", encoding="utf-8", prefix="ubs-findings-") as findings:
+        full_spool = (temporary_file(mode="w+", encoding="utf-8", prefix="ubs-baseline-")
+                      if full_snapshot is not None else nullcontext())
+        with temporary_file(mode="w+", encoding="utf-8", prefix="ubs-findings-") as findings, full_spool as full_findings:
             for sink in sorted(Path(tmp_dir).glob("*.findings.json")):
                 lang = sink.name.split(".", 1)[0]
                 saw_record = False
@@ -781,6 +809,8 @@ def merge(
                     saw_record = True
                     finding = _normalize(rec, lang, source_lines, project_dir=project_dir,
                                          ordinals=ordinals, source_root=source_root)
+                    if full_findings is not None:
+                        full_findings.write(json.dumps(finding) + "\n")
                     observed = observed_by_lang.setdefault(lang, {"critical": 0, "warning": 0, "info": 0})
                     # Summary counts are suppression-aware. A suppressed
                     # record cannot account for missing active diagnostics.
@@ -803,8 +833,7 @@ def merge(
 
             ast_reports = _ast_report_sources(doc)
             for lang, records in ast_reports:
-                normalized = []
-                for record in records:
+                for index, record in enumerate(records):
                     if "rule_id" in record and "file" in record:
                         finding = record
                     elif _looks_like_finding(record):
@@ -812,13 +841,16 @@ def merge(
                                              ordinals=ordinals, source_root=source_root)
                     else:
                         raise ValueError("AST report finding requires a rule id and source path")
-                    finding = baseline.retain(finding, "report")
-                    if finding is not None:
-                        normalized.append(finding)
-                records[:] = normalized
+                    records[index] = finding
 
+            # Only summary metadata and report-only AST records live in doc.
+            # Keep their original counts and fingerprints for baseline refresh.
+            full_doc = deepcopy(doc) if full_snapshot is not None else None
             if baseline_path and new_only:
                 _validate_baseline_coverage(doc, observed_by_lang)
+                for _, records in ast_reports:
+                    records[:] = [retained for finding in records
+                                  if (retained := baseline.retain(finding, "report")) is not None]
                 # Accumulate the same weighted totals without grouping copies
                 # of every finding by language. Report-only AST evidence never
                 # contributes to these counters.
@@ -842,21 +874,16 @@ def merge(
                 # must leave the original summary usable for a partial report.
                 with temporary_directory(prefix=".ubs-findings-", dir=combined_path.parent) as stage_dir:
                     staged = Path(stage_dir) / "combined.json"
-                    with staged.open("w", encoding="utf-8") as output:
-                        output.write("{")
-                        for key, value in doc.items():
-                            if key == "findings":
-                                continue
-                            output.write(json.dumps(key) + ": ")
-                            json.dump(value, output)
-                            output.write(", ")
-                        output.write('"findings": [')
-                        findings.seek(0)
-                        for index, line in enumerate(findings):
-                            if index:
-                                output.write(", ")
-                            output.write(line.rstrip("\n"))
-                        output.write("]}")
+                    _write_combined(staged, doc, findings)
+                    if full_snapshot is not None:
+                        full_staged = Path(stage_dir) / "full.json"
+                        _write_combined(full_staged, full_doc, full_findings)
+                        # An empty comparison grants no credit and can leave
+                        # a producer's report-only record unchecked. Verify
+                        # the full snapshot using the next scan's reader
+                        # before replacing any output.
+                        _BaselineFilter(full_staged).close()
+                        os.replace(full_staged, full_snapshot)
                     os.replace(staged, combined_path)
     except (OSError, sqlite3.Error) as exc:
         raise ValueError(f"cannot assemble findings: {exc}") from exc

@@ -2041,6 +2041,35 @@ class SwiftNarrowingOperators(unittest.TestCase):
     def test_actual_assignment_keeps_the_existing_narrowing_boundary(self):
         self.assertEqual(self.findings('value = replacement\nuse(value!)'), [])
 
+    def test_only_executable_binding_operations_affect_a_guard(self):
+        for prefix in (
+            'print(#"value = 4"#)',
+            '/* value! /* } */ value = 4 */',
+            'let pattern = #/value!/#',
+            'model. /* selected field */ value = 4',
+        ):
+            with self.subTest(prefix=prefix):
+                found = self.findings(prefix + '\nprint("size \\(value!.count)")')
+                self.assertEqual([(row[0], row[2], row[3]) for row in found],
+                                 [('negative_nil_guard', 3, 15)])
+        for tail in ('print("value!")', 'print(model.value!)',
+                     'let label = value\n!enabled'):
+            with self.subTest(tail=tail):
+                self.assertEqual(self.findings(tail), [])
+
+    def test_nested_block_guard_stops_at_its_enclosing_scope(self):
+        from ubs_core.analyzers.narrowing_swift import scan_text
+        source = ('func f(value: Int?) { if value == nil { log("}") } }\n'
+                  'func g(value: Int?) { use(value!) }\n')
+        self.assertEqual(scan_text(Path('F.swift'), source), [])
+
+    def test_quoted_exit_is_not_executable_in_guard_else(self):
+        from ubs_core.analyzers.narrowing_swift import scan_text
+        source = 'guard let value = raw else { print("return") }\n'
+        found = scan_text(Path('F.swift'), source)
+        self.assertEqual([(row[0], row[2], row[3]) for row in found],
+                         [('guard_let_no_exit', 1, 1)])
+
     def test_actual_unwrap_and_missing_guard_exit_remain_detected(self):
         self.assertEqual([(item[0], item[2], item[3]) for item in self.findings('use(value!)')],
                          [('negative_nil_guard', 2, 5)])
@@ -2062,6 +2091,8 @@ class SwiftNarrowingOperators(unittest.TestCase):
             ('other-binding', 'use(othervalue!)', []),
             ('equality-before-unwrap', 'observe(value == nil)\nuse(value!)', [3]),
             ('other-assignment-before-unwrap', 'othervalue = replacement\nuse(value!)', [3]),
+            ('literal-before-unwrap', 'print(#"value = 4"#)\nprint("value \\(value!)")', [3]),
+            ('inert-unwrap', 'print("value!")\n/* value! */', []),
         )
         for name, tail, lines in cases:
             target = artifact / (name + '.swift')

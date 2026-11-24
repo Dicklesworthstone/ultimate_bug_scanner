@@ -1,7 +1,6 @@
 """ubs_core.analyzers.narrowing_swift — Swift guard let / optional binding narrowing analysis (bead A2).
 
-Logic moved verbatim from modules/helpers/type_narrowing_swift.py, which remains
-as a thin entrypoint. Also exposes a structured `run(ctx)` for the
+The standalone helper remains a thin entrypoint. Also exposes a structured `run(ctx)` for the
 `python3 -m ubs_core` CLI.
 """
 from __future__ import annotations
@@ -10,18 +9,15 @@ import re
 from pathlib import Path
 from typing import Iterable
 
+from ubs_core.io import line_col
+from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.registry import Analyzer, RunContext, register
 
 SKIP_DIRS = {".git", ".hg", ".svn", "build", "DerivedData", ".swiftpm", ".idea", "node_modules"}
-GUARD_PATTERN = re.compile(r"guard\s+let\s+([A-Za-z_][\w]*)\s*=\s*[^\n]+\s+else\s*\{", re.MULTILINE)
-NEGATIVE_NIL_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*==\s*nil[^)\{]*\)?", re.MULTILINE)
-POSITIVE_NIL_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*!=\s*nil[^)\{]*\)?", re.MULTILINE)
-OPTIONAL_CHAIN_GUARD = re.compile(r"if\s*\(?\s*([A-Za-z_][\w]*)\s*\?\.[^)\{]*\)?", re.MULTILINE)
-# Match the binding and operator, not another identifier's suffix or a
-# comparison. Equality must not erase an outstanding unsafe unwrap either.
-FORCE_TEMPLATE = r"\b{name}\s*!(?!=)"
-ASSIGN_TEMPLATE = r"\b{name}\s*=(?!=)"
-COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
+GUARD_PATTERN = re.compile(r"\bguard\s+let\s+([A-Za-z_]\w*)\s*=\s*[^\n]+?\s+else\s*\{")
+NEGATIVE_NIL_GUARD = re.compile(r"\bif\b\s*\(?\s*([A-Za-z_]\w*)\s*==\s*nil\b[^{};]*\{")
+POSITIVE_NIL_GUARD = re.compile(r"\bif\b\s*\(?\s*([A-Za-z_]\w*)\s*!=\s*nil\b[^{};]*\{")
+OPTIONAL_CHAIN_GUARD = re.compile(r"\bif\b\s*\(?\s*([A-Za-z_]\w*)\s*\?\.[^{};]*\{")
 EXIT_PATTERN = re.compile(
     r"\b(?:return|throw|break|continue)\b|\b(?:fatalError|preconditionFailure)\b",
     re.IGNORECASE,
@@ -50,86 +46,55 @@ def iter_swift_files(root: Path):
             yield path
 
 
-def find_block_end(text: str, brace_start: int) -> int:
-    depth = 0
-    for idx in range(brace_start, len(text)):
-        ch = text[idx]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return idx
-    return len(text) - 1
+def brace_scopes(code: str):
+    """Index each block and its parent once, at original source offsets."""
+    stack = []
+    parents = {}
+    ends = {None: len(code)}
+    for brace in re.finditer(r"[{}]", code):
+        pos = brace.start()
+        if code[pos] == "{":
+            parents[pos] = stack[-1] if stack else None
+            ends[pos] = len(code)
+            stack.append(pos)
+        elif stack:
+            ends[stack.pop()] = pos
+    return parents, ends
 
 
-def block_has_exit(block: str) -> bool:
-    stripped = COMMENT_PATTERN.sub("", block)
-    return bool(EXIT_PATTERN.search(stripped))
-
-
-def line_col(text: str, pos: int) -> tuple[int, int]:
-    line = text.count("\n", 0, pos) + 1
-    last_newline = text.rfind("\n", 0, pos)
-    if last_newline == -1:
-        col = pos + 1
-    else:
-        col = pos - last_newline
-    return line, col
-
-
-def skip_ws(text: str, idx: int) -> int:
-    while idx < len(text) and text[idx].isspace():
-        idx += 1
-    return idx
-
-
-def extract_guard_region(text: str, match_end: int) -> tuple[str, int]:
-    idx = skip_ws(text, match_end)
-    if idx < len(text) and text[idx] == "{":
-        block_end = find_block_end(text, idx)
-        return text[idx : block_end + 1], block_end + 1
-    newline = text.find("\n", idx)
-    if newline == -1:
-        newline = len(text)
-    return text[idx:newline], newline
-
-
-def collect_guard_issues(text: str, pattern: re.Pattern[str], message: str, skip_on_exit: bool = True):
-    issues = []
-    for match in pattern.finditer(text):
-        name = match.group(1)
-        block_text, guard_end = extract_guard_region(text, match.end())
-        if skip_on_exit and block_has_exit(block_text):
+def unwrap_after_guard(code: str, start: int, end: int, name: str) -> int | None:
+    # A selected member of another object does not write or unwrap this
+    # unqualified binding, even across whitespace or comments after the dot.
+    operation = re.compile(rf"\b{re.escape(name)}(?:!(?!=)|\s*=(?!=))")
+    for match in operation.finditer(code, start, end):
+        previous = match.start() - 1
+        while previous >= 0 and code[previous].isspace():
+            previous -= 1
+        if previous >= 0 and code[previous] == ".":
             continue
-        assign_regex = re.compile(ASSIGN_TEMPLATE.format(name=re.escape(name)))
-        force_regex = re.compile(FORCE_TEMPLATE.format(name=re.escape(name)))
-        search_from = guard_end
-        while True:
-            force_match = force_regex.search(text, search_from)
-            if not force_match:
-                break
-            assign_match = assign_regex.search(text, search_from, force_match.start())
-            if assign_match:
-                break
-            line, col = line_col(text, force_match.start())
-            issues.append((line, col, message.format(name=name)))
-            break
-    return issues
+        return match.start() if match[0].endswith("!") else None
+    return None
 
 
 def scan_text(path: Path, text: str) -> list[tuple[str, Path, int, int, str]]:
     """Return (kind, path, line, col, message) findings for one file's text."""
     issues: list[tuple[str, Path, int, int, str]] = []
+    code = strip_comments_and_strings(text, "swift")
+    parents, ends = brace_scopes(code)
     for kind, pattern, template, skip_on_exit in _GUARD_SPECS:
-        for line, col, message in collect_guard_issues(text, pattern, template, skip_on_exit=skip_on_exit):
-            issues.append((kind, path, line, col, message))
-    for match in GUARD_PATTERN.finditer(text):
+        for match in pattern.finditer(code):
+            brace = match.end() - 1
+            if skip_on_exit and EXIT_PATTERN.search(code, brace, ends[brace]):
+                continue
+            name = match.group(1)
+            pos = unwrap_after_guard(code, ends[brace] + 1, ends[parents[brace]], name)
+            if pos is not None:
+                line, col = line_col(text, pos)
+                issues.append((kind, path, line, col, template.format(name=name)))
+    for match in GUARD_PATTERN.finditer(code):
         name = match.group(1)
-        brace_start = max(match.end() - 1, match.start())
-        block_end = find_block_end(text, brace_start)
-        block_text = text[brace_start : block_end + 1]
-        if block_has_exit(block_text):
+        brace = match.end() - 1
+        if EXIT_PATTERN.search(code, brace, ends[brace]):
             continue
         line, col = line_col(text, match.start())
         message = _GUARD_LET_TEMPLATE.format(name=name)

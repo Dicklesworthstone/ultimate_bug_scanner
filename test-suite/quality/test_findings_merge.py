@@ -1571,12 +1571,20 @@ class FindingsMergeFailureIntegrationTests(unittest.TestCase):
             unchanged = scan("--format=json", f"--baseline={baseline}", "--new-only")
             self.assertEqual(unchanged.returncode, 0, unchanged.stdout + unchanged.stderr)
             self.assertEqual(decode_report(self, unchanged.stdout)["findings"], [])
+            unchanged_text = scan(f"--baseline={baseline}", "--new-only")
+            self.assertEqual(unchanged_text.returncode, 0, unchanged_text.stdout + unchanged_text.stderr)
+            self.assertNotIn("bash.security.eval_variable", unchanged_text.stdout)
             (project / "new.sh").write_text('#!/bin/bash\neval "$other"\n', encoding="utf-8")
             changed = scan("--format=json", f"--baseline={baseline}", "--new-only")
             self.assertEqual(changed.returncode, 1, changed.stdout + changed.stderr)
             findings = decode_report(self, changed.stdout)["findings"]
             self.assertTrue(any(f["rule_id"] == "bash.security.eval_variable" for f in findings), findings)
             self.assertTrue(all(Path(f["file"]).name == "new.sh" for f in findings), findings)
+            changed_text = scan(f"--baseline={baseline}", "--new-only")
+            self.assertEqual(changed_text.returncode, 1, changed_text.stdout + changed_text.stderr)
+            self.assertIn("new.sh:2", changed_text.stdout)
+            self.assertNotIn("existing.sh:2", changed_text.stdout)
+            self.assertEqual(changed_text.stdout.count("bash.security.eval_variable"), 1)
         print(f"[findings-merge-text-baseline] PASS ({time.monotonic() - started:.2f}s)", flush=True)
 
     def test_staged_text_baseline_restores_paths_and_uses_snapshot_fingerprints(self) -> None:

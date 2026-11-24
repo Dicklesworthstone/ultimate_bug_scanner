@@ -11253,6 +11253,24 @@ case "$FORMAT" in
     fi
     ;;
   text|*)
+    if [[ "$NEW_ONLY" -eq 1 ]] && generate_combined_json && [[ "$RUN_STATUS" == "ok" ]]; then
+      # The module text predates baseline filtering. Render the retained
+      # occurrence records so stdout and the findings-based exit agree.
+      say "\n${WHITE}${BOLD}──────── New findings ────────${RESET}"
+      if ! jq -r '
+        (.findings[]?, .extras.ast_findings[]?, .scanners[]?.extras.ast_findings[]?)
+        | select(.suppressed != true)
+        | "[\(.severity)] \(.rule_id): \(.message // "")"
+          + (if (.count // 1) > 1 then " (\(.count) occurrences)" else "" end)
+          + (if (.file // "") != "" then "\n  " + .file
+             + (if (.line // 0) > 0 then ":\(.line):\(.col // 1)" else "" end)
+             else "" end)
+          + (if (.remediation // "") != "" then "\n  " + .remediation else "" end)
+      ' "$COMBINED_JSON_FILE"; then
+        say_err "ERROR: Could not render baseline-filtered findings"
+        REPORT_FAILED=1
+      fi
+    else
     for L in "${langs[@]}"; do
       say "\n${MAGENTA}${BOLD}──────── $L ────────${RESET}"
       if [ -s "$TMPDIR_RUN/$L.txt" ]; then
@@ -11275,6 +11293,7 @@ case "$FORMAT" in
         env_error_excerpt "$L" | sed 's/^/  /' || true
       fi
     done
+    fi
     if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
       say "\n${RED}${BOLD}──────── Environment Error ────────${RESET}"
       say "${RED}${X}${RESET} One or more scanners could not run correctly (exit 2)."
@@ -11316,6 +11335,8 @@ case "$FORMAT" in
             # batch of defects that got fixed.
             if [[ "$RUN_STATUS" != "ok" ]]; then
               say "${YELLOW}Δ vs baseline: unavailable — this scan is ${RUN_STATUS}, so a delta would measure coverage, not code${RESET}"
+            elif [[ "$NEW_ONLY" -eq 1 ]]; then
+              say "${DIM}Counts show findings introduced since $COMPARISON_FILE${RESET}"
             elif [[ ! -f "$COMPARISON_FILE" ]]; then
               say "${YELLOW}Δ vs baseline: unavailable — could not read $COMPARISON_FILE${RESET}"
             elif ! jq -e '(.status // "ok") == "ok" and ((.failed_modules // []) | length) == 0' "$COMPARISON_FILE" >/dev/null 2>&1; then

@@ -292,3 +292,53 @@ methods, affected Go suites, public reports and canonical integrity checks.
 Returned helper-local buffers and captured buffer-header replacement remain
 intentional incomplete-analysis boundaries. The detailed current checkpoint is
 `test-suite/patches/go-read-into-checkpoint.md`; keep `1b9j.6.18` in progress.
+
+## November 24 source review — mixed JavaScript heap updates
+
+Bead: `ultimate_bug_scanner-js-mixed-heap-updates`.
+
+The reviewed baseline is `34fcffa6744c4d15b0fc939b753ff29b31d9e599`.
+Read the feedback plan, active checklist, reality-check bridge plan and current
+Beads before selecting this work. Several older open beads already contain
+substantial implementations; this candidate addresses a separate current
+destructive-update defect.
+
+The shared `write_property` path refuses strong updates when the receiver has
+a scalar alternative. Property deletion and the literal array-length fast path
+omit that same proof. For example, `const target=flag?box:0; delete target.html;`
+can erase `box.html` in analysis even though the scalar branch leaves the
+original object unchanged. Likewise, `target.length=0` can discard the original
+array's tainted elements when the target might be a scalar. These are
+source-traced predicted false-clean cases, not executed baseline results.
+
+Preserved candidate:
+
+- `test-suite/patches/javascript-mixed-heap-updates.patch`, Git blob
+  `00a68981a6961c13d81ec39799ffa114fba46111`.
+- Base analyzer: `modules/helpers/ubs_core/analyzers/taint_js.py`,
+  blob `70f5bd3b0649718653829a61f25cc345fb48a704`.
+- Base tests: `test-suite/quality/test_taint_js_heap.py`,
+  blob `a849087682a0be68b9de139f0bee6bbf9db57432`.
+- Two production guards reuse the existing scalar-alternative proof. Six
+  maintained methods specify 24 scanner subcases and 40 optional Node witness
+  calls: unsafe original/aliased/helper cases, projection aliases, honest
+  incomplete projections after weak updates, and exact-target clean controls.
+  Primitive length-write witnesses intentionally use ordinary non-strict scripts.
+
+Root independently inspected the two update paths and checked every patch hunk
+against the immutable source, including exact forward/reverse reconstruction.
+That is text reconstruction only. No Python/Node execution, scanner baseline,
+syntax check, DSR gate, ShellCheck, public CLI, cache or full-suite result was
+obtained: this session exposes neither an attached computer nor an attachment
+or DSR execution tool. GitHub Actions are forbidden by repository policy and
+were not used. The production analyzer, version and canonical pins are unchanged.
+
+Before activation, run the new methods on the unchanged and candidate sources
+through DSR with Node available, retain the original recursive-clone controls,
+and run the affected heap/scan-cost and real module/runner report, selection,
+suppression, partial-result and cache checks. Refresh canonical integrity pins
+and the development version only for the qualified production edit, then run
+the prescribed checks without weakening existing limits or expectations.
+
+This does not implement `Object.keys` shape refinement or close
+`ultimate_bug_scanner-1b9j.6.22`, D6, or release qualification.

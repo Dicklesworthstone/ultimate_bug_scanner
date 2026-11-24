@@ -1,0 +1,115 @@
+diff --git a/modules/helpers/ubs_core/analyzers/taint_js.py b/modules/helpers/ubs_core/analyzers/taint_js.py
+--- a/modules/helpers/ubs_core/analyzers/taint_js.py
++++ b/modules/helpers/ubs_core/analyzers/taint_js.py
+@@ -4879,7 +4879,8 @@
+                 refs = _refs(receiver)
+                 for ref in refs:
+                     slots = state.heap.get(ref, {})
+                     exact = (key not in {None, '__proto__'} and len(refs) == 1 and not frozenset(receiver)
++                             and not getattr(receiver, 'scalar_alternative', False)
+                              and ref not in state.weak_refs and _ARRAY_WRITE_CONTRACT not in slots)
+                     if exact:
+                         slots.pop(key, None)
+@@ -4967,9 +4968,11 @@
+                 if key == 'length' and assignment.group(1) == '=':
+                     literal = text[rhs:end].strip()
+                     refs = _refs(receiver)
+                     if (literal.isdecimal() and len(literal) <= 10 and int(literal) <= 4294967295
+-                            and len(refs) == 1 and not frozenset(receiver) and not refs & evaluated.weak_refs):
++                            and len(refs) == 1 and not frozenset(receiver)
++                            and not getattr(receiver, 'scalar_alternative', False)
++                            and not refs & evaluated.weak_refs):
+                         ref = next(iter(refs))
+                         if ref in evaluated.array_lengths:
+                             size = int(literal)
+                             evaluated.array_lengths[ref] = size
+diff --git a/test-suite/quality/test_taint_js_heap.py b/test-suite/quality/test_taint_js_heap.py
+--- a/test-suite/quality/test_taint_js_heap.py
++++ b/test-suite/quality/test_taint_js_heap.py
+@@ -4902,6 +4902,86 @@
+             'items.flatMap((value, index, source) => { source.length = unknown; return [value]; });',
+             'xss', reason='flatMap.*length')
+ 
++    def test_mixed_scalar_delete_preserves_original_properties(self):
++        for scalar in ('0', 'false', '"fixed"'):
++            source = ('const box={html:req.query.html,safe:"fixed"}; '
++                      f'const target=flag?box:{scalar}; delete target.html; '
++                      'res.send(box.html); res.send(box.safe);')
++            with self.subTest(scalar=scalar):
++                self.scan_sort(source, 'xss')
++                self.assert_runtime_sends('const flag=false; ' + source, ['review-input', 'fixed'])
++                self.assert_runtime_sends('const flag=true; ' + source, [None, 'fixed'])
++
++    def test_mixed_scalar_length_preserves_original_elements(self):
++        for scalar in ('0', 'false', '"fixed"'):
++            source = ('const box=[req.query.html,"fixed"]; '
++                      f'const target=flag?box:{scalar}; target.length=0; '
++                      'res.send(box[0]); res.send(box[1]);')
++            with self.subTest(scalar=scalar):
++                self.scan_sort(source, 'xss')
++                # Primitive writes are ignored in this ordinary, non-strict script.
++                self.assert_runtime_sends('const flag=false; ' + source, ['review-input', 'fixed'])
++                self.assert_runtime_sends('const flag=true; ' + source, [None, None])
++
++    def test_mixed_scalar_cleanup_preserves_helper_and_stored_aliases(self):
++        for initial, mutation, selected in (
++            ('{html:req.query.html}', 'delete value.html;', 'box.html'),
++            ('[req.query.html]', 'value.length=0;', 'box[0]'),
++        ):
++            for setup, argument in (
++                ('const target=flag?box:0;', 'target'),
++                ('const holder={target:flag?box:0};', 'holder.target'),
++                ('function select(value){return flag?value:0;}', 'select(box)'),
++            ):
++                source = (f'function cleanup(value){{{mutation}}} const box={initial}; '
++                          + setup + f' cleanup({argument}); res.send({selected});')
++                with self.subTest(initial=initial, argument=argument):
++                    self.scan_sort(source, 'xss')
++                    self.assert_runtime_sends('const flag=false; ' + source, ['review-input'])
++                    self.assert_runtime_sends('const flag=true; ' + source, [None])
++
++    def test_mixed_scalar_cleanup_preserves_projection_aliases(self):
++        for initial, mutation, member in (
++            ('{html:req.query.html}', 'delete target.html;', '.html'),
++            ('[req.query.html]', 'target.length=0;', '[0]'),
++        ):
++            for method, alias in (('values', 'out[0]'), ('entries', 'out[0][1]')):
++                source = (f'const box={initial}; const out=Object.{method}({{item:box}}); '
++                          f'const target=flag?{alias}:0; {mutation} '
++                          f'res.send(box{member}); res.send({alias}{member});')
++                with self.subTest(initial=initial, method=method):
++                    self.scan_sort(source, 'xss', 'xss')
++                    self.assert_runtime_sends('const flag=false; ' + source,
++                                              ['review-input', 'review-input'])
++                    self.assert_runtime_sends('const flag=true; ' + source, [None, None])
++
++    def test_mixed_scalar_cleanup_keeps_later_projection_limits_explicit(self):
++        for initial, mutation, member in (
++            ('{html:req.query.html}', 'delete target.html;', '.html'),
++            ('[req.query.html]', 'target.length=0;', '[0]'),
++        ):
++            for method, selected in (('values', 'out[0]'), ('entries', 'out[0][1]')):
++                source = (f'const box={initial}; const target=flag?box:0; {mutation} '
++                          f'res.send(box{member}); const out=Object.{method}(box); '
++                          f'res.send({selected});')
++                with self.subTest(initial=initial, method=method):
++                    self.scan_sort(source, 'xss', 'xss', partial=f'Object.{method}')
++                    self.assert_runtime_sends('const flag=false; ' + source,
++                                              ['review-input', 'review-input'])
++
++    def test_exact_cleanup_retains_definite_deletion_and_truncation(self):
++        for initial, mutation, member in (
++            ('{html:req.query.html}', 'delete target.html;', '.html'),
++            ('[req.query.html]', 'target.length=0;', '[0]'),
++        ):
++            for helper in (False, True):
++                action = (f'function cleanup(target){{{mutation}}} cleanup(box);' if helper
++                          else f'const target=box; {mutation}')
++                source = f'const box={initial}; {action} res.send(box{member});'
++                with self.subTest(initial=initial, helper=helper):
++                    self.scan_sort(source)
++                    self.assert_runtime_sends(source, [None])
++
+     def test_object_projection_preserves_shallow_values_and_entries(self):
+         for expression, selected in (('Object.values({item:box})', 'out[0]'),
+                                      ('Object.entries({item:box})', 'out[0][1]')):

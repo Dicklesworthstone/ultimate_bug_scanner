@@ -1121,6 +1121,41 @@ class _Analysis:
         except ValueError:
             return None
 
+    def buffer_source_proven(self, expression, origin, info, state, scope):
+        """Prove current byte/string contents before granting a copy capability."""
+        # Missing byte-buffer metadata is not proof of a scalar string:
+        # ReadAll returns mutable bytes that may have untracked aliases.
+        if info is not None and info.buffer is not None:
+            escaped = {target.cell for target in self.buffer_escapes}
+            return (info.buffer.definite and (info.buffer.length == 0 or
+                    (bool(info.pointers) and all(
+                        target.whole and not target.path and not target.indexed
+                        and target.cell not in escaped for target in info.pointers))))
+        expression, origin = self.unparenthesize(expression, origin)
+        if _string_literal(expression) is not None:
+            return True
+        code = _call_code(_masked_source(expression))
+        call = re.match(r'([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))?\s*\(', code)
+        if call is None or _pairs(code).get(call.end() - 1) != len(code) - 1:
+            return False
+        parts = [(expression[call.end() + start:call.end() + end], origin + call.end() + start)
+                 for start, end in _parts(code[call.end():-1])]
+        root, member = call.group(1), call.group(2)
+        native = self.native_identity(root, member, origin, scope)
+        if native == ('os', 'Getenv'):
+            return len(parts) == 1
+        conversion = (root == 'string' and member is None and root not in scope.bindings
+                      and root not in self.summaries and len(parts) == 1)
+        sanitizer = native in _HTML_SANITIZERS and (
+            len(parts) == 1 or native == ('template', 'HTMLEscaper'))
+        if not (conversion or sanitizer):
+            return False
+        # A string conversion freezes its input, but cannot repair source
+        # contents already lost through an unmodeled mutable byte alias.
+        return all(self.buffer_source_proven(
+            argument, location, self.value_info(argument, location, state, scope), state, scope)
+                   for argument, location in parts)
+
     def buffer_expression(self, expr, offset, state, scope):
         """Describe selected builtin slices without inventing an object heap.
 
@@ -1140,8 +1175,11 @@ class _Analysis:
             parts = _parts(sliced.group(2), ':')
             info = self.value_info(sliced.group(1), offset, state, scope)
             if len(parts) in {2, 3} and info is not None and info.buffer is not None:
-                low_text = sliced.group(2)[slice(*parts[0])].strip()
-                high_text = sliced.group(2)[slice(*parts[1])].strip()
+                # Masking preserves delimiter positions but rewrites rune
+                # tokens. Only original integer text may prove a slice length.
+                bounds = expr[sliced.start(2):sliced.end(2)]
+                low_text = bounds[slice(*parts[0])].strip()
+                high_text = bounds[slice(*parts[1])].strip()
                 low = self.integer_literal(low_text) if low_text else 0
                 high = self.integer_literal(high_text) if high_text else info.buffer.length
                 length = high - low if high is not None and low is not None and high >= low >= 0 else None
@@ -1168,7 +1206,10 @@ class _Analysis:
                     length, fresh = len(literal.encode('utf-8')), True
                 elif (re.fullmatch(r'\s*string\s*\(.*\)\s*', argument, re.DOTALL)
                       and 'string' not in scope.bindings and 'string' not in self.summaries):
-                    fresh = True
+                    # A fresh backing array does not recover contents lost
+                    # through an untracked alias before the string snapshot.
+                    fresh = self.buffer_source_proven(
+                        argument, offset + converted.end(), info, state, scope)
         literal = re.fullmatch(r'\[\]\s*(byte|uint8)\s*\{(.*)\}', code, re.DOTALL)
         if literal and self.scan_type('[]' + literal.group(1), scope) == 'text':
             # The lexer preserves a token for rune literals; an empty-looking
@@ -1492,6 +1533,55 @@ class _Analysis:
         for target in info.pointers:
             self.buffer_writes[target] = _join(self.buffer_writes.get(target, _CLEAN), payload)
 
+    def copy_buffer(self, arguments, state, scope):
+        """Copy native bytes into shared backing cells, keeping the count clean.
+
+        copy may modify only a prefix, including when source and destination
+        overlap. Weak writes preserve the untouched suffix and aliases; a
+        fixed replacement is not proof that every prior source was erased.
+        """
+        if len(arguments) != 2:
+            raise AnalysisLimit('Go buffer copy argument shape is unsupported; analysis is incomplete')
+        destination_text, _ = self.unparenthesize(arguments[0][0])
+        passive_destination = re.fullmatch(r'[A-Za-z_]\w*', destination_text) is not None
+        sliced = re.fullmatch(r'([A-Za-z_]\w*)\s*\[(.*)\]', _masked_source(destination_text), re.DOTALL)
+        if sliced is not None:
+            original_bounds = destination_text[sliced.start(2):sliced.end(2)]
+            bounds = [original_bounds[start:end].strip()
+                      for start, end in _parts(sliced.group(2), ':')]
+            passive_destination = (len(bounds) in {2, 3}
+                                   and all(not bound or self.integer_literal(bound) is not None for bound in bounds))
+        values, infos = [], []
+        for expression, origin in arguments:
+            values.append(self.value(expression, origin, state, scope))
+            infos.append(self.value_info(expression, origin, state, scope))
+        # Effectful destination expressions can change an ordinary source
+        # read, whose order relative to the call is not fixed by Go. Refuse
+        # that case after retaining argument effects instead of copying only
+        # the post-call source. Direct names and literal reslices are passive.
+        if not passive_destination:
+            raise AnalysisLimit('Go buffer copy destination evaluation is unsupported; analysis is incomplete')
+        # Keep every available backing observation before granting a native
+        # write. Existing captured-header and ownership boundaries still apply;
+        # joining metadata here does not bypass the enclosing evaluator.
+        destination = _join_value_info(infos[0], self.value_info(*arguments[0], state, scope))
+        source = infos[1]
+        if destination is None or destination.native is None or source is None or source.native is None:
+            return  # A selected forward result has not reached the worklist yet.
+        if destination.buffer is not None and destination.buffer.definite and destination.buffer.length == 0:
+            return
+        if source.buffer is not None and source.buffer.definite and source.buffer.length == 0:
+            return
+        if _string_literal(arguments[1][0]) == '':
+            return
+        self.check_buffer_write(destination, state)
+        if not self.buffer_source_proven(*arguments[1], source, state, scope):
+            raise AnalysisLimit('Go buffer copy source identity or escape is unsupported; analysis is incomplete')
+        payload = values[1]
+        self.write_targets(destination.pointers, payload, state, 'copy', buffer=True)
+        for target in destination.pointers:
+            self.buffer_writes[target] = _join(self.buffer_writes.get(target, _CLEAN), payload)
+
     def scan_input(self, operations, arguments, values, targets, state, scope):
         """Bounded native text scanning; unsupported protocols remain visible.
 
@@ -1720,6 +1810,8 @@ class _Analysis:
         environment = operations & _ENVIRONMENT_OPERATIONS
         scanning = operations & _SCAN_OPERATIONS
         reading_into = operations & _READ_INTO_OPERATIONS
+        copying = (root == 'copy' and member is None and root not in scope.bindings
+                   and root not in self.summaries)
         commands = operations & _COMMAND_OPERATIONS
         unbound_command = (not commands and root == 'exec' and member in _NATIVE_MEMBERS['exec']
                            and root not in scope.bindings and root not in self.summaries
@@ -1744,7 +1836,7 @@ class _Analysis:
                 outer_end = pairs.get(end + chain.end())
                 if outer_end is None:
                     return None
-        if not (constructor or unmarshal or readall or sanitizer or environment or scanning or reading_into or commands
+        if not (constructor or unmarshal or readall or sanitizer or environment or scanning or reading_into or copying or commands
                 or unbound_command or method
                 or reader_constructor or reader_method):
             return None
@@ -1768,6 +1860,16 @@ class _Analysis:
         def arguments(start, stop):
             values, targets, _raw = self._eval_call_args(expr, code, offset, start, stop, state, scope)
             return values, targets
+
+        if copying:
+            raw_arguments = [(expr[match.end() + left:match.end() + right], offset + match.end() + left)
+                             for left, right in _parts(code[match.end():end])]
+            if re.search(r'\b(?:go|defer)\s*$', code[:match.start()]):
+                for argument, origin in raw_arguments:
+                    self.value(argument, origin, state, scope)
+                raise AnalysisLimit('Go delayed buffer copy is unsupported; analysis is incomplete')
+            self.copy_buffer(raw_arguments, state, scope)
+            return finish(end, (_CLEAN,))
 
         values, targets = arguments(match.end(), end)
         raw_arguments = [(expr[match.end() + left:match.end() + right], offset + match.end() + left)
@@ -2075,7 +2177,13 @@ class _Analysis:
                 if info is not None:
                     if any(state.get(_DecoderKey(target.cell)) is not None for target in info.pointers):
                         raise AnalysisLimit('Go decoder address transport is unsupported; analysis is incomplete')
-                    self.invalidate_native_targets(info.pointers, state)
+                    # A slice argument shares byte backing storage, not the
+                    # caller's slice-header or native-function variable.
+                    # Selected helper effects already account for content
+                    # writes and escapes. Treating its backing parameter as
+                    # an output pointer would revoke valid relay summaries.
+                    if info.buffer is None:
+                        self.invalidate_native_targets(info.pointers, state)
             self.invalidate_address_cell(expression, state, scope)
         for index, (expression, origin) in enumerate(expressions):
             # Argument calls and ordinary variable reads do not have a total

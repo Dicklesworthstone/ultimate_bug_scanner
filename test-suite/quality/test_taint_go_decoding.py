@@ -513,6 +513,224 @@ class NativeScanningFlowTests(packages.PackageTestCase):
                 self.check_scan('var buffer []byte\n' + call + '\nio.ReadFull(customReader, buffer)\n'
                                 'db.Query(string(buffer))', imports='import "io"', helpers=helpers)
 
+    def test_copy_native_byte_contents_and_clean_count(self):
+        self.check_scan('buffer := make([]byte, 32)\n'
+                        'n := copy(buffer, os.Getenv("UBS_COPY_INPUT"))\n'
+                        'db.Query(string(buffer)) // query\n'
+                        'exec.Command("sh", "-c", string(buffer)) // command\n'
+                        'fmt.Fprint(w, string(buffer)) // output\nfmt.Fprint(w, n)',
+                        [('query', 'sql', 'db.Query'), ('command', 'command', 'exec.Command'),
+                         ('output', 'xss', 'fmt.Fprint')],
+                        imports='import ("os"; "fmt"; "os/exec")')
+
+    def test_copy_aliases_and_string_snapshots_remain_distinct(self):
+        self.check_scan('buffer := make([]byte, 8)\nalias := buffer\n'
+                        'snapshot := string(buffer)\nbuffer = make([]byte, 8)\n'
+                        'copy(alias[1:], os.Getenv("UBS_COPY_INPUT"))\n'
+                        'db.Query(string(alias)) // alias\n'
+                        'db.Query(string(buffer))\ndb.Query(snapshot)',
+                        [('alias', 'sql', 'db.Query')], imports='import "os"')
+
+    def test_copy_buffer_sources_and_overlapping_slices_keep_payload(self):
+        self.check_scan('source := make([]byte, 8)\nio.ReadFull(r.Body, source)\n'
+                        'destination := make([]byte, 8)\n'
+                        'n := copy(destination, source)\ncopy(destination[1:], destination)\n'
+                        'db.Query(string(destination)) // destination\n'
+                        'db.Query(string(source)) // source\nfmt.Fprint(w, n)',
+                        [('destination', 'sql', 'db.Query'), ('source', 'sql', 'db.Query')],
+                        imports='import ("io"; "fmt")')
+
+    def test_copy_owned_buffer_string_conversion_preserves_contents(self):
+        self.check_scan('source := make([]byte, 8)\nio.ReadFull(r.Body, source)\n'
+                        'destination := make([]byte, 8)\nn := copy(destination, string(source))\n'
+                        'db.Query(string(destination)) // query\nfmt.Fprint(w, n)',
+                        [('query', 'sql', 'db.Query')], imports='import ("io"; "fmt")')
+
+    def test_copy_saved_rune_reslice_does_not_prove_empty_destination(self):
+        self.check_scan('buffer := make([]byte, 8)\n'
+                        "alias := buffer[:'\\x01']\n"
+                        'copy(alias, os.Getenv("UBS_COPY_INPUT"))\n'
+                        'db.Query(string(buffer)) // query',
+                        [('query', 'sql', 'db.Query')], imports='import "os"')
+
+    def test_copy_rune_reslice_sources_do_not_drop_contents(self):
+        for preparation, source in (
+            ('', "buffer[:'\\x01']"),
+            ("alias := buffer[:'\\x01']\n", 'alias'),
+        ):
+            with self.subTest(source=source):
+                self.check_scan('buffer := make([]byte, 8)\nio.ReadFull(r.Body, buffer)\n'
+                                'destination := make([]byte, 8)\n' + preparation +
+                                'copy(destination, ' + source + ')\n'
+                                'db.Query(string(destination)) // query',
+                                [('query', 'sql', 'db.Query')], imports='import "io"')
+
+    def test_readinto_rune_reslice_bounds_do_not_prove_zero_length(self):
+        self.check_scan('buffer := make([]byte, 8)\n'
+                        "alias := buffer[:'\\x01']\n"
+                        'io.ReadFull(r.Body, alias)\ndb.Query(string(buffer)) // query',
+                        [('query', 'sql', 'db.Query')], imports='import "io"')
+
+    def test_copy_empty_sources_and_destinations_do_not_write(self):
+        self.check_scan('buffer := make([]byte, 8)\nvar empty []byte\n'
+                        'n1 := copy(buffer[:0], r.FormValue("q"))\n'
+                        'n2 := copy(empty, r.FormValue("q"))\n'
+                        'n3 := copy(buffer, empty)\nn4 := copy(buffer, "")\n'
+                        'db.Query(string(buffer))\nfmt.Fprint(w, n1, n2, n3, n4)')
+
+    def test_copy_weak_prefix_writes_and_sanitizer_domains(self):
+        self.check_scan('buffer := make([]byte, 32)\ncopy(buffer, os.Getenv("UBS_COPY_INPUT"))\n'
+                        'copy(buffer, "x")\ndb.Query(string(buffer)) // suffix\n'
+                        'db.Query("SELECT $1", string(buffer))\n'
+                        'escaped := make([]byte, 32)\n'
+                        'copy(escaped, html.EscapeString(os.Getenv("UBS_COPY_INPUT")))\n'
+                        'fmt.Fprint(w, string(escaped))\ndb.Query(string(escaped)) // domain',
+                        [('suffix', 'sql', 'db.Query'), ('domain', 'sql', 'db.Query')],
+                        imports='import ("os"; "html"; "fmt")')
+
+    def test_copy_selected_helper_writes_and_return_count(self):
+        self.check_scan('buffer := make([]byte, 8)\nsource := make([]byte, 8)\n'
+                        'io.ReadFull(r.Body, source)\nn := relay(buffer, source)\n'
+                        'db.Query(string(buffer)) // query\nfmt.Fprint(w, n)\n'
+                        'empty := make([]byte, 0)\nrelay(empty, source)\n'
+                        'db.Query(string(empty))', [('query', 'sql', 'db.Query')],
+                        imports='import ("io"; "fmt")',
+                        helpers='func move(destination []byte, value []byte) int {\n'
+                                '    return copy(destination, value)\n}\n'
+                                'func relay(destination []byte, value []byte) int {\n'
+                                '    return move(destination, value)\n}\n')
+
+    def test_copy_shadowed_builtin_keeps_selected_function_behavior(self):
+        self.check_scan('buffer := make([]byte, 8)\ncopy(buffer, r.FormValue("q"))\n'
+                        'db.Query(string(buffer))',
+                        helpers='func copy(destination []byte, value string) int { return 0 }')
+
+    def test_copy_captured_header_replacement_stays_explicitly_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        self.source('handler.go', 'package app\nfunc h() {\n'
+                    'db.Query(r.FormValue("before"))\n'
+                    'original := make([]byte, 8)\nreplacement := make([]byte, 8)\n'
+                    'destination := original\n'
+                    'copy(destination, func() string {\n'
+                    '    destination = replacement\n    return r.FormValue("q")\n}())\n'
+                    'db.Query(string(original))\ndb.Query(string(replacement))\n}\n')
+        findings = []
+        with self.assertRaisesRegex(AnalysisLimit, 'captured buffer replacement'):
+            for finding in packages.taint_go.run(packages.RunContext(lang='go', files=list(self.sources.values()))):
+                findings.append(finding)
+        self.assertEqual([(finding['line'], finding['rule']) for finding in findings],
+                         [(3, 'go.taint.sql')], findings)
+
+    def test_copy_unknown_ownership_and_deferred_writes_are_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for body in (
+            'buffer := external()\ncopy(buffer, r.FormValue("q"))',
+            'buffer := make([]byte, 8)\n'
+            "copy(buffer[:'\\x01'], os.Getenv(\"UBS_COPY_INPUT\"))",
+            'buffer := make([]byte, 8)\ncopy(buffer, r.FormValue("q"))',
+            'source, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := source\n'
+            'alias[0] = r.FormValue("q")[0]\nbuffer := make([]byte, 5)\n'
+            'copy(buffer, source)\ndb.Query(string(buffer))',
+            'source, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := source\n'
+            'alias[0] = r.FormValue("q")[0]\nbuffer := make([]byte, 5)\n'
+            'copy(buffer, string(source))\ndb.Query(string(buffer))',
+            'buffer := make([]byte, 8)\nsource := r.FormValue("q")\n'
+            'copy(func() []byte { source = "fixed"; return buffer }(), source)',
+            'buffer := make([]byte, 8)\nsource := r.FormValue("q")\n'
+            'copy(buffer[index():], source)',
+            'buffer := make([]byte, 8)\nexternal.Mutate(buffer)\ncopy(buffer, r.FormValue("q"))',
+            'buffer := make([]byte, 8)\nreader := bytes.NewReader(buffer)\n'
+            'copy(buffer, r.FormValue("q"))',
+            'buffer := make([]byte, 8)\nsource := make([]byte, 8)\nexternal.Mutate(source)\n'
+            'copy(buffer, source)',
+            'buffer := make([]byte, 8)\ndefer copy(buffer, r.FormValue("q"))',
+            'buffer := make([]byte, 8)\ngo copy(buffer, r.FormValue("q"))',
+        ):
+            with self.subTest(body=body), self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+                self.check_scan(body, imports='import ("bytes"; "io"; "strings"; "os")')
+
+    def test_copy_boundary_preserves_findings_reached_before_it(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        self.source('handler.go', 'package app\nfunc h() {\n'
+                    'db.Query(r.FormValue("before"))\n'
+                    'buffer := external()\ncopy(buffer, r.FormValue("q"))\n}\n')
+        findings = []
+        with self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+            for finding in packages.taint_go.run(packages.RunContext(lang='go', files=list(self.sources.values()))):
+                findings.append(finding)
+        self.assertEqual([(finding['line'], finding['rule']) for finding in findings],
+                         [(3, 'go.taint.sql')], findings)
+
+    def test_copy_untracked_buffer_conversion_cannot_create_clean_content_proof(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for source in ('[]byte(string(raw))', 'snapshot'):
+            with self.subTest(source=source), self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+                self.check_scan('raw, _ := io.ReadAll(strings.NewReader("fixed"))\n'
+                                'alias := raw\nalias[0] = os.Getenv("QUERY")[0]\n'
+                                'snapshot := []byte(string(raw))\nbuffer := make([]byte, 8)\n'
+                                'copy(buffer, ' + source + ')\ndb.Query(string(buffer))',
+                                imports='import ("io"; "strings"; "os")')
+
+    @unittest.skipUnless(os.environ.get('UBS_GO_COPY_NATIVE') == '1',
+                         'set UBS_GO_COPY_NATIVE=1 for real Go copy witnesses')
+    def test_copy_native_witness_matches_alias_overlap_count_and_rune_slices(self):
+        source = textwrap.dedent(r'''
+            package main
+            import ("encoding/json"; "io"; "os"; "fmt"; "strings")
+            type Recorder struct { Queries []string }
+            func (db *Recorder) Query(query string) { db.Queries = append(db.Queries, query) }
+            func move(destination []byte, source []byte) int { return copy(destination, source) }
+            func relay(destination []byte, source []byte) int { return move(destination, source) }
+            func main() {
+                db := &Recorder{}
+                buffer := []byte("12345678")
+                snapshot := string(buffer)
+                n := copy(buffer, os.Getenv("UBS_GO_BUFFERED_INPUT"))
+                db.Query(string(buffer)) // payload
+                db.Query(snapshot)
+                db.Query(fmt.Sprint(n))
+                alias := buffer[1:5]
+                copy(alias, "x")
+                db.Query(string(buffer)) // short-alias
+                overlap := copy(buffer[1:], buffer)
+                db.Query(string(buffer)) // overlapping
+                db.Query(fmt.Sprint(overlap))
+                copy(buffer, "z")
+                db.Query(string(buffer)) // suffix
+                runeBuffer := make([]byte, 2)
+                runeAlias := runeBuffer[:'\x01']
+                copy(runeAlias, os.Getenv("UBS_GO_BUFFERED_INPUT"))
+                db.Query(string(runeBuffer)) // rune-copy
+                input := make([]byte, 8)
+                io.ReadFull(os.Stdin, input)
+                destination := make([]byte, 8)
+                count := relay(destination, input)
+                db.Query(string(destination)) // helper
+                db.Query(fmt.Sprint(count))
+                readBuffer := make([]byte, 2)
+                readAlias := readBuffer[:'\x01']
+                io.ReadFull(strings.NewReader(os.Getenv("UBS_GO_BUFFERED_INPUT")), readAlias)
+                db.Query(string(readBuffer)) // rune-read
+                emptyCount := copy(buffer[:0], os.Getenv("UBS_GO_BUFFERED_INPUT"))
+                noSource := copy(buffer, "")
+                db.Query(fmt.Sprint(emptyCount, ":", noSource))
+                if err := json.NewEncoder(os.Stdout).Encode(db.Queries); err != nil { panic(err) }
+            }
+        ''').lstrip('\n')
+        BufferedReaderFlowTests.run_native_reader(
+            self, source, ['<supplie', '12345678', '8', '<xupplie', '<<xuppli', '7',
+                           'z<xuppli', '<\0', '<stdin>\n', '8', '<\0', '0:0'])
+        findings = self.scan()
+        markers = ('payload', 'short-alias', 'overlapping', 'suffix', 'rune-copy', 'helper', 'rune-read')
+        expected = sorted((number, line.index('db.Query') + 1, 'go.taint.sql')
+                          for number, line in enumerate(source.splitlines(), 1)
+                          if any('// ' + marker in line for marker in markers))
+        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings), expected, findings)
+
     def test_string_scan_family_uses_input_slot_and_keeps_metadata_clean(self):
         for operation, arguments in [('Sscan', 'input, &value'), ('Sscanln', 'input, &value'),
                                      ('Sscanf', 'input, "%s", &value')]:
@@ -1180,6 +1398,27 @@ func h() {
 class BufferedReaderCacheTests(packages.PackageTestCase):
     scan_main = packages.PackageCacheTests.scan_main
 
+    def test_copy_helper_edit_invalidates_warm_selected_package(self):
+        helper = self.source('helper.go', 'package app\nimport "os"\n'
+                             'func move(buffer []byte) { copy(buffer, "fixed") }\n')
+        handler = self.source('handler.go', 'package app\nfunc h() {\n'
+                              'buffer := make([]byte, 8)\nmove(buffer)\n'
+                              'db.Query(string(buffer))\n}\n')
+        (self.root / 'unselected.go').write_text('package app\nimport "os"\n'
+                                              'func unselected() { db.Query(os.Getenv("SQL")) }\n')
+        self.assertEqual(self.scan_main()[0], [])
+        warm, stats = self.scan_main()
+        self.assertEqual(warm, [])
+        self.assertEqual(stats['hits'], 2, stats)
+        self.source('helper.go', 'package app\nimport "os"\n'
+                    'func move(buffer []byte) { copy(buffer, os.Getenv("SQL")) }\n')
+        changed, stats = self.scan_main()
+        self.assertEqual([(Path(row['path']).name, row['line'], row['col'], row['rule']) for row in changed],
+                         [('handler.go', 5, 1, 'go.taint.sql')], changed)
+        self.assertEqual(stats['misses'], 2, stats)
+        self.assertEqual(self.scan_main([helper])[0], [])
+        self.assertEqual(self.scan_main([helper, handler])[0], changed)
+
     def test_readinto_reader_factory_edit_invalidates_warm_selected_package(self):
         helper = self.source('helper.go', 'package app\nimport ("strings"; "io")\n'
                              'func open() io.Reader { return strings.NewReader("fixed") }\n')
@@ -1237,6 +1476,12 @@ class BufferedReaderModuleTests(unittest.TestCase):
     def test_public_readinto_controls_suppression_and_partial_findings(self):
         self.check_public_cases(12, 16)
 
+    def test_public_copy_unsafe_and_metadata_reports(self):
+        self.check_public_cases(16, 20)
+
+    def test_public_copy_controls_suppression_and_partial_findings(self):
+        self.check_public_cases(20, 24)
+
     def check_public_cases(self, start, end):
         from test_keep_temp import prevent_child_deletion
 
@@ -1276,6 +1521,23 @@ class BufferedReaderModuleTests(unittest.TestCase):
              'db.Query(string(buffer))', False, False),
             ('readinto-partial', 'db.Query(r.FormValue("prior")) // query\n'
              'buffer := make([]byte, 64)\nio.ReadFull(customReader, buffer)', True, True),
+            ('copy-content', 'buffer := make([]byte, 64)\ncopy(buffer, os.Getenv("QUERY"))\n'
+             'db.Query(string(buffer)) // query', True, False),
+            ('copy-alias', 'buffer := make([]byte, 64)\nalias := buffer[1:]\n'
+             'copy(alias, os.Getenv("QUERY"))\ndb.Query(string(buffer)) // query', True, False),
+            ('copy-metadata', 'buffer := make([]byte, 64)\nn := copy(buffer, os.Getenv("QUERY"))\n'
+             'fmt.Fprint(w, n, len(buffer), cap(buffer))', False, False),
+            ('copy-bound', 'buffer := make([]byte, 64)\ncopy(buffer, os.Getenv("QUERY"))\n'
+             'db.Query("SELECT $1", string(buffer))', False, False),
+            ('copy-fixed', 'buffer := make([]byte, 8)\ncopy(buffer, "fixed")\n'
+             'db.Query(string(buffer))', False, False),
+            ('copy-suppressed', 'buffer := make([]byte, 64)\ncopy(buffer, os.Getenv("QUERY"))\n'
+             'db.Query(string(buffer)) // ubs:ignore[go.taint.sql]', False, False),
+            ('copy-empty', 'buffer := make([]byte, 8)\nvar empty []byte\n'
+             'copy(buffer[:0], r.FormValue("q"))\ncopy(buffer, empty)\n'
+             'db.Query(string(buffer))', False, False),
+            ('copy-partial', 'db.Query(r.FormValue("prior")) // query\n'
+             'buffer := external()\ncopy(buffer, r.FormValue("q"))', True, True),
         )
         artifacts = packages.ROOT / 'test-suite' / 'artifacts'
         artifacts.mkdir(parents=True, exist_ok=True)

@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Track native Go `copy` writes through byte-buffer aliases, literal reslices
+  and selected helper chains while keeping copied-byte counts clean. Preserve
+  source flows across partial and overlapping writes, and stop masked rune
+  bounds from falsely proving that a destination is empty. Unsupported mutable
+  buffer histories remain explicitly incomplete through string conversions.
+
 - Preserve JavaScript source flows when a `delete` or array-length write may
   target either an object or a scalar. Uncertain receivers no longer erase
   properties or elements reachable through aliases and helper calls; definite

@@ -8021,8 +8021,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         roots, captures, records = set(), set(), {}
         for member in group:
             local = frozenset(bindings.owner_scopes[member]['names'])
-            loaded = {node.id for node in self.deferred_nodes(member)
-                      if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+            loaded = self.closure_load_names(member, bindings)
             indirect, free = set(), loaded - local
             for node in self.deferred_nodes(member):
                 if isinstance(node, ast.Call):
@@ -8053,6 +8052,26 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         """Lexical nonlocal declarations, never assignments guessed by name."""
         return frozenset(self.ownership_bindings().owner_scopes[function]['nonlocal_names'])
 
+    def closure_load_names(self, function, bindings):
+        """Exclude reads of iteration variables bound inside this function's comprehensions."""
+        nodes = self.deferred_nodes(function)
+        iteration_names = {
+            node: {name for clause in node.generators for name in binding_target_names(clause.target)}
+            for node in nodes if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
+        }
+        if not iteration_names:
+            return self._deferred_name_cache[function]
+        candidates = set().union(*iteration_names.values())
+        loaded = set()
+        for node in nodes:
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if node.id in candidates:
+                    owner = bindings.lexical_owner(node)
+                    if owner is not None and node.id in iteration_names.get(owner['node'], ()):
+                        continue
+                loaded.add(node.id)
+        return loaded
+
     def sealed_list_captures(self, function, *, allow_empty=False, closure_group=frozenset()):
         """Borrow a private enclosing list only for a nonescaping local closure."""
         if function in self._closure_groups and not closure_group:
@@ -8078,8 +8097,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
                     if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and own_scope(node)}
         local.update(node.name for node in nodes if node is not function
                      and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and own_scope(node))
-        loaded = {node.id for node in nodes if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
-        self._deferred_name_cache[function] = frozenset(loaded)
+        loaded = self._deferred_name_cache[function]
         writes = {node.func.value.id for node in nodes if isinstance(node, ast.Call) and own_scope(node)
                   and isinstance(node.func, ast.Attribute) and node.func.attr in {'append', 'extend', 'pop'}
                   and isinstance(node.func.value, ast.Name) and node.func.value.id not in local}
@@ -8111,6 +8129,7 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         # The binding index includes imports, exception/match bindings and
         # comprehension scopes; Name(Store) alone cannot identify locals.
         local = set(bindings.owner_scopes[function]['names']) - self.declared_closure_cells(function)
+        loaded = self.closure_load_names(function, bindings)
         roots = self.exclusive_lists.intersection(loaded | indirect) - local
         if not roots and not allow_empty:
             return set()

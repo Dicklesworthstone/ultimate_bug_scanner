@@ -6297,6 +6297,41 @@ class SQLValueCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(detector.SQLFlowLimit, 'closure mutation during list iteration.*incomplete'):
             list(detector.find([path]))
 
+    def test_recursive_comprehensions_keep_iteration_names_in_their_own_frame(self):
+        # GH #209: dictionary/list iteration in a recursive encoder does not
+        # make key, item, or index a free variable of the encoder itself.
+        source = (
+            'from decimal import Decimal\n'
+            'def store(db, state):\n'
+            '    paths = []\n'
+            '    def encode(value, path):\n'
+            '        if isinstance(value, Decimal):\n'
+            '            paths.append(path)\n'
+            '            return str(value)\n'
+            '        if isinstance(value, dict):\n'
+            '            return {key: encode(item, path + [key]) for key, item in value.items()}\n'
+            '        if isinstance(value, list):\n'
+            '            return [encode(item, path + [index]) for index, item in enumerate(value)]\n'
+            '        return value\n'
+            '    result = encode(state, [])\n'
+        )
+        self.inspect('recursive-encoder-literal', source + '    db.execute("SELECT 1")\n    return result\n', ())
+        self.inspect('recursive-encoder-computed', source + '    db.execute(f"SELECT {state}")\n', ((CRITICAL, 14),))
+
+    def test_outer_iterable_load_remains_a_closure_capture(self):
+        # Both loads spell query. The first iterable evaluates in the
+        # function's frame while its element expression sees a loop local.
+        source = program('    queries = []\n'
+                         '    query = (f"SELECT {user}",)\n'
+                         '    def add():\n'
+                         '        queries.append([query for query in query][0])\n'
+                         '    unused = [add() for query in ["fixed"]]\n'
+                         '    cursor.execute(queries[0])\n')
+        path = self.artifacts / 'outer-iterable-closure-frame.py'
+        path.write_text(source, encoding='utf-8')
+        with self.assertRaisesRegex(detector.SQLFlowLimit, 'closure lexical frame'):
+            list(detector.find([path]))
+
     def test_closure_lexical_and_lazy_boundaries_are_not_clean(self):
         unsafe = 'f"SELECT count(*) FROM users WHERE name = \'{user}\'"'
         cases = (

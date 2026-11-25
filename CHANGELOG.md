@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve JavaScript source flows when a `delete` or array-length write may
+  target either an object or a scalar. Uncertain receivers no longer erase
+  properties or elements reachable through aliases and helper calls; definite
+  object deletion and array truncation retain their clean results. Public
+  JSON/SARIF reports, suppressions and cache invalidation share the correction.
+
 - Resolve native Go `os/exec.Command` and `CommandContext` through file-local
   imports, aliases, captured constructors and selected helper summaries.
   Executable and interpreter-program operands retain command provenance;

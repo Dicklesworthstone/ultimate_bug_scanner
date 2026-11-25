@@ -4902,6 +4902,145 @@ class HeapTaintTests(unittest.TestCase):
             'items.flatMap((value, index, source) => { source.length = unknown; return [value]; });',
             'xss', reason='flatMap.*length')
 
+    def test_mixed_scalar_delete_preserves_original_properties(self):
+        for scalar in ('0', 'false', '"fixed"'):
+            source = ('const box={html:req.query.html,safe:"fixed"}; '
+                      f'const target=flag?box:{scalar}; delete target.html; '
+                      'res.send(box.html); res.send(box.safe);')
+            with self.subTest(scalar=scalar):
+                self.scan_sort(source, 'xss')
+                self.assert_runtime_sends('const flag=false; ' + source, ['review-input', 'fixed'])
+                self.assert_runtime_sends('const flag=true; ' + source, [None, 'fixed'])
+
+    def test_mixed_scalar_length_preserves_original_elements(self):
+        for scalar in ('0', 'false', '"fixed"'):
+            source = ('const box=[req.query.html,"fixed"]; '
+                      f'const target=flag?box:{scalar}; target.length=0; '
+                      'res.send(box[0]); res.send(box[1]);')
+            with self.subTest(scalar=scalar):
+                self.scan_sort(source, 'xss')
+                # Primitive writes are ignored in this ordinary, non-strict script.
+                self.assert_runtime_sends('const flag=false; ' + source, ['review-input', 'fixed'])
+                self.assert_runtime_sends('const flag=true; ' + source, [None, None])
+
+    def test_mixed_scalar_cleanup_preserves_helper_and_stored_aliases(self):
+        for initial, mutation, selected in (
+            ('{html:req.query.html}', 'delete value.html;', 'box.html'),
+            ('[req.query.html]', 'value.length=0;', 'box[0]'),
+        ):
+            for setup, argument in (
+                ('const target=flag?box:0;', 'target'),
+                ('const holder={target:flag?box:0};', 'holder.target'),
+                ('function select(value){return flag?value:0;}', 'select(box)'),
+            ):
+                source = (f'function cleanup(value){{{mutation}}} const box={initial}; '
+                          + setup + f' cleanup({argument}); res.send({selected});')
+                with self.subTest(initial=initial, argument=argument):
+                    self.scan_sort(source, 'xss')
+                    self.assert_runtime_sends('const flag=false; ' + source, ['review-input'])
+                    self.assert_runtime_sends('const flag=true; ' + source, [None])
+
+    def test_mixed_scalar_cleanup_preserves_projection_aliases(self):
+        for initial, mutation, member in (
+            ('{html:req.query.html}', 'delete target.html;', '.html'),
+            ('[req.query.html]', 'target.length=0;', '[0]'),
+        ):
+            for method, alias in (('values', 'out[0]'), ('entries', 'out[0][1]')):
+                source = (f'const box={initial}; const out=Object.{method}({{item:box}}); '
+                          f'const target=flag?{alias}:0; {mutation} '
+                          f'res.send(box{member}); res.send({alias}{member});')
+                with self.subTest(initial=initial, method=method):
+                    self.scan_sort(source, 'xss', 'xss')
+                    self.assert_runtime_sends('const flag=false; ' + source,
+                                              ['review-input', 'review-input'])
+                    self.assert_runtime_sends('const flag=true; ' + source, [None, None])
+
+    def test_mixed_scalar_cleanup_keeps_later_projection_limits_explicit(self):
+        for initial, mutation, member in (
+            ('{html:req.query.html}', 'delete target.html;', '.html'),
+            ('[req.query.html]', 'target.length=0;', '[0]'),
+        ):
+            for method, selected in (('values', 'out[0]'), ('entries', 'out[0][1]')):
+                source = (f'const box={initial}; const target=flag?box:0; {mutation} '
+                          f'res.send(box{member}); const out=Object.{method}(box); '
+                          f'res.send({selected});')
+                with self.subTest(initial=initial, method=method):
+                    self.scan_sort(source, 'xss', 'xss', partial=f'Object.{method}')
+                    self.assert_runtime_sends('const flag=false; ' + source,
+                                              ['review-input', 'review-input'])
+
+    def test_exact_cleanup_retains_definite_deletion_and_truncation(self):
+        for initial, mutation, member in (
+            ('{html:req.query.html}', 'delete target.html;', '.html'),
+            ('[req.query.html]', 'target.length=0;', '[0]'),
+        ):
+            for helper in (False, True):
+                action = (f'function cleanup(target){{{mutation}}} cleanup(box);' if helper
+                          else f'const target=box; {mutation}')
+                source = f'const box={initial}; {action} res.send(box{member});'
+                with self.subTest(initial=initial, helper=helper):
+                    self.scan_sort(source)
+                    self.assert_runtime_sends(source, [None])
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real module and meta-runner integration requires ast-grep')
+    def test_mixed_scalar_cleanup_public_json_sarif_selection_and_partial(self):
+        cases = (
+            ('delete', 'const box={html:req.query.html};\nconst target=flag?box:0;\n'
+             'delete target.html;\nres.send(box.html);\n',
+             [('javascript.taint.xss', 4, 1)], False),
+            ('truncate', 'const box=[req.query.html];\nconst target=flag?box:0;\n'
+             'target.length=0;\nres.send(box[0]);\n',
+             [('javascript.taint.xss', 4, 1)], False),
+            ('clean', 'const box={html:req.query.html}; const items=[req.query.html];\n'
+             'delete box.html; items.length=0;\nres.send(box.html); res.send(items[0]);\n',
+             [], False),
+            ('partial', 'const box={html:req.query.html};\nconst target=flag?box:0;\n'
+             'delete target.html;\nres.send(box.html);\nconst out=Object.values(box);\n'
+             'res.send(out[0]);\n',
+             [('javascript.taint.xss', 4, 1), ('javascript.taint.xss', 6, 1)], True),
+        )
+        artifacts = ROOT / 'test-suite/artifacts/javascript-mixed-heap-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for name, source, expected, partial in cases:
+            project = scratch / name
+            project.mkdir()
+            target = project / 'handler.js'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.js').write_text('res.send(req.query.html);\n', encoding='utf-8')
+            for meta, fmt in itertools.product((False, True), ('json', 'sarif')):
+                with self.subTest(case=name, meta=meta, format=fmt):
+                    self.sort_public_report(target, project / f'{meta}-{fmt}', meta=meta, fmt=fmt,
+                                            expected=expected, partial=partial, partial_reason='Object.values')
+
+    @unittest.skipUnless(shutil.which('ast-grep') or os.environ.get('UBS_AST_GREP_BIN'),
+                         'real meta-runner cache integration requires ast-grep')
+    def test_mixed_scalar_cleanup_public_cache_edits_exact_suppression_and_partial_nonreuse(self):
+        artifacts = ROOT / 'test-suite/artifacts/javascript-mixed-heap-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='cache-', dir=artifacts))
+        target = scratch / 'handler.js'
+        unsafe = ('const box=[req.query.html];\nconst target=flag?box:0;\n'
+                  'target.length=0;\nres.send(box[0]);\n')
+        clean = unsafe.replace('flag?box:0', 'box')
+        suppressed = unsafe.replace('res.send(box[0]);',
+                                    'res.send(box[0]); // ubs:ignore[javascript.taint.xss]')
+        partial = unsafe + 'Object.values(box);\n'
+        expected = [('javascript.taint.xss', 4, 1)]
+        for index, (source, findings, incomplete, cache_hits) in enumerate((
+            (unsafe, expected, False, 0), (unsafe, expected, False, 1), (clean, [], False, 0),
+            (suppressed, [], False, 0), (unsafe, expected, False, 1),
+            (partial, expected, True, 0), (partial, expected, True, 0),
+        )):
+            with self.subTest(index=index):
+                if index not in (1, 6):
+                    target.write_text(source, encoding='utf-8')
+                report = self.sort_public_report(target, scratch / f'cache-{index}', meta=True,
+                                                fmt='json', expected=findings, partial=incomplete,
+                                                cache=True, partial_reason='Object.values')
+                self.assertEqual(report['profile']['cache_hits'], cache_hits, report)
+
     def test_object_projection_preserves_shallow_values_and_entries(self):
         for expression, selected in (('Object.values({item:box})', 'out[0]'),
                                      ('Object.entries({item:box})', 'out[0][1]')):

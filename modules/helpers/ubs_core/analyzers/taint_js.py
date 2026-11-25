@@ -4880,6 +4880,7 @@ class _Flow:
                 for ref in refs:
                     slots = state.heap.get(ref, {})
                     exact = (key not in {None, '__proto__'} and len(refs) == 1 and not frozenset(receiver)
+                             and not getattr(receiver, 'scalar_alternative', False)
                              and ref not in state.weak_refs and _ARRAY_WRITE_CONTRACT not in slots)
                     if exact:
                         slots.pop(key, None)
@@ -4968,7 +4969,9 @@ class _Flow:
                     literal = text[rhs:end].strip()
                     refs = _refs(receiver)
                     if (literal.isdecimal() and len(literal) <= 10 and int(literal) <= 4294967295
-                            and len(refs) == 1 and not frozenset(receiver) and not refs & evaluated.weak_refs):
+                            and len(refs) == 1 and not frozenset(receiver)
+                            and not getattr(receiver, 'scalar_alternative', False)
+                            and not refs & evaluated.weak_refs):
                         ref = next(iter(refs))
                         if ref in evaluated.array_lengths:
                             size = int(literal)

@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.155-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.156-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1927,7 +1927,12 @@ available dependency inventory in this order:
    --disable-pip`; project packages are never built and dependency versions are
    never re-resolved. Locks with multiple versions of one package use separate
    nonconflicting batches under one total audit deadline.
-4. Static runtime dependencies declared in `[project]` in `pyproject.toml`,
+4. `Pipfile.lock` (Pipenv spec 6). The audit checks exact PyPI pins across
+   production, development and custom categories, including platform-specific
+   entries. It uses the same batched, resolution-free audit as uv. When a
+   package's registry is ambiguous, private, or a local/VCS source, coverage
+   is partial and verified PyPI packages still contribute findings.
+5. Static runtime dependencies declared in `[project]` in `pyproject.toml`,
    resolved by pip-audit's positional project-directory interface.
 
 A manifest is never treated as an installed-package directory, and the tool's
@@ -1950,8 +1955,8 @@ freshness. Checked local workspace project metadata is included in `inputs`;
 these projects are excluded from the PyPI audit only after their declared
 identity and containment inside the selected project have been verified.
 A missing manifest or unavailable tool is explicit skipped coverage. Dynamic
-dependencies, legacy project metadata, and unsupported lockfiles (`poetry.lock`,
-`Pipfile.lock`) require an exported resolved `requirements.txt`
+dependencies, legacy project metadata, and unsupported lockfiles (`poetry.lock`)
+require an exported resolved `requirements.txt`
 or PEP 751 lockfile. An unsupported lockfile is never silently replaced with
 fresh resolution of potentially different versions from `pyproject.toml`.
 For uv locks, unsupported origins (including private indexes, Git and direct

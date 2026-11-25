@@ -43,6 +43,12 @@ def uv_lock(*pins: tuple[str, str], revision: int = 3) -> str:
         'source = { registry = "https://pypi.org/simple" }\n' for name, version in pins)
 
 
+def pipenv_lock(default, **categories):
+    return {"_meta": {"pipfile-spec": 6, "sources": [
+        {"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": True}]},
+        "default": default, "develop": {}, **categories}
+
+
 class PipAuditResults(unittest.TestCase):
     def parse(self, doc=None, *, raw=None, expected=None):
         sink, errors = io.StringIO(), []
@@ -264,6 +270,59 @@ class UvLockAudit(unittest.TestCase):
                 self.assertEqual(outcome["dependencies"], 1)
                 self.assertEqual(len(findings), 1)
 
+    def use_pipenv_lock(self):
+        self.project = self.root / "pipenv-project"
+        self.project.mkdir()
+        self.lock = self.project / "Pipfile.lock"
+
+    def test_pipenv_checks_all_categories_markers_and_versions(self):
+        self.use_pipenv_lock()
+        doc = pipenv_lock({"Example_Package": {"version": "==1.0", "index": "pypi"}},
+                          develop={"other": {"version": "==3.0"}},
+                          docs={"example-package": {"version": "==2.0", "markers": "sys_platform == 'win32'"},
+                                "other": {"version": "==3.0"}})
+        self.lock.write_text(json.dumps(doc))
+        outcome, findings, errors = self.audit()
+        self.assertFalse(errors, errors)
+        self.assertEqual(outcome["status"], "ok")
+        self.assertEqual(outcome["input_kind"], "pipenv-lock")
+        self.assertEqual((outcome["dependencies"], outcome["audit_batches"]), (3, 2))
+        self.assertEqual({row["extras"]["version"] for row in findings}, {"1.0", "2.0"})
+        self.assertTrue(all(row["path"] == str(self.lock) for row in findings))
+
+    def test_pipenv_only_sends_verified_registry_pins_to_auditor(self):
+        self.use_pipenv_lock()
+        for unsupported in ({"version": "==1", "index": "internal"}, {"version": "==1"},
+                            {"version": "==1", "git": "local"}, {"version": "==1", "path": "."},
+                            {"version": "==1", "file": "./pkg.whl"}, {"version": ">=1", "index": "pypi"},
+                            {"version": "==1\nother==2", "index": "pypi"}):
+            with self.subTest(unsupported=unsupported):
+                doc = pipenv_lock({"example-package": {"version": "==1.0", "index": "pypi"},
+                                   "unverified": unsupported})
+                doc["_meta"]["sources"].append({"name": "internal", "url": "https://index.invalid/simple"})
+                self.lock.write_text(json.dumps(doc))
+                outcome, findings, errors = self.audit()
+                self.assertEqual(outcome["status"], "partial")
+                self.assertTrue(errors)
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(self.calls[-1]["pins"], [("example-package", "1.0")])
+
+    def test_invalid_pipenv_lock_never_launches_audit(self):
+        self.use_pipenv_lock()
+        doc = pipenv_lock({"example-package": {"version": "==1.0"}})
+        raw = json.dumps(doc)
+        for invalid in (raw.replace('"pipfile-spec": 6', '"pipfile-spec": 7'),
+                        raw.replace('"version": "==1.0"', '"version":"==0", "version":"==1.0"'),
+                        raw.replace('"default":', '"develop":'), "{}",
+                        json.dumps(pipenv_lock({"x": {"version": "==*"}}))):
+            with self.subTest(invalid=invalid):
+                self.lock.write_text(invalid)
+                outcome, findings, errors = self.audit()
+                self.assertEqual(outcome["status"], "partial")
+                self.assertTrue(errors)
+                self.assertFalse(findings)
+                self.assertFalse(self.calls)
+
     def test_shared_deadline_does_not_restart_for_each_version(self):
         self.lock.write_text(uv_lock(("example-package", "1.0"), ("example-package", "2.0")))
         with patch.object(external_tools.time, "monotonic", side_effect=[0, 0, 31]):
@@ -438,6 +497,9 @@ class RealPipAuditIntegration(unittest.TestCase):
 
     def test_real_uv_lock_audits_known_vulnerable_package_without_resolution(self):
         self.assert_vulnerable("uv.lock", uv_lock(("urllib3", "1.26.4")))
+
+    def test_real_pipenv_lock_audits_known_vulnerable_package_without_resolution(self):
+        self.assert_vulnerable("Pipfile.lock", json.dumps(pipenv_lock({"urllib3": {"version": "==1.26.4"}})))
 
     def test_real_uv_lock_audits_multiple_versions_of_one_package(self):
         outcome, findings, errors = self.audit("uv.lock", uv_lock(("urllib3", "1.26.4"), ("urllib3", "1.26.5")))
@@ -1018,6 +1080,37 @@ sys.exit(CODE)
         self.assertEqual(outcome["inputs"], [str(lock)])
         self.assertEqual(outcome["dependencies"], 1)
         self.assertEqual(len(self.calls.read_text().splitlines()), 2)
+
+    def test_lock_only_pipenv_project_emits_advisory_and_audit_status(self):
+        self.project = self.root / "pipenv-only"
+        self.project.mkdir()
+        lock = self.project / "Pipfile.lock"
+        self.audit_tool([audit_dependency()], code=1)
+        for partial in (False, True):
+            doc = pipenv_lock({"example-package": {"version": "==1.0"}})
+            if partial:
+                doc["develop"]["local-project"] = {"path": "."}
+            lock.write_text(json.dumps(doc))
+            for fmt in ("json", "sarif"):
+                with self.subTest(partial=partial, fmt=fmt):
+                    proc = subprocess.run([str(ROOT / "ubs"), str(self.project), f"--format={fmt}", "--ci"],
+                                          cwd=self.root, env={**self.env, "UV_TOOLS": "pip-audit"},
+                                          capture_output=True, text=True, timeout=60, check=False)
+                    self.assertEqual(proc.returncode, 2 if partial else 1, proc.stdout + proc.stderr)
+                    report = json.loads(proc.stdout)
+                    if fmt == "json":
+                        self.assertEqual(report["status"], "partial" if partial else "ok")
+                        self.assertEqual(report["totals"]["critical"], 1)
+                        outcome = report["scanners"][0]["extras"]["external_tools"][0]
+                        self.assertEqual((outcome["input_kind"], outcome["inputs"]), ("pipenv-lock", [str(lock)]))
+                    else:
+                        run = report["runs"][0]
+                        self.assertEqual([r["ruleId"] for r in run["results"]],
+                                         ["py.pip-audit.PYSEC-2026-123.example-package"])
+                        location = run["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                        self.assertTrue(location.endswith("Pipfile.lock"), location)
+        self.assertEqual([json.loads(line) for line in (self.root / "requirements.jsonl").read_text().splitlines()],
+                         ["example-package==1.0\n"] * 4)
 
     def test_uv_lock_advisories_and_partial_coverage_reach_all_public_formats(self):
         self.source.write_text("answer = 42\n")

@@ -371,6 +371,75 @@ def _audit_package_name(value: object) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def _audit_version(value: object) -> str:
+    version = _text(value)
+    # Only literal version tokens may enter the generated requirements file.
+    # pip-audit remains authoritative for PEP 440 validity.
+    if re.fullmatch(r"[A-Za-z0-9]+(?:[.!+_-][A-Za-z0-9]+)*", version) is None:
+        raise ValueError("invalid locked version")
+    return version
+
+
+def _pipenv_audit_inventory(manifest: Path, errors: list[str]) -> set[tuple[str, str]]:
+    """Read Pipenv spec 6 package pins across every locked category."""
+    def unique_keys(pairs: list) -> dict:
+        obj = {}
+        for key, value in pairs:
+            if key in obj:
+                raise ValueError("duplicate JSON key")
+            obj[key] = value
+        return obj
+
+    with manifest.open("rb") as source:
+        raw = source.read(OUTPUT_RECORD_LIMIT + 1)
+    if len(raw) > OUTPUT_RECORD_LIMIT:
+        raise ValueError("Pipfile.lock exceeds the manifest size limit")
+    doc = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_keys)
+    meta = doc.get("_meta") if isinstance(doc, dict) else None
+    if not isinstance(meta, dict) or type(meta.get("pipfile-spec")) is not int or meta["pipfile-spec"] != 6:
+        raise ValueError("unsupported Pipfile.lock schema (expected pipfile-spec 6)")
+
+    registries = {}
+    for source in _array(meta, "sources"):
+        if not isinstance(source, dict):
+            raise ValueError("invalid index record")
+        name = _text(source.get("name"))
+        if name in registries:
+            raise ValueError("duplicate index name")
+        url = _text(source.get("url"))
+        registries[name] = url.rstrip("/") == "https://pypi.org/simple" and source.get("verify_ssl") is True
+
+    pins = set()
+    if "default" not in doc:
+        errors.append("pip-audit: Pipfile.lock is missing the default category")
+    for category, packages in doc.items():
+        if category == "_meta":
+            continue
+        if not isinstance(packages, dict):
+            errors.append(f"pip-audit: Pipfile.lock {category} is not a package table")
+            continue
+        for key, package in packages.items():
+            try:
+                name = _audit_package_name(key)
+                if not isinstance(package, dict) or package.keys() - {"version", "index", "hashes", "markers", "extras"}:
+                    raise ValueError("unsupported package source or metadata")
+                # Multiple configured indexes and no explicit package index do
+                # not establish origin. Never query a private name on PyPI.
+                if "index" in package:
+                    pypi = registries.get(_text(package["index"]), False)
+                else:
+                    pypi = bool(registries) and all(registries.values())
+                if not pypi:
+                    raise ValueError("package index is not verified as PyPI")
+                version = _text(package.get("version"))
+                if not version.startswith("=="):
+                    raise ValueError("expected exact locked version")
+                pins.add((name, _audit_version(version[2:])))
+            except ValueError as exc:
+                errors.append(f"pip-audit: Pipfile.lock {category}.{key}: {exc}")
+    return pins
+
+
 def _uv_audit_inventory(manifest: Path, errors: list[str]) -> tuple[set[tuple[str, str]], list[str]]:
     """Collect all locked PyPI identities without resolving or building code.
 
@@ -416,11 +485,7 @@ def _uv_audit_inventory(manifest: Path, errors: list[str]) -> tuple[set[tuple[st
             if not isinstance(package, dict):
                 raise ValueError("invalid package record")
             name = _audit_package_name(package.get("name"))
-            version = _text(package.get("version"))
-            # Only literal version tokens may enter the temporary requirements
-            # file. pip-audit remains authoritative for PEP 440 validity.
-            if re.fullmatch(r"[A-Za-z0-9]+(?:[.!+_-][A-Za-z0-9]+)*", version) is None:
-                raise ValueError("invalid locked version")
+            version = _audit_version(package.get("version"))
             source = package.get("source")
             if (not isinstance(source, dict) or len(source) != 1
                     or any(not isinstance(value, str) or not value for value in source.values())):
@@ -590,7 +655,7 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
                       diagnostics: TextIO | None = None) -> dict:
     """Audit selected project dependencies, never the tool's own environment.
 
-    Requirements have precedence over PEP 751 locks, then uv locks and PEP 621
+    Requirements have precedence over PEP 751, uv and Pipenv locks, then PEP 621
     runtime dependencies. ``--path`` is intentionally absent: pip-audit reserves it
     for installed distributions, and a manifest passed there audits nothing.
     Missing tools/inputs are explicit skips; empty or failed audits are partial.
@@ -601,12 +666,11 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
         outcome["reason"] = "selected-file scan has no dependency manifest"
         return outcome
     requirements, pyproject = root / "requirements.txt", root / "pyproject.toml"
-    uv_lock = root / "uv.lock"
+    uv_lock, pipenv_lock = root / "uv.lock", root / "Pipfile.lock"
     locks = sorted(path for path in root.glob("pylock.*.toml") if path.is_file())
     if (root / "pylock.toml").is_file():
         locks.insert(0, root / "pylock.toml")
-    unsupported_locks = [root / name for name in ("poetry.lock", "Pipfile.lock")
-                         if (root / name).is_file()]
+    poetry_lock = root / "poetry.lock"
     unsupported_projects = [root / name for name in ("setup.py", "setup.cfg", "Pipfile")
                             if (root / name).is_file()]
     input_error = ""
@@ -622,12 +686,17 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
         manifest, arguments = uv_lock, []
         outcome.update(input_kind="uv-lock", inputs=[str(uv_lock)],
                        coverage="all-locked-registry-packages", lock_freshness="not-checked")
-    elif unsupported_locks:
-        manifest, arguments = unsupported_locks[0], []
-        outcome.update(input_kind="unsupported-lock", inputs=[str(path) for path in unsupported_locks])
+    elif pipenv_lock.is_file() and not poetry_lock.is_file():
+        manifest, arguments = pipenv_lock, []
+        outcome.update(input_kind="pipenv-lock", inputs=[str(manifest)],
+                       coverage="all-locked-registry-packages", lock_freshness="not-checked")
+    elif poetry_lock.is_file():
+        manifest, arguments = poetry_lock, []
+        locks_present = [path for path in (poetry_lock, pipenv_lock) if path.is_file()]
+        outcome.update(input_kind="unsupported-lock", inputs=[str(path) for path in locks_present])
         # Resolving a broad pyproject constraint here could select a newer,
         # unaffected version instead of the vulnerable version actually locked.
-        input_error = ("unsupported lockfile(s): " + ", ".join(path.name for path in unsupported_locks)
+        input_error = ("unsupported lockfile selection: " + ", ".join(path.name for path in locks_present)
                        + "; export resolved requirements.txt or PEP 751 pylock.toml")
     elif pyproject.is_file():
         manifest, arguments = pyproject, [str(root)]
@@ -651,11 +720,15 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
         outcome["status"] = "partial"
         return outcome
     pins: set[tuple[str, str]] | None = None
-    if manifest == uv_lock:
+    if manifest in (uv_lock, pipenv_lock):
         try:
-            pins, projects = _uv_audit_inventory(manifest, errors)
-            outcome.update(locked_dependencies=len(pins), workspace_projects=projects)
-            outcome["inputs"].extend(projects)
+            if manifest == uv_lock:
+                pins, projects = _uv_audit_inventory(manifest, errors)
+                outcome.update(workspace_projects=projects)
+                outcome["inputs"].extend(projects)
+            else:
+                pins = _pipenv_audit_inventory(manifest, errors)
+            outcome["locked_dependencies"] = len(pins)
             if not pins:
                 raise ValueError("empty dependency inventory; no locked PyPI packages were collected")
         except ImportError:
@@ -664,7 +737,7 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
             outcome["status"] = "partial"
             return outcome
         except (OSError, ValueError, UnicodeError, RuntimeError) as exc:
-            errors.append(f"pip-audit: cannot collect uv.lock dependencies: {exc}")
+            errors.append(f"pip-audit: cannot collect {manifest.name} dependencies: {exc}")
             outcome["status"] = "partial"
             return outcome
     if manifest == pyproject:

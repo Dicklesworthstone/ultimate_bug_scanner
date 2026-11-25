@@ -1457,6 +1457,38 @@ class StructuredSourceIdentityTests(unittest.TestCase):
                                  (record["path"], record["line"], record["col"]))
             self.assertEqual(self._native_swift(root, project, paths, cache, rules=rules, hits=len(paths)), cold)
 
+    def test_swift_force_operations_distinguish_code_and_prefix_negation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ubs-swift-operators-") as temp:
+            root = Path(temp).resolve()
+            project = root / "project"
+            project.mkdir()
+            path = project / "operators.swift"
+            path.write_text(
+                'let flag = !(isReady) && !other\n'
+                'let different = a != b\n'
+                'let example = #"try! f(); raw!; as! T"#\n'
+                '/* outer /* inner */ try! f(); value! */\n'
+                'let pattern = #/fake! try! as! /#\n'
+                'let result = values[0]!.name\n'
+                'let decoded = try! parse()\n'
+                'let typed = result as! Result\n'
+                'let summary = "value: \\(optional!)"\n'
+                'let ignored = next! // ubs:ignore[swift.optionals.force-some]\n'
+                'let url = URL(string: normalize(input))!\n'
+                'var delegate: Delegate!\n'
+                'func use() { update(value: delegate!) }\n'
+                'postfix operator >!\n'
+                + '// print(missing!)\n' * 40, encoding="utf-8")
+            cache = root / "cache"
+            records = self._native_swift(root, project, [path], cache, categories=(1,))
+            force = [(r["rule"], r["line"], r["severity"]) for r in records
+                     if r["rule"].startswith("swift.optionals.")]
+            self.assertCountEqual(force, [
+                ("swift.optionals.force-some", line, "info") for line in (6, 7, 8, 9, 11, 12, 13)
+            ] + [("swift.optionals.try-bang", 7, "warning"), ("swift.optionals.as-bang", 8, "warning"),
+                 ("swift.optionals.url-bang", 11, "warning"), ("swift.optionals.iuo", 12, "warning")])
+            self.assertEqual(self._native_swift(root, project, [path], cache, hits=1, categories=(1,)), records)
+
     def test_real_swift_global_thresholds_and_pathless_facts_recompute(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ubs-swift-global-") as temp:
             root = Path(temp).resolve()

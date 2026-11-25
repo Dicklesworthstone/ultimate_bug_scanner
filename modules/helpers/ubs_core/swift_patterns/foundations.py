@@ -11,23 +11,27 @@ import re
 from ubs_core.swift_scan import Pattern
 from ubs_core.suppression import SourceSuppressions
 
-FORCE_UNWRAP = r"!(\s|\.|\(|\)|\[|\]|\{|\}|,|;|:|\?|$)"
+# A postfix bang is attached to the expression on its left. Prefix negation
+# can be followed by a parenthesis too, e.g. `!(a && b)`.
+FORCE_UNWRAP = r"(?<=[\w`)\]}])!(?=[\s.()\[\]{},;:?!]|$)"
 
 PATTERNS = [
     # 1. OPTIONALS / FORCE OPERATIONS — force unwrap >30 warns, else info
     Pattern(1, "swift.optionals.force-heavy", "Heavy use of force unwrap",
-            FORCE_UNWRAP, ((30, "warning"),), swift_only=True, show_samples=True),
+            FORCE_UNWRAP, ((30, "warning"),), executable_swift=True, show_samples=True),
     Pattern(1, "swift.optionals.force-some", "Some force unwraps present",
-            FORCE_UNWRAP, ((0, "info"),), swift_only=True, max_count=30, show_samples=True),
+            FORCE_UNWRAP, ((0, "info"),), executable_swift=True, max_count=30, show_samples=True),
     Pattern(1, "swift.optionals.try-bang", "try! used",
-            r"\btry!", ((0, "warning"),), show_samples=True),
+            r"\btry!", ((0, "warning"),), executable_swift=True, show_samples=True),
     Pattern(1, "swift.optionals.as-bang", "as! used",
-            r"\bas!\s", ((0, "warning"),), show_samples=True),
+            r"\bas!(?=\s|[\[(])", ((0, "warning"),), executable_swift=True, show_samples=True),
     Pattern(1, "swift.optionals.iuo", "Implicitly unwrapped optionals",
-            r"(:|->)\s*[A-Za-z_][A-Za-z0-9_<>?:\.\[\] ]*!\b",
-            ((0, "warning"),), show_samples=True),
+            r"(?:\b(?:let|var)\s+[\w`]+\s*:|->)\s*[\w.]+(?:\s*<[\w.,:<>? \t\[\]]+>)?!"
+            r"(?=[\s,){;=]|$)|\b(?:let|var)\s+[\w`]+\s*:\s*\[[\w.,:<>\[\]? \t]+\]!(?=[\s,){;=]|$)",
+            ((0, "warning"),), executable_swift=True, show_samples=True),
     Pattern(1, "swift.optionals.url-bang", "URL(string:) force-unwrapped",
-            r"URL\(string:[^\)]*\)!\b", ((0, "warning"),), show_samples=True),
+            r"\bURL\s*\(\s*string\s*:\s*(?:[^()]|\([^()]*\))*\)!(?=[\s.()\[\]{},;:?!]|$)",
+            ((0, "warning"),), executable_swift=True, show_samples=True),
     # 2. CONCURRENCY / TASK — "Task usages" prints even at zero
     Pattern(2, "swift.concurrency.task-usages", "Task usages",
             r"\bTask\b", ((-1, "info"),), always=True),

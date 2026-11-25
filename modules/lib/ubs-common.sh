@@ -572,11 +572,11 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
   ['helpers/ubs_core/swift_patterns/closures_networking.py']='e9a53395a2ebcce3a6fa6b2271efdd67db47d489eee0457802ca1e874a27db7d'
   ['helpers/ubs_core/swift_patterns/debug_quality.py']='467066b5d51d8e0a523b6271407d36e9c44e2cfa5f15d597159011c81eb3137f'
   ['helpers/ubs_core/swift_patterns/errors_security.py']='6cc074c3909493dc6ea874ee8c5bc359ed07f1b6af657047cfb03d3d9db56539'
-  ['helpers/ubs_core/swift_patterns/foundations.py']='c04908fa89c5bec54d1f88fd55c00da87114d7526b2f3a5e80aec288e52e125f'
+  ['helpers/ubs_core/swift_patterns/foundations.py']='8e64fa869d0976a9f593faafb49994968ade0902fe86199f9a0252f70582a71d'
   ['helpers/ubs_core/swift_patterns/misc_cats.py']='36b2aabee7e7acb2b7e41ddfaaf2d6a33be5901be68d11e2e54a53772efdf469'
   ['helpers/ubs_core/swift_patterns/threading_perf.py']='3282b7f8ddb9df8476c315872f828905bd3b71e539e8834289578d9bc7abdd46'
   ['helpers/ubs_core/swift_rules.py']='a832cfbaa194d08944d2cc18b4683eb0ddc78b845da8de77163cb6882d605826'
-  ['helpers/ubs_core/swift_scan.py']='7543f49117b6549a56771e737c8d57a828c238af50a660faf27b65a1227bfd5f'
+  ['helpers/ubs_core/swift_scan.py']='cb202aed0282902182b14c63023036907c800d4ea9485e8d8d82c1e6e9fba9b3'
   ['helpers/ubs_core/taint_flow.py']='b50925e0f4bf7263f41650a1274c208b5e2c2a994d7cdfd518fb26b3dd5251cf'
 )
 

@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 from ubs_core.io import read_ndjson
+from ubs_core.lexer import strip_comments_and_strings
 from ubs_core.suppression import SourceSuppressions
 
 MARKER = "ubs:ignore"
@@ -192,6 +193,7 @@ class Pattern:
     show_samples: bool = False  # legacy show_detailed_finding
     always: bool = False  # print the finding even at count 0
     multiline: bool = False  # ^-anchored pipelines (rg is line-anchored)
+    executable_swift: bool = False  # Match Swift code, including string interpolation.
 
     def compiled(self) -> re.Pattern[str]:
         flags = re.IGNORECASE if self.case_insensitive else 0
@@ -229,7 +231,8 @@ def line_text_of(text: str, pos: int) -> str:
     return text[line_start:line_end]
 
 
-def file_match_entries(pattern: re.Pattern[str], path: Path, text: str) -> list[tuple[Path, int, str, str]]:
+def file_match_entries(pattern: re.Pattern[str], path: Path, text: str,
+                       match_text: str | None = None) -> list[tuple[Path, int, str, str]]:
     """Ordered rg-style entries [(path, line_no, display, line_text)] for one file.
 
     ``display`` mirrors the rg output line (path:line:code) so the marker and
@@ -237,8 +240,10 @@ def file_match_entries(pattern: re.Pattern[str], path: Path, text: str) -> list[
     """
     entries: list[tuple[Path, int, str, str]] = []
     seen: set[int] = set()
-    for match in pattern.finditer(text):
-        line_no = text.count("\n", 0, match.start()) + 1
+    line_no, previous = 1, 0
+    for match in pattern.finditer(text if match_text is None else match_text):
+        line_no += text.count("\n", previous, match.start())
+        previous = match.start()
         if line_no in seen:
             continue
         seen.add(line_no)
@@ -299,7 +304,8 @@ def active_tier(pattern: Pattern, count: int) -> str | None:
     return None
 
 
-def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set[int], prefilter: Any = None) -> None:
+def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set[int],
+                  prefilter: Any = None, errors: list[str] | None = None) -> None:
     """Run every pattern over the file list, writing sink records.
 
     Legacy parity semantics: counts are DISTINCT MATCHING LINES across the
@@ -311,8 +317,18 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
     if not active:
         return
     suppressions = SourceSuppressions("swift")
+    executable_sources = {}
+    needs_code = any(p.executable_swift for p in active)
     for path in ctx.files:
-        suppressions.index(path, ctx.text_of(path))
+        text = ctx.text_of(path)
+        suppressions.index(path, text)
+        if needs_code and path.suffix == ".swift":
+            try:
+                executable_sources[path] = strip_comments_and_strings(text, "swift")
+            except ValueError as exc:
+                if errors is None:
+                    raise
+                errors.append(f"{path}: Swift lexical analysis: {exc}")
     for pattern in active:
         files = ctx.files
         if pattern.swift_only:
@@ -335,7 +351,10 @@ def scan_patterns(patterns: Sequence[Pattern], ctx: ScanContext, sink, skip: set
             for path in files:
                 if prefilter is not None and pattern.rule_id not in prefilter.candidate_rules_for(path):
                     continue
-                file_hits = file_match_entries(regex, path, ctx.text_of(path))
+                if pattern.executable_swift and path not in executable_sources:
+                    continue
+                code = executable_sources[path] if pattern.executable_swift else None
+                file_hits = file_match_entries(regex, path, ctx.text_of(path), code)
                 if pattern.window > 0 and after is not None:
                     hits.extend(grep_after_emulation(file_hits, pattern.window, after, include, exclude, exclude_ci))
                 else:
@@ -1205,7 +1224,7 @@ def main(argv: list[str] | None = None) -> int:
         # including cache hits. Recompute these inexpensive report-level facts
         # here; only source-local AST/detector/analyzer records enter the cache.
         # Direct emission also preserves genuine pathless aggregate findings.
-        scan_patterns(patterns, ctx, sink_file, skip)
+        scan_patterns(patterns, ctx, sink_file, skip, errors=scan_errors)
         run_derived(ctx, sink_file, skip, errors=scan_errors)
         for f in files:
             recs = cached_findings.get(f)

@@ -1,5 +1,93 @@
 # Native dataflow recovery checkpoint — November 22, 2026
 
+## November 25 activation: three production correctness repairs
+
+The JavaScript mixed-receiver repair is committed in
+`35ec82cd254097deb291622d83bb66218ca3b8d8` (development version 5.5.153).
+The Go native-copy repair is committed in
+`e6c88dc076af7a00fb2722a39edc5eb9d055a49e` (5.5.154).
+The Python TLS repair ships with this update (5.5.155).
+These entries supersede the earlier statements that the three November 24
+candidates remain inactive. Their original Beads and broader D6/release goals
+remain open where their full acceptance is not yet satisfied.
+
+### Delivered behavior
+
+- **JavaScript:** object/scalar alternatives cannot justify destructive strong
+  updates. `delete` and literal array-length writes retain real source flows
+  through original objects, aliases, projections and selected helpers.
+  Definite deletion/truncation still produces clean controls. Uncertain later
+  projections retain explicit incomplete analysis.
+- **Go:** native `copy` writes reach supported byte-slice backing storage and
+  selected helper chains; copied-byte counts stay clean. Partial writes,
+  overlap and reslices retain possible contents. Slice-length proof reads
+  original rune text rather than lexer masks. Unsupported mutable alias
+  histories cannot gain trusted buffer metadata through string conversions.
+- **Python:** native TLS client/captured-callable identities distinguish
+  Requests, HTTPX, aiohttp, urllib3 and SSL contracts from response objects,
+  lookalikes and lexical shadows. Native scalar coercion and comprehension
+  scope controls are preserved. The shared HTTP timeout donor is unchanged.
+
+### Observed DSR evidence
+
+| Area | Baseline and focused results | Public CLI results |
+| --- | --- | --- |
+| JavaScript | Baseline: 20 failed assertions in six methods. Fixed: 24 scanner cases and 40 actual Node witnesses pass; 89 adjacent heap tests and 40 recursive/budget controls pass. | All 23 module/runner JSON/SARIF, selection, suppression, cache/edit and partial non-reuse calls pass. |
+| Go | Baseline: 19 failures and four errors across 14 methods. Final focused/cache cohort: 58 passed, three opt-in skips. Broader cohort: 462 passed, 30 skips, two native failures caused by a different executable named `go`; both failed native methods and the new compiled copy witness then pass with the actual Go SDK. Five independently authored probes pass. | 30/32 calls pass. One content runner JSON and one partial runner SARIF call exceed unchanged 45-second deadlines. |
+| Python TLS | Baseline: 38 failed assertions across 19 source methods. Final TLS/unchanged-timeout/suppression cohort: 48 passed, four public opt-in skips. All three installed no-network Requests/HTTPX/aiohttp witnesses execute; 12 adjacent security/suppression methods also pass. | All 15 module/runner JSON/SARIF, category, cache/edit and exact suppression calls pass; no public skips. |
+
+The Go timeout evidence does not establish a report-format bug. The first
+timed-out case had correct completed module JSON, a recorded module duration
+of 60,747 ms and no merged report yet. The corresponding SARIF module took
+2,997 ms; later JSON modules took roughly 2–3 seconds. The second timeout
+affected SARIF during another execution-service stall. A retry could not
+obtain a process after transport disconnection. Keep both checks unresolved.
+
+Source files were frozen and uploaded as GitHub blobs before the final outage:
+
+| File | Git blob | SHA-256 |
+| --- | --- | --- |
+| JS analyzer | `2753625141a7b3b2a735f7dcdba46607910464b5` | `c13195fbb21593cda69f3288bfc6466b97ff1fa73872c74002ce183edacfcfe7` |
+| Go analyzer | `94bb6393e734f8dd1c566b6955f9b51884d8c570` | `a78c608d87d3289eb129df92def746d4cbd2a34c199a6cb91ee1941dfc26d7cd` |
+| Go tests | `89d819b807927d14a01d2ee4e3d4bdbdbedf2fd4` | `702c3e563017f15916010b7052d41f62cff2c56a1635ae5c85ceabbf28c6a9f6` |
+| TLS detector | `0cae39f49070d8cac975dd74f5c053497b938d3f` | `9053b3fdbac7dca38d0fabaa983bc878c162ece3c5eff94c9a5cd520812e9115` |
+| TLS tests | `2ed0775a8bbe93ff6cd9fcd4113e295de5300cc8` | `c1dfd29813c2fb9d9a0832a7c2592ed838b47699d88d31e351270617162082e6` |
+
+Terminal public log SHA-256 receipts:
+JS `4a18921dff5712dc8ff9288453858a7e19b3f0a6379adc0eca9e336515496971`;
+Go `5b6fb3a7d000f8e259dde758788c40f015c156353b5983f282a1518e9509b56d`;
+TLS `c79be81c87454b856dc54dcde0c7e53b01b4049e838a6a806a81e56e1f96e370`.
+These identify observed logs; temporary-filesystem logs were lost when the
+execution environment restarted and are not included in this document.
+
+### Qualification limits and next concrete checks
+
+The exact prescribed aggregate ShellCheck invocation was killed with exit
+137. Serial ShellCheck of every module and script passed; the runner remains
+an unmet lint gate. The strict JS changed-source self-scan returned partial
+coverage with zero critical findings and 11 warnings, including unsupported
+Python generator/LDAP/SQL analysis. Later Go self-scan and full-suite
+invocations produced no completed result before ENOSPC/transport loss.
+No passing full-suite, strict self-scan or release qualification is claimed.
+
+Canonical pins were generated for the isolated public test trees. After
+executor loss, their propagation was reconstructed from the unchanged
+`scripts/update_checksums.py` algorithm and known frozen source hashes. The
+reconstruction exactly matches the captured TLS runner, Python-module and
+SHA256SUMS hashes, and all 15 original module hashes and the runner were
+checked against their existing pins. Final pins include both
+Go and TLS production changes. A fresh combined-tree execution remains
+necessary; checksum reproduction is not a claim that the runtime gates ran.
+
+Next work is to repeat the two original Go public methods under their
+unchanged deadlines, run the canonical checksum validators and the full
+DSR suite on the committed combined tree, and resolve the existing self-scan
+coverage limits. Do not close the original Beads or D6 on this bounded
+activation. No analysis budget, test expectation, deadline, incomplete-result
+policy or release gate was weakened; no Actions workflow or release tag was
+created.
+
+
 ## Status and scope
 
 The execution environment became unavailable while implementing three high-value

@@ -1,16 +1,14 @@
-"""ubs_core.py_detectors.tls_verification — category 7 TLS verification (bead 0xjg.5).
+"""Bounded native Python HTTP/TLS configuration and request identities.
 
-Port of run_tls_verification_checks (modules/ubs-python.sh 8749-9035): an
-ast.NodeVisitor flagging disabled certificate verification across httpx/
-requests (verify=False, incl. `from httpx import get` direct imports),
-aiohttp (TCPConnector(ssl=False), ClientSession(connector=...) with an
-unsafe connector, session-variable `.get(..., ssl=False)`), urllib3
-(PoolManager cert_reqs=CERT_NONE / assert_hostname=False), ssl
-(_create_unverified_context, CERT_NONE verify_mode, check_hostname=False,
-`ssl._create_default_https_context = ssl._create_unverified_context`).
+Requests sessions accept per-request verify; aiohttp sessions accept ssl.
+HTTPX configures verification on clients/transports, not client request
+methods. Reuse the timeout detector's lexical native-call visitor for
+imports, captured methods, argument evaluation, branches and scopes,
+while supplying a separate TLS policy. A response or a similar spelling
+never acquires a native client's authority.
 
-Comment directives use shared statement ownership and rule scopes, with
-per-file line dedupe preserved.
+This is an explicit configuration check. It does not prove the complete
+TLS policy of an arbitrary helper, subclass or externally configured object.
 """
 from __future__ import annotations
 
@@ -18,6 +16,7 @@ import ast
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from ubs_core.py_detectors.http_timeout import HttpTimeoutAnalyzer, UNKNOWN, _Value
 from ubs_core.suppression import SourceSuppressions
 
 RULE_ID = "py.security.tls-verification"
@@ -26,226 +25,256 @@ TITLE = "HTTP/TLS client disables certificate verification"
 SEVERITY = "critical"
 DESCRIPTION = "Keep certificate and hostname verification enabled; use explicit CA bundles for private trust roots"
 
-HTTP_METHODS = {'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'request', 'stream'}
+REQUEST_METHODS = frozenset({
+    "get", "post", "put", "patch", "delete", "head", "options", "request",
+})
+CLIENT_CONSTRUCTORS = {
+    "requests.Session": "requests",
+    "requests.session": "requests",
+    "requests.sessions.Session": "requests",
+    "httpx.Client": "httpx",
+    "httpx.AsyncClient": "httpx",
+    "aiohttp.ClientSession": "aiohttp",
+    "urllib3.PoolManager": "urllib3",
+    "urllib3.ProxyManager": "urllib3",
+    "ssl.SSLContext": "ssl_context",
+    "ssl.create_default_context": "ssl_context",
+    "ssl._create_unverified_context": "ssl_context",
+    "aiohttp.TCPConnector": "aiohttp_connector",
+    "httpx.HTTPTransport": "httpx_transport",
+    "httpx.AsyncHTTPTransport": "httpx_transport",
+}
+CLIENT_METHODS = {
+    "requests": REQUEST_METHODS | {"send"},
+    "aiohttp": REQUEST_METHODS | {"ws_connect"},
+}
 
 
-def _call_name(node):
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        parent = _call_name(node.value)
-        return f'{parent}.{node.attr}' if parent else node.attr
-    return ''
+def _literal_false(values) -> bool:
+    # Strings such as "false" and "off" can name CA bundles. They are not
+    # Boolean False and must not borrow a different library's coercion.
+    return any(value.kind == "literal" and value.data is False for value in values)
 
 
-def _const_value(node):
-    return node.value if isinstance(node, ast.Constant) else None
+def _ssl_hostname_disabled(values) -> bool:
+    # SSLContext.check_hostname applies Python truthiness to its argument.
+    # Unlike HTTPX/aiohttp options, zero, None and empty literals disable it,
+    # while nonempty strings such as "false" leave verification enabled.
+    return any(value.kind == "literal" and not value.data for value in values)
 
 
-def _is_false(node):
-    value = _const_value(node)
-    return value is False or value == 0 or (isinstance(value, str) and value.strip().lower() in {'0', 'false', 'no', 'off'})
+def _requests_verify_disabled(values, *, none_disables=False) -> bool:
+    # Request/get inherit the session default for None. Session.send passes
+    # an explicit None through to the adapter, and setting Session.verify
+    # stores None as the default itself; both disable certificate checks.
+    return any(value.kind == "literal"
+               and (none_disables if value.data is None else not value.data)
+               for value in values)
 
 
-def _is_cert_none(node, cert_none_names, ssl_aliases):
-    value = _const_value(node)
-    if isinstance(value, str) and value.strip().upper() in {'CERT_NONE', 'NONE'}:
-        return True
-    name = _call_name(node)
-    if name in cert_none_names:
-        return True
-    return any(name == f'{alias}.CERT_NONE' for alias in ssl_aliases)
+def _cert_none(values, *, string_names=False) -> bool:
+    for value in values:
+        if value.kind == "native" and value.name == "ssl.CERT_NONE":
+            return True
+        if value.kind == "literal":
+            if isinstance(value.data, int) and value.data == 0:
+                return True
+            if string_names and value.data in ("CERT_NONE", "NONE"):
+                return True
+    return False
 
 
-def _source_line(lines, line_no):
-    idx = line_no - 1
-    if 0 <= idx < len(lines):
-        return lines[idx].strip()
-    return ''
-
-
-class _TLSVerificationAnalyzer(ast.NodeVisitor):
-    def __init__(self, path, lines, suppressions):
-        self.path = path
-        self.lines = lines
-        self.suppressions = suppressions
-        self.ssl_aliases = {'ssl'}
-        self.httpx_aliases = {'httpx'}
-        self.requests_aliases = {'requests'}
-        self.aiohttp_aliases = {'aiohttp'}
-        self.urllib3_aliases = {'urllib3'}
-        self.httpx_direct = set()
-        self.requests_direct = set()
-        self.aiohttp_connector_names = set()
-        self.aiohttp_session_names = set()
-        self.urllib3_pool_names = set()
-        self.unverified_context_names = set()
-        self.cert_none_names = set()
-        self.client_vars = set()
-        self.issues = []
-        self.seen_lines = set()
+class _TLSVerificationAnalyzer(HttpTimeoutAnalyzer):
+    """Share native binding state; do not execute the timeout policy."""
 
     def remember_issue(self, line_no):
-        if self.suppressions.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
+        if self.suppression.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
             return
         self.seen_lines.add(line_no)
         self.issues.append(line_no)
 
-    def visit_Import(self, node):
-        for alias in node.names:
-            local = alias.asname or alias.name.split('.')[0]
-            if alias.name == 'ssl':
-                self.ssl_aliases.add(local)
-            elif alias.name == 'httpx':
-                self.httpx_aliases.add(local)
-            elif alias.name == 'requests':
-                self.requests_aliases.add(local)
-            elif alias.name == 'aiohttp':
-                self.aiohttp_aliases.add(local)
-            elif alias.name == 'urllib3':
-                self.urllib3_aliases.add(local)
-        self.generic_visit(node)
+    def values(self, node):
+        if isinstance(node, ast.Constant):
+            # False and 0 compare/hash equally in Python, but HTTPX and
+            # aiohttp accept Boolean False and reject numeric substitutes.
+            # Keep that distinction when abstract alternatives are joined.
+            return frozenset({_Value("literal", type(node.value).__name__, node.value)})
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            result = set()
+            for value in self.values(node.operand):
+                if value.kind == "literal" and isinstance(value.data, (int, float)):
+                    number = -value.data if isinstance(node.op, ast.USub) else +value.data
+                    result.add(_Value("literal", type(number).__name__, number))
+                else:
+                    result.update(UNKNOWN)
+            return frozenset(result) or UNKNOWN
+        if isinstance(node, ast.Attribute):
+            result = set()
+            for owner in self.values(node.value):
+                if owner.kind == "native":
+                    key = f"{owner.name}.{node.attr}"
+                    result.update(self.member_overrides.get(key, frozenset({_Value("native", key)})))
+                elif owner.kind == "client" and node.attr in CLIENT_METHODS.get(owner.name, ()):
+                    key = (owner, node.attr)
+                    result.update(self.member_overrides.get(key, self.member_default(key)))
+                else:
+                    result.update(UNKNOWN)
+            return frozenset(result) or UNKNOWN
+        return super().values(node)
 
-    def visit_ImportFrom(self, node):
-        module = node.module or ''
-        for alias in node.names:
-            local = alias.asname or alias.name
-            if module == 'ssl':
-                if alias.name == '_create_unverified_context':
-                    self.unverified_context_names.add(local)
-                elif alias.name == 'CERT_NONE':
-                    self.cert_none_names.add(local)
-            elif module == 'httpx' and alias.name in HTTP_METHODS | {'Client', 'AsyncClient'}:
-                self.httpx_direct.add(local)
-            elif module == 'requests' and alias.name in HTTP_METHODS | {'Session'}:
-                self.requests_direct.add(local)
-            elif module == 'aiohttp':
-                if alias.name == 'TCPConnector':
-                    self.aiohttp_connector_names.add(local)
-                elif alias.name == 'ClientSession':
-                    self.aiohttp_session_names.add(local)
-            elif module == 'urllib3' and alias.name in {'PoolManager', 'ProxyManager'}:
-                self.urllib3_pool_names.add(local)
-        self.generic_visit(node)
-
-    def keyword(self, call, key):
+    def keyword_values(self, call, name):
+        # Use the value captured when this argument was evaluated. A later
+        # keyword may rebind the same name. Opaque **kwargs grant no policy
+        # proof; this bounded check retains explicit keyword semantics.
         for keyword in call.keywords:
-            if keyword.arg == key:
-                return keyword.value
-        return None
+            if keyword.arg == name:
+                return self.argument_values(call, keyword.value)
+        return UNKNOWN
 
-    def target_names(self, targets):
-        names = []
-        for target in targets:
-            if isinstance(target, ast.Name):
-                names.append(target.id)
-        return names
+    def call_result(self, node, callees):
+        results = set()
+        for callee in callees:
+            if callee.kind == "method":
+                owner = callee.data
+                if owner.name == "requests" and callee.name in CLIENT_METHODS["requests"]:
+                    if _requests_verify_disabled(self.keyword_values(node, "verify"),
+                                                 none_disables=callee.name == "send"):
+                        self.remember_issue(node.lineno)
+                elif owner.name == "aiohttp" and callee.name in CLIENT_METHODS["aiohttp"]:
+                    if (_literal_false(self.keyword_values(node, "ssl"))
+                            or _literal_false(self.keyword_values(node, "verify_ssl"))):
+                        self.remember_issue(node.lineno)
+                results.update(UNKNOWN)
+                continue
 
-    def is_ssl_unverified_context(self, node):
-        name = _call_name(node)
-        return name in self.unverified_context_names or any(name == f'{alias}._create_unverified_context' for alias in self.ssl_aliases)
-
-    def is_httpx_or_requests_call(self, name):
-        if name in self.httpx_direct or name in self.requests_direct:
-            return True
-        if '.' not in name:
-            return False
-        prefix, short = name.rsplit('.', 1)
-        first = prefix.split('.', 1)[0]
-        return short in HTTP_METHODS | {'Client', 'AsyncClient', 'Session'} and (first in self.httpx_aliases or first in self.requests_aliases)
-
-    def is_aiohttp_connector_call(self, name):
-        if name in self.aiohttp_connector_names:
-            return True
-        return any(name == f'{alias}.TCPConnector' for alias in self.aiohttp_aliases)
-
-    def is_aiohttp_session_call(self, name):
-        if name in self.aiohttp_session_names:
-            return True
-        return any(name == f'{alias}.ClientSession' for alias in self.aiohttp_aliases)
-
-    def is_urllib3_pool_call(self, name):
-        if name in self.urllib3_pool_names:
-            return True
-        return any(name in {f'{alias}.PoolManager', f'{alias}.ProxyManager'} for alias in self.urllib3_aliases)
-
-    def has_unsafe_connector(self, node):
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call) and self.is_aiohttp_connector_call(_call_name(child.func)):
-                ssl_value = self.keyword(child, 'ssl')
-                if ssl_value is not None and _is_false(ssl_value):
-                    return True
-        return False
-
-    def call_disables_tls(self, node):
-        name = _call_name(node.func)
-        if self.is_ssl_unverified_context(node.func):
-            return True
-        verify = self.keyword(node, 'verify')
-        if verify is not None and _is_false(verify) and self.is_httpx_or_requests_call(name):
-            return True
-        if self.is_aiohttp_connector_call(name):
-            ssl_value = self.keyword(node, 'ssl')
-            if ssl_value is not None and _is_false(ssl_value):
-                return True
-        if self.is_aiohttp_session_call(name):
-            connector = self.keyword(node, 'connector')
-            if connector is not None and self.has_unsafe_connector(connector):
-                return True
-        if self.is_urllib3_pool_call(name):
-            cert_reqs = self.keyword(node, 'cert_reqs')
-            assert_hostname = self.keyword(node, 'assert_hostname')
-            if cert_reqs is not None and _is_cert_none(cert_reqs, self.cert_none_names, self.ssl_aliases):
-                return True
-            if assert_hostname is not None and _is_false(assert_hostname):
-                return True
-        if '.' in name:
-            prefix, short = name.rsplit('.', 1)
-            first = prefix.split('.', 1)[0]
-            ssl_value = self.keyword(node, 'ssl')
-            if short in HTTP_METHODS and ssl_value is not None and _is_false(ssl_value):
-                return first in self.aiohttp_aliases or first in self.client_vars or 'aiohttp' in prefix
-        return False
-
-    def visit_Assign(self, node):
-        if isinstance(node.value, ast.Call):
-            name = _call_name(node.value.func)
-            if self.is_httpx_or_requests_call(name) or self.is_aiohttp_session_call(name) or self.is_urllib3_pool_call(name):
-                self.client_vars.update(self.target_names(node.targets))
-            if self.call_disables_tls(node.value):
-                self.remember_issue(node.lineno)
-        for target in node.targets:
-            if isinstance(target, ast.Attribute):
-                attr = target.attr
-                target_owner = _call_name(target.value)
-                if attr == 'verify_mode' and _is_cert_none(node.value, self.cert_none_names, self.ssl_aliases):
+            name = callee.name if callee.kind == "native" else ""
+            family = CLIENT_CONSTRUCTORS.get(name)
+            if family:
+                results.add(_Value("client", family, (node.lineno, node.col_offset)))
+                if family in {"httpx", "httpx_transport"}:
+                    if _literal_false(self.keyword_values(node, "verify")):
+                        self.remember_issue(node.lineno)
+                elif family == "aiohttp_connector":
+                    if (_literal_false(self.keyword_values(node, "ssl"))
+                            or _literal_false(self.keyword_values(node, "verify_ssl"))):
+                        self.remember_issue(node.lineno)
+                elif family == "urllib3":
+                    if (_cert_none(self.keyword_values(node, "cert_reqs"), string_names=True)
+                            or _literal_false(self.keyword_values(node, "assert_hostname"))):
+                        self.remember_issue(node.lineno)
+                elif name == "ssl._create_unverified_context":
                     self.remember_issue(node.lineno)
-                elif attr == 'check_hostname' and _is_false(node.value):
-                    self.remember_issue(node.lineno)
-                elif attr == 'verify' and target_owner in self.client_vars and _is_false(node.value):
-                    self.remember_issue(node.lineno)
-                elif attr == '_create_default_https_context' and target_owner in self.ssl_aliases and self.is_ssl_unverified_context(node.value):
-                    self.remember_issue(node.lineno)
-        self.generic_visit(node)
+                continue
 
-    def visit_Call(self, node):
-        if self.call_disables_tls(node):
-            self.remember_issue(node.lineno)
-        self.generic_visit(node)
+            module, _, method = name.rpartition(".")
+            if module in {"requests", "requests.api"} and method in REQUEST_METHODS:
+                if _requests_verify_disabled(self.keyword_values(node, "verify")):
+                    self.remember_issue(node.lineno)
+            elif module == "httpx" and method in REQUEST_METHODS | {"stream"}:
+                if _literal_false(self.keyword_values(node, "verify")):
+                    self.remember_issue(node.lineno)
+            elif name == "aiohttp.request":
+                if (_literal_false(self.keyword_values(node, "ssl"))
+                        or _literal_false(self.keyword_values(node, "verify_ssl"))):
+                    self.remember_issue(node.lineno)
+            results.update(UNKNOWN)
+        return frozenset(results) or UNKNOWN
+
+    def bind(self, target, values):
+        if isinstance(target, ast.Attribute):
+            owners = self.values(target.value)
+            for owner in owners:
+                if owner.kind == "client":
+                    if (owner.name == "requests" and target.attr == "verify"
+                            and _requests_verify_disabled(values, none_disables=True)):
+                        self.remember_issue(target.lineno)
+                    elif owner.name == "ssl_context":
+                        if (target.attr == "verify_mode" and _cert_none(values)
+                                or target.attr == "check_hostname" and _ssl_hostname_disabled(values)):
+                            self.remember_issue(target.lineno)
+                    if target.attr in CLIENT_METHODS.get(owner.name, ()):
+                        key = (owner, target.attr)
+                        previous = self.member_overrides.get(key, self.member_default(key))
+                        self.member_overrides[key] = values if len(owners) == 1 else previous | values
+                elif owner.kind == "native" and owner.name == "ssl" and target.attr == "_create_default_https_context":
+                    if any(value.kind == "native" and value.name == "ssl._create_unverified_context"
+                           for value in values):
+                        self.remember_issue(target.lineno)
+        super().bind(target, values)
+
+    def visit_ListComp(self, node):
+        # Python evaluates only the first iterable in the enclosing class
+        # namespace. The implicit comprehension function resolves its body
+        # and later iterables through the class's enclosing scope instead.
+        outer, enclosing = self.snapshot(), self.class_enclosing
+        self.visit(node.generators[0].iter)
+        if enclosing is not None:
+            self.restore(enclosing)
+        self.class_enclosing = None
+        # Every comprehension target is local throughout its implicit
+        # function, including before a later generator binds it. Prebind
+        # them after evaluating the first iterable in the enclosing scope.
+        for generator in node.generators:
+            self.bind(generator.target, UNKNOWN)
+        for index, generator in enumerate(node.generators):
+            if index:
+                self.visit(generator.iter)
+            self.bind(generator.target, UNKNOWN)
+            for condition in generator.ifs:
+                self.visit(condition)
+        if isinstance(node, ast.DictComp):
+            self.visit(node.key)
+            self.visit(node.value)
+        else:
+            self.visit(node.elt)
+        self.restore(outer)
+        self.class_enclosing = enclosing
+
+    visit_SetComp = visit_ListComp
+    visit_DictComp = visit_ListComp
+    visit_GeneratorExp = visit_ListComp
+
+    def visit_While(self, node):
+        if isinstance(node.test, ast.Constant) and not node.test.value:
+            self.visit(node.test)
+            for statement in node.orelse:
+                self.visit(statement)
+            return
+        super().visit_While(node)
+
+    def visit_Lambda(self, node):
+        # The shared visitor masks positional/keyword-only parameters. TLS
+        # also masks *args/**kwargs before inspecting a lambda body so a
+        # captured client cannot lend identity to an unrelated parameter.
+        for expression in (*node.args.defaults,
+                           *(value for value in node.args.kw_defaults if value is not None)):
+            self.visit(expression)
+        outer, enclosing = self.snapshot(), self.class_enclosing
+        if enclosing is not None:
+            self.restore(enclosing)
+        self.class_enclosing = None
+        for argument in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs,
+                         *((node.args.vararg,) if node.args.vararg else ()),
+                         *((node.args.kwarg,) if node.args.kwarg else ())):
+            self.bindings[argument.arg] = UNKNOWN
+        self.visit(node.body)
+        self.restore(outer)
+        self.class_enclosing = enclosing
 
 
 def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
-    suppressions = SourceSuppressions('python')
+    suppressions = SourceSuppressions("python")
     for path in files:
-        if path.suffix.lower() not in {'.py', '.pyi'}:
+        if path.suffix.lower() not in {".py", ".pyi"}:
             continue
         try:
-            text = path.read_text(encoding='utf-8', errors='ignore')
+            text = path.read_text(encoding="utf-8", errors="ignore")
             tree = ast.parse(text, filename=str(path))
         except Exception:
             continue
         lines = text.splitlines()
-        analyzer = _TLSVerificationAnalyzer(path, lines, suppressions.index(path, text))
+        analyzer = _TLSVerificationAnalyzer(lines, suppressions.index(path, text))
         analyzer.visit(tree)
         for line_no in analyzer.issues:
-            yield path, line_no, 1, _source_line(lines, line_no)[:240]
+            code = lines[line_no - 1].strip() if 0 < line_no <= len(lines) else ""
+            yield path, line_no, 1, code[:240]

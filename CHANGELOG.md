@@ -10,6 +10,13 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Resolve native Python TLS client and saved-callable identities across scoped
+  imports, rebinding, aliases and comprehensions. Requests, HTTPX, aiohttp,
+  urllib3 and SSL retain their own verification-option semantics, catching
+  unsafe native Session calls without attributing them to response objects or
+  unrelated receivers. Preserve native literal coercion, rule suppression and
+  report/cache behavior; the shared HTTP timeout implementation is unchanged.
+
 - Track native Go `copy` writes through byte-buffer aliases, literal reslices
   and selected helper chains while keeping copied-byte counts clean. Preserve
   source flows across partial and overlapping writes, and stop masked rune

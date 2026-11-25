@@ -48,7 +48,8 @@ _OPAQUE_CALLABLE = ('builtin', 'opaque-callable')
 _ARRAY_FROM = ('builtin', 'Array.from')
 _ARRAY_AT = ('builtin', 'Array.prototype.at')
 _ARRAY_FILL = ('builtin', 'Array.prototype.fill')
-_OBJECT_PROJECTIONS = {('builtin', 'Object.' + name): name for name in ('values', 'entries')}
+_OBJECT_PROJECTION_NAMES = ('keys', 'values', 'entries')
+_OBJECT_PROJECTIONS = {('builtin', 'Object.' + name): name for name in _OBJECT_PROJECTION_NAMES}
 
 
 def _collapsed(ref):
@@ -3870,6 +3871,16 @@ class _Flow:
         orders = {ref: self.own_property_keys(ref, state) for ref in refs}
         if (not refs or frozenset(source) or getattr(source, 'absent', False)
                 or getattr(source, 'scalar_alternative', False) or any(keys is None for keys in orders.values())):
+            if method == 'keys':
+                # A computed or descriptor-defined property can introduce an
+                # attacker-controlled name even when every value is clean.
+                if any(any(key in state.heap.get(ref, {}) for key in (
+                           None, '__proto__', _METHOD_LOOKUP_CONTRACT)) for ref in refs):
+                    self.incomplete.add('Object.keys requires known ordinary enumerable own properties')
+                # Carry the input's provenance without certifying clean keys
+                # or creating a precise array. The captured native does not
+                # expose the global Object constructor to an opaque callee.
+                return self.materialize(source, state)
             self.incomplete.add(f'Object.{method} requires known ordinary enumerable own properties and order')
             return self.materialize(source, state)
 
@@ -3895,7 +3906,7 @@ class _Flow:
         for parent, keys in orders.items():
             branch, items = state.copy(), []
             for index, key in enumerate(keys):
-                value = branch.heap[parent][key]
+                value = frozenset() if method == 'keys' else branch.heap[parent][key]
                 if method == 'entries':
                     value = install((self.scope, location, 'object-entry', index), [frozenset(), value], branch)
                 items.append(value)
@@ -4449,7 +4460,7 @@ class _Flow:
         if (report and key == 'from' and ('builtin', 'Array') in _refs(receiver)
                 and self.native_target(name, state) is None):
             self.incomplete.add('Array.from requires a known native or selected callable')
-        if (report and key in {'values', 'entries'} and ('builtin', 'Object') in _refs(receiver)
+        if (report and key in _OBJECT_PROJECTION_NAMES and ('builtin', 'Object') in _refs(receiver)
                 and self.native_target(name, state) is None):
             self.incomplete.add(f'Object.{key} requires a known native or selected callable')
         return None, receiver
@@ -4901,8 +4912,8 @@ class _Flow:
                     if ref == ('builtin', 'Function.prototype') and key in {None, 'call', 'apply', 'bind'}:
                         for member in (('call', 'apply', 'bind') if key is None else (key,)):
                             slots[member] = _ABSENT
-                    if ref == ('builtin', 'Object') and key in {None, 'values', 'entries'}:
-                        for member in (('values', 'entries') if key is None else (key,)):
+                    if ref == ('builtin', 'Object') and (key is None or key in _OBJECT_PROJECTION_NAMES):
+                        for member in (_OBJECT_PROJECTION_NAMES if key is None else (key,)):
                             slots[member] = _ABSENT
                 return frozenset()
         if code[start] in '[{' and start in self.pairs:
@@ -5750,7 +5761,7 @@ class _Engine:
                 offset = module.end + 3
             text, code = ''.join(chunks), ''.join(masks)
         self.text, self.code = text, code
-        self.has_object_projections = any(name in text for name in ('values', 'entries'))
+        self.has_object_projections = any(name in text for name in _OBJECT_PROJECTION_NAMES)
         # Allocation-site contexts are finite but their heap shapes can grow
         # exponentially through a small chain of binary factories. Count the
         # actual copied/traversed facts as well as transfers. Larger selected

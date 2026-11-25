@@ -5041,6 +5041,37 @@ class HeapTaintTests(unittest.TestCase):
                                                 cache=True, partial_reason='Object.values')
                 self.assertEqual(report['profile']['cache_hits'], cache_hits, report)
 
+    def test_object_keys_returns_fresh_array_of_clean_names(self):
+        source = ('const input={10:req.query.html,2:"ok",after:req.query.html}; '
+                  'const keys=Object.keys(input); res.send(keys[0]); res.send(keys[1]); '
+                  'res.send(keys[2]); res.send(keys.length); '
+                  'keys[0]=req.query.html; res.send(keys[0]); res.send(input[2]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['2', '10', 'after', 3, 'review-input', 'ok'])
+
+    def test_object_keys_captured_and_overridden_calls(self):
+        source = ('const list=Object.keys; Object.keys=function(input){return [input.value];}; '
+                  'const input={value:req.query.html}; '
+                  'res.send(list(input)[0]); res.send(Object.keys(input)[0]);')
+        self.scan_sort(source, 'xss')
+        self.assert_runtime_sends(source, ['value', 'review-input'])
+
+    def test_object_keys_keeps_unknown_name_provenance_and_partial_findings(self):
+        self.scan_sort('const keys=Object.keys(req.body); res.send(keys[0]);', 'xss')
+        self.scan_sort('res.send(req.query.html); const box={}; box[req.query.html]="safe"; '
+                       'const keys=Object.keys(box);', 'xss', partial='Object.keys')
+        self.scan_sort('res.send(req.query.html); delete Object.keys; Object.keys({});',
+                       'xss', partial='Object.keys')
+
+    def test_object_keys_checks_each_input_before_returning_clean_names(self):
+        for input_expression in ('{dirty:req.query.html}', '[,req.query.html]',
+                                 'flag?{a:req.query.html}:{b:"safe"}'):
+            self.scan_sort('const flag=true; function names(input){return Object.keys(input);} '
+                           f'const keys=names({input_expression}); res.send(keys[0]);')
+        self.scan_sort('const Object={keys:function(input){return [input.html];}}; '
+                       'res.send(Object.keys({html:req.query.html})[0]);', 'xss')
+        self.scan_sort('Object.keys(null); res.send(req.query.html);')
+
     def test_object_projection_preserves_shallow_values_and_entries(self):
         for expression, selected in (('Object.values({item:box})', 'out[0]'),
                                      ('Object.entries({item:box})', 'out[0][1]')):
@@ -5206,6 +5237,9 @@ class HeapTaintTests(unittest.TestCase):
                          'real module and meta-runner integration requires ast-grep')
     def test_object_projection_public_json_sarif_selection_and_partial(self):
         cases = (
+            ('keys', 'const input={dirty:req.query.html};\nconst names=Object.keys(input);\n'
+             'res.send(names[0]);\nres.send(input.dirty);\n',
+             [('javascript.taint.xss', 4, 1)], False),
             ('alias', 'const box={html:"safe"};\nconst out=Object.values({item:box});\n'
              'box.html=req.query.html;\nres.send(out[0].html);\n',
              [('javascript.taint.xss', 4, 1)], False),

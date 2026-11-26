@@ -1,8 +1,9 @@
 """Regression controls for expression-level reaching definitions and call sinks."""
 import unittest
 import ast
+import subprocess
 import sys
-from test_taint_python_dataflow import SourceTest
+from test_taint_python_dataflow import SourceTest, taint_py
 
 
 class ExpressionFlowTests(SourceTest):
@@ -80,6 +81,113 @@ class ExpressionFlowTests(SourceTest):
     def test_callee_is_resolved_before_argument_side_effects(self):
         self.assert_rules('def run(code):\n    eval(code)\nrun((run := other, input())[1])\n', 'eval')
         self.assert_rules('import html\nHttpResponse(html.escape((html := other, input())[1]))\n')
+
+
+class NativeStringResultTests(SourceTest):
+    METHODS = ('strip', 'lstrip', 'rstrip', 'removeprefix', 'removesuffix')
+
+    def test_native_string_results_allow_membership_without_losing_sources(self):
+        for method in self.METHODS:
+            with self.subTest(method=method):
+                self.assert_rules(
+                    f'value = input().{method}(" ")\n'
+                    'any(mark in value for mark in ("a", "b"))\neval(value)\n', 'eval')
+                self.assert_rules(
+                    f'value = " aba ".{method}(" ")\n'
+                    'any(mark in value for mark in ("a", "b"))\neval(value)\n')
+
+    def test_strip_none_and_existing_no_argument_forms_keep_native_identity(self):
+        for method in ('strip', 'lstrip', 'rstrip'):
+            for argument in ('', 'None', 'chars'):
+                with self.subTest(method=method, argument=argument):
+                    self.assert_rules(
+                        'chars = None if flag else " "\n'
+                        f'value = input().{method}({argument})\n'
+                        'any(mark in value for mark in ("a", "b"))\neval(value)\n', 'eval')
+
+    def test_captured_string_methods_keep_their_original_receiver(self):
+        for method in self.METHODS:
+            with self.subTest(method=method):
+                self.assert_rules(
+                    f'text = input()\nnormalize = text.{method}\ntext = "fixed"\n'
+                    'value = normalize(" ")\n'
+                    'any(mark in value for mark in ("a", "b"))\neval(value)\n', 'eval')
+                self.assert_rules(
+                    f'def capture(text):\n    return text.{method}\n'
+                    'normalize = capture(input())\nvalue = normalize(" ")\n'
+                    'any(mark in value for mark in ("a", "b"))\neval(value)\n', 'eval')
+                self.assert_rules(
+                    f'def normalize(text, chars):\n    return text.{method}(chars)\n'
+                    'value = normalize(input(), " ")\n'
+                    'any(mark in value for mark in ("a", "b"))\neval(value)\n', 'eval')
+
+    def test_string_transforms_do_not_extend_sanitizer_domains(self):
+        for method in self.METHODS:
+            with self.subTest(method=method):
+                self.assert_rules(
+                    f'import html\nvalue = input().{method}(" ")\n'
+                    'any(mark in value for mark in ("a", "b"))\n'
+                    'HttpResponse(html.escape(value))\neval(html.escape(value))\n', 'eval')
+
+    def test_custom_and_opaque_operands_do_not_gain_native_string_proof(self):
+        operations = (
+            'value = receiver.strip(" ")',
+            'value = receiver.removeprefix(" ")',
+            'value = input().strip(opaque)',
+            'value = input().removeprefix(opaque)',
+            'value = input().removesuffix(None)',
+            'value = input().strip(b" ")',
+            'value = input().strip(" ", "x")',
+            'value = input().removeprefix()',
+            'value = input().strip(chars=" ")',
+            'value = input().removeprefix(prefix=" ")',
+        )
+        for operation in operations:
+            with self.subTest(operation=operation):
+                with self.assertRaises(taint_py.AnalysisLimit):
+                    self.scan(operation + '\nany(mark in value for mark in ("a", "b"))\n')
+
+    def test_unproved_argument_producer_cannot_be_repaired_by_a_native_result(self):
+        for method in self.METHODS:
+            for expression in (f'input().{method}(render())', f'render().{method}(" ")'):
+                with self.subTest(method=method, expression=expression):
+                    # A native result has string identity, but cannot grant
+                    # generator-consumer authority to an unresolved earlier
+                    # producer. The existing join boundary requires both.
+                    with self.assertRaisesRegex(taint_py.AnalysisLimit, 'producer effects'):
+                        self.scan('def render():\n    owned = opaque()\n    return " "\n'
+                                  f'value = {expression}\n'
+                                  'value.join(mark for mark in ("a", "b"))\n')
+
+    def test_native_runtime_results_and_argument_protocols(self):
+        source = '''
+text = ' aba '
+for method in ('strip', 'lstrip', 'rstrip', 'removeprefix', 'removesuffix'):
+    saved = getattr(text, method)
+    value = saved(' ')
+    assert type(value) is str
+    assert any(mark in value for mark in ('a', 'b'))
+for method in ('strip', 'lstrip', 'rstrip'):
+    assert type(getattr(text, method)()) is str
+    assert type(getattr(text, method)(None)) is str
+class Argument:
+    def __str__(self):
+        raise AssertionError('custom string conversion must not run')
+for method in ('strip', 'lstrip', 'rstrip', 'removeprefix', 'removesuffix'):
+    try:
+        getattr(text, method)(Argument())
+    except TypeError:
+        pass
+    else:
+        raise AssertionError('opaque argument was accepted')
+class Receiver:
+    def strip(self, chars):
+        return {'custom': chars}
+assert type(Receiver().strip(' ')) is dict
+'''
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', source],
+                                capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 if __name__ == '__main__':

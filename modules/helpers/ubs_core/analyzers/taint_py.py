@@ -3559,14 +3559,16 @@ class _Flow:
                 return True
         return False
 
-    def materialized_generator_string(self, node, state):
-        """Require the evaluated value to be an exact, callback-free string."""
+    def materialized_generator_string(self, node, state, *, allow_none=False):
+        """Require an exact native string, optionally None for strip's chars."""
         references = self.expression_references.get(node, NO_REFERENCES)
         binding = self.expression_bindings.get(node)
         choices = _binding_choices(binding)
         self.engine.budget.spend(1 + len(choices))
         return (not references & state.mutated and bool(choices)
-                and self.native_string_binding(binding))
+                and all(self.native_string_binding(value)
+                        or allow_none and isinstance(value, ast.Constant) and value.value is None
+                        for value in choices))
 
     @staticmethod
     def native_string_binding(binding):
@@ -3896,7 +3898,8 @@ class _Flow:
                 return self.materialized_generator_binding(lookup(expression.id), NO_REFERENCES, state)
             if isinstance(expression, ast.Attribute) and expression.attr in {
                     'join', 'strip', 'lstrip', 'rstrip', 'lower', 'upper',
-                    'capitalize', 'casefold', 'swapcase', 'title', 'replace'}:
+                    'capitalize', 'casefold', 'swapcase', 'title', 'replace',
+                    'removeprefix', 'removesuffix'}:
                 value = (lookup(expression.value.id) if isinstance(expression.value, ast.Name)
                          else expression.value if isinstance(expression.value, ast.Constant)
                          else literal_call(expression.value))
@@ -8487,14 +8490,24 @@ class _Flow:
                 self.expression_references[node] = frozenset({node, target})
                 self.possible_exception(state)
                 return CLEAN
+        native_string_result = False
         if (isinstance(node, ast.Call) and isinstance(target, _BoundCallable)
-                and self.native_string_binding(target.receiver_binding)
-                and not node.keywords
-                and (target.name.rsplit('.', 1)[-1] in {
+                and self.native_string_binding(target.receiver_binding) and not node.keywords):
+            method = target.name.rsplit('.', 1)[-1]
+            strip_chars = method in {'strip', 'lstrip', 'rstrip'}
+            if not node.args and method in {
                     'strip', 'lstrip', 'rstrip', 'lower', 'upper',
-                    'capitalize', 'casefold', 'swapcase', 'title'} and not node.args
-                    or target.name.rsplit('.', 1)[-1] == 'replace' and len(node.args) == 2
-                    and all(self.materialized_generator_string(argument, state) for argument in node.args))):
+                    'capitalize', 'casefold', 'swapcase', 'title'}:
+                native_string_result = True
+            elif (len(node.args) == 1 and (strip_chars or method in {'removeprefix', 'removesuffix'})
+                    or method == 'replace' and len(node.args) == 2):
+                # Selected helper parameters must retain operand identity;
+                # a symbolic placeholder is not evidence of a custom type.
+                for argument in node.args:
+                    self.require_value(self.expression_bindings.get(argument))
+                native_string_result = all(self.materialized_generator_string(
+                    argument, state, allow_none=strip_chars) for argument in node.args)
+        if native_string_result:
             # Exact native strings cannot replace these methods or invoke a
             # custom receiver/argument protocol. Keep producer authority from
             # the captured receiver; a fresh result cannot repair old effects.
@@ -9556,7 +9569,8 @@ class _Flow:
             receiver_fact = self.expression_facts.get(node.value, CLEAN)
             bases = _binding_choices(self.expression_bindings.get(node.value))
             if node.attr in {'join', 'strip', 'lstrip', 'rstrip', 'lower', 'upper',
-                             'capitalize', 'casefold', 'swapcase', 'title', 'replace', 'full_url', 'get_full_url'}:
+                             'capitalize', 'casefold', 'swapcase', 'title', 'replace',
+                             'removeprefix', 'removesuffix', 'full_url', 'get_full_url'}:
                 # A helper's symbolic receiver otherwise erases the scalar
                 # producer contract before its bound method is captured.
                 self.require_value(self.expression_bindings.get(node.value))

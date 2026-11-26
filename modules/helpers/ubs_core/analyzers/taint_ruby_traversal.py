@@ -1006,6 +1006,43 @@ class RubyEngine:
                 if name not in self.unresolved_definition_methods:
                     self.unresolved_definition_methods.add(name)
                     pending.append(name)
+        # A singleton method on a local value needs definition-time object
+        # identity. Refinements need lexical activation/dispatch. Neither can
+        # borrow a builtin guard contract merely from its method spelling.
+        self.unresolved_guard_methods = {
+            function.name for function in self.parser.functions.values() if not function.scope and (
+                function.definition_receiver and not re.fullmatch(
+                    r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', function.definition_receiver)
+                or any(part.startswith('<<') for part in function.owner))}
+        pending = list(self.unresolved_guard_methods)
+        while pending:
+            for name in reverse_aliases.get(pending.pop(), ()):
+                if name not in self.unresolved_guard_methods:
+                    self.unresolved_guard_methods.add(name)
+                    pending.append(name)
+        refinements, using = {}, set()
+
+        def guard_dispatch(statements, function):
+            for statement in statements:
+                self.budget.spend()
+                tokens = statement.tokens
+                if tokens and tokens[0].kind == 'code' and tokens[0].value in {'refine', 'using'}:
+                    name = token_text(ungroup(tokens[1:]))
+                    owner = (self.constant_identity(self.constant_owner(
+                        name, function.owner, function.lexical_owners))
+                        if re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name) else None)
+                    if tokens[0].value == 'refine':
+                        refinements.setdefault(function.owner, set()).add(owner)
+                    else:
+                        using.add(owner)
+                guard_dispatch(statement.body, function)
+                guard_dispatch(statement.alternate, function)
+                guard_dispatch(statement.handlers, function)
+                guard_dispatch(statement.finalizer, function)
+        for function in self.parser.functions.values():
+            guard_dispatch(function.body, function)
+        self.refined_guard_owners = set().union(*(refinements.get(owner, set()
+            if owner in self.constant_definitions else {None}) for owner in using))
         self.sql_models = {owner for owner in self.constant_definitions | {('ActiveRecord', 'Base')}
                            if self.active_record_model(owner)}
         self.process_mixin_scopes = set()
@@ -2151,17 +2188,27 @@ class RubyEngine:
                 self.mutations[index] = join(self.mutations.get(index, CLEAN), changed)
         return changed
 
-    def native_array_override(self, method):
-        """Do not borrow an Array contract through a visible override/alias."""
+    def native_instance_override(self, owner, method):
+        """Do not borrow a builtin instance contract through an override/alias."""
         names, pending = {method}, [method]
         while pending:
             self.budget.spend()
-            for alias in self.parser.aliases.get((('Array',), False, pending.pop()), ()):
+            for alias in self.parser.aliases.get((owner, False, pending.pop()), ()):
                 if alias not in names:
                     names.add(alias)
                     pending.append(alias)
-        return any(function.owner == ('Array',) and not function.singleton and function.name in names
+        return any(function.owner == owner and not function.singleton and function.name in names
                    for function in self.parser.functions.values())
+
+    def native_guard_available(self, tokens, owner, *methods):
+        uncertain = self.unresolved_guard_methods | self.unresolved_definition_methods
+        if (uncertain.intersection(methods) or owner in self.refined_guard_owners
+                or None in self.refined_guard_owners):
+            self.unresolved_calls.add(
+                f'{self.path}:{self.step(tokens[0].start, "guard", methods[0]).line}: '
+                'Ruby sanitizer guard dispatch is unresolved; analysis is incomplete')
+            return False
+        return not any(self.native_instance_override(owner, method) for method in methods)
 
     def native_input_call(self, name, receiver, arguments, token):
         """Read contents only from a proved Ruby process input receiver.
@@ -2179,7 +2226,7 @@ class RubyEngine:
         environment = kinds == {'native-environment'}
         valid = not any(trace.kind == 'keyword' for argument in arguments for trace in argument)
         count = len(arguments)
-        if arrays and self.native_array_override(method):
+        if arrays and self.native_instance_override(('Array',), method):
             self.unresolved_calls.add(
                 f'{self.path}:{self.step(token.start, "call", name).line}: '
                 'Ruby input array method is overridden; analysis is incomplete')
@@ -2894,6 +2941,9 @@ class RubyEngine:
                         and tokens[cursor + 1].value in {'include?', 'match?'}
                         and tokens[cursor + 2].value == '('
                         and closing_token(tokens, cursor + 2) == len(tokens) - 1):
+                    methods = (tokens[cursor + 1].value,) + (('to_s',) if cursor > 1 else ())
+                    if not self.native_guard_available(tokens, ('String',), *methods):
+                        return {}
                     operand = self.literal_value(tokens[cursor + 3:-1])
                     if tokens[cursor + 1].value == 'include?':
                         text_value = self.header_constant(operand, 'header-string')
@@ -2908,6 +2958,11 @@ class RubyEngine:
                     match = re.fullmatch(r'(?:(?:URI|Addressable::URI)\.parse\(([A-Za-z_]\w*)(?:\.to_s)?\)|([A-Za-z_]\w*))\.(scheme|host|hostname)', token_text(member))
                     values = self.literal(literal)
                     if match and len(values) == 1 and (not match.group(1) or self.policy == 'redirect'):
+                        methods = ('==',) + (('!=',) if not truth else ())
+                        if '.to_s' in text:
+                            methods += ('to_s',)
+                        if not self.native_guard_available(tokens, ('String',), *methods):
+                            return {}
                         target_name = match.group(1) or match.group(2)
                         prop = match.group(3)
                         item = next(iter(values))
@@ -2927,22 +2982,29 @@ class RubyEngine:
                         constants = [trace.key[1] for trace in allowed if trace.kind == 'constant' and trace.key[0] == 'literal']
                         if has_shape(allowed, 'literal-list') and not tainted(allowed) and constants:
                             valid = all(value in {'https', 'http'} for value in constants) if prop == 'scheme' else all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', value) for value in constants)
-                            if valid:
+                            string_methods = ('==',) + (('to_s',) if '.to_s' in text else ())
+                            if (valid and self.native_guard_available(tokens, ('Array',), 'include?')
+                                    and self.native_guard_available(tokens, ('String',), *string_methods)):
                                 return {target_name: frozenset({'url-scheme' if prop == 'scheme' else 'url-host'})}
             if self.policy == 'redirect':
                 if truth:
                     slash = re.fullmatch(r'([A-Za-z_]\w*)(?:\.to_s)?\.start_with\?\([\'\"]/[\'\"]\)', text)
-                    if slash:
+                    methods = ('start_with?',) + (('to_s',) if '.to_s' in text else ())
+                    if slash and self.native_guard_available(tokens, ('String',), *methods):
                         return {slash.group(1): frozenset({'redirect-slash-prefix'})}
                 else:
                     double_slash = re.fullmatch(r'([A-Za-z_]\w*)(?:\.to_s)?\.start_with\?\([\'\"](?://|/\\)[\'\"]\)', text)
-                    if double_slash:
+                    methods = ('start_with?',) + (('to_s',) if '.to_s' in text else ())
+                    if double_slash and self.native_guard_available(tokens, ('String',), *methods):
                         return {double_slash.group(1): frozenset({'redirect-not-double-slash'})}
         elif self.policy == 'path' and truth:
             prefix = re.fullmatch(r'([A-Za-z_]\w*)\.start_with\?\(([A-Za-z_]\w*)\+((?:::)?File::SEPARATOR|[\'\"]/[\'\"])\)', text)
             equality = re.fullmatch(r'([A-Za-z_]\w*)==([A-Za-z_]\w*)', text)
             match = prefix or equality
             if match:
+                methods = ('start_with?', '+') if prefix else ('==',)
+                if not self.native_guard_available(tokens, ('String',), *methods):
+                    return {}
                 name, base = match.group(1, 2)
                 if prefix and prefix.group(3).endswith('::SEPARATOR'):
                     owner = self.constant_owner(prefix.group(3)[:-len('::SEPARATOR')],
@@ -2956,7 +3018,8 @@ class RubyEngine:
             match = re.fullmatch(r"\['\.', '\.\.'\]\.include\?\(([A-Za-z_]\w*)\)", text)
             # token_text has no whitespace between array elements.
             match = match or re.fullmatch(r"\['\.','\.\.'\]\.include\?\(([A-Za-z_]\w*)\)", text)
-            if match:
+            if (match and self.native_guard_available(tokens, ('Array',), 'include?')
+                    and self.native_guard_available(tokens, ('String',), '==')):
                 return {match.group(1): frozenset({'not-dot-name'})}
         return {}
 
@@ -3309,7 +3372,7 @@ class RubyEngine:
             input_override = any(
                 has_shape(value, native_kind) and self.candidates('::' + owner[0] + '.' + method, None)
                 for owner, native_kind in NATIVE_INPUT_CONSTANTS.items())
-            array_override = (has_shape(value, 'native-argv') or has_shape(value, 'native-argv-copy')) and self.native_array_override(method)
+            array_override = (has_shape(value, 'native-argv') or has_shape(value, 'native-argv-copy')) and self.native_instance_override(('Array',), method)
             if input_override or array_override or self.candidates(token_text(tokens) + '.' + method, 0) or any(
                     not function.scope and not function.singleton and function.name == method
                     and function.owner in instances for function in self.parser.functions.values()):

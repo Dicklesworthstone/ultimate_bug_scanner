@@ -3233,6 +3233,209 @@ class RubyNativeInputTests(LoggedCase):
                              [(SHELL_COMMAND, 1)], payload)
 
 
+GUARD_URL_BODY = ("uri = URI.parse(params[:url])\n"
+                  "raise 'blocked' unless uri.scheme == 'https' && ['api.example.com'].include?(uri.host)\n"
+                  "Net::HTTP.get(uri)\n")
+GUARD_PATH_BODY = ("base = File.expand_path('/srv/app/files')\n"
+                   "target = File.expand_path(params[:file], base)\n"
+                   "raise 'blocked' unless target.start_with?(base + File::SEPARATOR)\n"
+                   "File.read(target)\n")
+GUARD_DOT_BODY = ("leaf = File.basename(params[:file])\n"
+                  "raise 'blocked' if ['.', '..'].include?(leaf)\n"
+                  "FileUtils.rm_rf(File.join('/srv/app/files', leaf))\n")
+GUARD_HEADER_BODY = ('value = params[:header]\n'
+                     'raise "blocked" if value.to_s.include?("\\r") || value.to_s.include?("\\n")\n'
+                     'response.headers["X-Value"] = value\n')
+GUARD_REDIRECT_BODY = ("value = params[:next]\n"
+                       "raise 'blocked' unless value.to_s.start_with?('/') && !value.to_s.start_with?('//')\n"
+                       "redirect_to value\n")
+NATIVE_GUARD_CASES = (
+    Case('guard_native_url', URL, GUARD_URL_BODY, ()),
+    Case('guard_native_path', PATH, GUARD_PATH_BODY, ()),
+    Case('guard_native_dot', PATH, GUARD_DOT_BODY, ()),
+    Case('guard_array_membership', URL, 'class Array\n  def include?(value)\n    true\n  end\nend\n'
+         + GUARD_URL_BODY, (8,)),
+    Case('guard_array_method_alias', URL, 'class Array\n  def permit(value)\n    true\n  end\n'
+         '  alias include? permit\nend\n' + GUARD_URL_BODY, (9,)),
+    Case('guard_string_prefix', PATH, 'class String\n  def start_with?(value)\n    true\n  end\nend\n'
+         + GUARD_PATH_BODY, (9,)),
+    Case('guard_string_prefix_alias', PATH, 'class String\n  def permit(value)\n    true\n  end\n'
+         '  alias start_with? permit\nend\n' + GUARD_PATH_BODY, (10,)),
+    Case('guard_prefix_concatenation', PATH, 'class String\n  def +(value)\n    ""\n  end\nend\n'
+         + GUARD_PATH_BODY, (9,)),
+    Case('guard_path_equality', PATH, 'class String\n  def ==(value)\n    true\n  end\nend\n'
+         "base = File.expand_path('/srv/app/files')\n"
+         'target = File.expand_path(params[:file], base)\n'
+         "raise 'blocked' unless target == base\nFile.read(target)\n", (9,)),
+    Case('guard_url_membership_equality', URL, 'class String\n  def ==(value)\n    true\n  end\nend\n'
+         'uri = URI.parse(params[:url])\n'
+         "raise 'blocked' unless ['https'].include?(uri.scheme) && ['api.example.com'].include?(uri.host)\n"
+         'Net::HTTP.get(uri)\n', (8,)),
+    Case('guard_url_inequality', URL, 'class String\n  def !=(value)\n    false\n  end\nend\n'
+         'uri = URI.parse(params[:url])\n'
+         "raise 'blocked' if uri.scheme != 'https' || uri.host != 'api.example.com'\n"
+         'Net::HTTP.get(uri)\n', (8,)),
+    Case('guard_dot_membership', PATH, 'class Array\n  def include?(value)\n    false\n  end\nend\n'
+         + GUARD_DOT_BODY, (8,)),
+    Case('guard_dot_equality', PATH, 'class String\n  def ==(value)\n    false\n  end\nend\n'
+         + GUARD_DOT_BODY, (8,)),
+    Case('guard_array_class_singleton_control', URL,
+         'class Array\n  def self.include?(value)\n    true\n  end\nend\n' + GUARD_URL_BODY, ()),
+    Case('guard_string_class_singleton_control', PATH,
+         'class String\n  def self.start_with?(value)\n    true\n  end\nend\n' + GUARD_PATH_BODY, ()),
+    Case('guard_unrelated_owner_control', URL,
+         'class Unrelated\n  def include?(value)\n    true\n  end\nend\n' + GUARD_URL_BODY, ()),
+    Case('guard_nested_string_control', PATH,
+         'module Other\n  class String\n    def start_with?(value)\n      true\n    end\n  end\nend\n'
+         + GUARD_PATH_BODY, ()),
+    Case('guard_native_header', 'ruby.header-injection.response', GUARD_HEADER_BODY, ()),
+    Case('guard_header_conversion', 'ruby.header-injection.response',
+         'class String\n  def to_s\n    "safe"\n  end\nend\n' + GUARD_HEADER_BODY, (8,)),
+    Case('guard_header_membership', 'ruby.header-injection.response',
+         'class String\n  def include?(value)\n    false\n  end\nend\n' + GUARD_HEADER_BODY, (8,)),
+    Case('guard_native_redirect', 'ruby.redirect.open', GUARD_REDIRECT_BODY, ()),
+    Case('guard_redirect_conversion', 'ruby.redirect.open',
+         'class String\n  def to_s\n    "/safe"\n  end\nend\n' + GUARD_REDIRECT_BODY, (8,)),
+)
+NATIVE_GUARD_BOUNDARIES = (
+    ('guard_array_singleton', "allowed = ['api.example.com']\n"
+     'def allowed.include?(value)\n  true\nend\nuri = URI.parse(params[:url])\n'
+     "raise 'blocked' unless uri.scheme == 'https' && allowed.include?(uri.host)\n"
+     'Net::HTTP.get(uri)\n', (1, 8)),
+    ('guard_array_singleton_rebinding', "allowed = ['unused.example.com']\n"
+     'def allowed.include?(value)\n  true\nend\n'
+     "allowed = ['api.example.com']\nuri = URI.parse(params[:url])\n"
+     "raise 'blocked' unless uri.scheme == 'https' && allowed.include?(uri.host)\n"
+     'Net::HTTP.get(uri)\n', (1, 9)),
+    ('guard_array_singleton_class', "allowed = ['api.example.com']\nclass << allowed\n"
+     '  def include?(value)\n    true\n  end\nend\nuri = URI.parse(params[:url])\n'
+     "raise 'blocked' unless uri.scheme == 'https' && allowed.include?(uri.host)\n"
+     'Net::HTTP.get(uri)\n', (1, 10)),
+    ('guard_active_refinement', 'module Permissive\n  refine Array do\n'
+     '    def include?(value)\n      true\n    end\n  end\nend\nusing Permissive\n'
+     + GUARD_URL_BODY, (1, 12)),
+)
+
+
+class RubyNativeGuardTests(LoggedCase):
+    native_scan = RubyRequestSourceTests.native_scan
+
+    def test_native_guard_binding_cases(self):
+        policies = {URL: 'url', PATH: 'path', 'ruby.header-injection.response': 'header',
+                    'ruby.redirect.open': 'redirect'}
+        for case in NATIVE_GUARD_CASES:
+            with self.subTest(case=case.name):
+                directory = self.artifact / case.name
+                directory.mkdir()
+                target = directory / 'source.rb'
+                target.write_text(case.source)
+                rows = list(taint_ruby_traversal.flow_findings(target, policies[case.rule]))
+                (directory / 'findings.json').write_text(json.dumps(rows, indent=2) + '\n')
+                self.assertEqual([(row[0], row[1]) for row in rows],
+                                 [(case.rule, line) for line in case.lines], (case.source, rows))
+
+    def test_native_guard_unresolved_dispatch_preserves_prior_findings(self):
+        for name, source, lines in NATIVE_GUARD_BOUNDARIES:
+            with self.subTest(case=name):
+                directory = self.artifact / name
+                directory.mkdir()
+                target = directory / 'source.rb'
+                target.write_text('Net::HTTP.get(URI.parse(params[:prior]))\n' + source)
+                findings = []
+                with self.assertRaisesRegex(ValueError, 'guard dispatch.*incomplete'):
+                    for row in taint_ruby_traversal.flow_findings(target, 'url'):
+                        findings.append(row)
+                (directory / 'findings.json').write_text(json.dumps(findings, indent=2) + '\n')
+                self.assertEqual([(row[0], row[1]) for row in findings], [(URL, line) for line in lines])
+
+    def test_native_guard_runtime_values_match_source_oracles(self):
+        executable = os.environ.get('UBS_RUBY_BIN') or shutil.which('ruby')
+        if not executable:
+            self.skipTest('native Ruby is required for sanitizer dispatch witnesses')
+        driver = r'''require 'uri'
+require 'json'
+require 'fileutils'
+$observed = []
+$input = JSON.parse(ARGV[1], symbolize_names: true)
+def params; $input; end
+module Net
+  module HTTP
+    def self.get(value); $observed << value.to_s; end
+  end
+end
+class File
+  def self.read(value); $observed << value; end
+end
+module FileUtils
+  def self.rm_rf(value); $observed << value; end
+end
+def redirect_to(value); $observed << value; end
+class RecordedHeaders
+  def headers; self; end
+  def []=(name, value); $observed << value; end
+end
+def response; $response ||= RecordedHeaders.new; end
+begin
+  load ARGV[0]
+rescue RuntimeError
+  $observed << 'blocked'
+end
+STDOUT.write(JSON.generate($observed))
+'''
+        for case in NATIVE_GUARD_CASES:
+            with self.subTest(case=case.name):
+                directory = self.artifact / ('runtime-' + case.name)
+                directory.mkdir()
+                target = directory / 'source.rb'
+                target.write_text(case.source)
+                values = {'url': 'https://outside.example/private', 'file': '../private.txt',
+                          'header': 'ok\r\nX-Injected: yes', 'next': 'https://outside.example/private'}
+                if 'dot' in case.name:
+                    values['file'] = '..'
+                expected = ('blocked' if not case.lines else
+                            '/srv/app/files/..' if 'dot' in case.name else
+                            '/srv/app/private.txt' if case.rule == PATH else
+                            values['header'] if case.rule == 'ruby.header-injection.response' else values['url'])
+                command = [executable, '-e', driver, str(target), json.dumps(values)]
+                started = time.monotonic()
+                result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                        preexec_fn=prevent_child_deletion)
+                (directory / 'stdout.log').write_text(result.stdout)
+                (directory / 'stderr.log').write_text(result.stderr)
+                (directory / 'identity.json').write_text(json.dumps({
+                    'command': command, 'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                    'elapsed': time.monotonic() - started, 'exit': result.returncode,
+                    'expected': [expected],
+                }, indent=2) + '\n')
+                self.assertEqual(result.returncode, 0, (command, result.stdout, result.stderr))
+                self.assertEqual(json.loads(result.stdout), [expected], (command, result.stdout, result.stderr))
+
+    def test_native_guard_scanner_cache_and_policy_controls(self):
+        directory = self.artifact / 'scanner-policy'
+        directory.mkdir()
+        target = directory / 'selected.rb'
+        unsafe = next(case for case in NATIVE_GUARD_CASES if case.name == 'guard_array_membership')
+        for attempt, (source, lines, hits) in enumerate(((unsafe.source, unsafe.lines, 0),
+                (unsafe.source, unsafe.lines, 1), (GUARD_URL_BODY, (), 0), (GUARD_URL_BODY, (), 1))):
+            target.write_text(source)
+            result, payload, _env = self.native_scan(directory / str(attempt), target)
+            self.assertEqual((result.returncode, payload['status'], payload['files'], payload['critical']),
+                             (int(bool(lines)), 'ok', 1, len(lines)), (payload, result.stderr))
+            self.assertEqual(payload['extras']['profile']['cache_hits'], hits, payload)
+            self.assertEqual([(row['rule'], row['line']) for row in payload['findings']
+                              if row['severity'] == 'critical'], [(URL, line) for line in lines], payload)
+        for label, source, skip, count in (
+            ('suppressed', unsafe.source.rstrip() + ' # ubs:ignore[ruby.taint.outbound_url]\n', '', 0),
+            ('unrelated', unsafe.source.rstrip() + ' # ubs:ignore[ruby.taint.path_traversal]\n', '', 1),
+            ('disabled', unsafe.source, '6', 0),
+        ):
+            with self.subTest(case=label):
+                target.write_text(source)
+                result, payload, _env = self.native_scan(directory / label, target, skip=skip)
+                self.assertEqual((result.returncode, payload['status'], payload['critical']),
+                                 (int(bool(count)), 'ok', count), (payload, result.stderr))
+
+
 class RubySemanticTests(LoggedCase):
     def check_case(self, case):
         target, records = self.observe(case)
@@ -4002,6 +4205,83 @@ class RubyPublicTests(LoggedCase):
                                              [(case.rule, line) for line in case.lines], payload)
                         else:
                             self.assert_findings(result, payload, case, fmt, selected)
+
+    def test_native_guard_overrides_reach_module_and_runner_reports(self):
+        self.check_native_guard_public(('guard_array_membership', 'guard_string_prefix',
+                                        'guard_header_conversion', 'guard_redirect_conversion'))
+
+    def test_native_guard_controls_and_partial_reports(self):
+        self.check_native_guard_public(('guard_array_class_singleton_control', 'guard_native_path',
+                                        'guard_dot_equality', 'guard_array_singleton'))
+
+    def check_native_guard_public(self, names):
+        cases = {case.name: case for case in NATIVE_GUARD_CASES}
+        boundary_name, boundary_source, boundary_lines = NATIVE_GUARD_BOUNDARIES[0]
+        cases[boundary_name] = Case(boundary_name, URL,
+            'Net::HTTP.get(URI.parse(params[:prior]))\n' + boundary_source, boundary_lines)
+        # Ordinary full scans also report the existing core-class warning and
+        # numeric notes. Keep those identities, sites and totals in the oracle.
+        other_findings = {
+            'guard_array_membership': [('ruby.variables.monkey-patch', 1, 1, 'warning')],
+            'guard_string_prefix': [('ruby.variables.monkey-patch', 1, 1, 'warning'),
+                                    ('ruby.numeric.division-operations', 6, 1, 'info')],
+            'guard_header_conversion': [('ruby.variables.monkey-patch', 1, 1, 'warning')],
+            'guard_redirect_conversion': [('ruby.variables.monkey-patch', 1, 1, 'warning'),
+                                          ('ruby.numeric.division-operations', 3, 1, 'info')],
+            'guard_array_class_singleton_control': [('ruby.variables.monkey-patch', 1, 1, 'warning')],
+            'guard_native_path': [('ruby.numeric.division-operations', 1, 1, 'info')],
+            'guard_dot_equality': [('ruby.variables.monkey-patch', 1, 1, 'warning'),
+                                   ('ruby.numeric.division-operations', 8, 1, 'info')],
+            'guard_array_singleton': [],
+        }
+        for name in names:
+            case = cases[name]
+            partial = name == boundary_name
+            directory = self.artifact / name
+            directory.mkdir()
+            selected = directory / 'selected.rb'
+            selected.write_text(case.source)
+            (directory / 'unselected.rb').write_text('Net::HTTP.get(URI.parse(params[:unselected]))\n')
+            expected = [(case.rule, line, 1, 'critical') for line in case.lines] + other_findings[name]
+            for module in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, module=module, format=fmt):
+                        result, payload = self.scan(directory / f'{module}-{fmt}', selected, fmt, module=module)
+                        self.assertEqual(result.returncode, 2 if partial else int(bool(case.lines)),
+                                         (result.stdout, result.stderr))
+                        if fmt == 'json':
+                            self.assertEqual(payload['status'], 'partial' if partial else 'ok', payload)
+                            counts = payload if module else payload['totals']
+                            self.assertEqual(tuple(counts[key] for key in ('files', 'critical', 'warning', 'info')),
+                                             (1, len(case.lines), sum(row[3] == 'warning' for row in expected),
+                                              sum(row[3] == 'info' for row in expected)), payload)
+                            rows = payload['findings']
+                            actual = [(row['rule' if module else 'rule_id'], row['line'], row['col'], row['severity'])
+                                      for row in rows]
+                            for row in rows:
+                                self.assertEqual(Path(row.get('path', row.get('file'))).name, selected.name, row)
+                            if not module:
+                                self.assertEqual(bool(payload['failed_modules']), partial, payload)
+                        else:
+                            self.assertEqual(payload['version'], '2.1.0', payload)
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])]
+                            actual = []
+                            for row in rows:
+                                physical = row['locations'][0]['physicalLocation']
+                                actual.append((row['ruleId'], physical['region']['startLine'],
+                                               physical['region']['startColumn'],
+                                               {'error': 'critical', 'warning': 'warning', 'note': 'info'}[row['level']]))
+                                self.assertEqual(Path(physical['artifactLocation']['uri']).name, selected.name, row)
+                            invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                            if partial:
+                                self.assertTrue(any(not item['executionSuccessful'] and item.get('exitCode') == 2
+                                                    for item in invocations), payload)
+                            else:
+                                self.assertTrue(all(item['executionSuccessful'] for item in invocations), payload)
+                        self.assertEqual(sorted(actual), sorted(expected), payload)
+                        if partial:
+                            self.assertIn('sanitizer guard dispatch', json.dumps(payload), payload)
+                        print('RUBY_GUARD_PUBLIC_PASS', name, 'module' if module else 'runner', fmt, flush=True)
 
     def test_constant_receiver_identity_reaches_json_and_sarif(self):
         for case in CONSTANT_RECEIVER_CASES:

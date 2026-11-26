@@ -181,17 +181,7 @@ class _ReceiverProof:
             and not (isinstance(node.ctx, ast.Load) and isinstance(parents.get(node), ast.Call)
                      and parents[node].func is node)
             for node in nodes)
-        reflected_fields = set()
-        for node in nodes:
-            if not isinstance(node, ast.Call):
-                continue
-            name = _call_name(node.func)
-            leaf = name.rsplit('.', 1)[-1]
-            if leaf not in {'setattr', 'delattr', '__setattr__', '__delattr__'}:
-                continue
-            position = 1 if leaf in {'setattr', 'delattr'} or name.startswith('object.') else 0
-            attribute = node.args[position] if position < len(node.args) else None
-            reflected_fields.update(self.attribute_names(attribute, node, parents))
+        reflected_fields = self.reflection_writes(nodes, parents)
         self.reflection |= 'vars' in reflected_fields
         factory_shadowed = bool({None, 'set'} & reflected_fields) or any(
             isinstance(node, ast.Attribute) and node.attr == 'set' and isinstance(node.ctx, (ast.Store, ast.Del))
@@ -283,6 +273,115 @@ class _ReceiverProof:
                     fields.add(target.attr)
             for method in instance_methods:
                 self.fields[method] = (method.args.args[0].arg, fields)
+
+    def reflection_writes(self, nodes, parents):
+        """Follow bounded reflector aliases without granting a receiver proof.
+
+        Direct alias calls retain their exact attribute operands. An escaped
+        capability or ambiguous binding may write any field, including the
+        builtins namespace or an otherwise constructor-owned set field.
+        """
+        writers = {'setattr', 'delattr', '__setattr__', '__delattr__'}
+        readers = {'getattr', 'getattr_static'}
+        reflectors = writers | readers
+        bindings = {}
+        for node in nodes:
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                parent = parents.get(node)
+                value = (parent.value if isinstance(parent, (ast.Assign, ast.AnnAssign))
+                         and (node in parent.targets if isinstance(parent, ast.Assign)
+                              else node is parent.target) else None)
+                bindings.setdefault(node.id, []).append(value)
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    identity = (alias.name if node.module in {'builtins', 'inspect'}
+                                and alias.name in reflectors else None)
+                    bindings.setdefault(alias.asname or alias.name, []).append(identity)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    bindings.setdefault(alias.asname or alias.name.split('.')[0], []).append(None)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.ExceptHandler)):
+                if node.name is not None:
+                    bindings.setdefault(node.name, []).append(None)
+            elif isinstance(node, ast.arg):
+                bindings.setdefault(node.arg, []).append(None)
+
+        unknown = '@unknown-reflector'
+        cache = {}
+
+        def resolve(node, pending=frozenset()):
+            if isinstance(node, str):
+                return frozenset({node})
+            if node is None:
+                return frozenset()
+            if node in pending or len(pending) >= 128:
+                return frozenset({unknown})
+            if node in cache:
+                return cache[node]
+            pending = pending | {node}
+            result = frozenset()
+            if isinstance(node, ast.Name):
+                definitions = bindings.get(node.id)
+                if definitions is not None:
+                    choices = [resolve(value, pending) for value in definitions]
+                    result = frozenset().union(*choices)
+                    if result and (not all(choices) or node.id in self.engine.generator_external_writers):
+                        result |= {unknown}
+                elif node.id in reflectors:
+                    result = frozenset({node.id})
+            elif isinstance(node, ast.Attribute) and node.attr in reflectors:
+                name = ('object.' + node.attr if isinstance(node.value, ast.Name)
+                        and node.value.id == 'object' and node.attr.startswith('__') else node.attr)
+                result = frozenset({name})
+            elif isinstance(node, ast.Call):
+                callables = resolve(node.func, pending)
+                if unknown in callables:
+                    result |= {unknown}
+                for reader in callables & readers:
+                    attribute = node.args[1] if len(node.args) > 1 else None
+                    names = self.attribute_names(attribute, node, parents)
+                    if None in names:
+                        result |= {unknown}
+                    result |= names & reflectors
+                    if (node.args and isinstance(node.args[0], ast.Name) and node.args[0].id == 'object'):
+                        result = frozenset('object.' + name if name.startswith('__') else name for name in result)
+            if any(name.rsplit('.', 1)[-1] in self.engine.generator_attribute_writes for name in result):
+                result |= {unknown}
+            cache[node] = result
+            return result
+
+        fields = set()
+        for node in nodes:
+            if isinstance(node, ast.Call):
+                names = resolve(node.func)
+                direct_name = _call_name(node.func)
+                # Alias discovery only adds possible writes. Preserve the
+                # original conservative check for a shadowed/re-exported
+                # direct setter whose concrete binding remains unknown.
+                if direct_name.rsplit('.', 1)[-1] in writers:
+                    names |= {direct_name}
+                for name in names:
+                    leaf = name.rsplit('.', 1)[-1]
+                    if name == unknown:
+                        fields.add(None)
+                    elif leaf in writers:
+                        position = 1 if leaf in {'setattr', 'delattr'} or name.startswith('object.') else 0
+                        attribute = node.args[position] if position < len(node.args) else None
+                        fields.update(self.attribute_names(attribute, node, parents))
+            if not isinstance(node, (ast.Name, ast.Attribute, ast.Call)):
+                continue
+            if isinstance(node, (ast.Name, ast.Attribute)) and not isinstance(node.ctx, ast.Load):
+                continue
+            if not resolve(node):
+                continue
+            parent = parents.get(node)
+            direct_call = isinstance(parent, ast.Call) and parent.func is node
+            simple_alias = (isinstance(parent, (ast.Assign, ast.AnnAssign)) and parent.value is node
+                            and (all(isinstance(target, ast.Name) for target in parent.targets)
+                                 if isinstance(parent, ast.Assign) else isinstance(parent.target, ast.Name)))
+            if not direct_call and not simple_alias:
+                fields.add(None)
+        return fields
 
     @staticmethod
     def attribute_names(attribute, call, parents):

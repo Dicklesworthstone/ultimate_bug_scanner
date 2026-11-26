@@ -3157,6 +3157,193 @@ assert search('dc=example', '(uid=*)') == (
             ''',
         })
 
+    def test_reflective_aliases_revoke_native_receiver_proofs(self):
+        self.check_cases({
+            'imported-setter-replaces-factory': '''
+                import builtins as native
+                from builtins import setattr as write_member
+                def collect(request, connection):
+                    write_member(native, 'set', lambda: connection)
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'member-setter-replaces-factory': '''
+                import builtins as native
+                write_member = native.setattr
+                def collect(request, connection):
+                    write_member(native, 'set', lambda: connection)
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'getter-setter-replaces-factory': '''
+                import builtins as native
+                write_member = getattr(native, 'setattr')
+                def collect(request, connection):
+                    write_member(native, 'set', lambda: connection)
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'imported-setter-replaces-owned-field': '''
+                from builtins import setattr as write_member
+                class Holder:
+                    def __init__(self): self.values = {None}
+                    def collect(self, request): self.values.add(request.args['dn'])  # ldap-finding
+                def collect(request, connection):
+                    holder = Holder()
+                    write_member(holder, 'values', connection)
+                    holder.collect(request)
+            ''',
+            'object-setter-replaces-owned-field': '''
+                write_member = object.__setattr__
+                class Holder:
+                    def __init__(self): self.values = {None}
+                    def collect(self, request): self.values.add(request.args['dn'])  # ldap-finding
+                def collect(request, connection):
+                    holder = Holder()
+                    write_member(holder, 'values', connection)
+                    holder.collect(request)
+            ''',
+            'getter-setter-replaces-owned-field': '''
+                import builtins as native
+                write_member = getattr(native, 'setattr')
+                class Holder:
+                    def __init__(self): self.values = set()
+                    def collect(self, request): self.values.add(request.args['dn'])  # ldap-finding
+                def collect(request, connection):
+                    holder = Holder()
+                    write_member(holder, 'values', connection)
+                    holder.collect(request)
+            ''',
+            'aliased-getter-replaces-owned-field': '''
+                import builtins as native
+                from builtins import getattr as read_member
+                write_member = read_member(native, 'setattr')
+                class Holder:
+                    def __init__(self): self.values = set()
+                    def collect(self, request): self.values.add(request.args['dn'])  # ldap-finding
+                def collect(request, connection):
+                    holder = Holder()
+                    write_member(holder, 'values', connection)
+                    holder.collect(request)
+            ''',
+            'deleted-owned-field-reveals-directory': '''
+                from builtins import delattr as remove_member
+                class Holder:
+                    values = connection
+                    def __init__(self): self.values = {None}
+                    def collect(self, request): self.values.add(request.args['dn'])  # ldap-finding
+                holder = Holder()
+                remove_member(holder, 'values')
+                holder.collect(request)
+            ''',
+            'escaped-setter-revokes-factory': '''
+                import builtins as native
+                from builtins import setattr as write_member
+                def collect(request, connection):
+                    replace_factory(write_member, native, connection)
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'rebound-setter-revokes-factory': '''
+                import builtins as native
+                write_member = setattr
+                write_member = choose_writer()
+                def collect(request, connection):
+                    write_member(native, 'metadata', connection)
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'conditional-setter-revokes-factory': '''
+                import builtins as native
+                write_member = setattr if enabled else choose_writer()
+                def collect(request, connection):
+                    write_member(native, 'metadata', connection)
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'rebound-getter-revokes-factory': '''
+                import builtins as native
+                read_member = getattr
+                read_member = choose_reader()
+                write_member = read_member(native, 'setattr')
+                def collect(request, connection):
+                    write_member(native, 'metadata', connection)
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'unknown-reflected-name-revokes-factory': '''
+                import builtins as native
+                write_member = getattr(native, operation)
+                def collect(request, connection):
+                    write_member(native, field_name, connection)
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'shadowed-direct-setter-stays-conservative': '''
+                import builtins as native
+                def collect(request, connection, setattr):
+                    setattr(native, 'set', lambda: connection)
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+            'reexported-direct-setter-stays-conservative': '''
+                import builtins as native
+                from reexported_helpers import setattr
+                def collect(request, connection):
+                    setattr(native, 'set', lambda: connection)
+                    values = set()
+                    values.add(request.args['dn'])  # ldap-finding
+            ''',
+        })
+
+    def test_reflective_aliases_preserve_fixed_metadata_controls(self):
+        self.check_cases({
+            'imported-setter-metadata-only': '''
+                from builtins import setattr as write_member
+                from types import SimpleNamespace
+                def collect(request):
+                    config = SimpleNamespace()
+                    write_member(config, 'metadata', 'fixed')
+                    values = set()
+                    values.add(request.args['dn'])
+            ''',
+            'object-setter-metadata-only': '''
+                from types import SimpleNamespace
+                write_member = object.__setattr__
+                def collect(request):
+                    config = SimpleNamespace()
+                    write_member(config, 'metadata', 'fixed')
+                    values = set()
+                    values.add(request.args['dn'])
+            ''',
+            'getter-setter-metadata-only': '''
+                import builtins
+                from types import SimpleNamespace
+                write_member = getattr(builtins, 'setattr')
+                def collect(request):
+                    config = SimpleNamespace()
+                    write_member(config, 'metadata', 'fixed')
+                    values = set()
+                    values.add(request.args['dn'])
+            ''',
+            'unused-setter-import': '''
+                from builtins import setattr as unused_setter
+                def collect(request):
+                    values = set()
+                    values.add(request.args['dn'])
+            ''',
+            'finite-aliased-metadata-fields': '''
+                from builtins import setattr as write_member
+                class Holder:
+                    def __init__(self): self.values = set()
+                    def collect(self, request): self.values.add(request.args['dn'])
+                holder = Holder()
+                for field in ('__doc__', '__name__'):
+                    write_member(holder, field, 'fixed')
+                holder.collect(request)
+            ''',
+        })
+
     def test_suppression_owns_sink_not_source(self):
         self.check_cases({
             'source-marker': '''

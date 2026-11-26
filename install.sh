@@ -1640,27 +1640,20 @@ verify_installation() {
   # `ubs` to an older copy elsewhere (warn_if_stale_binary reports that); running
   # it would vouch for the wrong scanner and, after an authenticated install,
   # execute code the release verifier never checked.
+  if [[ ! -f "$installed_bin" || ! -x "$installed_bin" ]]; then
+    error "Installed scanner missing or not executable at $installed_bin"
+    return 1
+  fi
+  ubs_cmd="$installed_bin"
   if command -v ubs >/dev/null 2>&1; then
     success "ubs command available in PATH"
     log "   Location: $(command -v ubs)"
-    if [ -x "$installed_bin" ]; then
-      ubs_cmd="$installed_bin"
-    else
-      ubs_cmd="ubs"
-    fi
-  elif [ -x "$installed_bin" ]; then
-    warn "ubs command not found in PATH yet (installed at $installed_bin; reload your shell or add its directory to PATH)"
-    ubs_cmd="$installed_bin"
   else
-    error "ubs command not found in PATH and no binary at $installed_bin"
-    # Not `((errors++))`: with errors=0 that evaluates to 0, returns status 1,
-    # and under `set -e` aborted the whole installer before the doctor run,
-    # session log, and PATH advice ever happened.
-    errors=$((errors + 1))
+    warn "ubs command not found in PATH yet (installed at $installed_bin; reload your shell or add its directory to PATH)"
   fi
 
-  # Test 2: Can execute --help (against whichever binary Test 1 found)
-  if [ -n "$ubs_cmd" ] && { "$ubs_cmd" --help >/dev/null 2>&1 || "$ubs_cmd" -h >/dev/null 2>&1; }; then
+  # Test 2: Exercise the installed binary even if PATH resolves elsewhere.
+  if "$ubs_cmd" --help >/dev/null 2>&1 || "$ubs_cmd" -h >/dev/null 2>&1; then
     success "ubs executes successfully"
   else
     error "ubs command fails to run"
@@ -1733,19 +1726,22 @@ SMOKE
 
   if [[ "$SKIP_AST_GREP" -eq 1 ]] && ! check_ast_grep; then
     warn "JS smoke test skipped: ast-grep was explicitly skipped and is unavailable"
-  elif [ -n "$ubs_cmd" ]; then
+  else
     local smoke_status=0
-    UBS_NO_CACHE=1 safe_timeout 10 "$ubs_cmd" --fail-on-warning --ci --only=js "$test_dir" >/dev/null 2>&1 || smoke_status=$?
+    # Include cold verified-generation startup in the one-file scan budget.
+    UBS_NO_CACHE=1 UBS_ALLOW_PARTIAL=0 UBS_ALLOW_NO_SCAN=0 \
+      safe_timeout 60 "$ubs_cmd" --fail-on-warning --ci --only=js "$test_dir" >/dev/null 2>&1 || smoke_status=$?
     case "$smoke_status" in
-      0) warn "Smoke test FAILED - scanner did not flag known bugs (exit 0)" ;;
+      0)
+        error "Smoke test FAILED - scanner did not flag known bugs (exit 0)"
+        errors=$((errors + 1))
+        ;;
       1) success "Smoke test PASSED - scanner detects bugs (exit 1)" ;;
       *)
         error "Smoke test could not verify the installation (exit $smoke_status)"
         errors=$((errors + 1))
         ;;
     esac
-  else
-    warn "Smoke test skipped - ubs command unavailable"
   fi
 
   # Test 5: Module cache directory

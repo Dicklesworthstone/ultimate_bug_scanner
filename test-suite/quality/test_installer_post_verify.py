@@ -42,7 +42,7 @@ class InstallerPostVerifyTests(unittest.TestCase):
             flags.append('--skip-hooks')
         return flags
 
-    def prepare_installer(self, response='', *, smoke_exit=0):
+    def prepare_installer(self, response='', *, smoke_exit=1, smoke_delay=0):
         self.prepare_unsigned_update()
         runner_path = self.bundle / 'ubs'
         runner = runner_path.read_text()
@@ -64,21 +64,70 @@ if [[ ${#UBS_ORIGINAL_ARGS[@]} -eq 4 \
       && "${UBS_ORIGINAL_ARGS[1]:-}" == "--ci" \
       && "${UBS_ORIGINAL_ARGS[2]:-}" == "--only=js" \
       && "${UBS_ORIGINAL_ARGS[3]:-}" == */ubs-smoke.* ]]; then
+  [[ "$UBS_ALLOW_PARTIAL" == 0 && "$UBS_ALLOW_NO_SCAN" == 0 ]] || exit 2
+  sleep %d
   exit %d
 fi
-''' % smoke_exit
+''' % (smoke_delay, smoke_exit)
         runner_path.write_text(runner.replace(
             transaction_end, transaction_end + smoke_response + response + '\n', 1))
         self.env['UBS_INSTALLER_WORKDIR'] = str(self.root / 'work')
         self.sign()
 
+    def enable_smoke(self):
+        ast_grep = self.bin / 'ast-grep'
+        ast_grep.write_text('#!/usr/bin/env bash\necho "ast-grep 0.45.3"\n')
+        ast_grep.chmod(0o755)
+
+    def test_clean_smoke_result_cannot_verify_known_bug(self):
+        self.prepare_installer(smoke_exit=0)
+        self.enable_smoke()
+        result = self.run_verify('--artifact-dir', str(self.bundle), '--',
+                                 *self.install_flags(self.home / 'installed'), expected=1)
+        self.assertIn('scanner did not flag known bugs (exit 0)', result.stderr)
+        self.assertNotIn('INSTALLATION COMPLETE', result.stdout)
+
+    def test_slow_cold_start_can_verify_detection(self):
+        self.env.update(UBS_ALLOW_PARTIAL="1", UBS_ALLOW_NO_SCAN="1")
+        self.prepare_installer(smoke_exit=1, smoke_delay=11)
+        self.enable_smoke()
+        result = self.run_verify('--artifact-dir', str(self.bundle), '--',
+                                 *self.install_flags(self.home / 'installed'))
+        self.assertIn('Smoke test PASSED', result.stdout)
+
+    def test_missing_installed_binary_cannot_fall_back_to_path(self):
+        stale = self.bin / 'ubs'
+        stale.write_text(STALE_UBS)
+        stale.chmod(0o755)
+        log = self.root / 'stale.log'
+        env = {**self.env, 'STALE_UBS_LOG': str(log)}
+        # Isolate the verification step that runs after publication. The
+        # destination can disappear independently before the installer checks it.
+        installer = (verified_release.ROOT / 'install.sh').read_text()
+        start = installer.index('verify_installation() {\n')
+        end = installer.index('\nrun_self_tests_if_requested() {', start)
+        driver = installer[start:end] + """
+RUN_VERIFICATION=1
+INSTALL_NAME=ubs
+dry_run_enabled(){ return 1; }
+determine_install_dir(){ printf '%s\\n' "$HOME/installed"; }
+log_section(){ :; }
+log(){ :; }
+success(){ :; }
+error(){ echo "$*" >&2; }
+verify_installation
+"""
+        result = subprocess.run(['bash', '-eu', '-c', driver], cwd=self.project, env=env,
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('Installed scanner missing or not executable', result.stderr)
+        self.assertFalse(log.exists())
+
     def test_failed_smoke_scan_is_not_reported_as_detection_success(self):
         self.prepare_installer(smoke_exit=2)
         # Only the smoke response is doubled in this status-handling test;
         # keep ast-grep available so the installer must actually run the smoke.
-        ast_grep = self.bin / 'ast-grep'
-        ast_grep.write_text('#!/usr/bin/env bash\necho "ast-grep 0.45.3"\n')
-        ast_grep.chmod(0o755)
+        self.enable_smoke()
         result = self.run_verify('--artifact-dir', str(self.bundle), '--',
                                  *self.install_flags(self.home / 'installed'), expected=1)
         self.assertIn('Smoke test could not verify the installation (exit 2)', result.stderr)

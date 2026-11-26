@@ -2260,6 +2260,37 @@ class LDAPFlowTests(unittest.TestCase):
         self.check_cases({name: unrelated + textwrap.dedent(source).lstrip('\n')
                           for name, source in cases.items()})
 
+    def test_escaped_namespaces_preserve_ldap_evidence_and_completeness(self):
+        # Frozen source witnesses: opaque consumers can replace a callback's
+        # globals or closure cells. Scan the source without executing it.
+        fixtures = REPO_ROOT / 'test-suite/python/security/ldap_namespace_escapes'
+        cases = (
+            ('captured-cell-callback-with-obligation', [], True),
+            ('captured-cell-container-with-obligation', [], True),
+            ('decorated-cell-with-obligation', [], True),
+            ('global-set-callback-with-obligation', [], True),
+            ('factory-through-callback-with-obligation', [], True),
+            ('factory-through-class-with-obligation', [], True),
+            ('regex-global-callback', [(4, 1)], False),
+            ('regex-global-callback-with-obligation', [(4, 1)], True),
+        )
+        for label, expected, partial in cases:
+            with self.subTest(case=label):
+                target = fixtures / f'{label}.py'
+                before = target.read_bytes()
+                findings = []
+                if partial:
+                    with self.assertRaisesRegex(ldap_injection.LDAPAnalysisLimit,
+                                                'generator predicate helper has unresolved native inputs') as raised:
+                        findings.extend(ldap_injection.find([target]))
+                    self.assertEqual([component['symbol'] for component in raised.exception.components],
+                                     ['unrelated'])
+                else:
+                    findings.extend(ldap_injection.find([target]))
+                self.assertEqual([(line, column) for _, line, column, _ in findings], expected)
+                self.assertTrue(all(path == target for path, *_ in findings))
+                self.assertEqual(target.read_bytes(), before)
+
     def test_non_directory_applicability_requires_unshadowed_unescaped_identity(self):
         unrelated = ('def opaque(values):\n'
                      '    return any(item in values for item in ("a", "b"))\n')

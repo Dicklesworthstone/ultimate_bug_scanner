@@ -198,7 +198,8 @@ class _ReceiverProof:
                                       or bool(engine.generator_execution_capabilities)
                                       or any(isinstance(node, ast.ImportFrom) and node.module == 'builtins'
                                              and any(alias.name in {'exec', 'eval'} for alias in node.names)
-                                             for node in nodes))
+                                             for node in nodes)
+                                      or self.exposed_namespaces(nodes, parents))
         self.attribute_writes = attribute_writes | reflected_fields
         self.named_writes = {name for node in nodes if isinstance(node, (ast.Global, ast.Nonlocal))
                              for name in node.names}
@@ -273,6 +274,47 @@ class _ReceiverProof:
                     fields.add(target.attr)
             for method in instance_methods:
                 self.fields[method] = (method.args.args[0].arg, fields)
+
+    def exposed_namespaces(self, nodes, parents):
+        """Refuse static identities whose defining frames can reach opaque code.
+
+        A callback exposes its globals and captured cells even when this file
+        contains no reflective attribute spelling. Class objects, suspended
+        frames and exception tracebacks carry the same authority. Their
+        receiver identities stay with the ordinary flow analysis.
+        """
+        functions = {node.name for node in nodes
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        for node in nodes:
+            parent = parents.get(node)
+            if isinstance(node, (ast.ClassDef, ast.AsyncFunctionDef, ast.Lambda,
+                                 ast.Yield, ast.YieldFrom, ast.ExceptHandler,
+                                 ast.With, ast.AsyncWith)):
+                return True
+            if isinstance(node, ast.FunctionDef) and node.decorator_list:
+                return True
+            if ((isinstance(node, ast.Name) and node.id in functions
+                 or isinstance(node, ast.Attribute) and node.attr in functions)
+                    and isinstance(node.ctx, ast.Load)
+                    and not (isinstance(parent, ast.Call) and parent.func is node)):
+                return True
+            if isinstance(node, ast.GeneratorExp):
+                # Exact eager builtin consumers keep the generator private.
+                # A deferred or opaque consumer can retain its live frame.
+                if not (isinstance(parent, ast.Call) and parent.args == [node]
+                        and not parent.keywords and isinstance(parent.func, ast.Name)):
+                    return True
+                name = parent.func.id
+                scope = self.engine.enclosing(parent)
+                if (name not in {'all', 'any', 'list', 'tuple', 'set', 'frozenset'}
+                        or not self.engine.generator_input_identity
+                        or name in self.engine.generator_external_writers
+                        or name in self.engine.generator_attribute_writes
+                        or not self.builtin_visible(name, scope)
+                        or any(name in self.engine.generator_binders.get(owner, {})
+                               for owner in self.lexical_scopes(scope))):
+                    return True
+        return False
 
     def reflection_writes(self, nodes, parents):
         """Follow bounded reflector aliases without granting a receiver proof.
@@ -615,6 +657,11 @@ class _ReceiverProof:
         Any unresolved candidate keeps the original whole-file analysis and
         its completeness requirements, including all called helper scopes.
         """
+        # This receiver is intrinsically a native set; no saved binding or
+        # replaceable constructor participates in the operation.
+        if (isinstance(node, ast.Attribute) and node.attr == 'add'
+                and isinstance(node.value, (ast.Set, ast.SetComp))):
+            return True
         if node not in self.non_directory_proofs:
             self.non_directory_proofs[node] = self.static_receiver(node) in {
                 'set.add', 're.search', 're.Pattern.search'}

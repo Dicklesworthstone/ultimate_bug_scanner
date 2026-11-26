@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.164-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.165-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -2254,6 +2254,22 @@ Unproved callbacks, custom iteration or result-object protocols, third-party
 sanitizers returning string subclasses, `strict=True` and reflected native
 identities report incomplete analysis while retaining findings already reached.
 These boundaries do not certify unsupported pipelines as clean.
+
+### Python native string sequences
+
+Python taint analysis preserves the string elements returned by native
+`str.split`, `str.rsplit`, and `str.splitlines`. Saved methods, selected local
+helper returns, integer indexing, slices, and simple eager string
+comprehensions retain their source facts. Supported generator consumers can
+analyze these elements without treating every split result as an opaque
+iterator. The model does not assume a list length or a valid index.
+
+Aliased `+=` writes update the shared list's source facts. Element writes,
+opaque calls, and storage inside another object revoke the old element proof.
+Unknown receivers, unproved option protocols, empty separators, and zero-step
+slices do not acquire native producer authority. Type annotations alone are
+not runtime type evidence; `pathlib` result modeling remains outside this
+support.
 
 ### Python subprocess taint
 

@@ -10,6 +10,14 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Preserve native Python string elements through `split`, `rsplit`,
+  `splitlines`, saved methods, selected helpers, indexing, slices and simple
+  eager comprehensions. Supported generator consumers retain source findings
+  and clean controls without an opaque-iterator failure. Shared list `+=`
+  updates preserve alias provenance; mutation and aggregate storage revoke
+  stale element proofs. Unknown protocols and unsupported iterator histories
+  remain incomplete rather than gaining native execution authority.
+
 - Add eight static Python LDAP regression cases for captured cells, tracing,
   suspended execution and traceback exposure, preserving incomplete analysis.
 

@@ -543,6 +543,19 @@ class _LiteralMapping:
 
 
 @dataclass(frozen=True)
+class _NativeSequence:
+    """An unknown-length native list, optionally with an element contract.
+
+    The ordinary heap retains aggregate facts and allocation aliases. This
+    marker proves neither a position nor a length. Writes erase the element
+    proof while keeping list identity for subsequent aliased mutations.
+    Producer authority remains separate from the final element's type.
+    """
+    element: object
+    format_safe: bool = True
+
+
+@dataclass(frozen=True)
 class _CsvReader:
     """A native lazy CSV iterator; its handle and metadata are not row data."""
     stream: str
@@ -1215,6 +1228,8 @@ def _without_object_contract(binding):
             # Content writes retain the native type, but a resize invalidates
             # the allocation's original empty-capacity proof.
             value = _ByteBuffer(format_safe=value.format_safe)
+        if isinstance(value, _NativeSequence):
+            value = _NativeSequence(None, False)
         if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance,
                               _LiteralMethodInstance, _ProcessInput, ast.ClassDef)):
             value = None
@@ -2657,7 +2672,7 @@ class _Flow:
             if (isinstance(value, _ZipIterator) or isinstance(value, _BoundCallable)
                     and isinstance(value.receiver_binding, _ZipIterator)):
                 raise AnalysisLimit('native zip iterator storage or escape is unresolved; analysis is incomplete')
-            if isinstance(value, (_LiteralMapping, _LiteralJoinInstance, _LiteralMethodInstance)):
+            if isinstance(value, (_LiteralMapping, _NativeSequence, _LiteralJoinInstance, _LiteralMethodInstance)):
                 self.mutate(references, CLEAN, state)
             elif isinstance(value, _BoundCallable) and (
                     value.name == _LITERAL_MAPPING_GET or isinstance(value.receiver_binding, _LiteralJoinInstance)):
@@ -3554,6 +3569,9 @@ class _Flow:
                 return True
             if isinstance(choice, (_LiteralString, _GeneratorString)) and not choice.format_safe:
                 return True
+            if isinstance(choice, _NativeSequence) and (
+                    not choice.format_safe or self.borrowed_producer_revoked(choice.element)):
+                return True
             if isinstance(choice, _ArgumentVector) and any(
                     self.borrowed_producer_revoked(operand) for operand, _fact in choice.operands):
                 return True
@@ -3580,7 +3598,7 @@ class _Flow:
     @staticmethod
     def unproved_producer(binding):
         return any(isinstance(value, _UnprovedProducer)
-                   or isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance,
+                   or isinstance(value, (_LiteralString, _GeneratorString, _NativeSequence, _LiteralJoinInstance,
                                          _CsvReader, _StdinCallableIterator, _ByteBuffer)) and not value.format_safe
                    for value in _binding_choices(binding))
 
@@ -3643,6 +3661,8 @@ class _Flow:
             elif isinstance(value, _ArgumentVector):
                 value = _ArgumentVector(tuple((self.without_format_authority(operand), fact)
                                               for operand, fact in value.operands), value.references)
+            elif isinstance(value, _NativeSequence):
+                value = _NativeSequence(self.without_format_authority(value.element), False)
             elif isinstance(value, _LiteralMapping):
                 value = _LiteralMapping(self.without_format_authority(value.value_binding)
                                         if value.value_binding is not None else _UnprovedProducer(), value.keys)
@@ -3756,6 +3776,9 @@ class _Flow:
                     self.materialized_generator_binding(operand, value.references_at(index), state)
                     for index, (operand, _fact) in enumerate(value.operands)):
                 continue
+            if (isinstance(value, _NativeSequence) and value.format_safe
+                    and self.materialized_generator_binding(value.element, NO_REFERENCES, state)):
+                continue
             if isinstance(value, _LiteralMapping) and not self.unproved_producer(value.value_binding):
                 continue
             if isinstance(value, _LiteralJoinInstance) and value.format_safe:
@@ -3778,7 +3801,7 @@ class _Flow:
         if isinstance(node, ast.Constant):
             return type(node.value) in {str, bytes, int, float, complex, bool, type(None)}
         choices = _binding_choices(self.expression_bindings.get(node))
-        return (not any(isinstance(value, (_ArgumentVector, _LiteralMapping)) for value in choices)
+        return (not any(isinstance(value, (_ArgumentVector, _LiteralMapping, _NativeSequence)) for value in choices)
                 and self.materialized_generator_binding(self.expression_bindings.get(node),
                     self.expression_references.get(node, NO_REFERENCES), state))
 
@@ -3899,7 +3922,7 @@ class _Flow:
             if isinstance(expression, ast.Attribute) and expression.attr in {
                     'join', 'strip', 'lstrip', 'rstrip', 'lower', 'upper',
                     'capitalize', 'casefold', 'swapcase', 'title', 'replace',
-                    'removeprefix', 'removesuffix'}:
+                    'removeprefix', 'removesuffix', 'split', 'rsplit', 'splitlines'}:
                 value = (lookup(expression.value.id) if isinstance(expression.value, ast.Name)
                          else expression.value if isinstance(expression.value, ast.Constant)
                          else literal_call(expression.value))
@@ -3911,6 +3934,17 @@ class _Flow:
             if isinstance(expression, ast.Dict):
                 return all(key is not None and hashable(key) and primitive(value)
                            for key, value in zip(expression.keys, expression.values))
+            if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute)
+                    and expression.func.attr in {'split', 'rsplit', 'splitlines'}
+                    and primitive(expression.func)):
+                receiver = (lookup(expression.func.value.id) if isinstance(expression.func.value, ast.Name)
+                            else expression.func.value if isinstance(expression.func.value, ast.Constant)
+                            else literal_call(expression.func.value))
+                def operand_binding(argument):
+                    return (lookup(argument.id) if isinstance(argument, ast.Name)
+                            else argument if isinstance(argument, ast.Constant) else None)
+                result = self.split_sequence_binding(expression, expression.func.attr, receiver, operand_binding)
+                return result is not None and result.format_safe
             if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute)
                     and expression.func.attr == 'join' and primitive(expression.func)
                     and len(expression.args) == 1 and not expression.keywords
@@ -3943,8 +3977,11 @@ class _Flow:
                 return all(hashable(item) for item in expression.elts)
             if isinstance(expression, (ast.List, ast.Set, ast.Dict)):
                 return False
+            if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute)
+                    and expression.func.attr in {'split', 'rsplit', 'splitlines'}):
+                return False
             if isinstance(expression, ast.Name) and any(
-                    isinstance(value, (_ArgumentVector, _LiteralMapping))
+                    isinstance(value, (_ArgumentVector, _LiteralMapping, _NativeSequence))
                     for value in _binding_choices(lookup(expression.id))):
                 return False
             return primitive(expression)
@@ -4082,6 +4119,11 @@ class _Flow:
         if (not references & state.mutated and choices
                 and all(isinstance(value, (_LiteralString, _GeneratorString)) for value in choices)):
             return True
+        if (not references & state.mutated and choices
+                and all(isinstance(value, _NativeSequence) and value.format_safe
+                        and self.materialized_generator_binding(value.element, NO_REFERENCES, state)
+                        for value in choices)):
+            return True
         if (not references or references & state.mutated or not choices
                 or not all(isinstance(value, _ArgumentVector) for value in choices)):
             return False
@@ -4095,6 +4137,66 @@ class _Flow:
                            for value in _binding_choices(operand)):
                     return False
         return True
+
+    def native_sequence_element(self, binding, references, state):
+        """Project only unchanged native collections, never an old initializer."""
+        choices = _binding_choices(binding)
+        if (references & state.mutated or not choices
+                or not all(isinstance(value, _NativeSequence) and value.element is not None
+                           for value in choices)):
+            return None
+        return _join_bindings(*(value.element if value.format_safe else
+                                self.without_format_authority(value.element) for value in choices))
+
+    @staticmethod
+    def split_sequence_binding(node, method, receiver, argument_binding, *, producer_unproved=False):
+        """Describe an intrinsic str split result after its operands ran."""
+        parameters = ('keepends',) if method == 'splitlines' else ('sep', 'maxsplit')
+        if (method not in {'split', 'rsplit', 'splitlines'} or len(node.args) > len(parameters)
+                or any(isinstance(argument, ast.Starred) for argument in node.args)
+                or not _Flow.native_string_binding(receiver)):
+            return None
+        supplied = dict(zip(parameters, node.args))
+        for keyword in node.keywords:
+            if keyword.arg not in parameters or keyword.arg in supplied:
+                return None
+            supplied[keyword.arg] = keyword.value
+        operands = []
+        for name, expression in supplied.items():
+            binding = argument_binding(expression)
+            choices = _binding_choices(binding)
+            if not choices:
+                return None
+            if name == 'sep':
+                if any(isinstance(value, _LiteralString) and not value.value
+                       or isinstance(value, ast.Constant) and value.value == '' for value in choices):
+                    return None  # A known empty separator always raises ValueError.
+                if not all(_Flow.native_string_binding(value)
+                           or isinstance(value, ast.Constant) and value.value is None for value in choices):
+                    return None
+            elif not all(isinstance(value, ast.Constant) and type(value.value) in {int, bool}
+                         for value in choices):
+                return None
+            operands.append(binding)
+        safe = (not producer_unproved and not _Flow.unproved_producer(receiver)
+                and not any(_Flow.unproved_producer(binding) for binding in operands))
+        return _NativeSequence(_GeneratorString(format_safe=safe), safe)
+
+    def native_string_sequence(self, node, target, state):
+        """Keep exact native element types without trusting opaque coercions."""
+        if not isinstance(target, _BoundCallable):
+            return None
+        method = target.name.rsplit('.', 1)[-1]
+        if method not in {'split', 'rsplit', 'splitlines'}:
+            return None
+        self.require_value(target.receiver_binding)
+        arguments = (*node.args, *(keyword.value for keyword in node.keywords))
+        for expression in arguments:
+            self.require_value(self.expression_bindings.get(expression))
+            if self.expression_references.get(expression, NO_REFERENCES) & state.mutated:
+                return None
+        return self.split_sequence_binding(node, method, target.receiver_binding,
+            self.expression_bindings.get, producer_unproved=target.producer_unproved)
 
     def generator_predicate_inputs(self, node, state, consumer):
         """Defer only a closed, pure predicate's symbolic input protocols.
@@ -8490,6 +8592,12 @@ class _Flow:
                 self.expression_references[node] = frozenset({node, target})
                 self.possible_exception(state)
                 return CLEAN
+        sequence = self.native_string_sequence(node, target, state)
+        if sequence is not None:
+            self.expression_bindings[node] = sequence
+            self.expression_references[node] = frozenset({node})
+            self.possible_exception(state)
+            return join_facts(target.receiver, *arguments, *keywords.values())
         native_string_result = False
         if (isinstance(node, ast.Call) and isinstance(target, _BoundCallable)
                 and self.native_string_binding(target.receiver_binding) and not node.keywords):
@@ -8908,7 +9016,7 @@ class _Flow:
                         or _same_witness(binding, nominal)):
                     continue
                 if any(isinstance(value, (str, _LiteralString, _GeneratorString, _UnprovedProducer,
-                                          _LiteralMapping, _ArgumentVector, _ProcessInput, _ByteBuffer,
+                                          _LiteralMapping, _NativeSequence, _ArgumentVector, _ProcessInput, _ByteBuffer,
                                           _StdinCallableIterator,
                                           _LiteralMethodInstance,
                                           _FunctionValue, _ClosureValue,
@@ -9076,7 +9184,7 @@ class _Flow:
             # the caller's distinct generator/closure cells.
             format_frame_inert = (bool(self.materialized_generator_depth) or native_callback or not any(
                 isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _LiteralMethodInstance,
-                                   _ArgumentVector, _LiteralMapping, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer,
+                                   _ArgumentVector, _LiteralMapping, _NativeSequence, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer,
                                    _SymbolicValue, ast.Constant))
                 or isinstance(value, str) and value in _STDIN_PARSER_CARRIERS
                 or isinstance(value, _BoundCallable) and (
@@ -9390,7 +9498,7 @@ class _Flow:
                 if {'functools', _PARTIAL_CHANGED_MODULE} & _binding_choices(value) and name not in {
                         'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr'}:
                     self.mutate(frozenset({_PARTIAL_MODULE_REF}), CLEAN, state)
-                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, _LiteralJoinInstance, _LiteralMethodInstance, _ByteBuffer,
+                if any(isinstance(choice, (_ArgumentVector, _NativeSequence, _SymbolicValue, _LiteralJoinInstance, _LiteralMethodInstance, _ByteBuffer,
                                            ast.ClassDef, _BoundClassMethod))
                        for choice in _binding_choices(value)) and name not in SANITIZERS and name not in {
                            'print', 'str', 'len', 'repr', 'tuple', 'list', 'bool', 'int', 'float',
@@ -9490,7 +9598,7 @@ class _Flow:
                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                             ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
                             _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _GeneratorString,
-                            _UnprovedProducer, _LiteralMapping, _LiteralJoinInstance, _LiteralMethodInstance,
+                            _UnprovedProducer, _LiteralMapping, _NativeSequence, _LiteralJoinInstance, _LiteralMethodInstance,
                             _ProcessInput, _StdinCallableIterator, _ZipIterator, _ByteBuffer, ast.Constant)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
@@ -9786,6 +9894,34 @@ class _Flow:
                 # Framework annotation tuples use a separate marker binding.
                 # Only unexpanded syntax has the same positions as its values.
                 binding = self.expression_bindings.get(node.value.elts[node.slice.value])
+            element = self.native_sequence_element(self.expression_bindings.get(node.value),
+                self.expression_references.get(node.value, NO_REFERENCES), state)
+            if element is not None:
+                parts = ((node.slice.lower, node.slice.upper, node.slice.step)
+                         if isinstance(node.slice, ast.Slice) else (node.slice,))
+                native_index = all(part is None or (
+                    bool(_binding_choices(self.expression_bindings.get(part)))
+                    and all(isinstance(value, ast.Constant) and type(value.value) in {int, bool}
+                            for value in _binding_choices(self.expression_bindings.get(part))))
+                    or isinstance(part, ast.UnaryOp) and isinstance(part.op, (ast.UAdd, ast.USub))
+                    and isinstance(part.operand, ast.Constant) and type(part.operand.value) is int
+                    for part in parts)
+                if isinstance(node.slice, ast.Slice) and node.slice.step is not None:
+                    step = node.slice.step
+                    step = step.operand if isinstance(step, ast.UnaryOp) and isinstance(step.op, (ast.UAdd, ast.USub)) else step
+                    if any(isinstance(value, ast.Constant) and type(value.value) in {int, bool}
+                           and value.value == 0 for value in _binding_choices(self.expression_bindings.get(step))):
+                        native_index = False  # A zero step cannot produce a list.
+                if native_index:
+                    binding = (_NativeSequence(element, not self.unproved_producer(element))
+                               if isinstance(node.slice, ast.Slice) else element)
+                    self.expression_references[node] = (frozenset({node})
+                        if isinstance(node.slice, ast.Slice) else NO_REFERENCES)
+                else:
+                    # Index coercion can run a user protocol; retain its
+                    # producer obligation after selecting an immutable value.
+                    binding = self.without_format_authority(
+                        _NativeSequence(element) if isinstance(node.slice, ast.Slice) else element)
             mappings = _binding_choices(self.expression_bindings.get(node.value))
             if mappings and all(isinstance(value, _LiteralMapping) for value in mappings):
                 contents, unchanged = self.literal_mapping_contents(
@@ -10291,6 +10427,24 @@ class _Flow:
             nested.references[name] = NO_REFERENCES
         result = CLEAN
         result_bindings, result_references = [], []
+        source_element = self.native_sequence_element(self.expression_bindings.get(first.iter),
+            self.expression_references.get(first.iter, NO_REFERENCES), original)
+        # Only a single eager clause whose body copies or intrinsically
+        # transforms its string element gets a collection contract. Arbitrary
+        # calls, filters and nested clauses retain their ordinary boundaries.
+        native_list_result = (
+            isinstance(node, ast.ListComp) and not synchronous_generator
+            and len(node.generators) == 1 and not first.is_async and not first.ifs
+            and isinstance(first.target, ast.Name) and self.native_string_binding(source_element)
+            and not self.unproved_producer(source_element)
+            and (isinstance(node.elt, ast.Name) and node.elt.id == first.target.id
+                 or isinstance(node.elt, ast.Call) and isinstance(node.elt.func, ast.Attribute)
+                 and isinstance(node.elt.func.value, ast.Name)
+                 and node.elt.func.value.id == first.target.id
+                 and node.elt.func.attr in {'strip', 'lstrip', 'rstrip', 'lower', 'upper',
+                     'capitalize', 'casefold', 'swapcase', 'title', 'replace', 'removeprefix', 'removesuffix'}
+                 and not node.elt.keywords
+                 and all(isinstance(argument, ast.Constant) for argument in node.elt.args)))
         iterator_references = set()
         stopped = []
 
@@ -10394,6 +10548,9 @@ class _Flow:
                                 self.expression_references.get(item, NO_REFERENCES) for item in elements))
                         elif synchronous_generator and isinstance(binding, (_LiteralString, _GeneratorString)):
                             current.bindings[generator.target.id] = _GeneratorString(format_safe=binding.format_safe)
+                        elif (element_binding := self.native_sequence_element(binding, refs, current)) is not None:
+                            current.bindings[generator.target.id] = element_binding
+                            current.references[generator.target.id] = NO_REFERENCES
                         elif generator.iter in self.generator_returns:
                             current.bindings[generator.target.id] = binding
                             current.references[generator.target.id] = refs
@@ -10438,6 +10595,8 @@ class _Flow:
                                 raise AnalysisLimit('generator materialization result lifetime is unresolved; '
                                                     'analysis is incomplete')
                             result = join_facts(result, fact)
+                            if native_list_result:
+                                result_bindings.append(self.expression_bindings.get(node.elt))
                             if first_result:
                                 result_bindings.append(self.expression_bindings.get(node.elt))
                                 result_references.append(self.expression_references.get(node.elt, NO_REFERENCES))
@@ -10524,6 +10683,10 @@ class _Flow:
                     stopped.append(normal)
             normal = _join_states(*stopped)
             self.expression_bindings[node] = _join_bindings(*result_bindings)
+        if (native_list_result and result_bindings
+                and all(self.native_string_binding(binding) and not self.unproved_producer(binding)
+                        for binding in result_bindings)):
+            self.expression_bindings[node] = _NativeSequence(_join_bindings(*result_bindings))
         if synchronous_generator and any(
                 current is not None and current.mutated & iterator_references
                 for current in (normal, exceptional, *(item.state for item in outgoing))):
@@ -10681,14 +10844,19 @@ class _Flow:
         elif isinstance(node, ast.AugAssign):
             previous = self.expr(node.target, state)
             references = self.expression_references.get(node.target, NO_REFERENCES)
+            binding = self.expression_bindings.get(node.target)
+            self.require_value(binding)
+            native_list = any(isinstance(value, _NativeSequence) for value in _binding_choices(binding))
             fact = join_facts(previous, self.expr(node.value, state))
             self.assign(node.target, fact, state, target_references=references)
             # A known list += mutates the object observed by earlier aliases;
             # tuple/string += instead rebinds. Do not conflate these cases.
-            if isinstance(node.target, ast.Name) and references and all(isinstance(ref, ast.List) for ref in references):
+            if (isinstance(node.target, ast.Name) and references
+                    and (native_list or all(isinstance(ref, ast.List) for ref in references))):
                 self.mutate(references, fact, state)
                 self.write_name(state, node.target.id, state.get(node.target.id, CLEAN),
-                                state.bindings.get(node.target.id), references)
+                                _without_object_contract(binding) if native_list
+                                else state.bindings.get(node.target.id), references)
         elif isinstance(node, ast.Assert):
             self.expr(node.test, state)
             if not state.reachable:
@@ -10834,6 +11002,9 @@ class _Flow:
                 # element a snapshot (not an alias of the iterable itself).
                 current_value = join_facts(value, *(body.heap.get(ref, CLEAN) for ref in references))
                 self.assign(node.target, current_value, body)
+                element_binding = self.native_sequence_element(binding, references, body)
+                if isinstance(node.target, ast.Name) and element_binding is not None:
+                    self.write_name(body, node.target.id, current_value, element_binding, NO_REFERENCES)
                 # A local generator summary identifies its yielded callable;
                 # an ordinary iterable object is not itself that callable.
                 if isinstance(node.target, ast.Name) and node.iter in self.generator_returns:
@@ -12237,6 +12408,8 @@ class _Analysis:
                 # Ownership proofs need this identity; ordinary dataflow
                 # parameters must keep sharing their symbolic summaries.
                 pass
+            elif isinstance(value, _NativeSequence) and (captured or name in value_parameters):
+                pass
             elif isinstance(value, _UnprovedProducer) and (captured or name in value_parameters):
                 pass
             elif isinstance(value, _LiteralJoinInstance) and (captured or name in value_parameters):
@@ -12353,7 +12526,7 @@ class _Analysis:
                     continue
                 if (binding is nominal
                         and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
-                                                     _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
+                                                     _ArgumentVector, _LiteralString, _GeneratorString, _NativeSequence, _UnprovedProducer,
                                                      _LiteralMapping, _ProcessInput, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer))
                         and not explicit_override
                         and gname in owner_bindings
@@ -12366,7 +12539,7 @@ class _Analysis:
                 if not explicit_override and not any(
                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
                                            ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
-                                           _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
+                                           _ArgumentVector, _LiteralString, _GeneratorString, _NativeSequence, _UnprovedProducer,
                                            _LiteralMapping, _ProcessInput, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer, ast.Constant))
                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
                     continue

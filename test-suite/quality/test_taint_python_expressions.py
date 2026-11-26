@@ -190,5 +190,180 @@ assert type(Receiver().strip(' ')) is dict
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+class NativeStringSequenceTests(SourceTest):
+    """Ordinary source analysis only; analyzed snippets are never executed."""
+
+    def test_splitting_keeps_native_elements_and_source_facts(self):
+        operations = (
+            'split()', 'split(",")', 'split(None)', 'split(",", 2)',
+            'split(sep=",", maxsplit=2)', 'rsplit(",", 1)',
+            'rsplit(sep=",", maxsplit=1)', 'splitlines()',
+            'splitlines(True)', 'splitlines(keepends=True)',
+        )
+        for operation in operations:
+            for producer, expected in (('input()', ('eval',)), ('"red,green\\nblue"', ())):
+                with self.subTest(operation=operation, producer=producer):
+                    source = (
+                        f'parts = {producer}.{operation}\n'
+                        'any(part == "item" for part in parts)\n'
+                        'eval("".join(parts))\n')
+                    rows = self.assert_rules(source, *expected)
+                    if expected:
+                        self.assertEqual([(row['line'], row['col']) for row in rows], [(3, 1)])
+
+    def test_captured_split_methods_keep_their_original_receiver(self):
+        for method in ('split', 'rsplit', 'splitlines'):
+            with self.subTest(method=method):
+                self.assert_rules(
+                    f'text = input()\nsplit = text.{method}\ntext = "fixed"\n'
+                    'parts = split()\n'
+                    'any(part == "item" for part in parts)\n'
+                    'eval("".join(parts))\n', 'eval')
+
+    def test_selected_helpers_preserve_sequence_and_element_contracts(self):
+        for body in (
+            'return text.splitlines()',
+            'parts = text.splitlines()\n    return parts',
+        ):
+            with self.subTest(body=body):
+                self.assert_rules(
+                    f'def lines(text):\n    {body}\n'
+                    'parts = lines(input())\n'
+                    'any(part == "item" for part in parts)\n'
+                    'eval("".join(parts))\n', 'eval')
+        self.assert_rules(
+            'def identity(values):\n    return values\n'
+            'parts = identity(input().split())\n'
+            'any(part == "item" for part in parts)\n'
+            'eval("".join(parts))\n', 'eval')
+
+    def test_scalar_indices_and_slices_keep_taint_without_inventing_a_length(self):
+        for index in ('0', '-1'):
+            with self.subTest(index=index):
+                self.assert_rules(
+                    f'parts = input().split(",")\nvalue = parts[{index}]\n'
+                    'any(marker in value for marker in ("x", "y"))\n'
+                    'eval(value)\n', 'eval')
+        for index in ('[:1]', '[1:]', '[::-1]'):
+            with self.subTest(index=index):
+                self.assert_rules(
+                    f'parts = input().splitlines(){index}\n'
+                    'any(part == "item" for part in parts)\n'
+                    'eval("".join(parts))\n', 'eval')
+        self.assert_rules(
+            'try:\n    value = "".split()[0]\n'
+            'except IndexError:\n    eval(input())\n', 'eval')
+        self.assert_rules(
+            'value = input()\n'
+            'for part in "".split():\n    value = "fixed"\n'
+            'eval(value)\n', 'eval')
+
+    def test_native_sequence_loops_and_eager_string_transforms(self):
+        self.assert_rules(
+            'parts = input().split(",")\n'
+            'for part in parts:\n    eval(part)\n', 'eval')
+        # A later eval in the same loop prevents proving the next iteration's
+        # consumer identity. A native element does not discharge that boundary.
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'live delayed reads'):
+            self.scan(
+                'for line in input().splitlines():\n'
+                '    any(marker in line for marker in ("x", "y"))\n'
+                '    eval(line)\n')
+        for transform in ('line', 'line.lower()', 'line.strip()', 'line.removeprefix("x")'):
+            for producer, expected in (('input()', ('eval',)), ('"red\\ngreen"', ())):
+                with self.subTest(transform=transform, producer=producer):
+                    self.assert_rules(
+                        f'parts = [{transform} for line in {producer}.splitlines()]\n'
+                        'any(part == "item" for part in parts)\n'
+                        'eval("".join(parts))\n', *expected)
+        self.assert_rules(
+            'parts = input().splitlines()\n'
+            'value = "".join(part.strip() for part in parts)\n'
+            'eval(value)\n', 'eval')
+
+    def test_collection_writes_keep_source_facts_and_revoke_old_element_proofs(self):
+        for mutation in ('alias.append(input())', 'alias[0] = input()'):
+            with self.subTest(mutation=mutation):
+                source = (
+                    'parts = "fixed".split()\nalias = parts\n'
+                    f'{mutation}\neval("".join(parts))\n'
+                    'any(part == "item" for part in parts)\n')
+                # The earlier eval already invalidates native consumer identity;
+                # both versions use the ordinary call path and retain its sink.
+                rows = self.assert_rules(source, 'eval')
+                self.assertEqual([(row['line'], row['col']) for row in rows], [(4, 1)])
+        for source in (
+            "parts = 'fixed'.split()\nalias = parts\nalias.append(input())\n"
+            "any(part == 'item' for part in parts)\neval(''.join(parts))\n",
+            "parts = 'fixed'.split()\nparts[0] = input()\n"
+            "any(part == 'item' for part in parts)\neval(''.join(parts))\n",
+        ):
+            with self.subTest(source=source), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan(source)
+        with self.assertRaises(taint_py.AnalysisLimit):
+            self.scan(
+                'parts = "fixed".split()\nconsume(parts)\n'
+                'any(part == "item" for part in parts)\n')
+
+    def test_augmented_sequence_writes_reach_existing_and_new_aliases(self):
+        for initializer in (
+            '"fixed".split()',
+            '"fixed".splitlines()[:]',
+            '[part.lower() for part in "fixed".splitlines()]',
+        ):
+            for writes in (
+                'alias += [input()]\n',
+                'alias += ["also fixed"]\nlater = alias\nlater += [input()]\n',
+            ):
+                with self.subTest(initializer=initializer, writes=writes):
+                    source = (f'parts = {initializer}\nalias = parts\n' + writes
+                              + 'eval("".join(parts))\n')
+                    rows = self.assert_rules(source, 'eval')
+                    self.assertEqual([(row['line'], row['col']) for row in rows],
+                                     [(len(source.splitlines()), 1)])
+        self.assert_rules(
+            'def extend(values, item):\n    values += [item]\n'
+            'parts = "fixed".split()\nextend(parts, input())\n'
+            'eval("".join(parts))\n', 'eval')
+
+    def test_stored_sequences_do_not_keep_an_unchanged_element_contract(self):
+        for storage in ('holder = [parts]', 'holder = {"parts": parts}', 'holder.parts = parts'):
+            with self.subTest(storage=storage), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan('parts = "fixed".split()\n' + storage + '\n'
+                          'any(part == "item" for part in parts)\n')
+
+    def test_unknown_receivers_options_and_annotations_keep_their_boundaries(self):
+        operations = (
+            'receiver.splitlines()', '"fixed".split(separator)',
+            '"fixed".split(" ", count)', '"fixed".splitlines(flag)',
+            '"fixed".split(b" ")', '"fixed".splitlines(unknown=True)',
+            '"fixed".split("")', '"fixed".rsplit("", 1)',
+            '"fixed".split(" ", maxsplit=opaque)',
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan(f'parts = {operation}\nany(part == "item" for part in parts)\n')
+        with self.assertRaises(taint_py.AnalysisLimit):
+            self.scan(
+                'def inspect_text(text: str):\n'
+                '    parts = text.splitlines()\n'
+                '    return any(part == "item" for part in parts)\n')
+
+    def test_unproved_producers_do_not_gain_sequence_authority(self):
+        sources = (
+            'def render():\n    owned = opaque()\n    return "data"\n'
+            'parts = render().splitlines()\n',
+            'def render(text):\n    owned = opaque()\n    return text.splitlines()\n'
+            'parts = render(input())\n',
+            'parts = input(opaque).splitlines()\n',
+            'parts = "fixed".splitlines()\nparts = parts[opaque:]\n',
+            'parts = "fixed".splitlines()\nparts = parts[::0]\n',
+            'parts = "fixed".splitlines()\nstep = 0\nparts = parts[::step]\n',
+        )
+        for source in sources:
+            with self.subTest(source=source), self.assertRaises(taint_py.AnalysisLimit):
+                self.scan(source + 'any(part == "item" for part in parts)\n')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

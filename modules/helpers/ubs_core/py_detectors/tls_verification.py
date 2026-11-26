@@ -150,7 +150,7 @@ class _TLSVerificationAnalyzer(HttpTimeoutAnalyzer):
             name = callee.name if callee.kind == "native" else ""
             family = CLIENT_CONSTRUCTORS.get(name)
             if family:
-                results.add(_Value("client", family, (node.lineno, node.col_offset)))
+                results.add(self.native_client(node, family))
                 if family in {"httpx", "httpx_transport"}:
                     if _literal_false(self.keyword_values(node, "verify")):
                         self.remember_issue(node.lineno)

@@ -125,6 +125,9 @@ class HttpTimeoutAnalyzer(ast.NodeVisitor):
         self.call_results = {}
         self.call_inputs = {}
         self.class_enclosing = None
+        self.loop_depth = 0
+        self.loop_clients = set()
+        self.repeated_loop_clients = set()
 
     def remember_issue(self, line_no):
         if self.suppression.is_suppressed(line_no, RULE_ID) or line_no in self.seen_lines:
@@ -152,7 +155,10 @@ class HttpTimeoutAnalyzer(ast.NodeVisitor):
         if isinstance(node, ast.Constant):
             return frozenset({_Value('literal', data=node.value)})
         if isinstance(node, (ast.Tuple, ast.List)):
-            return frozenset({_Value('sequence', data=tuple(self.values(item) for item in node.elts))})
+            shape = 'tuple' if isinstance(node, ast.Tuple) else 'list'
+            if any(isinstance(item, ast.Starred) for item in node.elts):
+                shape = 'expanded'
+            return frozenset({_Value('sequence', shape, tuple(self.values(item) for item in node.elts))})
         if isinstance(node, ast.Dict) and all(isinstance(key, ast.Constant) and isinstance(key.value, str)
                                               for key in node.keys):
             items = {key.value: self.values(value) for key, value in zip(node.keys, node.values)}
@@ -289,7 +295,11 @@ class HttpTimeoutAnalyzer(ast.NodeVisitor):
             elif name in CLIENT_CONSTRUCTORS:
                 family = CLIENT_CONSTRUCTORS[name]
                 policy = self.policy(node, family, family in {'httpx', 'aiohttp'}, constructor=True)
-                client = _Value('client', family, (node.lineno, node.col_offset))
+                client = self.native_client(node, family)
+                if (client in self.repeated_loop_clients and client in self.client_policies
+                        and self.client_policies[client] != policy):
+                    raise ValueError('Python HTTP configuration loop analysis is incomplete: '
+                                     'repeated client allocation has distinct timeout policies')
                 self.client_policies[client] = policy
                 results.add(client)
                 if policy is False and family != 'requests':
@@ -308,18 +318,35 @@ class HttpTimeoutAnalyzer(ast.NodeVisitor):
                 results.update(UNKNOWN)
         return frozenset(results) or UNKNOWN
 
+    def native_client(self, node, family):
+        client = _Value('client', family, (node.lineno, node.col_offset))
+        if self.loop_depth:
+            if client in self.loop_clients:
+                self.repeated_loop_clients.add(client)
+            self.loop_clients.add(client)
+        if client in self.repeated_loop_clients and any(
+                isinstance(key, tuple) and key[0] == client for key in self.member_overrides):
+            raise ValueError('Python HTTP configuration loop analysis is incomplete: '
+                             'repeated client allocation has distinct method bindings')
+        return client
+
     def bind(self, target, values):
         if isinstance(target, ast.Name):
             self.bindings[target.id] = values
         elif isinstance(target, (ast.Tuple, ast.List)):
-            sequence = next(iter(values)) if len(values) == 1 else None
-            elements = (sequence.data if sequence and sequence.kind == 'sequence'
-                        and len(sequence.data) == len(target.elts) else (UNKNOWN,) * len(target.elts))
+            elements = tuple(frozenset().union(*(
+                value.data[index] if value.kind == 'sequence' and value.name != 'expanded'
+                and len(value.data) == len(target.elts) else UNKNOWN for value in values)) or UNKNOWN
+                for index in range(len(target.elts)))
             for child, item in zip(target.elts, elements):
                 self.bind(child, item)
         elif isinstance(target, ast.Attribute):
             owners = self.values(target.value)
             for owner in owners:
+                if (owner in self.repeated_loop_clients
+                        and target.attr in HTTP_METHODS | URLLIB3_METHODS | {'timeout'}):
+                    raise ValueError('Python HTTP configuration loop analysis is incomplete: '
+                                     'mutation of a repeated client allocation')
                 if owner.kind == 'client' and target.attr == 'timeout' and owner.name == 'httpx':
                     policy = self.bounded(values, owner.name)
                     self.client_policies[owner] = (policy if len(owners) == 1 else
@@ -477,25 +504,233 @@ class HttpTimeoutAnalyzer(ast.NodeVisitor):
     visit_TryStar = visit_Try
 
     def visit_For(self, node):
-        self.visit(node.iter)
-        before = self.snapshot()
-        self.bind(node.target, UNKNOWN)
-        for statement in node.body:
-            self.visit(statement)
-        self.merge(before, self.snapshot())
-        for statement in node.orelse:
-            self.visit(statement)
+        outcomes = self.loop(node)
+        self.restore(self.join_states(outcomes.values()))
 
     visit_AsyncFor = visit_For
 
     def visit_While(self, node):
-        self.visit(node.test)
+        outcomes = self.loop(node)
+        self.restore(self.join_states(outcomes.values()))
+
+    def join_states(self, states):
+        states = iter(states)
+        result = next(states, None)
+        if result is None:
+            return self.snapshot()
+        for state in states:
+            self.merge(result, state)
+            result = self.snapshot()
+        return result
+
+    def join_outcomes(self, *branches):
+        result = {}
+        for branch in branches:
+            for route, state in branch.items():
+                result[route] = self.join_states((result[route], state)) if route in result else state
+        return result
+
+    def loop_block(self, statements, exceptional=None):
+        """Keep abrupt paths separate so they cannot become loop backedges."""
+        outcomes = {'normal': self.snapshot()}
+        for statement in statements:
+            state = outcomes.pop('normal', None)
+            if state is None:
+                break
+            self.restore(state)
+            if exceptional is not None:
+                exceptional.append(state)
+            step = self.loop_statement(statement)
+            if exceptional is not None:
+                exceptional.extend(step.values())
+            outcomes = self.join_outcomes(outcomes, step)
+        return outcomes
+
+    def loop_statement(self, node):
+        if isinstance(node, ast.If):
+            self.visit(node.test)
+            if isinstance(node.test, ast.Constant):
+                return self.loop_block(node.body if node.test.value else node.orelse)
+            before = self.snapshot()
+            left = self.loop_block(node.body)
+            self.restore(before)
+            return self.join_outcomes(left, self.loop_block(node.orelse))
+        if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            return self.loop(node)
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                self.visit(item.context_expr)
+                if item.optional_vars is not None:
+                    self.bind(item.optional_vars, self.values(item.context_expr))
+            outcomes = self.loop_block(node.body)
+            if 'raise' in outcomes:
+                # __exit__/__aexit__ may suppress an exception. Preserve
+                # both possibilities; other abrupt routes stay abrupt.
+                outcomes = self.join_outcomes(outcomes, {'normal': outcomes['raise']})
+            return outcomes
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            exceptional = [self.snapshot()]
+            outcomes = self.loop_block(node.body, exceptional)
+            completed = outcomes.pop('normal', None)
+            if completed is not None:
+                self.restore(completed)
+                outcomes = self.join_outcomes(outcomes, self.loop_block(node.orelse))
+            for handler in node.handlers:
+                self.restore(self.join_states(exceptional))
+                if handler.type is not None:
+                    self.visit(handler.type)
+                if handler.name:
+                    self.bindings[handler.name] = UNKNOWN
+                branch = self.loop_block(handler.body)
+                if handler.name:
+                    for state in branch.values():
+                        state[0][handler.name] = UNKNOWN
+                outcomes = self.join_outcomes(outcomes, branch)
+            if not node.finalbody:
+                return outcomes
+            finalized = {}
+            for route, state in outcomes.items():
+                self.restore(state)
+                final = self.loop_block(node.finalbody)
+                normal = final.pop('normal', None)
+                if normal is not None:
+                    final = self.join_outcomes(final, {route: normal})
+                finalized = self.join_outcomes(finalized, final)
+            return finalized
+        for kind, route in ((ast.Break, 'break'), (ast.Continue, 'continue'),
+                            (ast.Return, 'return'), (ast.Raise, 'raise')):
+            if isinstance(node, kind):
+                self.generic_visit(node)
+                return {route: self.snapshot()}
+        self.visit(node)
+        return {'normal': self.snapshot()}
+
+    @staticmethod
+    def native_loop_state(state):
+        # Most project loops have no native HTTP facts. Their unrelated
+        # container construction must not pay for a configuration fixpoint.
+        pending = [value for values in state[0].values() for value in values]
+        pending.extend(value for values in state[2].values() for value in values)
+        seen = set()
+        while pending:
+            value = pending.pop()
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            if value.kind in {'client', 'method', 'timeout'}:
+                return True
+            if value.kind == 'native' and value.name.split('.')[0] in {
+                    'requests', 'httpx', 'aiohttp', 'urllib3', 'urllib', 'ssl'}:
+                return True
+            if value.kind == 'sequence':
+                pending.extend(item for values in value.data for item in values)
+            elif value.kind == 'mapping':
+                pending.extend(item for _, values in value.data for item in values)
+        return bool(state[1])
+
+    @staticmethod
+    def check_loop_state(state):
+        # Recursive containers and synthesized attribute chains have no
+        # finite native identity proof. Refuse explicitly, never truncate
+        # them and certify the remaining configuration as clean.
+        pending = [(value, 0) for values in state[0].values() for value in values]
+        pending.extend((value, 0) for values in state[2].values() for value in values)
+        seen = {}
+        while pending:
+            value, depth = pending.pop()
+            if depth > 12 or len(seen) > 4096:
+                raise ValueError('Python HTTP configuration loop analysis is incomplete: value growth')
+            if seen.get(id(value), -1) >= depth:
+                continue
+            seen[id(value)] = depth
+            if value.kind == 'sequence':
+                pending.extend((item, depth + 1) for values in value.data for item in values)
+            elif value.kind == 'mapping':
+                pending.extend((item, depth + 1) for _, values in value.data for item in values)
+
+    def loop(self, node):
+        self.loop_depth += 1
+        try:
+            return self.loop_transfer(node)
+        finally:
+            self.loop_depth -= 1
+
+    def loop_transfer(self, node):
+        is_for = isinstance(node, (ast.For, ast.AsyncFor))
+        count = None
+        elements = None
+        if is_for:
+            self.visit(node.iter)
+            values = self.values(node.iter)
+            sequence = next(iter(values)) if len(values) == 1 else None
+            if (sequence is not None and sequence.kind == 'sequence'
+                    and (sequence.name == 'tuple'
+                         or sequence.name == 'list' and isinstance(node.iter, ast.List))):
+                # Tuple length is immutable. A direct list literal has no
+                # published alias; an aliased list may grow during iteration.
+                elements, count = sequence.data, len(sequence.data)
+            elif (isinstance(node.iter, ast.Call) and not node.iter.keywords
+                  and isinstance(node.iter.func, ast.Name) and node.iter.func.id == 'range'
+                  and 'range' not in self.bindings and 1 <= len(node.iter.args) <= 3
+                  and all(isinstance(arg, ast.Constant) and isinstance(arg.value, int)
+                          for arg in node.iter.args)):
+                try:
+                    count = len(range(*(arg.value for arg in node.iter.args)))
+                except (ValueError, OverflowError):
+                    pass
         before = self.snapshot()
-        for statement in node.body:
-            self.visit(statement)
-        self.merge(before, self.snapshot())
-        for statement in node.orelse:
-            self.visit(statement)
+        head = before
+        exits, exhausted, terminated = [], [], {}
+        iteration = 0
+        while True:
+            self.restore(head)
+            if is_for:
+                if count is not None and iteration >= count:
+                    exhausted.append(head)
+                    break
+                if count is None:
+                    exhausted.append(head)
+                self.bind(node.target, elements[iteration] if elements is not None else UNKNOWN)
+            else:
+                self.visit(node.test)
+                truth = bool(node.test.value) if isinstance(node.test, ast.Constant) else None
+                if truth is not True:
+                    exhausted.append(self.snapshot())
+                if truth is False:
+                    break
+            outcomes = self.loop_block(node.body)
+            if 'break' in outcomes:
+                exits.append(outcomes.pop('break'))
+            backs = [outcomes.pop(route) for route in ('normal', 'continue') if route in outcomes]
+            terminated = self.join_outcomes(terminated, outcomes)
+            if not backs:
+                break
+            back = self.join_states(backs)
+            iteration += 1
+            # Exact short sequences keep order and do not invent a second
+            # execution for singleton loops. A stable transfer can skip the
+            # remaining iterations of a range without unrolling its size.
+            next_head = back if count is not None else self.join_states((head, back))
+            native = self.native_loop_state(head) or self.native_loop_state(back)
+            if native:
+                self.check_loop_state(next_head)
+            stable = next_head == head
+            if (count is None and stable) or (count is not None and elements is None and stable):
+                if is_for:
+                    exhausted.append(next_head)
+                break
+            if not native:
+                exhausted.append(self.join_states((before, back)))
+                break
+            if iteration >= 64:
+                raise ValueError('Python HTTP configuration loop analysis is incomplete: fixpoint limit')
+            head = next_head
+        if exhausted:
+            self.restore(self.join_states(exhausted))
+            terminated = self.join_outcomes(terminated, self.loop_block(node.orelse))
+        if exits:
+            terminated = self.join_outcomes(terminated, {'normal': self.join_states(exits)})
+        return terminated
 
     def visit_FunctionDef(self, node):
         for expression in (*node.decorator_list, *node.args.defaults,

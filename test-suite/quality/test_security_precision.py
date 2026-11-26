@@ -9059,6 +9059,90 @@ class PythonHTTPTimeoutPrecisionTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get("UBS_RUN_HTTP_TIMEOUT_E2E") == "1",
                          "set UBS_RUN_HTTP_TIMEOUT_E2E=1 for real module/runner qualification")
+    def test_public_loop_carried_timeout_policy_in_json_and_sarif(self):
+        for count, expected in ((2, [5]), (1, [])):
+            source = self.root / ("public-loop-timeout-" + str(count) + ".py")
+            source.write_text('import httpx\nclient = httpx.Client(timeout=5)\n'
+                              'limit = 5\n'
+                              f'for retry in range({count}):\n'
+                              '    client.get("https://example.invalid", timeout=limit)\n'
+                              '    limit = None\n', encoding="utf-8")
+            combinations = ((surface, format_) for surface in ("module", "runner")
+                            for format_ in ("json", "sarif")) if count == 2 else (("runner", "json"),)
+            for surface, format_ in combinations:
+                label = f"http-timeout-loop-{count}-{surface}-{format_}"
+                with self.subTest(label=label):
+                    self.assertEqual(self.public_scan(source, surface=surface, format_=format_,
+                                                     cache=self.root / (label + "-cache"), label=label), expected)
+
+    @unittest.skipUnless(os.environ.get("UBS_RUN_HTTP_TIMEOUT_E2E") == "1",
+                         "set UBS_RUN_HTTP_TIMEOUT_E2E=1 for real module/runner qualification")
+    def test_public_loop_client_mutation_retains_findings_without_certifying_completeness(self):
+        # The timeout detector models this mutation, but the separate taint
+        # engine currently refuses client attributes. Preserve that public
+        # partial contract and the supported finding, without accepting a
+        # partial run as a successful complete scan.
+        for count, expected in ((2, [4]), (1, [])):
+            source = self.root / ("public-loop-mutation-" + str(count) + ".py")
+            source.write_text('import httpx\nclient = httpx.Client(timeout=5)\n'
+                              f'for retry in range({count}):\n'
+                              '    client.get("https://example.invalid")\n'
+                              '    client.timeout = None\n', encoding="utf-8")
+            combinations = ((surface, format_) for surface in ("module", "runner")
+                            for format_ in ("json", "sarif")) if count == 2 else (("runner", "json"),)
+            for surface, format_ in combinations:
+                label = f"http-timeout-loop-mutation-{count}-{surface}-{format_}"
+                with self.subTest(label=label):
+                    output = self.root / label
+                    output.mkdir()
+                    env = {key: value for key, value in os.environ.items()
+                           if not key.startswith(("UBS_", "XDG_"))}
+                    env.update({"UBS_KEEP_TEMP": "1", "UBS_NO_AUTO_UPDATE": "1",
+                                "UBS_CACHE_DIR": str(output / "cache"), "ENABLE_UV_TOOLS": "0",
+                                "PYTHONDONTWRITEBYTECODE": "1", "TMPDIR": str(output),
+                                "UBS_ALLOW_UNVERIFIED_HELPERS": "0", "UBS_ALLOW_PARTIAL": "0"})
+                    command = [str(REPO_ROOT / ("ubs" if surface == "runner" else "modules/ubs-python.sh")),
+                               "--ci", "--fail-on-warning", "--no-color", f"--format={format_}",
+                               "--skip=" + ",".join(str(n) for n in range(1, 26) if n != 7)]
+                    if surface == "runner":
+                        command.append("--only=python")
+                    command.append(str(source))
+                    proc = subprocess.run(command, text=True, capture_output=True, cwd=self.root,
+                                          env=env, timeout=90)
+                    (output / "stdout.log").write_text(proc.stdout, encoding="utf-8")
+                    (output / "stderr.log").write_text(proc.stderr, encoding="utf-8")
+                    (output / "command.json").write_text(json.dumps({
+                        "command": command, "exit": proc.returncode,
+                        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                    }, indent=2), encoding="utf-8")
+                    context = f"{command!r}\nexit={proc.returncode}\n{proc.stdout}\n{proc.stderr}"
+                    self.assertEqual(proc.returncode, 2, context)
+                    doc = json.loads(proc.stdout)
+                    self.assertIn("HTTP client mutation is unmodeled", json.dumps(doc), context)
+                    if format_ == "json":
+                        self.assertEqual(doc["status"], "partial", context)
+                        self.assertEqual(doc["reason"], "analysis-incomplete", context)
+                        key = "rule_id" if surface == "runner" else "rule"
+                        rows = [row for row in doc.get("findings", []) if row[key] == self.RULE]
+                        actual = sorted(row["line"] for row in rows) if surface == "runner" else sorted(
+                            sample["line"] for row in rows for sample in row["samples"])
+                        totals = doc["totals"] if surface == "runner" else doc
+                        self.assertEqual((totals["critical"], totals["warning"]), (0, len(expected)), context)
+                        self.assertTrue(all(row["severity"] == "warning" for row in rows), context)
+                    else:
+                        rows = [row for run in doc["runs"] for row in run.get("results", [])
+                                if row["ruleId"] == self.RULE]
+                        actual = sorted(row["locations"][0]["physicalLocation"]["region"]["startLine"]
+                                        for row in rows)
+                        self.assertTrue(all(row["level"] == "warning" for row in rows), context)
+                        invocations = [item for run in doc["runs"] for item in run.get("invocations", [])]
+                        self.assertTrue(invocations, context)
+                        self.assertTrue(all(item["executionSuccessful"] is False for item in invocations), context)
+                    self.assertEqual(actual, expected, context)
+                    print(f"[{label}] PASS", flush=True)
+
+    @unittest.skipUnless(os.environ.get("UBS_RUN_HTTP_TIMEOUT_E2E") == "1",
+                         "set UBS_RUN_HTTP_TIMEOUT_E2E=1 for real module/runner qualification")
     def test_public_module_runner_json_and_sarif_agree_on_native_timeout_sites(self):
         for value, expected in (("None", [3]), ("5", [])):
             source = self.root / ("public-" + value + ".py")
@@ -9088,6 +9172,279 @@ class PythonHTTPTimeoutPrecisionTests(unittest.TestCase):
                 self.assertEqual(self.public_scan(source, surface="runner", format_="json", cache=cache,
                                                  label="http-timeout-cache-" + label), expected)
         self.assertTrue(list(cache.glob("*/files/**/*.json")), "public runs must exercise the real file cache")
+
+
+class PythonHTTPLoopPrecisionTests(unittest.TestCase):
+    """Native identity and policy changes take effect on later iterations."""
+
+    @classmethod
+    def setUpClass(cls):
+        artifacts = REPO_ROOT / "test-suite" / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="python-http-loops-", dir=artifacts))
+
+    def run(self, result=None):
+        started = time.monotonic()
+        print(f"[{self.id()}] RUN", flush=True)
+        result = super().run(result)
+        failed = any(case is self or getattr(case, "test_case", None) is self
+                     for case, _ in (*result.failures, *result.errors))
+        print(f"[{self.id()}] {'FAIL' if failed else 'PASS'} "
+              f"({time.monotonic() - started:.3f}s)", flush=True)
+        return result
+
+    def check_source(self, name, source, *, tls=(), timeout=()):
+        from ubs_core.py_detectors import http_timeout, tls_verification
+
+        path = self.root / (name + ".py")
+        path.write_text(source, encoding="utf-8")
+        for detector, expected in ((tls_verification, tls), (http_timeout, timeout)):
+            with self.subTest(case=name, detector=detector.RULE_ID):
+                records = list(detector.find([path]))
+                actual = sorted((str(p), line, col) for p, line, col, _ in records)
+                (self.root / (name + "-" + detector.RULE_ID + ".json")).write_text(
+                    json.dumps({"source": source, "expected": expected, "actual": actual,
+                                "detector_sha256": hashlib.sha256(
+                                    Path(detector.__file__).read_bytes()).hexdigest()}, indent=2),
+                    encoding="utf-8")
+                self.assertEqual(actual, [(str(path), line, 1) for line in expected], source)
+
+    def test_later_iterations_resolve_saved_native_calls_and_clients(self):
+        for loop in ("for retry in range(2)", "while retry()"):
+            for name, assignment, call in (
+                ("function", "requests.get", "selected"),
+                ("client", "requests.Session()", "selected.get"),
+                ("method", "requests.Session().get", "selected"),
+            ):
+                label = name + ("-for" if loop.startswith("for") else "-while")
+                self.check_source(label, "import requests\nselected = local\n" + loop + ":\n"
+                                  f'    {call}("https://example.invalid", verify=False)\n'
+                                  f"    selected = {assignment}\n", tls=[4], timeout=[4])
+        self.check_source("async-for", 'import requests\nasync def fetch(stream):\n'
+                          '    selected = local\n    async for item in stream:\n'
+                          '        selected("https://example.invalid", verify=False)\n'
+                          '        selected = requests.get\n', tls=[5], timeout=[5])
+
+    def test_native_alias_chains_require_more_than_one_replay(self):
+        self.check_source("alias-chain", 'import requests\nfirst = second = selected = local\n'
+                          'while retry():\n'
+                          '    selected("https://example.invalid", verify=False)\n'
+                          '    selected = first\n    first = second\n    second = requests.get\n',
+                          tls=[4], timeout=[4])
+        self.check_source("module-member", 'import requests\nsaved = requests.get\n'
+                          'requests.get = local\nfor retry in range(2):\n'
+                          '    requests.get("https://example.invalid", verify=False)\n'
+                          '    requests.get = saved\n', tls=[5], timeout=[5])
+
+    def test_client_timeout_mutations_reach_later_requests(self):
+        self.check_source("timeout-option-carried", 'import httpx\nclient = httpx.Client(timeout=5)\n'
+                          'limit = 5\nfor retry in range(2):\n'
+                          '    client.get("https://example.invalid", timeout=limit)\n'
+                          '    limit = None\n', timeout=[5])
+        self.check_source("timeout-mutation", 'import httpx\nclient = httpx.Client(timeout=5)\n'
+                          'for retry in range(2):\n'
+                          '    client.get("https://example.invalid")\n'
+                          '    client.timeout = None\n', timeout=[4])
+        self.check_source("bounded-before-call", 'import httpx\nclient = httpx.Client(timeout=5)\n'
+                          'while retry():\n    client.timeout = 5\n'
+                          '    client.get("https://example.invalid")\n'
+                          '    client.timeout = None\n')
+        self.check_source("shadow-before-call", 'import requests\nselected = requests.get\n'
+                          'while retry():\n    selected = local\n'
+                          '    selected("https://example.invalid", verify=False)\n'
+                          '    selected = requests.get\n')
+
+    def test_empty_singleton_and_ordered_iterables_do_not_invent_iterations(self):
+        for expression in ("range(0)", "range(1)", "()", "[]", "(0,)"):
+            self.check_source("short-" + str(len(expression)) + expression[:1],
+                              'import requests\nselected = local\n'
+                              f'for retry in {expression}:\n'
+                              '    selected("https://example.invalid", verify=False)\n'
+                              '    selected = requests.get\n')
+        self.check_source("ordered-callees", 'import requests\n'
+                          'for selected in (local, requests.get, local):\n'
+                          '    selected("https://example.invalid", verify=False)\n',
+                          tls=[3], timeout=[3])
+        self.check_source("range-shadow", 'import requests\nrange = external_iterable\n'
+                          'for item in range(0):\n'
+                          '    requests.get("https://example.invalid", verify=False)\n',
+                          tls=[4], timeout=[4])
+        self.check_source("dead-while", 'import requests\nwhile False:\n'
+                          '    requests.get("https://example.invalid", verify=False)\n')
+
+    def test_break_continue_and_return_do_not_feed_dead_assignments_back(self):
+        for name, statement in (("break", "break"), ("continue", "continue"), ("return", "return")):
+            self.check_source("dead-binding-" + name, 'import requests\ndef fetch():\n'
+                              '    selected = local\n    for retry in range(2):\n'
+                              '        selected("https://example.invalid", verify=False)\n'
+                              f'        {statement}\n        selected = requests.get\n')
+        self.check_source("possible-break", 'import requests\nselected = local\n'
+                          'while retry():\n'
+                          '    selected("https://example.invalid", verify=False)\n'
+                          '    if stop():\n        break\n    selected = requests.get\n',
+                          tls=[4], timeout=[4])
+        self.check_source("continue-after-binding", 'import requests\nselected = local\n'
+                          'while retry():\n'
+                          '    selected("https://example.invalid", verify=False)\n'
+                          '    selected = requests.get\n    continue\n    selected = local\n',
+                          tls=[4], timeout=[4])
+
+    def test_finally_effects_belong_to_the_correct_loop_exit(self):
+        prefix = ('import requests\nselected = local\nfor retry in range(2):\n'
+                  '    selected("https://example.invalid", verify=False)\n')
+        self.check_source("finally-installs", prefix + '    try:\n        continue\n'
+                          '    finally:\n        selected = requests.get\n', tls=[4], timeout=[4])
+        self.check_source("finally-restores", prefix + '    try:\n'
+                          '        selected = requests.get\n        continue\n'
+                          '    finally:\n        selected = local\n')
+        self.check_source("finally-break", prefix + '    try:\n        break\n'
+                          '    finally:\n        selected = requests.get\n'
+                          'selected("https://example.invalid", verify=False)\n', tls=[9], timeout=[9])
+        self.check_source("finally-overrides-break", prefix + '    try:\n        break\n'
+                          '    finally:\n        selected = requests.get\n        continue\n',
+                          tls=[4], timeout=[4])
+
+    def test_nested_loop_breaks_and_loop_else_keep_their_owners(self):
+        self.check_source("inner-break", 'import requests\nselected = local\n'
+                          'for outer in range(2):\n    for inner in range(1):\n        break\n'
+                          '    selected("https://example.invalid", verify=False)\n'
+                          '    selected = requests.get\n', tls=[6], timeout=[6])
+        self.check_source("break-skips-else", 'import requests\nselected = local\n'
+                          'for item in range(2):\n    break\nelse:\n    selected = requests.get\n'
+                          'selected("https://example.invalid", verify=False)\n')
+        self.check_source("empty-runs-else", 'import requests\nselected = local\n'
+                          'for item in ():\n    pass\nelse:\n    selected = requests.get\n'
+                          'selected("https://example.invalid", verify=False)\n', tls=[7], timeout=[7])
+
+    def test_loop_growth_is_explicitly_incomplete_and_unrelated_loops_remain_bounded(self):
+        from ubs_core.py_detectors import http_timeout, tls_verification
+
+        path = self.root / "unbounded-identities.py"
+        path.write_text('import requests\nclient = requests\nwhile retry():\n'
+                        '    client = client.api\n', encoding="utf-8")
+        for detector in (http_timeout, tls_verification):
+            with self.subTest(detector=detector.RULE_ID):
+                with self.assertRaisesRegex(ValueError, 'HTTP configuration loop analysis is incomplete'):
+                    list(detector.find([path]))
+        self.check_source("unrelated-container-growth", 'value = []\nwhile retry():\n    value = [value]\n')
+
+    def test_suppressed_exceptions_resume_the_live_loop_body(self):
+        import contextlib
+
+        body = ('for retry in range(1):\n    with contextlib.suppress(ValueError):\n'
+                '        raise ValueError()\n'
+                '    requests.get("https://example.invalid", verify=False)\n')
+        observed = []
+        recorder = SimpleNamespace(get=lambda *args, **kwargs: observed.append((args, kwargs)))
+        exec(compile(body, '<suppressed-loop-witness>', 'exec'),
+             {"contextlib": contextlib, "requests": recorder})
+        self.assertEqual(observed, [(("https://example.invalid",), {"verify": False})])
+        self.check_source("suppressed-loop", 'import contextlib\nimport requests\n' + body,
+                          tls=[6], timeout=[6])
+        self.check_source("async-suppressed-loop", 'import requests\nasync def run(manager):\n'
+                          '    for retry in range(1):\n        async with manager:\n'
+                          '            raise ValueError()\n'
+                          '        requests.get("https://example.invalid", verify=False)\n',
+                          tls=[6], timeout=[6])
+        for jump in ("break", "continue", "return"):
+            self.check_source("with-abrupt-" + jump, 'import contextlib\nimport requests\n'
+                              'def run():\n    for retry in range(2):\n'
+                              '        with contextlib.suppress(ValueError):\n'
+                              f'            {jump}\n'
+                              '        requests.get("https://example.invalid", verify=False)\n')
+
+    def test_mutable_aliases_and_expanded_sequences_do_not_prove_single_iterations(self):
+        body = ('selected = local\nqueue = [0]\nfor item in queue:\n'
+                '    selected("https://example.invalid", verify=False)\n'
+                '    if item == 0:\n        queue.append(1)\n    selected = requests.get\n')
+        observed = []
+        recorder = SimpleNamespace(get=lambda *args, **kwargs: observed.append((args, kwargs)))
+        exec(compile(body, '<growing-loop-witness>', 'exec'),
+             {"requests": recorder, "local": lambda *args, **kwargs: None})
+        self.assertEqual(observed, [(("https://example.invalid",), {"verify": False})])
+        self.check_source("growing-list", 'import requests\n' + body, tls=[5], timeout=[5])
+        self.check_source("immutable-tuple", 'import requests\nselected = local\nqueue = (0,)\n'
+                          'for item in queue:\n'
+                          '    selected("https://example.invalid", verify=False)\n'
+                          '    selected = requests.get\n')
+        self.check_source("expanded-tuple", 'import requests\nselected = local\n'
+                          'for item in (*external_items,):\n'
+                          '    selected("https://example.invalid", verify=False)\n'
+                          '    selected = requests.get\n', tls=[4], timeout=[4])
+        self.check_source("joined-sequence-destructure", 'import requests\n'
+                          '(selected,) = [requests.get] if flag else (requests.get,)\n'
+                          'selected("https://example.invalid", verify=False)\n', tls=[3], timeout=[3])
+
+    def test_repeated_allocations_cannot_reassign_old_client_alias_policies(self):
+        from ubs_core.py_detectors import http_timeout, tls_verification
+
+        cases = (
+            (http_timeout, 'import httpx\nlimit = None\nprior = local\n'
+             'for retry in range(2):\n    client = httpx.Client(timeout=limit)\n'
+             '    prior.get("https://example.invalid")\n    prior = client\n    limit = 5\n'),
+            (http_timeout, 'import httpx\nprior = local\nfor retry in range(2):\n'
+             '    client = httpx.Client(timeout=5)\n    prior.timeout = None\n'
+             '    client.get("https://example.invalid")\n    prior = client\n'),
+            (tls_verification, 'import requests\nfor retry in range(2):\n'
+             '    client = requests.Session()\n'
+             '    client.get("https://example.invalid", verify=False)\n    client.get = local\n'),
+        )
+        for index, (detector, source) in enumerate(cases):
+            with self.subTest(index=index):
+                path = self.root / ("repeated-allocation-" + str(index) + ".py")
+                path.write_text(source, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, 'HTTP configuration loop analysis is incomplete'):
+                    list(detector.find([path]))
+
+    @unittest.skipUnless(importlib.util.find_spec("requests"), "native Requests witness requires requests")
+    def test_native_requests_second_iteration_uses_saved_client_without_network(self):
+        import requests
+
+        observed = []
+
+        class Capture(requests.adapters.BaseAdapter):
+            def send(self, request, **kwargs):
+                observed.append((kwargs["verify"], kwargs["timeout"]))
+                response = requests.Response()
+                response.status_code = 200
+                response._content = b"transport"
+                return response
+
+            def close(self):
+                pass
+
+        with requests.Session() as client:
+            client.trust_env = False
+            client.mount("https://", Capture())
+            selected = lambda *args, **kwargs: None
+            for retry in range(2):
+                selected("https://example.invalid", verify=False, timeout=5)
+                selected = client.get
+        self.assertEqual(observed, [(False, 5)])
+        self.check_source("requests-witness", 'import requests\nclient = requests.Session()\n'
+                          'selected = lambda *args, **kwargs: None\nfor retry in range(2):\n'
+                          '    selected("https://example.invalid", verify=False, timeout=5)\n'
+                          '    selected = client.get\n', tls=[5])
+
+    @unittest.skipUnless(importlib.util.find_spec("httpx"), "native HTTPX witness requires httpx")
+    def test_native_httpx_second_iteration_observes_timeout_mutation_without_network(self):
+        import httpx
+
+        observed = []
+
+        def respond(request):
+            observed.append(dict(request.extensions["timeout"]))
+            return httpx.Response(200)
+
+        with httpx.Client(transport=httpx.MockTransport(respond), trust_env=False, timeout=5) as client:
+            for retry in range(2):
+                client.get("https://example.invalid")
+                client.timeout = None
+        self.assertEqual(observed, [dict.fromkeys(("connect", "read", "write", "pool"), value)
+                                    for value in (5, None)])
+        self.check_source("httpx-witness", 'import httpx\nclient = httpx.Client(timeout=5)\n'
+                          'for retry in range(2):\n    client.get("https://example.invalid")\n'
+                          '    client.timeout = None\n', timeout=[4])
 
 
 class PythonTLSReceiverPrecisionTests(unittest.TestCase):
@@ -9655,6 +10012,24 @@ class PythonTLSReceiverPrecisionTests(unittest.TestCase):
                     self.assertIs(invocation["executionSuccessful"], True, context)
         self.assertEqual(proc.returncode, int(bool(sites)), context)
         return sites
+
+    @unittest.skipUnless(os.environ.get("UBS_RUN_TLS_RECEIVER_E2E") == "1",
+                         "set UBS_RUN_TLS_RECEIVER_E2E=1 for real module/runner qualification")
+    def test_public_loop_carried_tls_client_in_json_and_sarif(self):
+        for count, expected in ((2, [5]), (1, [])):
+            source = self.root / ("public-loop-tls-" + str(count) + ".py")
+            source.write_text('import requests\ndef local(*args, **kwargs): return None\n'
+                              f'selected = local\nfor retry in range({count}):\n'
+                              '    selected("https://example.invalid", verify=False, timeout=5)\n'
+                              '    selected = requests.get\n', encoding="utf-8")
+            combinations = ((surface, format_) for surface in ("module", "runner")
+                            for format_ in ("json", "sarif")) if count == 2 else (("runner", "json"),)
+            for surface, format_ in combinations:
+                label = f"tls-receivers-loop-{count}-{surface}-{format_}"
+                with self.subTest(label=label):
+                    self.assertEqual(self.public_scan(source, surface=surface, format_=format_,
+                                                     cache=self.root / (label + "-cache"), label=label),
+                                     [(source, line) for line in expected])
 
     @unittest.skipUnless(os.environ.get("UBS_RUN_TLS_RECEIVER_E2E") == "1",
                          "set UBS_RUN_TLS_RECEIVER_E2E=1 for real module/runner qualification")

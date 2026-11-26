@@ -1,77 +1,125 @@
-UNACTIVATED CANDIDATE: native-set LDAP admission
-Base: 1cf5529bfa6afb2b247cf5ce1e8cb95dbba061c6
+UNACTIVATED CANDIDATE: guarded native-set LDAP admission
+Original base: 1cf5529bfa6afb2b247cf5ce1e8cb95dbba061c6
 Related beads: ultimate_bug_scanner-4ndb, ultimate_bug_scanner-1b9j.6.15,
 ultimate_bug_scanner-q150.11
 
-This file preserves a functional candidate; committing this patch does not
-activate it. It adds a whole-file admission proof for exact native set.add
-operations, so unsupported unrelated functions do not make those files partial.
-One unknown or actual directory candidate keeps the existing analyzer,
-findings, failure collector, work limits, and partial-result contract.
+This guarded checkpoint supersedes the earlier unqualified draft in this file.
+It is an unapplied patch, not runtime activation. Main has concurrently acquired
+a broader native regex/set applicability implementation (a7715717207b768185ae6a88371c4460ba28c96e).
+Do not apply this old-base implementation wholesale over that code. The
+measured frame/cell guards must be integrated with the current applicability
+API and qualified against its exact source.
 
-The proof supports direct set literals/comprehensions and one stable local
-allocation. It refuses uncertain aliases, fields, parameters, captures,
-constructor authority, eager headers, exception binders, global writers, and
-assignment-expression constructor writes. Existing tests are not weakened.
-The maintained additions exercise successful exclusions and conservative
-fallbacks, independently executed native operations, and real JSON/SARIF/NDJSON
-reports. The checksum changes below were produced by the canonical generators.
+The candidate avoids LDAP flow only when every candidate is a proved native
+set operation. An unknown or actual directory operation retains the original
+analyzer, findings, work limits, and incomplete-analysis diagnostics. Its
+named-local proof rejects nested callable/generator captures, suspension,
+tracebacks, context-manager frame exposure, and tracing/profile callbacks.
+Direct native allocations remain distinct from mutable local bindings.
 
-Observed evidence before this checkpoint:
-- Unchanged baseline LDAP source tests: 19 tests, OK, 3 existing skips.
-- Frozen independent baseline/candidate comparison: 28 CPython native
-  witnesses; 8 incomplete-to-complete improvements; every fallback result
-  identical; no new incorrect complete-clean verdict.
-- Three pre-existing incorrect complete-clean results remain for escaped
-  builtins module/alias/callable-owner cases. This candidate does not repair
-  those existing runtime-identity defects.
-- Three initially incorrect new test expectations were corrected only after
-  a separate Python 3.14 DSR comparison proved original/candidate findings
-  and diagnostic components identical.
-- Corrected source tests on Python 3.14.10 with real ldap3 2.9.1 enabled:
-  28 tests, OK, 1 existing constructor-cohort skip. The enclosing DSR job
-  later failed to write receipts when the workspace filled; this observation
-  is not a passing aggregate qualification.
-- Canonical checksum verification: frozen DSR passed 2/2, source unchanged.
-- Public-report and all-shell lint qualification are still pending. An earlier
-  public attempt ran out of disk and aggregate ShellCheck exited 137. Those
-  interrupted attempts are not passes; retries use an isolated writable copy.
+Native Python 3.14 witnesses found eight incorrect complete-clean results in
+the earlier draft. The corrected patch below admits all eight to ordinary
+analysis and exactly preserves the original partial results. It does not
+pretend the solver detects opaque callback mutations that it cannot resolve.
 
-Activation remains pending the complete maintained/public suite, source scan,
-full repository gates, and the repository's version/tag requirements.
-AGENTS.md requires a version bump plus tag for module changes; docs/release.md
-requires review of exact commit/version/commands/destinations before tag
-creation. No tag or release is created by this checkpoint. The P0 compatible
-release/installer bead is not resolved.
+Frozen qualification of this exact old-base candidate:
+- CPython 3.14.10, real ldap3 2.9.1 and pyasn1 0.6.5.
+- LDAP source suite: 29 selected, 28 passed, one pre-existing intentional
+  constructor-precision cohort skip; both genuine ldap3 runtime tests passed.
+- Independent 35-case native comparison: nine incomplete-to-complete
+  improvements, unchanged conservative fallbacks, no new incorrect clean
+  result in that cohort. Six existing baseline unsafe-clean cases remain
+  (three exposed-builtin and three comprehension-constructor variants).
+- Eight separate native frame/cell witnesses: earlier draft complete-clean;
+  corrected candidate partial, byte-for-byte original finding/diagnostic
+  observations preserved. All eight reached Directory.add with request data.
+- Public contract: all 12 module/runner JSON/SARIF invocations passed, with
+  six actual NDJSON sidecars checked. A native-only file is complete; adding
+  an opaque generator retains the independent taint_py partial diagnostic
+  while removing the irrelevant LDAP diagnostic. A real directory receiver
+  retains its finding and incomplete-LDAP diagnostic.
+- Both canonical checksum verifiers passed on unchanged source.
+- Maintained-source inventory: 377 files, 248 syntactic LDAP candidates,
+  four native-only exclusions, zero parse/proof errors. This is admission
+  evidence, not a complete self-scan or a speedup measurement.
+- Full ShellCheck remains unmet: ubs was killed with exit 137 even in an
+  isolated serial retry. The other 25 shell files passed that earlier run.
+  The complete repository suite, strict self-scan and release gates are not
+  claimed passed. No release or tag was created.
 
-The unified patch below applies to the stated base. If the source or version
-changes, review the code and regenerate the canonical checksum chain before
-qualification; do not reuse stale pins.
+Qualified source snapshot:
+b45a822db799c2660c8e4051178d563ae473980c43c7f5c4eb1ea7c7462f32a2
+LDAP adapter SHA256:
+5a1c508db6a9740a6d2ce48187edf59b1b4a41d88833e95db6021e10a244eccc
+
+DSR evidence identities:
+- ldap-frame-qualification-v2 / 20261126T005333-yVtYNMEI: 2/2 passed.
+- ldap-final-public / 20261126T005319-gCQObI0L: 2/2 passed.
+  Oracle log SHA256: 531340d681cea3282cb064a2a1b838c7a99e8e0aa08beb879400e1c1edf4a862
+  Public log SHA256: aa592bb12d0f02c144d4f887e7836697c66d7db1b2d879fcb4d58828bec61b39
+- ldap-final-checksum-inventory / 20261126T005317-3eJo3Zsa: 3/3 passed.
+  Checksum log SHA256: 246b2a8e675cee1618ff67a8b149b2407ec280d7d39b5232c9fc0d5247759fcb
+  Manifest log SHA256: 3595f0ae42ca27de7984f85e45013e1d4a533dd3a1a27327ada1cf245624bd8d
+  Inventory log SHA256: 6da597397753bdd03660ad7aef1500c7bd0fed6a053120a6dc93809587bef12e
+
+Canonical checksum changes below belong only to the stated base. Regenerate
+them after any source or version integration. This checkpoint does not resolve
+the P0 compatible-release/installer bead or authorize tag/release publication.
 
 diff --git a/SHA256SUMS b/SHA256SUMS
-index 8588240..5e94c03 100644
+index 8588240..516e3e7 100644
 --- a/SHA256SUMS
 +++ b/SHA256SUMS
 @@ -1,3 +1,3 @@
  2ce00f23960661d5a2613c4561c64612365e9b14c44bcdf0cbc076d28d940389  install.sh
 -5c6060c491855aa80365e47ec614f0664f6876c878e5136bff5c568c4d94e3fb  ubs
-+b3d0f16d3b7b48832599a8f81006f3c95ac892cbbd093a2a539ef5e710a21269  ubs
++079d77a0df8a6065450ff646755426fef1bb2168a8bb6d7c11f0a47094717ffe  ubs
  c8fd0acbf349e8bb83598d9f507e8e4adaba72dcfc0c43c33c5fe02709f02158  ubs-daemon
 diff --git a/modules/helpers/ubs_core/py_detectors/ldap_injection.py b/modules/helpers/ubs_core/py_detectors/ldap_injection.py
-index d3804f3..51ac34c 100644
+index d3804f3..92ff3a7 100644
 --- a/modules/helpers/ubs_core/py_detectors/ldap_injection.py
 +++ b/modules/helpers/ubs_core/py_detectors/ldap_injection.py
-@@ -148,6 +148,9 @@ class _ReceiverProof:
+@@ -148,6 +148,39 @@ class _ReceiverProof:
          self.engine = engine
          tree = engine.tree
          nodes = tuple(ast.walk(tree))
 +        self.set_expression_writes = any(
 +            isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name)
 +            and node.target.id == 'set' for node in nodes)
++        # Python frames can replace live locals without another AST store.
++        # Keep this optional proof out of suspension, implicit/eager-header
++        # closures, traceback handlers, and explicit tracing capabilities.
++        # The ordinary analyzer retains its existing uncertainty in each case.
++        frame_hooks = {'settrace', 'setprofile', 'settrace_all_threads',
++                       'setprofile_all_threads', 'register_callback',
++                       'set_events', 'set_local_events'}
++        self.frame_hooks_exposed = any(
++            isinstance(node, ast.Name) and node.id in frame_hooks
++            or isinstance(node, ast.Attribute) and node.attr in frame_hooks
++            or isinstance(node, ast.ImportFrom)
++            and any(alias.name in frame_hooks for alias in node.names)
++            for node in nodes)
++        self.private_local_scopes = set()
++        self.nested_local_names = {}
++        for scope in engine.functions:
++            if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                continue
++            # Include eager headers and implicit generator/annotation cells.
++            # Their actual capture owner is not always the AST's nearest scope.
++            self.nested_local_names[scope] = {
++                reference.id for child in flow._scope_nodes(scope)
++                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef,
++                                      ast.Lambda, ast.ClassDef, ast.GeneratorExp))
++                for reference in ast.walk(child) if isinstance(reference, ast.Name)
++            }
++            if not any(isinstance(child, (ast.Yield, ast.YieldFrom, ast.Await,
++                                          ast.ExceptHandler, ast.Try, ast.With, ast.AsyncWith))
++                       for child in ast.walk(scope) if child is not scope):
++                self.private_local_scopes.add(scope)
          parents = {child: node for node in nodes for child in ast.iter_child_nodes(node)}
          self.class_locals = {node: flow._local_names(node) for node in nodes if isinstance(node, ast.ClassDef)}
          attribute_writes = {node.attr for node in nodes if isinstance(node, ast.Attribute)
-@@ -314,6 +317,95 @@ class _ReceiverProof:
+@@ -314,6 +347,96 @@ class _ReceiverProof:
          return (isinstance(node, ast.Attribute) and node.attr in fields
                  and isinstance(node.value, ast.Name) and node.value.id == receiver)
  
@@ -124,7 +172,8 @@ index d3804f3..51ac34c 100644
 +            return False
 +        engine = self.engine
 +        scope = engine.enclosing(node)
-+        if (not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
++        if (scope not in self.private_local_scopes or self.frame_hooks_exposed
++                or node.id in self.nested_local_names.get(scope, ())
 +                or node.id not in engine.locals.get(scope, ())
 +                or node.id in engine.cell_locals.get(scope, ())
 +                or self.reflection or engine.generator_namespace_exposed
@@ -167,7 +216,7 @@ index d3804f3..51ac34c 100644
  
  class _LDAPFlow(flow._Flow):
      @staticmethod
-@@ -630,6 +722,8 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
+@@ -630,6 +753,8 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
              if not _has_sink(tree):
                  continue
              analyzer = _LDAPAnalysis(tree)
@@ -177,7 +226,7 @@ index d3804f3..51ac34c 100644
              effects = analyzer.analyze()
          except (OSError, UnicodeError, SyntaxError, RecursionError, RuntimeError, flow.AnalysisLimit) as exc:
 diff --git a/modules/lib/ubs-common.sh b/modules/lib/ubs-common.sh
-index 5b4abff..df872b1 100644
+index 5b4abff..cb11609 100644
 --- a/modules/lib/ubs-common.sh
 +++ b/modules/lib/ubs-common.sh
 @@ -477,7 +477,7 @@ declare -g -A UBS_COMMON_HELPER_CHECKSUMS=(
@@ -185,12 +234,12 @@ index 5b4abff..df872b1 100644
    ['helpers/ubs_core/py_detectors/json_loads.py']='4194a9f5a0704e0dfa3d30acc8c0553a46b4c02ab5f4408cf6851ff84e8ce5f7'
    ['helpers/ubs_core/py_detectors/jwt_verification.py']='d96ea02bb64da7dd9e5f5e6edb1c15f9c147f47c4628758d8e878693ee4d7284'
 -  ['helpers/ubs_core/py_detectors/ldap_injection.py']='096a2d110cdf4582f46c3590e7d0d44d606c42f93ef373b6489798d1ac3ab25a'
-+  ['helpers/ubs_core/py_detectors/ldap_injection.py']='f1dd2ab034c533102ac811882b916f04ca0b58583663cdb403c7f7bc655837c9'
++  ['helpers/ubs_core/py_detectors/ldap_injection.py']='5a1c508db6a9740a6d2ce48187edf59b1b4a41d88833e95db6021e10a244eccc'
    ['helpers/ubs_core/py_detectors/mass_assignment.py']='b60fe05d739f80b061cbd3e4f2d564ea59d0b4049b4ed6fd0d93109716ec07f8'
    ['helpers/ubs_core/py_detectors/missing_returns.py']='f8766918f1f408b5ee4fae8a5c2df8e300ca203a3ec5ca200c04558365795cb5'
    ['helpers/ubs_core/py_detectors/mutation_during_iteration.py']='3857f060cbc9c627581875decb38e88ec64c879e8301bbc218accda1d67cde81'
 diff --git a/modules/ubs-bash.sh b/modules/ubs-bash.sh
-index adfa2b0..3b8d096 100755
+index adfa2b0..5d59bcd 100755
 --- a/modules/ubs-bash.sh
 +++ b/modules/ubs-bash.sh
 @@ -11,7 +11,7 @@ set -Eeuo pipefail
@@ -198,12 +247,12 @@ index adfa2b0..3b8d096 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-cpp.sh b/modules/ubs-cpp.sh
-index 8d8235b..f43b05e 100755
+index 8d8235b..7e3e0cf 100755
 --- a/modules/ubs-cpp.sh
 +++ b/modules/ubs-cpp.sh
 @@ -16,7 +16,7 @@ set -Eeuo pipefail
@@ -211,12 +260,12 @@ index 8d8235b..f43b05e 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-csharp.sh b/modules/ubs-csharp.sh
-index 2ff06b7..c01f868 100755
+index 2ff06b7..42fe9f4 100755
 --- a/modules/ubs-csharp.sh
 +++ b/modules/ubs-csharp.sh
 @@ -27,7 +27,7 @@ set -Eeuo pipefail
@@ -224,12 +273,12 @@ index 2ff06b7..c01f868 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-elixir.sh b/modules/ubs-elixir.sh
-index f586977..abfb2c2 100755
+index f586977..9da843f 100755
 --- a/modules/ubs-elixir.sh
 +++ b/modules/ubs-elixir.sh
 @@ -16,7 +16,7 @@ set -Eeuo pipefail
@@ -237,12 +286,12 @@ index f586977..abfb2c2 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-golang.sh b/modules/ubs-golang.sh
-index 0663f73..3b95df1 100755
+index 0663f73..e181745 100755
 --- a/modules/ubs-golang.sh
 +++ b/modules/ubs-golang.sh
 @@ -15,7 +15,7 @@ set -Eeuo pipefail
@@ -250,12 +299,12 @@ index 0663f73..3b95df1 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-hcl.sh b/modules/ubs-hcl.sh
-index 79043db..4718f39 100755
+index 79043db..6711bf6 100755
 --- a/modules/ubs-hcl.sh
 +++ b/modules/ubs-hcl.sh
 @@ -4,7 +4,7 @@
@@ -263,12 +312,12 @@ index 79043db..4718f39 100755
  
  # Bootstrap the same checksum-pinned shared library as the other modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-java.sh b/modules/ubs-java.sh
-index 16ea971..de81777 100755
+index 16ea971..bf99387 100755
 --- a/modules/ubs-java.sh
 +++ b/modules/ubs-java.sh
 @@ -18,7 +18,7 @@ set -Eeuo pipefail
@@ -276,12 +325,12 @@ index 16ea971..de81777 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-js.sh b/modules/ubs-js.sh
-index a8cbaf5..89e15e7 100755
+index a8cbaf5..63d419e 100755
 --- a/modules/ubs-js.sh
 +++ b/modules/ubs-js.sh
 @@ -16,7 +16,7 @@ set -Eeuo pipefail
@@ -289,12 +338,12 @@ index a8cbaf5..89e15e7 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-kotlin.sh b/modules/ubs-kotlin.sh
-index 2c04a7a..bc92682 100755
+index 2c04a7a..a356c47 100755
 --- a/modules/ubs-kotlin.sh
 +++ b/modules/ubs-kotlin.sh
 @@ -10,7 +10,7 @@ set -Eeuo pipefail
@@ -302,12 +351,12 @@ index 2c04a7a..bc92682 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-php.sh b/modules/ubs-php.sh
-index 976ebb7..fcfe0bf 100755
+index 976ebb7..59133bd 100755
 --- a/modules/ubs-php.sh
 +++ b/modules/ubs-php.sh
 @@ -5,7 +5,7 @@ set -Eeuo pipefail
@@ -315,12 +364,12 @@ index 976ebb7..fcfe0bf 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-python.sh b/modules/ubs-python.sh
-index fd7a4a4..565d6ca 100755
+index fd7a4a4..77768a9 100755
 --- a/modules/ubs-python.sh
 +++ b/modules/ubs-python.sh
 @@ -18,7 +18,7 @@ set -Eeuo pipefail
@@ -328,12 +377,12 @@ index fd7a4a4..565d6ca 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-ruby.sh b/modules/ubs-ruby.sh
-index 9782b26..fef737e 100755
+index 9782b26..c1c0fd8 100755
 --- a/modules/ubs-ruby.sh
 +++ b/modules/ubs-ruby.sh
 @@ -18,7 +18,7 @@ set -Eeuo pipefail
@@ -341,12 +390,12 @@ index 9782b26..fef737e 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-rust.sh b/modules/ubs-rust.sh
-index 47551e2..fba05e2 100755
+index 47551e2..c78afec 100755
 --- a/modules/ubs-rust.sh
 +++ b/modules/ubs-rust.sh
 @@ -17,7 +17,7 @@ set -Eeuo pipefail
@@ -354,12 +403,12 @@ index 47551e2..fba05e2 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-sql.sh b/modules/ubs-sql.sh
-index df66c1f..982f372 100755
+index df66c1f..4dec797 100755
 --- a/modules/ubs-sql.sh
 +++ b/modules/ubs-sql.sh
 @@ -4,7 +4,7 @@
@@ -367,12 +416,12 @@ index df66c1f..982f372 100755
  
  # Bootstrap the same checksum-pinned shared library as the other modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/modules/ubs-swift.sh b/modules/ubs-swift.sh
-index 3a0fce7..2f8f7d8 100755
+index 3a0fce7..7eebfa5 100755
 --- a/modules/ubs-swift.sh
 +++ b/modules/ubs-swift.sh
 @@ -17,7 +17,7 @@ set -Eeuo pipefail
@@ -380,12 +429,12 @@ index 3a0fce7..2f8f7d8 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/scripts/new-module.sh b/scripts/new-module.sh
-index 6872da0..d33e70d 100755
+index 6872da0..e4a9171 100755
 --- a/scripts/new-module.sh
 +++ b/scripts/new-module.sh
 @@ -93,7 +93,7 @@ set -Eeuo pipefail
@@ -393,15 +442,15 @@ index 6872da0..d33e70d 100755
  # Shared primitives (bead A1): locale export, json_escape, format contract,
  # NUL-safe file listing. Shipped and checksum-verified next to the modules.
 -UBS_LIB_CHECKSUM="76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0"
-+UBS_LIB_CHECKSUM="9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643"
++UBS_LIB_CHECKSUM="6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b"
  UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
  if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
    if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
 diff --git a/test-suite/quality/test_python_precision.py b/test-suite/quality/test_python_precision.py
-index 03e2c64..e4afeee 100644
+index 03e2c64..4f5f16d 100644
 --- a/test-suite/quality/test_python_precision.py
 +++ b/test-suite/quality/test_python_precision.py
-@@ -2764,6 +2764,386 @@ class LDAPFlowTests(unittest.TestCase):
+@@ -2764,6 +2764,465 @@ class LDAPFlowTests(unittest.TestCase):
                  self.assertEqual([line for _, line, _, _ in findings], [3])
  
  
@@ -410,7 +459,7 @@ index 03e2c64..e4afeee 100644
 +
 +    OPAQUE_GENERATOR = (
 +        'def unrelated_generator(values):\n'
-+        '    return any(item in values for item in ("first", "second"))\n'
++        '    return tuple(value.name for value in values)\n'
 +    )
 +    EXHAUSTED_SCOPE = (
 +        'def unrelated_work(value):\n' + '    value = str(value)\n' * 100 +
@@ -669,6 +718,85 @@ index 03e2c64..e4afeee 100644
 +            ''',
 +        }, incomplete=True, exhausted=True)
 +
++    def test_frame_and_cell_exposure_retains_incomplete_analysis(self):
++        # Native Python 3.14 witnesses replace these sets through exposed
++        # frames or cells before add(). The unchanged solver has no findings
++        # for these opaque callbacks, but its incomplete status must survive.
++        self.check_relevance({
++            'generator-expression-cell': '''
++                def run(request, conn):
++                    values = {0}
++                    captured = (values for _ in (0,))
++                    configure(captured, conn)
++                    values.add(request.args['dn'])
++            ''',
++            'eager-default-lambda-cell': '''
++                def run(request, conn):
++                    values = {0}
++                    def holder(values=lambda: values):
++                        return values
++                    configure(holder, conn)
++                    values.add(request.args['dn'])
++            ''',
++            'suspended-generator-function': '''
++                def collect(request, conn):
++                    values = {0}
++                    yield
++                    values.add(request.args['dn'])
++                def run(request, conn):
++                    pending = collect(request, conn)
++                    next(pending)
++                    configure(pending, conn)
++                    next(pending, None)
++            ''',
++            'suspended-coroutine-function': '''
++                async def collect(request, conn):
++                    values = {0}
++                    await pause()
++                    values.add(request.args['dn'])
++                def run(request, conn):
++                    pending = collect(request, conn)
++                    pending.send(None)
++                    configure(pending, conn)
++                    finish(pending)
++            ''',
++            'registered-trace-callback': '''
++                import sys
++                sys.settrace(trace)
++                def run(request, conn):
++                    values = {0}
++                    values.add(request.args['dn'])
++            ''',
++            'caught-exception-traceback': '''
++                def run(request, conn):
++                    values = {0}
++                    try:
++                        raise RuntimeError('frame boundary')
++                    except RuntimeError as error:
++                        configure(error, conn)
++                    values.add(request.args['dn'])
++            ''',
++            'context-manager-traceback': '''
++                def run(request, conn):
++                    values = {0}
++                    with boundary_context(conn):
++                        raise RuntimeError('frame boundary')
++                    values.add(request.args['dn'])
++            ''',
++            'implicit-async-with-suspension': '''
++                async def collect(request, conn):
++                    values = {0}
++                    async with boundary_async_context():
++                        pass
++                    values.add(request.args['dn'])
++                def run(request, conn):
++                    pending = collect(request, conn)
++                    pending.send(None)
++                    configure(pending, conn)
++                    finish(pending)
++            ''',
++        }, incomplete=True)
++
 +    def test_constructor_authority_rejects_eager_headers_and_namespace_writers(self):
 +        """An optional preflight must never bypass an unknown callable."""
 +        import ast
@@ -788,7 +916,7 @@ index 03e2c64..e4afeee 100644
  class HeaderInjectionFlowTests(unittest.TestCase):
      """Header decisions must follow actual values, callees and control flow."""
  
-@@ -3404,6 +3784,99 @@ class HeaderInjectionFlowTests(unittest.TestCase):
+@@ -3404,6 +3863,115 @@ class HeaderInjectionFlowTests(unittest.TestCase):
  @unittest.skipUnless(os.environ.get('UBS_PY_LDAP_E2E') == '1',
                       'set UBS_PY_LDAP_E2E=1 for actual LDAP CLI scans')
  class LDAPInjectionPublicTests(unittest.TestCase):
@@ -798,15 +926,15 @@ index 03e2c64..e4afeee 100644
 +        artifacts.mkdir(parents=True, exist_ok=True)
 +        work = Path(tempfile.mkdtemp(prefix='python-ldap-set-public-', dir=artifacts))
 +        (work / 'tmp').mkdir()
-+        prefix = ('def unrelated(values):\n'
-+                  '    return tuple(value.name for value in values)\n'
-+                  '\n'
-+                  'def handle(request, conn):\n')
++        noise = ('def unrelated(values):\n'
++                 '    return tuple(value.name for value in values)\n\n')
++        prefix = 'def handle(request, conn):\n'
++        native = prefix + '    values = {0}\n    values.add(request.args["dn"])\n'
 +        sources = (
-+            ('native', prefix + '    values = {0}\n'
-+             '    values.add(request.args["dn"])\n', False),
-+            ('directory', prefix + '    values = conn\n'
-+             '    values.add(request.args["dn"])\n', True),
++            ('native', native, False, False),
++            ('native-opaque', noise + native, True, False),
++            ('directory', noise + prefix + '    values = conn\n'
++             '    values.add(request.args["dn"])\n', True, True),
 +        )
 +        env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
 +               'UBS_NO_CACHE': '1', 'UBS_ALLOW_PARTIAL': '0', 'UBS_KEEP_TEMP': '1',
@@ -815,12 +943,12 @@ index 03e2c64..e4afeee 100644
 +               'XDG_DATA_HOME': str(work / 'data'), 'XDG_CONFIG_HOME': str(work / 'config'),
 +               'XDG_CACHE_HOME': str(work / 'cache')}
 +        skip = '--skip=' + ','.join(str(i) for i in range(1, 24) if i != 7)
-+        for label, source, partial in sources:
++        for label, source, partial, directory in sources:
 +            selected = work / label
 +            selected.mkdir()
 +            path = selected / 'view.py'
 +            path.write_text(source, encoding='utf-8')
-+            expected = [(ldap_injection.RULE_ID, path.name, 6, 5, 'critical')] if partial else []
++            expected = [(ldap_injection.RULE_ID, path.name, 6, 5, 'critical')] if directory else []
 +            for module in (True, False):
 +                for fmt in ('json', 'sarif'):
 +                    with self.subTest(case=label, module=module, format=fmt):
@@ -855,6 +983,9 @@ index 03e2c64..e4afeee 100644
 +                            else:
 +                                self.assertEqual([(row['rule_id'], Path(row['file']).name, row['line'],
 +                                                   row['col'], row['severity']) for row in rows], expected, context)
++                            errors = (payload.get('analysis_errors', []) if module else
++                                      [error for scanner in payload['scanners']
++                                       for error in scanner.get('analysis_errors', [])])
 +                        else:
 +                            rows = [row for run in payload['runs'] for row in run.get('results', [])]
 +                            sites = []
@@ -873,6 +1004,9 @@ index 03e2c64..e4afeee 100644
 +                            else:
 +                                self.assertTrue(all(item.get('executionSuccessful') is not False
 +                                                    for item in invocations), context)
++                            errors = [error for invocation in invocations
++                                      for notification in invocation.get('toolExecutionNotifications', [])
++                                      for error in notification.get('properties', {}).get('analysis_errors', [])]
 +                        if module:
 +                            records = [json.loads(line) for line in ledger.read_text(encoding='utf-8').splitlines()]
 +                            self.assertEqual([(row['rule'], Path(row['path']).name, row['line'],
@@ -882,14 +1016,24 @@ index 03e2c64..e4afeee 100644
 +                                self.assertIn('request.args', row['message'])
 +                                self.assertIn('LDAP distinguished name', row['message'])
 +                        if partial:
++                            # LDAP irrelevance must not hide an independent analyzer's failure.
++                            self.assertTrue(any(error['stage'].startswith('taint_py (')
++                                                and error.get('semantic') is True for error in errors), context)
++                        else:
++                            self.assertEqual(errors, [], context)
++                        self.assertEqual(any('incomplete LDAP analysis' in error.get('message', '')
++                                             for error in errors), directory, context)
++                        if directory:
 +                            self.assertIn('incomplete LDAP analysis', result.stdout + result.stderr, context)
++                        else:
++                            self.assertNotIn('incomplete LDAP analysis', result.stdout + result.stderr, context)
 +                        print('PYTHON_LDAP_SET_PUBLIC', label, module, fmt, 'PASS', flush=True)
 +
      def test_module_and_runner_json_sarif_preserve_findings_and_partial_status(self):
          artifacts = REPO_ROOT / 'test-suite/artifacts'
          artifacts.mkdir(parents=True, exist_ok=True)
 diff --git a/ubs b/ubs
-index 790f99a..a06f1ba 100755
+index 790f99a..e24abbb 100755
 --- a/ubs
 +++ b/ubs
 @@ -215,21 +215,21 @@ MODULE_PATH_TEMPLATE_LATEST="$REPO_RAW_LATEST/modules/ubs-%s.sh"
@@ -911,21 +1055,21 @@ index 790f99a..a06f1ba 100755
 -  [rust]='d7a539fe3877e08afc46cf2610073777a9555172b0932aec1ceb093df46b852b'
 -  [sql]='0ceb304e06e6c1e1d8ef4a53e446dcc9bc91058591f37a1813159149476804c8'
 -  [swift]='51c2d35085c7dddada91e8ec577cce7c00412274c211eabd619d0ab6b34b0f57'
-+  [bash]='fc501dfaceaf3c6cea1e777259a75991341067def739abfdcbb59899cb9593a0'
-+  [cpp]='0923c5ca6e35d142a679c3f849b25dc68ff46e69e0ae5b5ccce14d4accd0bf15'
-+  [csharp]='9a184b0ebc7f83a123af469bc8168beb17da642879718f09102361117e031779'
-+  [elixir]='7b0d46caa25bf7410b32dce611dcd65624bd4f71b04a4b952a66c4fca28be5a0'
-+  [golang]='9cfc2eb7f1748c0671fd15e8ff5955d9d42db6f63fed2463bc50305e6f0a5be0'
-+  [hcl]='ff2d552beb3b0cf28bdeebb07c3abad2a87b5fa325adf6bdf6a3610a48a4f7e0'
-+  [java]='c0b4239ea1cdf422e19aa620f02e9f2315e4210468083a35c1f63385bc0cafab'
-+  [js]='419b24187040da4fad1c490f6709abd1ea7078966ccb19f81ca03d7b7acd7723'
-+  [kotlin]='e07446f6b63f6e557411b5a6a398eb570556b0324fe56af4217b8179989af06e'
-+  [php]='52cc6ba95c3b8c0a4c6306909ee4c9bcf37b55a7fd7d3eae235cd24819236709'
-+  [python]='b852d8439f236b3eb93f01b3fbbedd46b57063f47756b92104aa55c0a890644e'
-+  [ruby]='23c32dac56d3e1f677390b4b846a764a50c2e17eaedee6c36ecab44fd0180744'
-+  [rust]='901316b846a5556b526165cf3ae5a65150cba693f7f82d9d452767e7e6d2bb7d'
-+  [sql]='ae38a3f2c7e8319c5f71baf608820359efc07fc7511756a1da0fe113cc2121ae'
-+  [swift]='fb87a4527c59aa50979bfba588685e8220e568a9b8f9b3160864c92bf7a2d4f5'
++  [bash]='0e7fd688478755ef2800eabefa9138318b81e747c70940fce884913d9915cb8c'
++  [cpp]='8898eacee87ced5c0b5c96beb7a08dcb1960a3c2ed5eb28d8daae04af0ff2f92'
++  [csharp]='ca7efc696edd86aa6eb953ceeb165630c9bb9b5ea519c4b3826dc73d74bca33f'
++  [elixir]='09f9a93f31aae0f10d880a1c9c1b24a152a10c083311b02abf135340d6be3925'
++  [golang]='b2f1cd3996e2a23aa8777eb5fbfe96e685cde58e7a54a02be13ef757d1149405'
++  [hcl]='2608ebf839e5f044d7fa9fdc8b6d07c7ab9c0673651fe69e8bc6eafdfe492c76'
++  [java]='753f315985018948479d9ad59c7a75d48a9948a3b2960f0e4ef589b6d57c72f2'
++  [js]='d4ba749cb7bfb0fe7a913fc59d238c31937ba55e1c34ce7b1641e97ce4b77d06'
++  [kotlin]='c8a977f07b5d1802ee3eb6e3972528e7a51ae9f6fabd40e9dd663add13825ece'
++  [php]='da135f9a6235aacf9074f064185f0c94f53a5ee13783f5ff79759c8045693ee0'
++  [python]='3bffd2f295ca1466a22bcf85b98007000113fa43b9fbec95399f792b70bc50bf'
++  [ruby]='c846fb03b8ce66bba32a1693e3de9992a869e3bc6598d4d82d1884da3380c548'
++  [rust]='91adf254f4205c88a80741894bf6014c0e4ef7828c328dfd01b2963a43b804fb'
++  [sql]='ccbb8bdaba781970c8482b5e8b564155200106f02fe8c25dc161584517d3bb47'
++  [swift]='c5e800fcbe5c76c6be46821ae33100391d427da534dee40ae61a51a2268ad2d9'
  )
  
  # Helper assets used by some modules (AST correlation and type narrowing).
@@ -934,7 +1078,7 @@ index 790f99a..a06f1ba 100755
    ['helpers/ubs_core/py_detectors/json_loads.py']='4194a9f5a0704e0dfa3d30acc8c0553a46b4c02ab5f4408cf6851ff84e8ce5f7'
    ['helpers/ubs_core/py_detectors/jwt_verification.py']='d96ea02bb64da7dd9e5f5e6edb1c15f9c147f47c4628758d8e878693ee4d7284'
 -  ['helpers/ubs_core/py_detectors/ldap_injection.py']='096a2d110cdf4582f46c3590e7d0d44d606c42f93ef373b6489798d1ac3ab25a'
-+  ['helpers/ubs_core/py_detectors/ldap_injection.py']='f1dd2ab034c533102ac811882b916f04ca0b58583663cdb403c7f7bc655837c9'
++  ['helpers/ubs_core/py_detectors/ldap_injection.py']='5a1c508db6a9740a6d2ce48187edf59b1b4a41d88833e95db6021e10a244eccc'
    ['helpers/ubs_core/py_detectors/mass_assignment.py']='b60fe05d739f80b061cbd3e4f2d564ea59d0b4049b4ed6fd0d93109716ec07f8'
    ['helpers/ubs_core/py_detectors/missing_returns.py']='f8766918f1f408b5ee4fae8a5c2df8e300ca203a3ec5ca200c04558365795cb5'
    ['helpers/ubs_core/py_detectors/mutation_during_iteration.py']='3857f060cbc9c627581875decb38e88ec64c879e8301bbc218accda1d67cde81'
@@ -943,7 +1087,7 @@ index 790f99a..a06f1ba 100755
    ['helpers/ubs_core/swift_scan.py']='cb202aed0282902182b14c63023036907c800d4ea9485e8d8d82c1e6e9fba9b3'
    ['helpers/ubs_core/taint_flow.py']='b50925e0f4bf7263f41650a1274c208b5e2c2a994d7cdfd518fb26b3dd5251cf'
 -  ['lib/ubs-common.sh']='76b87af91e814cda3ee4201829051fb80585621da3bc3561ac9ecd9c1744aad0'
-+  ['lib/ubs-common.sh']='9346e9f2b688e71ad2bfe86614f0bd49da9b096d31ed758dabee05a38a1b6643'
++  ['lib/ubs-common.sh']='6faf7c2f285fc5b9d7523616eaeff6ad8b474c87be6e2d41d2f3f56c3549cc2b'
  )
  
  # contract.json as shipped by earlier releases (sha256 -> first tag), kept out

@@ -10926,13 +10926,23 @@ fi
 export UBS_SCAN_CONFIG_POLICY
 unset _policy_args _policy_lang
 
-# Screen AST engine versions for every language, not only JS/TS provisioning.
-if ! shadow_ast_grep_launcher; then
+# Native PHP, HCL and SQL scans have no AST engine dependency. PHP custom
+# rules enable that dependency; the other modules use their AST rule packs.
+_scan_uses_ast_grep=0
+for _ast_lang in "${langs[@]}"; do
+  case "$_ast_lang" in
+    hcl|sql) ;;
+    php) [[ -z "$USER_RULES_DIR" ]] || _scan_uses_ast_grep=1 ;;
+    *) _scan_uses_ast_grep=1 ;;
+  esac
+done
+if [[ "$_scan_uses_ast_grep" -eq 1 ]] && ! shadow_ast_grep_launcher; then
   emit_error_envelope "environment" "error" "$AST_GREP_SETUP_ERROR" \
     "$AST_GREP_SETUP_MESSAGE" \
     '"failed_modules":[]'
   exit 2
 fi
+unset _scan_uses_ast_grep _ast_lang
 
 # Ensure ast-grep is available for JS/TS runs (tool-cache auto-provisioning).
 if [[ " ${langs[*]} " == *" js "* ]]; then

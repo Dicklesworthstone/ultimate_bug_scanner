@@ -391,6 +391,117 @@ raise SystemExit(2)
         self.assertEqual(out["exported"], "")
         self.assertNotIn("launcher", result.stderr)
 
+    def shipped_scan(self, target: Path, languages: str, engine: Path, label: str,
+                     *options: str, explicit: bool = False) -> tuple[subprocess.CompletedProcess[str], dict]:
+        tool_dirs = [str(engine.parent)]
+        for name in ("bash", "python3", "rg", "jq"):
+            located = shutil.which(name)
+            self.assertIsNotNone(located, f"{name} is required for the real runner test")
+            tool_dirs.append(str(Path(located).parent))
+        tool_dirs.extend(("/usr/bin", "/bin"))
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("UBS_") and key not in ("BASH_ENV", "ENV", "PYTHONPATH")}
+        env.update(PATH=os.pathsep.join(dict.fromkeys(tool_dirs)), HOME=str(self.root),
+                   XDG_CACHE_HOME=str(self.root / "cache"), XDG_CONFIG_HOME=str(self.root / "config"),
+                   XDG_DATA_HOME=str(self.root / "data"), TMPDIR=str(self.scratch),
+                   UBS_KEEP_TEMP="1", UBS_NO_AUTO_UPDATE="1", UBS_NO_CACHE="1",
+                   UBS_SKIP_RUST_BUILD="1", NO_COLOR="1", PYTHONDONTWRITEBYTECODE="1",
+                   # Exercise unavailable provisioning without depending on
+                   # the host's cache/network. Real modules still run.
+                   UBS_TEST_RUNNER_NO_AST_GREP="1")
+        if explicit:
+            env["UBS_AST_GREP_BIN"] = str(engine)
+        result = subprocess.run(
+            ["bash", str(ROOT / "ubs"), str(target), f'--module-dir={ROOT / "modules"}',
+             f"--only={languages}", "--format=json", "--ci", "--fail-on-warning", *options],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=60, check=False,
+        )
+        (self.root / f"{label}.stdout.json").write_text(result.stdout, encoding="utf-8")
+        (self.root / f"{label}.stderr.log").write_text(result.stderr, encoding="utf-8")
+        try:
+            return result, json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            self.fail(f"invalid runner JSON: {exc}\n{result.stdout}\n{result.stderr}")
+
+    def test_native_scans_ignore_unneeded_engines_and_preserve_findings(self) -> None:
+        cases = (
+            ("php", "php", "<?php\n$value = 1;\n", "<?php\nsystem($_GET['cmd']);\n",
+             [("php.security.command-injection", "critical")]),
+            ("hcl", "tf", 'locals { name = "value" }\n', 'provider "aws" { insecure = true }\n',
+             [("hcl.aws.insecure-provider-tls", "warning")]),
+            ("sql", "sql", "SELECT 1;\n",
+             "CREATE FUNCTION public.example() RETURNS integer LANGUAGE sql "
+             "SECURITY DEFINER AS $$ SELECT 1 $$;\n",
+             [("sql.security.definer-public-execute", "warning"),
+              ("sql.security.definer-search-path", "warning")]),
+        )
+        engines = (
+            ("old-native", self.write_versioned_engine("old-native", "ast-grep 0.40.1"), False),
+            ("invalid-native", self.write_versioned_engine("invalid-native", "unrecognized engine"), True),
+        )
+        for engine_label, engine, explicit in engines:
+            for language, suffix, clean, unsafe, expected in cases:
+                for case, source, findings in (("clean", clean, []), ("unsafe", unsafe, expected)):
+                    label = f"{engine_label}-{language}-{case}"
+                    with self.subTest(case=label):
+                        target = self.root / f"{label}.{suffix}"
+                        target.write_text(source, encoding="utf-8")
+                        result, report = self.shipped_scan(target, language, engine, label, explicit=explicit)
+                        details = result.stdout + "\n" + result.stderr
+                        self.assertEqual(result.returncode, int(bool(findings)), details)
+                        self.assertEqual(report["status"], "ok", details)
+                        self.assertEqual(report["failed_modules"], [], details)
+                        self.assertEqual(report["totals"], {
+                            "files": 1, "critical": sum(severity == "critical" for _, severity in findings),
+                            "warning": sum(severity == "warning" for _, severity in findings), "info": 0,
+                        }, details)
+                        self.assertEqual(sorted((item["rule_id"], item["severity"])
+                                                for item in report.get("findings", [])), sorted(findings), details)
+                        self.assertEqual(target.read_text(encoding="utf-8"), source)
+            self.assertFalse((self.root / f"{engine_label}-executions.jsonl").exists(),
+                             "native scans must not probe or execute an unrelated AST engine")
+        # A mixed selection of native modules also has no engine dependency.
+        project = self.root / "native-project"
+        project.mkdir()
+        for language, suffix, _clean, unsafe, _findings in cases:
+            (project / f"{language}.{suffix}").write_text(unsafe, encoding="utf-8")
+        result, report = self.shipped_scan(project, "php,hcl,sql", engines[0][1], "mixed-native")
+        details = result.stdout + "\n" + result.stderr
+        self.assertEqual(result.returncode, 1, details)
+        self.assertEqual(report["status"], "ok", details)
+        self.assertEqual(report["failed_modules"], [], details)
+        self.assertEqual(report["totals"], {"files": 3, "critical": 1, "warning": 3, "info": 0}, details)
+        self.assertFalse((self.root / "old-native-executions.jsonl").exists())
+
+    def test_ast_consumers_still_refuse_an_incompatible_engine_without_replacement(self) -> None:
+        old = self.write_versioned_engine("required-old", "ast-grep 0.40.1")
+        project = self.root / "mixed-project"
+        project.mkdir()
+        (project / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+        (project / "clean.php").write_text("<?php\n$value = 1;\n", encoding="utf-8")
+        rules = self.root / "php-rules"
+        rules.mkdir()
+        (rules / "echo.yml").write_text(
+            "id: local.php.echo\nlanguage: Php\nrule:\n  pattern: echo $X;\n"
+            "message: Echo policy\nseverity: warning\n", encoding="utf-8",
+        )
+        for label, languages, options in (
+            ("rust-required", "rust", ()),
+            ("mixed-required", "php,rust", ()),
+            ("custom-php-required", "php", (f"--rules={rules}",)),
+        ):
+            with self.subTest(case=label):
+                result, report = self.shipped_scan(project, languages, old, label, *options)
+                details = result.stdout + "\n" + result.stderr
+                self.assertEqual(result.returncode, 2, details)
+                self.assertEqual(report["status"], "error", details)
+                self.assertEqual(report["error"], "environment", details)
+                self.assertEqual(report["reason"], "ast-grep-incompatible", details)
+        calls = [json.loads(line) for line in
+                 (self.root / "required-old-executions.jsonl").read_text().splitlines()]
+        self.assertTrue(calls)
+        self.assertTrue(all(args == ["--version"] for args in calls), calls)
+
     def test_rust_only_runner_recovers_from_stale_engine_without_losing_findings(self) -> None:
         # Run the shipped runner and Rust module. The external AST engines are
         # protocol doubles: old no-match exits reproduce 0.40.x; current exits

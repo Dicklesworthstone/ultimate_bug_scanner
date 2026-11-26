@@ -1,0 +1,1138 @@
+UNACTIVATED IMPLEMENTATION: native Python string collection values
+=================================================================
+
+Source baseline: 7205cf0e661f46fd6ac6a0fdf36e415ea7470560
+Inspected main: a7c6b847de7b53be647b936c6804bdd54ee83ad4
+Both source files below are unchanged between those commits.
+
+This is an implementation checkpoint, not active scanner behavior. The execution
+workspace became unavailable during implementation. The candidate, its eight new
+test methods, and the authored public CLI matrix have NOT been executed.
+Canonical checksum generation has NOT run for this candidate. Source version
+5.5.164 and all active scanner files remain unchanged by this archive.
+
+Relevant open work:
+- ultimate_bug_scanner-release-self-scan-partial-0tgu
+- ultimate_bug_scanner-q150.11
+
+Proposed functionality
+----------------------
+- Give exact native str.split, str.rsplit and str.splitlines results a finite
+  homogeneous list-element contract without inventing a length or position.
+- Retain source facts through captured methods, selected helper returns,
+  integer indexing, slicing, ordinary loops, and a bounded eager list
+  comprehension that copies or intrinsically transforms string elements.
+- Keep producer authority separate from the result type. Unknown receivers,
+  options, annotation-only types and unproved producers retain their boundaries.
+- Revoke collection contracts through existing alias mutation and opaque escape
+  handling. Scalar elements use immutable snapshots.
+- Decline known empty separators and zero-step slice proofs.
+- Preserve existing work limits and incomplete-analysis policy.
+
+The patch adds 176 helper lines and removes 12; it adds 136 test lines defining
+eight source-only regression methods. Existing test methods are unchanged.
+No analyzed fixture program is executed by these proposed new methods.
+
+Observed evidence and remaining limits
+--------------------------------------
+Before the outage, the independent CPython 3.14.4 baseline ran 28 static cases:
+15 of 16 ordinary string-collection cases reported incomplete analysis; the
+plain source-bearing for-loop was already complete. Three existing scalar and
+literal controls completed, five unsupported controls stayed partial, and four
+pathlib controls remained partial. These are BASELINE results, not repairs.
+
+A six-file diagnostic sample on the same baseline found taint incomplete on
+5/6 files, LDAP incomplete on 2/6, and SQL complete on 6/6. Repeated reasons were
+opaque generator operands, delayed reads and the unchanged function work limit.
+This was a bounded sample, not the strict repository self-scan.
+
+Two source reviews found no concrete unsafe-complete path in the reviewed
+candidate. That does not qualify runtime behavior. Known bounded omissions:
+helper bodies which merely loop over a sequence may not request contextual value
+refinement; explicit negative maxsplit syntax is outside the first argument
+proof. Pathlib support and actual repository-wide improvement are deferred.
+The new mutation/retained-finding test uses an earlier eval, which can itself
+revoke generator authority; its partial assertion is not isolated evidence of
+mutation invalidation. The stronger independent mutation cases remain frozen in
+the harness below. A follow-on test-authoring task was stopped by an automatic
+safety check; no result from that task is claimed.
+
+Transport verification
+----------------------
+The unified diff below was replayed against the immutable baseline in memory.
+Every context line and hunk count matched and both complete reconstructed files
+matched these SHA256 identities. This verifies recovery/transport only; it is
+not a Python syntax check or analyzer test.
+
+[
+  {
+    "path": "modules/helpers/ubs_core/analyzers/taint_py.py",
+    "base_sha256": "0b6fad27f24421100a3f8f59235c1e4b2c676f739a22114b1613d2bf4f05a53a",
+    "target_sha256": "fd2a167e64ecdbb2ef0a865965ff6035e82a35e61145720243abe3938a747fcb",
+    "patch_sha256": "cc94b275a4dada92b4441abfd6412bad802043589e409e1664e18d85986504e5"
+  },
+  {
+    "path": "test-suite/quality/test_taint_python_expressions.py",
+    "base_sha256": "debac840ae25a3197638f373fac468b94522086875abff94f4bd8d66f8d18a1f",
+    "target_sha256": "40c2e67d58482c999027efc4fe36b8a61117468b4b9fb983f9802884a757f4ca",
+    "patch_sha256": "e24ce8085938c6c42b4b5ebf2dba0ed0757ca6ed1e066942bef58a2fc996b4a6"
+  }
+]
+
+Resume with a functioning execution workspace. Apply the source/test patch in an
+isolated current-main checkout, reconcile newer source changes, bump the development
+source version, and regenerate all integrity pins with the canonical repository scripts. Run the eight new
+methods, unchanged surrounding Python regression suites, the frozen independent
+cases, and actual module/runner JSON/SARIF checks before activation. Do not
+weaken any expected finding, partial-status assertion, work budget or release
+gate. No tag, release, P0 closure or performance improvement is claimed.
+
+Recovered baseline receipt
+---------------------------
+This receipt contains only results recovered from completed tool outputs; its
+limitations and preliminary harness errors are explicit.
+
+{
+  "recovered_from": "Visible successful functions.exec/write_stdin tool outputs after final harness correction; original report.json was not fetched before workspace loss.",
+  "source_recovery": "Harness reconstructed from exact manual edit inputs. Its pre-loss local SHA256 was not recorded, so byte identity to the local file has not been independently rechecked.",
+  "harness_blob_sha": "ccf2ec28a9ea184d12375a00ace1c3ba9cc7187d",
+  "original_harness_path": "/tmp/ubs-next-7205/test-suite/artifacts/ordinary-completeness-7205/acceptance.py",
+  "original_report_path": "/tmp/ubs-next-7205/test-suite/artifacts/ordinary-completeness-7205/frozen/report.json",
+  "baseline_ref": "7205cf0",
+  "helper_sha256": "0b6fad27f24421100a3f8f59235c1e4b2c676f739a22114b1613d2bf4f05a53a",
+  "runtime": "CPython 3.14.4",
+  "analyzed_programs_executed": false,
+  "invocation_exit_code": 0,
+  "all_28_source_ast_parses_succeeded": true,
+  "comparison_at_this_stage": "Both arms executed the identical immutable 7205 baseline helper hash. This is the frozen baseline, not candidate verification.",
+  "candidate_verification_executed": false,
+  "rows": [
+    {
+      "name": "split-source",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "split-literal-clean",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "split-separator-source",
+      "group": "native-text-collection",
+      "observed_status": "complete",
+      "observed_findings": [
+        [
+          "py.taint.eval",
+          3,
+          5,
+          "input( -> parts -> part -> eval"
+        ]
+      ],
+      "baseline_acceptance": true
+    },
+    {
+      "name": "rsplit-bounded-source",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "splitlines-source",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "splitlines-keepends-source",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "splitlines-literal-clean",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "captured-splitlines-receiver",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "helper-string-splitlines",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "split-first-index-source",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "split-last-index-source",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "splitlines-eager-lower-comprehension",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "splitlines-clean-eager-comprehension",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "splitlines-generator-consumer",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "split-list-alias-append",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "split-list-element-write",
+      "group": "native-text-collection",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "path-parts-literal-clean",
+      "group": "native-path",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "path-parts-source",
+      "group": "native-path",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "pure-posix-path-parts-source",
+      "group": "native-path",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "path-part-lowercase-list",
+      "group": "native-path",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": false
+    },
+    {
+      "name": "existing-native-lower-scalar",
+      "group": "existing-native-scalar",
+      "observed_status": "complete",
+      "observed_findings": [
+        [
+          "py.taint.eval",
+          3,
+          1,
+          "input( -> value -> eval"
+        ]
+      ],
+      "baseline_acceptance": true
+    },
+    {
+      "name": "existing-native-strip-scalar",
+      "group": "existing-native-scalar",
+      "observed_status": "complete",
+      "observed_findings": [
+        [
+          "py.taint.eval",
+          3,
+          1,
+          "input( -> value -> eval"
+        ]
+      ],
+      "baseline_acceptance": true
+    },
+    {
+      "name": "existing-literal-string-list",
+      "group": "existing-native-scalar",
+      "observed_status": "complete",
+      "observed_findings": [],
+      "baseline_acceptance": true
+    },
+    {
+      "name": "unknown-splitlines-receiver",
+      "group": "unsupported",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": true
+    },
+    {
+      "name": "unknown-split-separator",
+      "group": "unsupported",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": true
+    },
+    {
+      "name": "unknown-split-count",
+      "group": "unsupported",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": true
+    },
+    {
+      "name": "unknown-path-parts-receiver",
+      "group": "unsupported",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": true
+    },
+    {
+      "name": "annotation-is-not-runtime-string-proof",
+      "group": "unsupported",
+      "observed_status": "partial",
+      "observed_findings": [],
+      "baseline_acceptance": true
+    }
+  ],
+  "counts": {
+    "cases": 28,
+    "native_text_collection": 16,
+    "native_text_collection_complete": 1,
+    "native_text_collection_partial": 15,
+    "deferred_path_cases_partial": 4,
+    "existing_controls_complete": 3,
+    "unsupported_controls_partial": 5,
+    "baseline_acceptance_matches": 9
+  },
+  "retained_failed_artifacts": [
+    {
+      "label": "baseline",
+      "cause": "Initial two-arm in-process loader failed on duplicate analyzer registry registration before scanning fixtures."
+    },
+    {
+      "label": "baseline2",
+      "cause": "Two clean newline literals were initially escaped incorrectly in authored test source. Corrected to raw outer strings and added ast.parse validation before the frozen run; this preliminary receipt is not the accepted baseline."
+    }
+  ],
+  "missing_after_outage": "Full per-case error/component text, timing data and report-source hashes remain only in the original filesystem report; this recovery receipt does not fabricate them."
+}
+
+Recovered independent harness
+-----------------------------
+Save this exact block under test-suite/artifacts/ordinary-completeness-7205/
+acceptance.py. It expects baseline_taint_py.py beside it containing the immutable
+7205cf0 helper. It takes a fresh output-directory label and compares both arms
+in isolated scanner subprocesses. This reconstructed harness was not re-executed
+after recovery, and its original local byte hash was not captured.
+
+```python
+"""Independent static-only acceptance for ordinary native text iteration.
+
+The snippets are parsed by UBS; none of the analyzed programs are executed.
+Exact sources and expected results are frozen before the candidate is applied.
+"""
+from __future__ import annotations
+
+import ast
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
+import time
+
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[2]
+sys.path.insert(0, str(ROOT / 'modules/helpers'))
+
+
+CASES = [
+    ('split-source', 'native-text-collection', 'eval', '''
+        text = input()
+        parts = text.split()
+        any(part == 'item' for part in parts)
+        eval(''.join(parts))
+    '''),
+    ('split-literal-clean', 'native-text-collection', None, '''
+        parts = 'red green blue'.split()
+        any(part == 'item' for part in parts)
+        eval(''.join(parts))
+    '''),
+    ('split-separator-source', 'native-text-collection', 'eval', '''
+        parts = input().split(',')
+        for part in parts:
+            eval(part)
+    '''),
+    ('rsplit-bounded-source', 'native-text-collection', 'eval', '''
+        parts = input().rsplit(',', 1)
+        any(part == 'item' for part in parts)
+        eval(''.join(parts))
+    '''),
+    ('splitlines-source', 'native-text-collection', 'eval', '''
+        text = input()
+        lines = text.splitlines()
+        any(line == 'item' for line in lines)
+        eval(''.join(lines))
+    '''),
+    ('splitlines-keepends-source', 'native-text-collection', 'eval', '''
+        lines = input().splitlines(True)
+        any(line == 'item' for line in lines)
+        eval(''.join(lines))
+    '''),
+    ('splitlines-literal-clean', 'native-text-collection', None, r'''
+        lines = 'red\ngreen\n'.splitlines()
+        any(line == 'item' for line in lines)
+        eval(''.join(lines))
+    '''),
+    ('captured-splitlines-receiver', 'native-text-collection', 'eval', '''
+        text = input()
+        read_lines = text.splitlines
+        text = 'fixed'
+        lines = read_lines()
+        any(line == 'item' for line in lines)
+        eval(''.join(lines))
+    '''),
+    ('helper-string-splitlines', 'native-text-collection', 'eval', '''
+        def lines(text):
+            return text.splitlines()
+        values = lines(input())
+        any(value == 'item' for value in values)
+        eval(''.join(values))
+    '''),
+    ('split-first-index-source', 'native-text-collection', 'eval', '''
+        parts = input().split(',')
+        value = parts[0]
+        any(marker in value for marker in ('x', 'y'))
+        eval(value)
+    '''),
+    ('split-last-index-source', 'native-text-collection', 'eval', '''
+        parts = input().split(',')
+        value = parts[-1]
+        any(marker in value for marker in ('x', 'y'))
+        eval(value)
+    '''),
+    ('splitlines-eager-lower-comprehension', 'native-text-collection', 'eval', '''
+        lines = [line.lower() for line in input().splitlines()]
+        any(line == 'item' for line in lines)
+        eval(''.join(lines))
+    '''),
+    ('splitlines-clean-eager-comprehension', 'native-text-collection', None, r'''
+        lines = [line.lower() for line in 'red\ngreen\n'.splitlines()]
+        any(line == 'item' for line in lines)
+        eval(''.join(lines))
+    '''),
+    ('splitlines-generator-consumer', 'native-text-collection', 'eval', '''
+        lines = input().splitlines()
+        result = ''.join(line.strip() for line in lines)
+        eval(result)
+    '''),
+    ('split-list-alias-append', 'native-text-collection', 'eval', '''
+        parts = 'fixed'.split()
+        alias = parts
+        alias.append(input())
+        any(part == 'item' for part in parts)
+        eval(''.join(parts))
+    '''),
+    ('split-list-element-write', 'native-text-collection', 'eval', '''
+        parts = 'fixed'.split()
+        parts[0] = input()
+        any(part == 'item' for part in parts)
+        eval(''.join(parts))
+    '''),
+    ('path-parts-literal-clean', 'native-path', None, '''
+        from pathlib import Path
+        parts = Path('tests/main.py').parts
+        any(part in {'tests', 'test'} for part in parts)
+        eval('/'.join(parts))
+    '''),
+    ('path-parts-source', 'native-path', 'eval', '''
+        from pathlib import Path
+        parts = Path(input()).parts
+        any(part in {'tests', 'test'} for part in parts)
+        eval('/'.join(parts))
+    '''),
+    ('pure-posix-path-parts-source', 'native-path', 'eval', '''
+        from pathlib import PurePosixPath
+        parts = PurePosixPath(input()).parts
+        any(part == 'item' for part in parts)
+        eval('/'.join(parts))
+    '''),
+    ('path-part-lowercase-list', 'native-path', 'eval', '''
+        from pathlib import Path
+        path = Path(input())
+        parts = [part.lower() for part in path.parts]
+        any(part in {'tests', 'test'} for part in parts)
+        eval('/'.join(parts))
+    '''),
+    ('existing-native-lower-scalar', 'existing-native-scalar', 'eval', '''
+        value = input().lower()
+        any(marker in value for marker in ('x', 'y'))
+        eval(value)
+    '''),
+    ('existing-native-strip-scalar', 'existing-native-scalar', 'eval', '''
+        value = input().strip(' ')
+        any(marker in value for marker in ('x', 'y'))
+        eval(value)
+    '''),
+    ('existing-literal-string-list', 'existing-native-scalar', None, '''
+        parts = ['red', 'green']
+        any(part == 'item' for part in parts)
+        eval(''.join(parts))
+    '''),
+    ('unknown-splitlines-receiver', 'unsupported', None, '''
+        lines = receiver.splitlines()
+        any(line == 'item' for line in lines)
+    '''),
+    ('unknown-split-separator', 'unsupported', None, '''
+        parts = 'red green'.split(delimiter)
+        any(part == 'item' for part in parts)
+    '''),
+    ('unknown-split-count', 'unsupported', None, '''
+        parts = 'red green'.split(' ', count)
+        any(part == 'item' for part in parts)
+    '''),
+    ('unknown-path-parts-receiver', 'unsupported', None, '''
+        parts = receiver.parts
+        any(part in {'tests', 'test'} for part in parts)
+    '''),
+    ('annotation-is-not-runtime-string-proof', 'unsupported', None, '''
+        def inspect_text(text: str):
+            lines = text.splitlines()
+            return any(line == 'item' for line in lines)
+    '''),
+]
+
+
+def sha(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def load(label, path):
+    spec = importlib.util.spec_from_file_location('ordinary_acceptance_' + label, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def scan(module, path):
+    started = time.perf_counter()
+    rows, error, components = [], None, []
+    try:
+        for row in module.scan_file_findings(path):
+            rows.append(list(row))
+    except Exception as exc:
+        error = type(exc).__name__ + ': ' + str(exc)
+        components = list(getattr(exc, 'components', ()))
+    return {'status': 'partial' if error else 'complete', 'findings': rows,
+            'error': error, 'components': components,
+            'seconds': time.perf_counter() - started}
+
+
+def isolated_scan(analyzer, path):
+    process = subprocess.run([sys.executable, '-B', str(Path(__file__).resolve()),
+                              '--worker', str(analyzer), str(path)],
+                             capture_output=True, text=True, timeout=20)
+    if process.returncode != 0:
+        return {'status': 'harness-error', 'findings': [], 'error': process.stderr,
+                'components': [], 'seconds': None}
+    return json.loads(process.stdout)
+
+
+def main():
+    label = sys.argv[1]
+    destination = HERE / label
+    destination.mkdir(exist_ok=False)
+    baseline_path = HERE / 'baseline_taint_py.py'
+    candidate_path = destination / 'candidate_taint_py.py'
+    candidate_path.write_bytes((ROOT / 'modules/helpers/ubs_core/analyzers/taint_py.py').read_bytes())
+    report = {'analyzed_programs_executed': False,
+              'baseline_sha256': sha(baseline_path.read_bytes()),
+              'candidate_sha256': sha(candidate_path.read_bytes()), 'runtime': sys.version, 'rows': []}
+    for name, group, rule, source in CASES:
+        source = textwrap.dedent(source).lstrip('\n')
+        ast.parse(source, filename=name)
+        path = destination / (name + '.py')
+        path.write_text(source)
+        expected = [] if rule is None else [('py.taint.' + rule, index)
+            for index, line in enumerate(source.splitlines(), 1) if line.strip().startswith('eval(')]
+        row = {'name': name, 'group': group, 'source': source, 'source_sha256': sha(source.encode()),
+               'expected_complete': group != 'unsupported', 'expected_findings': expected,
+               'baseline': isolated_scan(baseline_path, path),
+               'candidate': isolated_scan(candidate_path, path)}
+        for arm in ('baseline', 'candidate'):
+            result = row[arm]
+            observed = [(item[0], item[1]) for item in result['findings']]
+            result['accepted'] = ((result['status'] == 'partial') if group == 'unsupported'
+                                  else result['status'] == 'complete' and observed == expected)
+        report['rows'].append(row)
+        print(json.dumps({'name': name, 'group': group,
+                          **{arm: {key: row[arm][key] for key in ('status', 'findings', 'accepted')}
+                             for arm in ('baseline', 'candidate')}}), flush=True)
+    (destination / 'report.json').write_text(json.dumps(report, indent=2, default=str) + '\n')
+    print(json.dumps({'report': str(destination / 'report.json'),
+                      'baseline_sha256': report['baseline_sha256'],
+                      'candidate_sha256': report['candidate_sha256']}))
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == '--worker':
+        print(json.dumps(scan(load('worker', Path(sys.argv[2])), Path(sys.argv[3])), default=str))
+    else:
+        main()
+```
+
+Source and maintained-test patch
+--------------------------------
+diff --git a/modules/helpers/ubs_core/analyzers/taint_py.py b/modules/helpers/ubs_core/analyzers/taint_py.py
+--- a/modules/helpers/ubs_core/analyzers/taint_py.py
++++ b/modules/helpers/ubs_core/analyzers/taint_py.py
+@@ -543,6 +543,18 @@
+ 
+ 
+ @dataclass(frozen=True)
++class _NativeSequence:
++    """An unknown-length native list with one immutable element contract.
++
++    The ordinary heap retains aggregate facts and allocation aliases. This
++    marker proves neither a position nor a length, and writes invalidate it.
++    Producer authority remains separate from the final element's type.
++    """
++    element: object
++    format_safe: bool = True
++
++
++@dataclass(frozen=True)
+ class _CsvReader:
+     """A native lazy CSV iterator; its handle and metadata are not row data."""
+     stream: str
+@@ -1215,7 +1227,7 @@
+             # Content writes retain the native type, but a resize invalidates
+             # the allocation's original empty-capacity proof.
+             value = _ByteBuffer(format_safe=value.format_safe)
+-        if isinstance(value, (_ArgumentVector, _LiteralMapping, _LiteralJoinInstance,
++        if isinstance(value, (_ArgumentVector, _LiteralMapping, _NativeSequence, _LiteralJoinInstance,
+                               _LiteralMethodInstance, _ProcessInput, ast.ClassDef)):
+             value = None
+         elif isinstance(value, _BoundCallable) and value.name == _LITERAL_MAPPING_GET:
+@@ -3554,6 +3566,9 @@
+                 return True
+             if isinstance(choice, (_LiteralString, _GeneratorString)) and not choice.format_safe:
+                 return True
++            if isinstance(choice, _NativeSequence) and (
++                    not choice.format_safe or self.borrowed_producer_revoked(choice.element)):
++                return True
+             if isinstance(choice, _ArgumentVector) and any(
+                     self.borrowed_producer_revoked(operand) for operand, _fact in choice.operands):
+                 return True
+@@ -3580,7 +3595,7 @@
+     @staticmethod
+     def unproved_producer(binding):
+         return any(isinstance(value, _UnprovedProducer)
+-                   or isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance,
++                   or isinstance(value, (_LiteralString, _GeneratorString, _NativeSequence, _LiteralJoinInstance,
+                                          _CsvReader, _StdinCallableIterator, _ByteBuffer)) and not value.format_safe
+                    for value in _binding_choices(binding))
+ 
+@@ -3643,6 +3658,8 @@
+             elif isinstance(value, _ArgumentVector):
+                 value = _ArgumentVector(tuple((self.without_format_authority(operand), fact)
+                                               for operand, fact in value.operands), value.references)
++            elif isinstance(value, _NativeSequence):
++                value = _NativeSequence(self.without_format_authority(value.element), False)
+             elif isinstance(value, _LiteralMapping):
+                 value = _LiteralMapping(self.without_format_authority(value.value_binding)
+                                         if value.value_binding is not None else _UnprovedProducer(), value.keys)
+@@ -3756,6 +3773,9 @@
+                     self.materialized_generator_binding(operand, value.references_at(index), state)
+                     for index, (operand, _fact) in enumerate(value.operands)):
+                 continue
++            if (isinstance(value, _NativeSequence) and value.format_safe
++                    and self.materialized_generator_binding(value.element, NO_REFERENCES, state)):
++                continue
+             if isinstance(value, _LiteralMapping) and not self.unproved_producer(value.value_binding):
+                 continue
+             if isinstance(value, _LiteralJoinInstance) and value.format_safe:
+@@ -3778,7 +3798,7 @@
+         if isinstance(node, ast.Constant):
+             return type(node.value) in {str, bytes, int, float, complex, bool, type(None)}
+         choices = _binding_choices(self.expression_bindings.get(node))
+-        return (not any(isinstance(value, (_ArgumentVector, _LiteralMapping)) for value in choices)
++        return (not any(isinstance(value, (_ArgumentVector, _LiteralMapping, _NativeSequence)) for value in choices)
+                 and self.materialized_generator_binding(self.expression_bindings.get(node),
+                     self.expression_references.get(node, NO_REFERENCES), state))
+ 
+@@ -3899,7 +3919,7 @@
+             if isinstance(expression, ast.Attribute) and expression.attr in {
+                     'join', 'strip', 'lstrip', 'rstrip', 'lower', 'upper',
+                     'capitalize', 'casefold', 'swapcase', 'title', 'replace',
+-                    'removeprefix', 'removesuffix'}:
++                    'removeprefix', 'removesuffix', 'split', 'rsplit', 'splitlines'}:
+                 value = (lookup(expression.value.id) if isinstance(expression.value, ast.Name)
+                          else expression.value if isinstance(expression.value, ast.Constant)
+                          else literal_call(expression.value))
+@@ -3912,6 +3932,17 @@
+                 return all(key is not None and hashable(key) and primitive(value)
+                            for key, value in zip(expression.keys, expression.values))
+             if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute)
++                    and expression.func.attr in {'split', 'rsplit', 'splitlines'}
++                    and primitive(expression.func)):
++                receiver = (lookup(expression.func.value.id) if isinstance(expression.func.value, ast.Name)
++                            else expression.func.value if isinstance(expression.func.value, ast.Constant)
++                            else literal_call(expression.func.value))
++                def operand_binding(argument):
++                    return (lookup(argument.id) if isinstance(argument, ast.Name)
++                            else argument if isinstance(argument, ast.Constant) else None)
++                result = self.split_sequence_binding(expression, expression.func.attr, receiver, operand_binding)
++                return result is not None and result.format_safe
++            if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute)
+                     and expression.func.attr == 'join' and primitive(expression.func)
+                     and len(expression.args) == 1 and not expression.keywords
+                     and isinstance(expression.args[0], ast.GeneratorExp)):
+@@ -3943,8 +3974,11 @@
+                 return all(hashable(item) for item in expression.elts)
+             if isinstance(expression, (ast.List, ast.Set, ast.Dict)):
+                 return False
+-            if isinstance(expression, ast.Name) and any(
+-                    isinstance(value, (_ArgumentVector, _LiteralMapping))
++            if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute)
++                    and expression.func.attr in {'split', 'rsplit', 'splitlines'}):
++                return False
++            if isinstance(expression, ast.Name) and any(
++                    isinstance(value, (_ArgumentVector, _LiteralMapping, _NativeSequence))
+                     for value in _binding_choices(lookup(expression.id))):
+                 return False
+             return primitive(expression)
+@@ -4082,6 +4116,11 @@
+         if (not references & state.mutated and choices
+                 and all(isinstance(value, (_LiteralString, _GeneratorString)) for value in choices)):
+             return True
++        if (not references & state.mutated and choices
++                and all(isinstance(value, _NativeSequence) and value.format_safe
++                        and self.materialized_generator_binding(value.element, NO_REFERENCES, state)
++                        for value in choices)):
++            return True
+         if (not references or references & state.mutated or not choices
+                 or not all(isinstance(value, _ArgumentVector) for value in choices)):
+             return False
+@@ -4096,6 +4135,65 @@
+                     return False
+         return True
+ 
++    def native_sequence_element(self, binding, references, state):
++        """Project only unchanged native collections, never an old initializer."""
++        choices = _binding_choices(binding)
++        if (references & state.mutated or not choices
++                or not all(isinstance(value, _NativeSequence) for value in choices)):
++            return None
++        return _join_bindings(*(value.element if value.format_safe else
++                                self.without_format_authority(value.element) for value in choices))
++
++    @staticmethod
++    def split_sequence_binding(node, method, receiver, argument_binding, *, producer_unproved=False):
++        """Describe an intrinsic str split result after its operands ran."""
++        parameters = ('keepends',) if method == 'splitlines' else ('sep', 'maxsplit')
++        if (method not in {'split', 'rsplit', 'splitlines'} or len(node.args) > len(parameters)
++                or any(isinstance(argument, ast.Starred) for argument in node.args)
++                or not _Flow.native_string_binding(receiver)):
++            return None
++        supplied = dict(zip(parameters, node.args))
++        for keyword in node.keywords:
++            if keyword.arg not in parameters or keyword.arg in supplied:
++                return None
++            supplied[keyword.arg] = keyword.value
++        operands = []
++        for name, expression in supplied.items():
++            binding = argument_binding(expression)
++            choices = _binding_choices(binding)
++            if not choices:
++                return None
++            if name == 'sep':
++                if any(isinstance(value, _LiteralString) and not value.value
++                       or isinstance(value, ast.Constant) and value.value == '' for value in choices):
++                    return None  # A known empty separator always raises ValueError.
++                if not all(_Flow.native_string_binding(value)
++                           or isinstance(value, ast.Constant) and value.value is None for value in choices):
++                    return None
++            elif not all(isinstance(value, ast.Constant) and type(value.value) in {int, bool}
++                         for value in choices):
++                return None
++            operands.append(binding)
++        safe = (not producer_unproved and not _Flow.unproved_producer(receiver)
++                and not any(_Flow.unproved_producer(binding) for binding in operands))
++        return _NativeSequence(_GeneratorString(format_safe=safe), safe)
++
++    def native_string_sequence(self, node, target, state):
++        """Keep exact native element types without trusting opaque coercions."""
++        if not isinstance(target, _BoundCallable):
++            return None
++        method = target.name.rsplit('.', 1)[-1]
++        if method not in {'split', 'rsplit', 'splitlines'}:
++            return None
++        self.require_value(target.receiver_binding)
++        arguments = (*node.args, *(keyword.value for keyword in node.keywords))
++        for expression in arguments:
++            self.require_value(self.expression_bindings.get(expression))
++            if self.expression_references.get(expression, NO_REFERENCES) & state.mutated:
++                return None
++        return self.split_sequence_binding(node, method, target.receiver_binding,
++            self.expression_bindings.get, producer_unproved=target.producer_unproved)
++
+     def generator_predicate_inputs(self, node, state, consumer):
+         """Defer only a closed, pure predicate's symbolic input protocols.
+ 
+@@ -8490,6 +8588,12 @@
+                 self.expression_references[node] = frozenset({node, target})
+                 self.possible_exception(state)
+                 return CLEAN
++        sequence = self.native_string_sequence(node, target, state)
++        if sequence is not None:
++            self.expression_bindings[node] = sequence
++            self.expression_references[node] = frozenset({node})
++            self.possible_exception(state)
++            return join_facts(target.receiver, *arguments, *keywords.values())
+         native_string_result = False
+         if (isinstance(node, ast.Call) and isinstance(target, _BoundCallable)
+                 and self.native_string_binding(target.receiver_binding) and not node.keywords):
+@@ -8908,7 +9012,7 @@
+                         or _same_witness(binding, nominal)):
+                     continue
+                 if any(isinstance(value, (str, _LiteralString, _GeneratorString, _UnprovedProducer,
+-                                          _LiteralMapping, _ArgumentVector, _ProcessInput, _ByteBuffer,
++                                          _LiteralMapping, _NativeSequence, _ArgumentVector, _ProcessInput, _ByteBuffer,
+                                           _StdinCallableIterator,
+                                           _LiteralMethodInstance,
+                                           _FunctionValue, _ClosureValue,
+@@ -9076,7 +9180,7 @@
+             # the caller's distinct generator/closure cells.
+             format_frame_inert = (bool(self.materialized_generator_depth) or native_callback or not any(
+                 isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _LiteralMethodInstance,
+-                                   _ArgumentVector, _LiteralMapping, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer,
++                                   _ArgumentVector, _LiteralMapping, _NativeSequence, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer,
+                                    _SymbolicValue, ast.Constant))
+                 or isinstance(value, str) and value in _STDIN_PARSER_CARRIERS
+                 or isinstance(value, _BoundCallable) and (
+@@ -9390,7 +9494,7 @@
+                 if {'functools', _PARTIAL_CHANGED_MODULE} & _binding_choices(value) and name not in {
+                         'print', 'str', 'repr', 'bool', 'builtins.print', 'builtins.str', 'builtins.repr'}:
+                     self.mutate(frozenset({_PARTIAL_MODULE_REF}), CLEAN, state)
+-                if any(isinstance(choice, (_ArgumentVector, _SymbolicValue, _LiteralJoinInstance, _LiteralMethodInstance, _ByteBuffer,
++                if any(isinstance(choice, (_ArgumentVector, _NativeSequence, _SymbolicValue, _LiteralJoinInstance, _LiteralMethodInstance, _ByteBuffer,
+                                            ast.ClassDef, _BoundClassMethod))
+                        for choice in _binding_choices(value)) and name not in SANITIZERS and name not in {
+                            'print', 'str', 'len', 'repr', 'tuple', 'list', 'bool', 'int', 'float',
+@@ -9490,7 +9594,7 @@
+                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
+                             ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
+                             _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _GeneratorString,
+-                            _UnprovedProducer, _LiteralMapping, _LiteralJoinInstance, _LiteralMethodInstance,
++                            _UnprovedProducer, _LiteralMapping, _NativeSequence, _LiteralJoinInstance, _LiteralMethodInstance,
+                             _ProcessInput, _StdinCallableIterator, _ZipIterator, _ByteBuffer, ast.Constant)
+                 if (not nominal_helper and any(isinstance(value, identity)
+                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
+@@ -9786,6 +9890,34 @@
+                 # Framework annotation tuples use a separate marker binding.
+                 # Only unexpanded syntax has the same positions as its values.
+                 binding = self.expression_bindings.get(node.value.elts[node.slice.value])
++            element = self.native_sequence_element(self.expression_bindings.get(node.value),
++                self.expression_references.get(node.value, NO_REFERENCES), state)
++            if element is not None:
++                parts = ((node.slice.lower, node.slice.upper, node.slice.step)
++                         if isinstance(node.slice, ast.Slice) else (node.slice,))
++                native_index = all(part is None or (
++                    bool(_binding_choices(self.expression_bindings.get(part)))
++                    and all(isinstance(value, ast.Constant) and type(value.value) in {int, bool}
++                            for value in _binding_choices(self.expression_bindings.get(part))))
++                    or isinstance(part, ast.UnaryOp) and isinstance(part.op, (ast.UAdd, ast.USub))
++                    and isinstance(part.operand, ast.Constant) and type(part.operand.value) is int
++                    for part in parts)
++                if isinstance(node.slice, ast.Slice) and node.slice.step is not None:
++                    step = node.slice.step
++                    step = step.operand if isinstance(step, ast.UnaryOp) and isinstance(step.op, (ast.UAdd, ast.USub)) else step
++                    if any(isinstance(value, ast.Constant) and type(value.value) in {int, bool}
++                           and value.value == 0 for value in _binding_choices(self.expression_bindings.get(step))):
++                        native_index = False  # A zero step cannot produce a list.
++                if native_index:
++                    binding = (_NativeSequence(element, not self.unproved_producer(element))
++                               if isinstance(node.slice, ast.Slice) else element)
++                    self.expression_references[node] = (frozenset({node})
++                        if isinstance(node.slice, ast.Slice) else NO_REFERENCES)
++                else:
++                    # Index coercion can run a user protocol; retain its
++                    # producer obligation after selecting an immutable value.
++                    binding = self.without_format_authority(
++                        _NativeSequence(element) if isinstance(node.slice, ast.Slice) else element)
+             mappings = _binding_choices(self.expression_bindings.get(node.value))
+             if mappings and all(isinstance(value, _LiteralMapping) for value in mappings):
+                 contents, unchanged = self.literal_mapping_contents(
+@@ -10291,6 +10423,24 @@
+             nested.references[name] = NO_REFERENCES
+         result = CLEAN
+         result_bindings, result_references = [], []
++        source_element = self.native_sequence_element(self.expression_bindings.get(first.iter),
++            self.expression_references.get(first.iter, NO_REFERENCES), original)
++        # Only a single eager clause whose body copies or intrinsically
++        # transforms its string element gets a collection contract. Arbitrary
++        # calls, filters and nested clauses retain their ordinary boundaries.
++        native_list_result = (
++            isinstance(node, ast.ListComp) and not synchronous_generator
++            and len(node.generators) == 1 and not first.is_async and not first.ifs
++            and isinstance(first.target, ast.Name) and self.native_string_binding(source_element)
++            and not self.unproved_producer(source_element)
++            and (isinstance(node.elt, ast.Name) and node.elt.id == first.target.id
++                 or isinstance(node.elt, ast.Call) and isinstance(node.elt.func, ast.Attribute)
++                 and isinstance(node.elt.func.value, ast.Name)
++                 and node.elt.func.value.id == first.target.id
++                 and node.elt.func.attr in {'strip', 'lstrip', 'rstrip', 'lower', 'upper',
++                     'capitalize', 'casefold', 'swapcase', 'title', 'replace', 'removeprefix', 'removesuffix'}
++                 and not node.elt.keywords
++                 and all(isinstance(argument, ast.Constant) for argument in node.elt.args)))
+         iterator_references = set()
+         stopped = []
+ 
+@@ -10394,6 +10544,9 @@
+                                 self.expression_references.get(item, NO_REFERENCES) for item in elements))
+                         elif synchronous_generator and isinstance(binding, (_LiteralString, _GeneratorString)):
+                             current.bindings[generator.target.id] = _GeneratorString(format_safe=binding.format_safe)
++                        elif (element_binding := self.native_sequence_element(binding, refs, current)) is not None:
++                            current.bindings[generator.target.id] = element_binding
++                            current.references[generator.target.id] = NO_REFERENCES
+                         elif generator.iter in self.generator_returns:
+                             current.bindings[generator.target.id] = binding
+                             current.references[generator.target.id] = refs
+@@ -10438,6 +10591,8 @@
+                                 raise AnalysisLimit('generator materialization result lifetime is unresolved; '
+                                                     'analysis is incomplete')
+                             result = join_facts(result, fact)
++                            if native_list_result:
++                                result_bindings.append(self.expression_bindings.get(node.elt))
+                             if first_result:
+                                 result_bindings.append(self.expression_bindings.get(node.elt))
+                                 result_references.append(self.expression_references.get(node.elt, NO_REFERENCES))
+@@ -10524,6 +10679,10 @@
+                     stopped.append(normal)
+             normal = _join_states(*stopped)
+             self.expression_bindings[node] = _join_bindings(*result_bindings)
++        if (native_list_result and result_bindings
++                and all(self.native_string_binding(binding) and not self.unproved_producer(binding)
++                        for binding in result_bindings)):
++            self.expression_bindings[node] = _NativeSequence(_join_bindings(*result_bindings))
+         if synchronous_generator and any(
+                 current is not None and current.mutated & iterator_references
+                 for current in (normal, exceptional, *(item.state for item in outgoing))):
+@@ -10834,6 +10993,9 @@
+                 # element a snapshot (not an alias of the iterable itself).
+                 current_value = join_facts(value, *(body.heap.get(ref, CLEAN) for ref in references))
+                 self.assign(node.target, current_value, body)
++                element_binding = self.native_sequence_element(binding, references, body)
++                if isinstance(node.target, ast.Name) and element_binding is not None:
++                    self.write_name(body, node.target.id, current_value, element_binding, NO_REFERENCES)
+                 # A local generator summary identifies its yielded callable;
+                 # an ordinary iterable object is not itself that callable.
+                 if isinstance(node.target, ast.Name) and node.iter in self.generator_returns:
+@@ -12237,6 +12399,8 @@
+                 # Ownership proofs need this identity; ordinary dataflow
+                 # parameters must keep sharing their symbolic summaries.
+                 pass
++            elif isinstance(value, _NativeSequence) and (captured or name in value_parameters):
++                pass
+             elif isinstance(value, _UnprovedProducer) and (captured or name in value_parameters):
+                 pass
+             elif isinstance(value, _LiteralJoinInstance) and (captured or name in value_parameters):
+@@ -12353,7 +12517,7 @@
+                     continue
+                 if (binding is nominal
+                         and not isinstance(binding, (frozenset, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
+-                                                     _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
++                                                     _ArgumentVector, _LiteralString, _GeneratorString, _NativeSequence, _UnprovedProducer,
+                                                      _LiteralMapping, _ProcessInput, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer))
+                         and not explicit_override
+                         and gname in owner_bindings
+@@ -12366,7 +12530,7 @@
+                 if not explicit_override and not any(
+                         isinstance(value, (str, ast.FunctionDef, ast.AsyncFunctionDef,
+                                            ast.Lambda, ast.ClassDef, _BoundCallable, _BoundClassMethod, _FunctionValue, _ClosureValue,
+-                                           _ArgumentVector, _LiteralString, _GeneratorString, _UnprovedProducer,
++                                           _ArgumentVector, _LiteralString, _GeneratorString, _NativeSequence, _UnprovedProducer,
+                                            _LiteralMapping, _ProcessInput, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer, ast.Constant))
+                         for value in (*_binding_choices(binding), *_binding_choices(nominal))):
+                     continue
+diff --git a/test-suite/quality/test_taint_python_expressions.py b/test-suite/quality/test_taint_python_expressions.py
+--- a/test-suite/quality/test_taint_python_expressions.py
++++ b/test-suite/quality/test_taint_python_expressions.py
+@@ -190,5 +190,141 @@
+         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+ 
+ 
++class NativeStringSequenceTests(SourceTest):
++    """Ordinary source analysis only; analyzed snippets are never executed."""
++
++    def test_splitting_keeps_native_elements_and_source_facts(self):
++        operations = (
++            'split()', 'split(",")', 'split(None)', 'split(",", 2)',
++            'split(sep=",", maxsplit=2)', 'rsplit(",", 1)',
++            'rsplit(sep=",", maxsplit=1)', 'splitlines()',
++            'splitlines(True)', 'splitlines(keepends=True)',
++        )
++        for operation in operations:
++            for producer, expected in (('input()', ('eval',)), ('"red,green\\nblue"', ())):
++                with self.subTest(operation=operation, producer=producer):
++                    source = (
++                        f'parts = {producer}.{operation}\n'
++                        'any(part == "item" for part in parts)\n'
++                        'eval("".join(parts))\n')
++                    rows = self.assert_rules(source, *expected)
++                    if expected:
++                        self.assertEqual([(row['line'], row['col']) for row in rows], [(3, 1)])
++
++    def test_captured_split_methods_keep_their_original_receiver(self):
++        for method in ('split', 'rsplit', 'splitlines'):
++            with self.subTest(method=method):
++                self.assert_rules(
++                    f'text = input()\nsplit = text.{method}\ntext = "fixed"\n'
++                    'parts = split()\n'
++                    'any(part == "item" for part in parts)\n'
++                    'eval("".join(parts))\n', 'eval')
++
++    def test_selected_helpers_preserve_sequence_and_element_contracts(self):
++        for body in (
++            'return text.splitlines()',
++            'parts = text.splitlines()\n    return parts',
++        ):
++            with self.subTest(body=body):
++                self.assert_rules(
++                    f'def lines(text):\n    {body}\n'
++                    'parts = lines(input())\n'
++                    'any(part == "item" for part in parts)\n'
++                    'eval("".join(parts))\n', 'eval')
++        self.assert_rules(
++            'def identity(values):\n    return values\n'
++            'parts = identity(input().split())\n'
++            'any(part == "item" for part in parts)\n'
++            'eval("".join(parts))\n', 'eval')
++
++    def test_scalar_indices_and_slices_keep_taint_without_inventing_a_length(self):
++        for index in ('0', '-1'):
++            with self.subTest(index=index):
++                self.assert_rules(
++                    f'parts = input().split(",")\nvalue = parts[{index}]\n'
++                    'any(marker in value for marker in ("x", "y"))\n'
++                    'eval(value)\n', 'eval')
++        for index in ('[:1]', '[1:]', '[::-1]'):
++            with self.subTest(index=index):
++                self.assert_rules(
++                    f'parts = input().splitlines(){index}\n'
++                    'any(part == "item" for part in parts)\n'
++                    'eval("".join(parts))\n', 'eval')
++        self.assert_rules(
++            'try:\n    value = "".split()[0]\n'
++            'except IndexError:\n    eval(input())\n', 'eval')
++        self.assert_rules(
++            'value = input()\n'
++            'for part in "".split():\n    value = "fixed"\n'
++            'eval(value)\n', 'eval')
++
++    def test_native_sequence_loops_and_eager_string_transforms(self):
++        self.assert_rules(
++            'for line in input().splitlines():\n'
++            '    any(marker in line for marker in ("x", "y"))\n'
++            '    eval(line)\n', 'eval')
++        for transform in ('line', 'line.lower()', 'line.strip()', 'line.removeprefix("x")'):
++            for producer, expected in (('input()', ('eval',)), ('"red\\ngreen"', ())):
++                with self.subTest(transform=transform, producer=producer):
++                    self.assert_rules(
++                        f'parts = [{transform} for line in {producer}.splitlines()]\n'
++                        'any(part == "item" for part in parts)\n'
++                        'eval("".join(parts))\n', *expected)
++        self.assert_rules(
++            'parts = input().splitlines()\n'
++            'value = "".join(part.strip() for part in parts)\n'
++            'eval(value)\n', 'eval')
++
++    def test_collection_writes_revoke_old_element_proofs_and_keep_prior_findings(self):
++        for mutation in ('alias.append(input())', 'alias[0] = input()'):
++            with self.subTest(mutation=mutation):
++                source = (
++                    'parts = "fixed".split()\nalias = parts\n'
++                    f'{mutation}\neval("".join(parts))\n'
++                    'any(part == "item" for part in parts)\n')
++                engine = taint_py._Analysis(ast.parse(source))
++                with self.assertRaises(taint_py.AnalysisLimit) as raised:
++                    engine.analyze()
++                self.assertEqual(
++                    {(kind, line, column) for kind, line, column, _label in raised.exception.effects},
++                    {('eval', 4, 1)})
++        with self.assertRaises(taint_py.AnalysisLimit):
++            self.scan(
++                'parts = "fixed".split()\nconsume(parts)\n'
++                'any(part == "item" for part in parts)\n')
++
++    def test_unknown_receivers_options_and_annotations_keep_their_boundaries(self):
++        operations = (
++            'receiver.splitlines()', '"fixed".split(separator)',
++            '"fixed".split(" ", count)', '"fixed".splitlines(flag)',
++            '"fixed".split(b" ")', '"fixed".splitlines(unknown=True)',
++            '"fixed".split("")', '"fixed".rsplit("", 1)',
++            '"fixed".split(" ", maxsplit=opaque)',
++        )
++        for operation in operations:
++            with self.subTest(operation=operation), self.assertRaises(taint_py.AnalysisLimit):
++                self.scan(f'parts = {operation}\nany(part == "item" for part in parts)\n')
++        with self.assertRaises(taint_py.AnalysisLimit):
++            self.scan(
++                'def inspect_text(text: str):\n'
++                '    parts = text.splitlines()\n'
++                '    return any(part == "item" for part in parts)\n')
++
++    def test_unproved_producers_do_not_gain_sequence_authority(self):
++        sources = (
++            'def render():\n    owned = opaque()\n    return "data"\n'
++            'parts = render().splitlines()\n',
++            'def render(text):\n    owned = opaque()\n    return text.splitlines()\n'
++            'parts = render(input())\n',
++            'parts = input(opaque).splitlines()\n',
++            'parts = "fixed".splitlines()\nparts = parts[opaque:]\n',
++            'parts = "fixed".splitlines()\nparts = parts[::0]\n',
++            'parts = "fixed".splitlines()\nstep = 0\nparts = parts[::step]\n',
++        )
++        for source in sources:
++            with self.subTest(source=source), self.assertRaises(taint_py.AnalysisLimit):
++                self.scan(source + 'any(part == "item" for part in parts)\n')
++
++
+ if __name__ == '__main__':
+     unittest.main(verbosity=2)

@@ -2424,6 +2424,96 @@ class LDAPFlowTests(unittest.TestCase):
                 self.assertTrue(raised.exception.components, (source, findings))
                 print(f'[ldap-applicability-{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
 
+    def test_frame_and_cell_exposure_preserves_incomplete_analysis(self):
+        # Source-only regressions for the eight retained frame/cell witnesses.
+        # A native-looking set must not bypass an independent flow obligation.
+        cases = {
+            'generator-expression-cell': '''
+                def run(request, conn):
+                    values = {0}
+                    captured = (values for _ in (0,))
+                    configure(captured, conn)
+                    values.add(request.args['dn'])
+            ''',
+            'eager-default-lambda-cell': '''
+                def run(request, conn):
+                    values = {0}
+                    def holder(values=lambda: values):
+                        return values
+                    configure(holder, conn)
+                    values.add(request.args['dn'])
+            ''',
+            'suspended-generator-function': '''
+                def collect(request, conn):
+                    values = {0}
+                    yield
+                    values.add(request.args['dn'])
+                def run(request, conn):
+                    pending = collect(request, conn)
+                    next(pending)
+                    configure(pending, conn)
+                    next(pending, None)
+            ''',
+            'suspended-coroutine-function': '''
+                async def collect(request, conn):
+                    values = {0}
+                    await pause()
+                    values.add(request.args['dn'])
+                def run(request, conn):
+                    pending = collect(request, conn)
+                    pending.send(None)
+                    configure(pending, conn)
+                    finish(pending)
+            ''',
+            'registered-trace-callback': '''
+                import sys
+                sys.settrace(trace)
+                def run(request, conn):
+                    values = {0}
+                    values.add(request.args['dn'])
+            ''',
+            'caught-exception-traceback': '''
+                def run(request, conn):
+                    values = {0}
+                    try:
+                        raise RuntimeError('frame boundary')
+                    except RuntimeError as error:
+                        configure(error, conn)
+                    values.add(request.args['dn'])
+            ''',
+            'context-manager-traceback': '''
+                def run(request, conn):
+                    values = {0}
+                    with boundary_context(conn):
+                        raise RuntimeError('frame boundary')
+                    values.add(request.args['dn'])
+            ''',
+            'implicit-async-with-suspension': '''
+                async def collect(request, conn):
+                    values = {0}
+                    async with boundary_async_context():
+                        pass
+                    values.add(request.args['dn'])
+                def run(request, conn):
+                    pending = collect(request, conn)
+                    pending.send(None)
+                    configure(pending, conn)
+                    finish(pending)
+            ''',
+        }
+        for label, operation in cases.items():
+            with self.subTest(case=label):
+                source = textwrap.dedent(operation).lstrip('\n')
+                source += ('\ndef unrelated(values):\n'
+                           '    return tuple(value.name for value in values)\n')
+                target = self.work / f'frame-cell-obligation-{label}.py'
+                target.write_text(source, encoding='utf-8')
+                findings = []
+                with self.assertRaises(ldap_injection.LDAPAnalysisLimit) as raised:
+                    findings.extend(ldap_injection.find([target]))
+                self.assertTrue(any(component['symbol'] == 'unrelated'
+                                    for component in raised.exception.components), (source, findings))
+
     def test_reflective_namespace_write_cannot_prove_a_set_receiver(self):
         self.check_cases({
             'reflective-set-replacement': '''

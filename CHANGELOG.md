@@ -10,6 +10,9 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Add eight static Python LDAP regression cases for captured cells, tracing,
+  suspended execution and traceback exposure, preserving incomplete analysis.
+
 - Resolve native Python TLS client and saved-callable identities across scoped
   imports, rebinding, aliases and comprehensions. Requests, HTTPX, aiohttp,
   urllib3 and SSL retain their own verification-option semantics, catching

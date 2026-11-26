@@ -54,7 +54,7 @@ FUNCTIONS = "\n".join(function(name) for name in (
     "checksum_tool_name", "compute_sha256", "sha256_into", "ubs_remove_temp",
     "ubs_remove_empty_temp_dir",
     "find_ast_grep_in_path", "download_url_to_file", "extract_zip_member",
-    "verify_ast_grep_bin", "looks_like_toon_rust_encoder",
+    "ast_grep_version_supported", "verify_ast_grep_bin", "looks_like_toon_rust_encoder",
     "ensure_ast_grep_tool_cache", "ensure_toon_tool_cache",
     "ast_grep_cached_bin_path", "ensure_ast_grep",
 )) + function("install_tool_cache_binary", optional=True) + function("is_ast_grep_launcher", optional=True)

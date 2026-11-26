@@ -396,7 +396,7 @@ import json, os, sys, time
 from pathlib import Path
 name = Path(sys.argv[0]).name
 if name == "ast-grep":
-    if "--version" in sys.argv: print("ast-grep 0.41.0")
+    if "--version" in sys.argv: print("ast-grep 0.45.3")
     elif "--json=stream" not in sys.argv: print("[]")
     raise SystemExit(0)
 if name == "go" and "run" in sys.argv:

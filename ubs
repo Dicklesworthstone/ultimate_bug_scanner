@@ -1334,6 +1334,9 @@ HELPERS_READY=0
 
 # Pinned ast-grep release for tool-cache auto-provisioning (JS/TS accuracy).
 AST_GREP_VERSION="0.45.3"
+# Older engines can report exit 0 without matches, violating the Rust AST
+# completeness contract. Keep the supported floor independent of cache labels.
+AST_GREP_MIN_VERSION="0.45.3"
 AST_GREP_BASE_URL="${UBS_AST_GREP_BASE_URL:-https://github.com/ast-grep/ast-grep/releases/download/${AST_GREP_VERSION}}"
 TOOLS_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/tools"
 TOOLS_DIR="${UBS_TOOLS_DIR:-$TOOLS_DIR_DEFAULT}"
@@ -5819,12 +5822,31 @@ is_ast_grep_launcher(){
   LC_ALL=C grep -q -a -F 'is deprecated. Use `ast-grep` instead' "$bin" 2>/dev/null
 }
 
+# Accept the stable minimum and newer releases, including build metadata.
+# Bound numeric components before shell arithmetic; unparseable output and
+# prereleases are not evidence of a compatible released engine.
+ast_grep_version_supported(){
+  local version="$1" minimum="${AST_GREP_MIN_VERSION:-0.45.3}"
+  local major minor patch minimum_major minimum_minor minimum_patch
+  local version_pattern='^ast-grep[[:space:]]+([0-9]{1,9})\.([0-9]{1,9})\.([0-9]{1,9})(\+[0-9A-Za-z.-]+)?[[:space:]]*$'
+  [[ "$version" =~ $version_pattern ]] || return 1
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+  patch="${BASH_REMATCH[3]}"
+  IFS=. read -r minimum_major minimum_minor minimum_patch <<< "$minimum"
+  (( 10#$major > 10#$minimum_major ||
+     (10#$major == 10#$minimum_major && 10#$minor > 10#$minimum_minor) ||
+     (10#$major == 10#$minimum_major && 10#$minor == 10#$minimum_minor &&
+      10#$patch >= 10#$minimum_patch) ))
+}
+
 verify_ast_grep_bin(){
-  local bin="$1"
+  local bin="$1" version
   [[ -n "$bin" && -x "$bin" ]] || return 1
   # Never run the launcher: the --version probe below would already recurse.
   is_ast_grep_launcher "$bin" && return 1
-  "$bin" --version 2>&1 | grep -qi "ast-grep" || return 1
+  version="$("$bin" --version </dev/null 2>&1)" || return 1
+  ast_grep_version_supported "$version" || return 1
   "$bin" scan -h >/dev/null 2>&1 || return 1
 
   # UBS depends on JSON-stream output for AST-powered rules. Confirm the binary

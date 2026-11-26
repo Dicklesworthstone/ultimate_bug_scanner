@@ -193,7 +193,7 @@ class InstalledContract(unittest.TestCase):
         # Optional external encoders are unrelated to asset integrity. Their
         # probes may warn, but the doctor helper record itself must be exact.
         ast = self.bin / "ast-grep-probe"
-        ast.write_text('#!/bin/sh\necho "ast-grep 0.41.0"\n', encoding="utf-8")
+        ast.write_text('#!/bin/sh\necho "ast-grep 0.45.3"\n', encoding="utf-8")
         ast.chmod(0o755)
         toon = self.bin / "toon-probe"
         toon.write_text('#!/bin/sh\necho "toon_rust 0.1.0 --encode --decode"\n', encoding="utf-8")

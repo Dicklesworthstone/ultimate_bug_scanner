@@ -1,0 +1,370 @@
+UNACTIVATED SOURCE FOLLOW-UP: LDAP tracing and consumer authority
+================================================================
+
+Base commit: 678ee1aa0cf305bd2fdc9c451193b863a60edade
+Upstream runtime baseline: 7205cf0e661f46fd6ac6a0fdf36e415ea7470560
+Reviewable source checkpoint (no branch ref points to this tree):
+19c1ed62ca8b866b58e026cca530f040601db0da
+
+Status
+------
+This patch is preserved for continuation, not activated detector behavior.
+The execution workspace disconnected during canonical checksum preparation.
+Only DSR startup was observed; generator completion, new pin values and final
+receipts were not observed. Final current-base source/public/checksum validation
+was not launched. Do not infer a pass from the older candidate's results.
+
+No checksum updates are included here. Applying this source patch alone does
+not produce an integrity-consistent installation or a qualified release tree.
+
+Proposed change
+---------------
+- Extend existing exposed_namespaces() with tracing, profiling and monitoring
+  hooks, try/finally boundaries, and implicit/explicit suspension syntax.
+- Reject immediate-generator identity proofs involving consumer-name walrus
+  writes, multiple/async clauses, explicit producer calls, or unproved eager
+  header/generic/class execution contexts.
+- Preserve all six existing native consumers, existing namespace/attribute
+  safeguards, and the direct native-set-literal add fast path.
+- Add 13 source-only frame/helper/consumer boundary cases and four independent
+  tracing/monitoring work-limit cases. The eight measured frame cases are
+  already maintained by the base commit and are not duplicated here.
+- Add an actual module/runner JSON/SARIF case requiring the tracing example's
+  LDAP work-limit diagnostic to survive alongside independent analysis errors.
+
+The consumer rule does not prove that arbitrary implicit user protocols are
+inert. Broader native identity, constructor-field precision and whole-repository
+release qualification remain open.
+
+Evidence already completed
+--------------------------
+The exact eight maintained frame/cell fixture sources were hash-verified and
+replayed statically against pristine 7205cf0e. All eight were admitted and
+reported partial with zero findings. That upstream commit ALREADY fixes these
+eight cases; they are regression preservation, not new wins for this patch.
+No native fixture programs were executed in the replay.
+
+DSR tool: ldap-namespace-static-baseline
+Run: 20261126T011912-wnumY2DY
+Source snapshot:
+7205cf0e661f46fd6ac6a0fdf36e415ea7470560|
+632281d8d882a0e31a99677c76355c125b64518c08b815f3ed42c4ec0b26ded9|
+no-lockfile
+Config SHA256:
+117ad5aab41d9de1eaf12c4f6b6d066ffeb7623a494d200933dbd987ddc67451
+Completed log SHA256:
+c3150471dd982f7489060f5626c3299ecafbe9353da9153028758784516a1d65
+Result: 1/1 checks passed, unchanged source/configuration, exit 0.
+
+An earlier, broader candidate on a771571 passed 24 selected static methods,
+39 public CLI invocations (32 report + 7 cache), and both canonical checksum
+verifiers. Its snapshot was
+1ba9f34219db64c58af07551b6ef442d8284a43efbf3b1afd2c090946f9e40ce.
+That evidence does NOT qualify this smaller patch on the newer namespace code.
+The four newly isolated tracing obligations have not been measured.
+
+Resume
+------
+Use an isolated checkout of the stated base and inspect newer main changes.
+Apply this source patch, then use genuine DSR to run the canonical
+scripts/update_checksums.sh and scripts/update_sha256sums.sh. A preparation run
+that changes source is preparation evidence, not a frozen-source pass.
+
+Freeze the resulting source and run the selected static LDAP regressions,
+including the maintained eight-case method, both new methods in this patch,
+and the upstream namespace regression. The selected static cohort is now 27
+methods. Run both LDAPInjectionPublicTests methods with real pinned ast-grep,
+Python and the existing deletion fence: 32 report invocations and 7 cache
+invocations. Run scripts/verify_checksums.sh and scripts/verify_sha256sums.sh.
+Use UBS_PYTHON_FLOW_SCOPE_STEPS=200 for the four independent tracing comparisons.
+The test methods themselves set that budget for those cases.
+
+The focused static cohort excludes the four unconditional fixture-runtime
+methods, two optional native-runtime methods and the pre-existing open
+constructor-precision cohort. It is not a full-suite qualification. Preserve
+all ordinary native-positive, ambiguous-identity, findings, suppression and
+partial-cache controls. Broader tests, full ShellCheck, strict self-scan and Nix
+remain separate unmet release gates; this patch does not authorize a tag,
+release, installer fallback, or P0 closure.
+
+Patch integrity
+---------------
+GitHub generated the following unified diffs from the exact source checkpoint.
+Each hunk was textually replayed against the stated base and verified to
+reconstruct its complete target file. This is transport verification only,
+not Python execution or detector qualification.
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -10,6 +10,12 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
+ 
+ ## [Unreleased]
+ 
++- Retain Python LDAP analysis when tracing, profiling, monitoring or exception
++  boundaries expose otherwise native-looking bindings. Tighten the immediate
++  generator-consumer proof around eager headers, assignment expressions and
++  explicit producer callbacks. Private native operations keep their shortcut;
++  unresolved operations preserve work-limit diagnostics in JSON and SARIF.
++
+ - Add eight static Python LDAP regression cases for captured cells, tracing,
+   suspended execution and traceback exposure, preserving incomplete analysis.
+ 
+diff --git a/modules/helpers/ubs_core/py_detectors/ldap_injection.py b/modules/helpers/ubs_core/py_detectors/ldap_injection.py
+--- a/modules/helpers/ubs_core/py_detectors/ldap_injection.py
++++ b/modules/helpers/ubs_core/py_detectors/ldap_injection.py
+@@ -189,9 +189,9 @@ def __init__(self, engine):
+                 alias.name == '*' for alias in node.names)
+             for node in nodes)
+         self.builtin_set = not self.reflection and not factory_shadowed
+-        self.set_expression_writes = any(
+-            isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name)
+-            and node.target.id == 'set' for node in nodes)
++        self.expression_writes = {node.target.id for node in nodes
++                                  if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name)}
++        self.set_expression_writes = 'set' in self.expression_writes
+         self.applicability_exposed = (self.reflection or engine.generator_builtin_reflection
+                                       or engine.generator_namespace_exposed or engine.generator_frame_exposed
+                                       or engine.generator_literal_authority_exposed
+@@ -285,12 +285,21 @@ def exposed_namespaces(self, nodes, parents):
+         """
+         functions = {node.name for node in nodes
+                      if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
++        frame_hooks = {'settrace', 'setprofile', 'settrace_all_threads',
++                       'setprofile_all_threads', 'register_callback',
++                       'set_events', 'set_local_events'}
+         for node in nodes:
+             parent = parents.get(node)
+             if isinstance(node, (ast.ClassDef, ast.AsyncFunctionDef, ast.Lambda,
+-                                 ast.Yield, ast.YieldFrom, ast.ExceptHandler,
++                                 ast.Yield, ast.YieldFrom, ast.Await, ast.AsyncFor,
++                                 ast.Try, ast.ExceptHandler,
+                                  ast.With, ast.AsyncWith)):
+                 return True
++            if (isinstance(node, ast.Name) and node.id in frame_hooks
++                    or isinstance(node, ast.Attribute) and node.attr in frame_hooks
++                    or isinstance(node, ast.ImportFrom)
++                    and any(alias.name in frame_hooks for alias in node.names)):
++                return True
+             if isinstance(node, ast.FunctionDef) and node.decorator_list:
+                 return True
+             if ((isinstance(node, ast.Name) and node.id in functions
+@@ -308,12 +317,28 @@ def exposed_namespaces(self, nodes, parents):
+                 scope = self.engine.enclosing(parent)
+                 if (name not in {'all', 'any', 'list', 'tuple', 'set', 'frozenset'}
+                         or not self.engine.generator_input_identity
++                        or name in self.expression_writes
+                         or name in self.engine.generator_external_writers
+                         or name in self.engine.generator_attribute_writes
++                        or len(node.generators) != 1 or node.generators[0].is_async
++                        or any(isinstance(child, ast.Call) for child in ast.walk(node))
++                        or not isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+                         or not self.builtin_visible(name, scope)
+                         or any(name in self.engine.generator_binders.get(owner, {})
+                                for owner in self.lexical_scopes(scope))):
+                     return True
++                # Eager headers run outside the declared function's frame;
++                # generic/class scopes require a separate binding proof.
++                child, owner = parent, parents.get(parent)
++                while owner is not None:
++                    if getattr(owner, 'type_params', ()):
++                        return True
++                    if isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
++                        if child not in owner.body:
++                            return True
++                    elif isinstance(owner, ast.Lambda) and child is not owner.body:
++                        return True
++                    child, owner = owner, parents.get(owner)
+         return False
+ 
+     def reflection_writes(self, nodes, parents):
+diff --git a/test-suite/quality/test_python_precision.py b/test-suite/quality/test_python_precision.py
+--- a/test-suite/quality/test_python_precision.py
++++ b/test-suite/quality/test_python_precision.py
+@@ -2514,6 +2514,145 @@ def run(request, conn):
+                 self.assertTrue(any(component['symbol'] == 'unrelated'
+                                     for component in raised.exception.components), (source, findings))
+ 
++    def test_generator_consumers_and_frame_helpers_retain_incomplete_analysis(self):
++        # Source-only checks for conservative frame and consumer boundaries.
++        # These extend the separately maintained eight measured frame cases.
++        cases = {
++            'implicit-async-for-suspension': '''
++                async def collect(request, pending):
++                    values = {0}
++                    async for item in pending:
++                        pass
++                    values.add(request.args['dn'])
++            ''',
++            'sibling-helper-traceback': '''
++                def expose(conn):
++                    try:
++                        raise RuntimeError('frame boundary')
++                    except RuntimeError as error:
++                        configure(error, conn)
++                def run(request, conn):
++                    values = {0}
++                    expose(conn)
++                    values.add(request.args['dn'])
++            ''',
++            'module-binding-traceback': '''
++                values = {0}
++                def expose(conn):
++                    with boundary_context(conn):
++                        raise RuntimeError('frame boundary')
++                expose(directory)
++                values.add(request.args['dn'])
++            ''',
++            'constructor-after-frame-exposure': '''
++                def expose(conn):
++                    with boundary_context(conn):
++                        raise RuntimeError('frame boundary')
++                expose(directory)
++                set().add(request.args['dn'])
++            ''',
++            'local-regex-frame': '''
++                def run(request):
++                    import re
++                    with boundary_context():
++                        pass
++                    re.search('dc=example', request.args['filter'])
++            ''',
++            'captured-regex-frame': '''
++                import re
++                lookup = re.search
++                with boundary_context():
++                    pass
++                lookup('dc=example', request.args['filter'])
++            ''',
++            'regex-eager-default-shadow': '''
++                def run(request, conn):
++                    re = conn
++                    def nested(callback=lambda: re.search('dc=example', request.args['filter'])):
++                        import re
++                        callback()
++                    nested()
++            ''',
++            'shadowed-generator-consumer': '''
++                def run(request, tuple):
++                    values = {0}
++                    tuple(value for value in (0,))
++                    values.add(request.args['dn'])
++            ''',
++            'generator-callback': '''
++                def run(request):
++                    values = {0}
++                    tuple(configure(value) for value in (0,))
++                    values.add(request.args['dn'])
++            ''',
++            'class-header-consumer-writer': '''
++                class Holder(metaclass=(any := factory)):
++                    pass
++                def run(request):
++                    values = {0}
++                    any(value for value in (0,))
++                    values.add(request.args['dn'])
++            ''',
++            'prepared-class-consumer': '''
++                class Holder(metaclass=factory):
++                    captured = any(value for value in (0,))
++                values = {0}
++                values.add(request.args['dn'])
++            ''',
++            'eager-default-consumer-writer': '''
++                def setup(value=(tuple := consumer)):
++                    pass
++                values = {0}
++                tuple(value for value in (0,))
++                values.add(request.args['dn'])
++            ''',
++            'try-finally-frame': '''
++                def run(request):
++                    values = {0}
++                    try:
++                        operation()
++                    finally:
++                        configure_current_exception()
++                    values.add(request.args['dn'])
++            ''',
++        }
++        for label, operation in cases.items():
++            with self.subTest(case=label):
++                source = textwrap.dedent(operation).lstrip('\n')
++                source += ('\ndef unrelated(values):\n'
++                           '    return tuple(value.name for value in values)\n')
++                target = self.work / f'frame-applicability-{label}.py'
++                target.write_text(source, encoding='utf-8')
++                findings = []
++                with self.assertRaises(ldap_injection.LDAPAnalysisLimit) as raised:
++                    findings.extend(ldap_injection.find([target]))
++                self.assertTrue(any(component['symbol'] == 'unrelated'
++                                    for component in raised.exception.components), (source, findings))
++
++    def test_tracing_capabilities_retain_ldap_analysis_obligations(self):
++        from unittest import mock
++        hooks = {
++            'module-trace': 'import sys\nsys.settrace(callback)\n',
++            'imported-profile': 'from sys import setprofile as install\ninstall(callback)\n',
++            'thread-profile': 'import threading\nthreading.setprofile_all_threads(callback)\n',
++            'monitoring-events': 'import sys\nsys.monitoring.set_events(tool_id, event_mask)\n',
++        }
++        for label, hook in hooks.items():
++            with self.subTest(case=label):
++                # A scope budget is an independent analysis obligation, so
++                # this does not rely on an unrelated generator revoking the
++                # namespace proof for some other reason. Never execute hooks.
++                source = ('def expensive(value):\n' + '    value = str(value)\n' * 100 +
++                          '    return value\n' + hook + 'def collect(request):\n'
++                          '    values = {0}\n    values.add(request.args["dn"])\n')
++                target = self.work / f'tracing-applicability-{label}.py'
++                target.write_text(source, encoding='utf-8')
++                with mock.patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'}), \
++                        self.assertRaisesRegex(ldap_injection.LDAPAnalysisLimit, 'work limit') as raised:
++                    list(ldap_injection.find([target]))
++                self.assertTrue(any(component['symbol'] == 'expensive'
++                                    for component in raised.exception.components))
++
+     def test_reflective_namespace_write_cannot_prove_a_set_receiver(self):
+         self.check_cases({
+             'reflective-set-replacement': '''
+@@ -4218,6 +4357,10 @@ def test_module_and_runner_json_sarif_preserve_findings_and_partial_status(self)
+         non_directory_opaque = ('def unrelated(values):\n'
+                                 '    return any(item in values for item in ("a", "b"))\n'
+                                 + non_directory)
++        exposed_frame = ('def expensive(value):\n' + '    value = str(value)\n' * 100 +
++                         '    return value\nimport sys\nsys.settrace(callback)\n'
++                         'def collect(request):\n    values = {0}\n'
++                         '    values.add(request.args["dn"])\n')
+         limited = ('def expensive(value):\n' + '    value = str(value)\n' * 100 +
+                    '    return value\n' + unsafe)
+         env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
+@@ -4229,6 +4372,7 @@ def test_module_and_runner_json_sarif_preserve_findings_and_partial_status(self)
+                 ('unsafe', unsafe, [3], False), ('clean', clean, [], False),
+                 ('non-directory', non_directory, [], False),
+                 ('non-directory-opaque', non_directory_opaque, [], True),
++                ('exposed-frame', exposed_frame, [], True),
+                 ('suppressed', unsafe.replace('value)\n', 'value)  # ubs:ignore[py.security.ldap-injection]\n'), [], False),
+                 ('partial', unsafe, [3], True), ('limited', limited, [105], True)):
+             selected = work / label
+@@ -4237,7 +4381,8 @@ def test_module_and_runner_json_sarif_preserve_findings_and_partial_status(self)
+             path.write_text(source, encoding='utf-8')
+             if label == 'partial':
+                 (selected / 'malformed.py').write_text('directory.search( = input()\n', encoding='utf-8')
+-            run_env = {**env, 'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'} if label == 'limited' else env
++            run_env = ({**env, 'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'}
++                       if label in {'limited', 'exposed-frame'} else env)
+             surfaces = (True,) if os.environ.get('UBS_PY_LDAP_MODULE_ONLY') == '1' else (True, False)
+             for module in surfaces:
+                 for fmt in ('json', 'sarif'):
+@@ -4293,6 +4438,11 @@ def test_module_and_runner_json_sarif_preserve_findings_and_partial_status(self)
+                             self.assertTrue(analysis_errors[0]['stage'].startswith('taint_py ('), payload)
+                             self.assertEqual([component['symbol'] for component in
+                                               analysis_errors[0].get('components', [])], ['unrelated'], payload)
++                        elif label == 'exposed-frame':
++                            self.assertTrue(any('incomplete LDAP analysis' in error.get('message', '')
++                                                and any(component['symbol'] == 'expensive'
++                                                        for component in error.get('components', []))
++                                                for error in analysis_errors), payload)
+                         print('PYTHON_LDAP_PUBLIC', label, module, fmt, 'PASS', flush=True)
+ 
+     def test_runner_cache_edits_suppression_and_partial_nonreuse(self):

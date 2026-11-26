@@ -2534,9 +2534,7 @@ class _Flow:
             return default, True
         if kinds.get(index) == 'null':
             return 0, True
-        if index >= len(arguments) or any(
-                self.engine.text[left:right].lstrip().startswith('...')
-                for left, right in arguments[:index + 1]):
+        if index >= len(arguments) or arguments[index] is None:
             return None, kinds.get(index) == 'noniterable'
         left, right = arguments[index]
         text, code = self.engine.text, self.scope.code
@@ -3827,9 +3825,9 @@ class _Flow:
                             for k in ('call', None, _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT, '__proto__')))
                     arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
                                  if self.engine.code[left:right].strip()]
-                    values, prepared = self.evaluate_arguments(arguments, state)
                     native = (('array-fill-call' if proven_call else 'array-fill-unknown'), fact, bmethod)
-                    fact = self.mutation_call(native, arguments, values, state, prepared, location=cursor)
+                    values, prepared, ranges = self.evaluate_call_arguments(native, arguments, state)
+                    fact = self.mutation_call(native, ranges, values, state, prepared, location=cursor)
                     cursor = closing + 1
                     continue
             match = re.match(r'\s*\.\s*(flat|flatMap|map|forEach|reduce|reduceRight|some|every|filter|find|findIndex|findLast|findLastIndex|slice|concat|sort|toSorted|toReversed|toSpliced|with|at|fill)\s*\(', code[cursor:end])
@@ -3845,14 +3843,14 @@ class _Flow:
             arguments = [(left, right) for left, right in _chunks(code, opening + 1, closing)
                          if self.engine.code[left:right].strip()]
             callback = self.callable(*arguments[0], state) if arguments else None
-            values, prepared = self.evaluate_arguments(arguments, state)
+            values, prepared, ranges = self.evaluate_call_arguments(native, arguments, state)
             if native is None:
                 if callback is not None:
                     self.engine.escaped_callbacks.add(callback)
                 self.incomplete.add(f'Array.{method} postfix requires a known native receiver method')
                 fact = self.materialize(_join(fact, *values), state)
             else:
-                fact = self.mutation_call(native, arguments, values, state, prepared,
+                fact = self.mutation_call(native, ranges, values, state, prepared,
                                           location=cursor, callback=callback)
             cursor = closing + 1
         return fact, cursor
@@ -4448,9 +4446,10 @@ class _Flow:
                     self.incomplete.add('Own method requires an unsupported escaped closure environment')
                 return None, receiver
             return candidate, receiver
-        if (report and key in {'splice', 'copyWithin', 'slice', 'concat', 'sort', 'toSorted', 'toReversed', 'toSpliced',
+        uncertain_fill = key == 'fill' and None in state.heap.get(('builtin', 'Array.prototype'), {})
+        if (report and (uncertain_fill or key in {'splice', 'copyWithin', 'slice', 'concat', 'sort', 'toSorted', 'toReversed', 'toSpliced',
                               'with', 'at', 'flat', 'flatMap', 'map', 'forEach', 'reduce', 'reduceRight', 'some', 'every', 'filter',
-                              'find', 'findIndex', 'findLast', 'findLastIndex'}
+                              'find', 'findIndex', 'findLast', 'findLastIndex'})
                 and _refs(receiver)
                 and all(ref in state.array_lengths for ref in _refs(receiver))
                 and self.native_target(name, state) is None):
@@ -4558,7 +4557,30 @@ class _Flow:
             cursor -= 1
         return False
 
-    def evaluate_arguments(self, ranges, state):
+    def ordinary_spread_iterator(self, refs, state):
+        # Computed keys can replace Symbol.iterator. Indexed prototype
+        # properties and descriptors can supply values or run getters on holes.
+        prototypes = (('builtin', 'Array.prototype'), ('builtin', 'Object.prototype'))
+        for ref in (*prototypes, *refs):
+            slots = state.heap.get(ref, {})
+            if any(key in slots for key in (None, '__proto__', _ARRAY_WRITE_CONTRACT, _METHOD_LOOKUP_CONTRACT)):
+                return False
+            if ref in prototypes and any(self.array_index(key) is not None for key in slots):
+                return False
+        return True
+
+    def evaluate_call_arguments(self, native, ranges, state):
+        # Integer-bound transfers read source literals at *actual* argument
+        # positions. One spread at the call site can supply zero or many slots.
+        bounds = native and (native[0] == 'array-fill-call' or (
+            native[0] == 'array' and native[2] in {
+                'at', 'fill', 'splice', 'slice', 'copyWithin', 'toSpliced', 'with', 'flat'}))
+        positions = [] if bounds and any(
+            self.scope.code[left:right].lstrip().startswith('...') for left, right in ranges) else None
+        facts, prepared = self.evaluate_arguments(ranges, state, positions=positions)
+        return facts, prepared, ranges if positions is None else positions
+
+    def evaluate_arguments(self, ranges, state, *, positions=None):
         """Evaluate and snapshot each spread before the following argument.
 
         A later argument may mutate the iterable or replace one of its slots.
@@ -4584,19 +4606,28 @@ class _Flow:
                     elements = []
                     if self.scope.code[opening + 1:closing].strip():
                         for begin, finish in _chunks(self.scope.code, opening + 1, closing):
-                            if begin == finish == closing:
-                                continue  # a trailing comma creates no argument
                             if self.scope.code[begin:finish].strip():
                                 elements.append(expand(begin, finish))
-                            else:
+                            elif finish != closing:  # a trailing comma creates no argument
                                 actual.append((frozenset(), True))  # an array hole is undefined
+                                if positions is not None:
+                                    positions.append(None)
+                    if positions is not None and not self.ordinary_spread_iterator((), state):
+                        self.incomplete.add('Array argument spread requires ordinary iteration')
+                        uncertain = 0
                     return _join(*elements)
                 fact = self.value(opening, right, state)
                 refs = _refs(fact)
                 lengths = [state.array_lengths.get(ref) for ref in refs]
-                if (refs and not frozenset(fact) and lengths[0] is not None
+                ordinary = positions is None or (
+                    not getattr(fact, 'absent', False) and not getattr(fact, 'scalar_alternative', False)
+                    and self.ordinary_spread_iterator(refs, state))
+                if (ordinary and refs and not frozenset(fact) and lengths[0] is not None
                         and all(length == lengths[0] for length in lengths)):
                     self.engine.budget.spend(lengths[0])
+                    if positions is not None:
+                        # Heap slots carry facts, but have no expression span.
+                        positions.extend([None] * lengths[0])
                     for position in range(lengths[0]):
                         key = str(position)
                         missing = all(key not in state.heap.get(ref, {})
@@ -4612,6 +4643,8 @@ class _Flow:
                     return _join(*(value for value, _missing in actual[-lengths[0]:])) if lengths[0] else frozenset()
                 if uncertain is None:
                     uncertain = len(actual)
+                if positions is not None:
+                    self.incomplete.add('Array argument spread requires finite ordinary iteration')
                 if refs and all(ref in state.array_lengths for ref in refs):
                     # An unknown-length spread supplies array elements, not
                     # the array object itself. Retain borrowed element refs.
@@ -4628,6 +4661,8 @@ class _Flow:
             unknown_undefined = kind is None and raw.strip('() \t\r\n') == 'undefined'
             if unknown_undefined:
                 maybe_missing.add(len(actual))
+            if positions is not None:
+                positions.append((left, right))
             actual.append((fact, kind == 'undefined' or unknown_undefined))
             return fact
 
@@ -5153,7 +5188,7 @@ class _Flow:
                 if (unmodeled is not None and unmodeled.parent is self.scope
                         and arguments[0][0] <= unmodeled.start < unmodeled.end <= arguments[0][1]):
                     self.engine.escaped_callbacks.add(unmodeled)
-            argument_facts, prepared = self.evaluate_arguments(arguments, state)
+            argument_facts, prepared, native_ranges = self.evaluate_call_arguments(native, arguments, state)
             if native is None and not isinstance(callee, _Scope):
                 # Use the prepared snapshots: a later argument can replace
                 # an earlier callback binding or mutate its spread source.
@@ -5243,7 +5278,7 @@ class _Flow:
                     if not (deferred and thrown is not None):
                         self.apply_writes(writes, callee, bound, state, incoming)
             else:
-                mutation = self.mutation_call(native, arguments, argument_facts, state, prepared,
+                mutation = self.mutation_call(native, native_ranges, argument_facts, state, prepared,
                                               location=match_start, callback=callback)
                 if native is not None and native[0] == 'sql-factory':
                     proof_role, proof_value = 'factory', mutation

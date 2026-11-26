@@ -2724,6 +2724,59 @@ class HeapTaintTests(unittest.TestCase):
                 self.sort_public_report(target, scratch / f'cache-{index}', meta=True, fmt='json',
                                         expected=expected, cache=True)
 
+    def test_spread_fill_bounds_follow_evaluated_argument_positions(self):
+        calls = (
+            'a.fill(...[], req.query.html, 1, 2)',
+            'a.fill(...[req.query.html, ...[1, 2]])',
+            'Array.prototype.fill.call(...[], a, req.query.html, 1, 2)',
+            'Array.prototype.fill.call(...[a, req.query.html], 1, 2)',
+            'const args=[a, req.query.html]; Array.prototype.fill.call(...args, 1, 2)',
+            'const fill=a.fill; fill.call(...[a, ], req.query.html, 1, 2)',
+            'const b=a; [].fill.call(...[b, req.query.html, -1], undefined)',
+            'function put(items,v){items.fill(...[v,1,2]);} put(a,req.query.html)',
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                source = ('const a=["first","last"];\n' + call
+                          + ';\nres.send(a[0]);\nres.send(a[1]);')
+                self.assert_runtime_sends(source, ['first', 'review-input'])
+                self.assertEqual([f['line'] for f in self.scan(source, 'xss')], [4])
+
+        for arguments, outputs, line in (
+            ('...["clean", , 1]', ['clean', 'review-input'], 4),
+            ('...["clean"], 1, 2', ['review-input', 'clean'], 3),
+        ):
+            with self.subTest(arguments=arguments):
+                source = ('const a=[req.query.html,req.query.html];\n'
+                          f'a.fill({arguments});\nres.send(a[0]);\nres.send(a[1]);')
+                self.assert_runtime_sends(source, outputs)
+                self.assertEqual([f['line'] for f in self.scan(source, 'xss')], [line])
+
+    def test_spread_bounds_in_native_reads_and_copies(self):
+        for expression in ('a.at(...[-1])', 'a.slice(...[1,2])[0]',
+                           'a.splice(...[1,1])[0]', 'a.copyWithin(...[0,1,2])[0]'):
+            with self.subTest(expression=expression):
+                for first, second, expected, rules in (
+                    ('"fixed"', 'req.query.html', 'review-input', ('xss',)),
+                    ('req.query.html', '"fixed"', 'fixed', ()),
+                ):
+                    source = f'const a=[{first},{second}]; res.send({expression});'
+                    self.assert_runtime_sends(source, [expected])
+                    self.scan(source, *rules)
+
+    def test_spread_bound_protocols_and_opaque_heap_scalars_remain_partial(self):
+        for body, reason in (
+            ('const args=[a,"clean"]; args[Symbol.iterator]=external; '
+             'Array.prototype.fill.call(...args, 0, 1);', 'Array argument spread'),
+            ('const fill=a.fill; Array.prototype[Symbol.iterator]=external; '
+             'fill.call(...[a,"clean",0,1]);', 'Array argument spread'),
+            ('Array.prototype[Symbol.iterator]=external; a.fill(...["clean",0,1]);', 'Array.fill'),
+            ('const bounds=[0,1]; a.fill("clean", ...bounds);', 'Array.fill bound coercion'),
+        ):
+            with self.subTest(body=body):
+                self.assert_fill_partial('const a=[req.query.html]; ' + body + ' res.send(a[0]);',
+                                         'xss', reason=reason)
+
     def test_fill_mutates_alias_and_returns_same_array(self):
         self.scan('const items = ["safe"]; const alias = items; '
                   'const returned = alias.fill(req.query.html); '

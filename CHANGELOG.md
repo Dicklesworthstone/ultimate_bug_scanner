@@ -10,6 +10,8 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Use expanded argument positions for native JavaScript array bounds, including borrowed fill calls. Preserve findings on written elements and keep untouched elements distinct.
+
 - Keep Swift forced unwrap findings when a nil check exits only a nested closure, loop, local function, or one conditional branch.
 
 - Preserve native Python string elements through `split`, `rsplit`,

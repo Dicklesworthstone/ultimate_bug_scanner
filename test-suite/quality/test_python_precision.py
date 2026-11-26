@@ -2420,6 +2420,17 @@ class LDAPFlowTests(unittest.TestCase):
                 update = builtins.setattr
                 update(builtins, 'set', directory_factory)
             ''',
+            'escaped-builtins-module': '''
+                import builtins
+                configure(builtins)
+            ''',
+            'escaped-builtins-module-alias': '''
+                import builtins as runtime
+                configure(runtime)
+            ''',
+            'escaped-builtin-callable-owner': '''
+                configure(len.__self__)
+            ''',
         }
         for label, operation in cases.items():
             with self.subTest(case=label):
@@ -2432,6 +2443,147 @@ class LDAPFlowTests(unittest.TestCase):
                         self.assertRaisesRegex(ldap_injection.LDAPAnalysisLimit, 'work limit') as raised:
                     list(ldap_injection.find([target]))
                 self.assertTrue(raised.exception.components)
+
+    def test_set_constructor_admission_respects_execution_frames_and_binders(self):
+        from types import SimpleNamespace
+        cases = {
+            'eager-default': '''
+                def run(request, conn):
+                    set = lambda: conn
+                    def nested(value=set().add(request.args['dn'])):
+                        global set
+                    nested()
+            ''',
+            'default-lambda-capture': '''
+                def run(request, conn):
+                    set = lambda: conn
+                    def nested(callback=lambda: set().add(request.args['dn'])):
+                        global set
+                        callback()
+                    nested()
+            ''',
+            'eager-decorator': '''
+                def run(request, conn):
+                    set = lambda: conn
+                    @set().add(request.args['dn'])
+                    def nested():
+                        global set
+                    nested()
+            ''',
+            'global-constructor-writer': '''
+                def replace(conn):
+                    global set
+                    set = lambda: conn
+                def run(request, conn):
+                    replace(conn)
+                    values = set()
+                    values.add(request.args['dn'])
+            ''',
+            'exception-constructor': '''
+                class FactoryError(Exception):
+                    def __call__(self): return self.args[0]
+                def run(request, conn):
+                    try: raise FactoryError(conn)
+                    except FactoryError as set:
+                        values = set()
+                        values.add(request.args['dn'])
+            ''',
+            'enclosing-exception-constructor': '''
+                class FactoryError(Exception):
+                    def __call__(self): return self.args[0]
+                def run(request, conn):
+                    try: raise FactoryError(conn)
+                    except FactoryError as set:
+                        def nested():
+                            values = set()
+                            values.add(request.args['dn'])
+                        nested()
+            ''',
+            'eager-default-walrus': '''
+                def run(request, conn):
+                    def nested(value=(set := lambda: conn)): pass
+                    set().add(request.args['dn'])
+            ''',
+            'prepared-class-namespace': '''
+                def run(request, conn):
+                    class Meta(type):
+                        @classmethod
+                        def __prepare__(metaclass, name, bases):
+                            return {'set': lambda: conn}
+                    class Holder(metaclass=Meta):
+                        member = set().add(request.args['dn'])
+            ''',
+        }
+        for label, program in cases.items():
+            with self.subTest(case=label):
+                source = textwrap.dedent(program).lstrip('\n')
+                calls = []
+
+                class Directory:
+                    def add(self, value):
+                        calls.append(value)
+                        return lambda function: function
+
+                namespace = {}
+                request = SimpleNamespace(args={'dn': 'cn=untrusted,ou=admins'})
+                exec(compile(source, label, 'exec'), namespace)
+                namespace['run'](request, Directory())
+                self.assertEqual(calls, [request.args['dn']])
+
+                target = self.work / f'set-authority-{label}.py'
+                target.write_text(source, encoding='utf-8')
+                if label in {'eager-default', 'eager-decorator'}:
+                    # These findings existed before the applicability proof.
+                    self.assertEqual([line for _, line, _, _ in ldap_injection.find([target])], [3])
+                elif label == 'global-constructor-writer':
+                    with self.assertRaisesRegex(ldap_injection.LDAPAnalysisLimit, 'new global declaration'):
+                        list(ldap_injection.find([target]))
+
+                source += ('\ndef unrelated(values):\n'
+                           '    return any(item in values for item in ("a", "b"))\n')
+                target = self.work / f'set-authority-{label}-partial.py'
+                target.write_text(source, encoding='utf-8')
+                findings = []
+                with self.assertRaises(ldap_injection.LDAPAnalysisLimit) as raised:
+                    findings.extend(ldap_injection.find([target]))
+                self.assertTrue(any(component['symbol'] == 'unrelated'
+                                    for component in raised.exception.components))
+                if label in {'eager-default', 'eager-decorator'}:
+                    self.assertEqual([line for _, line, _, _ in findings], [3])
+
+    def test_imported_execution_alias_cannot_preserve_native_regex_authority(self):
+        cases = {
+            'imported-exec-replaces-regex': '''
+                from builtins import exec as run
+                import re
+                run("re.search = directory.search")
+                re.search('dc=example', request.args['filter'])  # ldap-finding
+            ''',
+            'imported-eval-replaces-regex': '''
+                from builtins import eval as run
+                import re
+                run("setattr(re, 'search', directory.search)")
+                re.search('dc=example', request.args['filter'])  # ldap-finding
+            ''',
+        }
+        self.check_cases(cases)
+        setup = '''
+from types import SimpleNamespace
+calls = []
+class Directory:
+    def search(self, base, value): calls.append((base, value))
+directory = Directory()
+request = SimpleNamespace(args={'filter': '(uid=*)'})
+'''
+        for label, source in cases.items():
+            with self.subTest(runtime=label):
+                # Imported aliases execute the payload in the same module
+                # namespace; isolate the replacement of Python's re module.
+                program = (setup + textwrap.dedent(source).lstrip('\n') +
+                           "assert calls == [('dc=example', '(uid=*)')]\n")
+                result = subprocess.run([sys.executable, '-I', '-S', '-c', program],
+                                        capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
 
     def test_native_regex_callable_escape_can_replace_its_behavior(self):
         # A real Python function is mutable even when its owning module

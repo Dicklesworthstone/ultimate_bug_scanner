@@ -199,9 +199,16 @@ class _ReceiverProof:
                 alias.name == '*' for alias in node.names)
             for node in nodes)
         self.builtin_set = not self.reflection and not factory_shadowed
+        self.set_expression_writes = any(
+            isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name)
+            and node.target.id == 'set' for node in nodes)
         self.applicability_exposed = (self.reflection or engine.generator_builtin_reflection
                                       or engine.generator_namespace_exposed or engine.generator_frame_exposed
-                                      or engine.generator_literal_authority_exposed)
+                                      or engine.generator_literal_authority_exposed
+                                      or bool(engine.generator_execution_capabilities)
+                                      or any(isinstance(node, ast.ImportFrom) and node.module == 'builtins'
+                                             and any(alias.name in {'exec', 'eval'} for alias in node.names)
+                                             for node in nodes))
         self.attribute_writes = attribute_writes | reflected_fields
         self.named_writes = {name for node in nodes if isinstance(node, (ast.Global, ast.Nonlocal))
                              for name in node.names}
@@ -422,6 +429,38 @@ class _ReceiverProof:
         self.regex_authority = True
         return True
 
+    def native_set_constructor(self, node):
+        """Prove the callable in its actual execution frame before admission."""
+        engine = self.engine
+        if (not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name)
+                or node.func.id != 'set' or not self.builtin_set
+                or self.set_expression_writes or not engine.generator_input_identity
+                or 'set' in engine.generator_external_writers
+                or engine.generator_execution_capabilities
+                or engine.generator_literal_authority_exposed):
+            return False
+        scope = engine.enclosing(node)
+        if not isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            return False
+        # Defaults/decorators execute outside the declared function's frame.
+        # A lambda nested inside one also captures that outer environment.
+        # Class headers and generic scopes need their own binding proof.
+        child, parent = node, engine.parents.get(node)
+        while parent is not None:
+            if getattr(parent, 'type_params', ()):
+                return False
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if child not in parent.body:
+                    return False
+            elif isinstance(parent, ast.Lambda) and child is not parent.body:
+                return False
+            child, parent = parent, engine.parents.get(parent)
+        # Exception targets are string-valued AST binders and can be absent
+        # from the ordinary local-name inventory. Check every lexical owner.
+        return (self.builtin_visible('set', scope)
+                and not any('set' in engine.generator_binders.get(owner, {})
+                            for owner in self.lexical_scopes(scope)))
+
     def static_receiver(self, node, active=None):
         if self.applicability_exposed:
             return None
@@ -454,9 +493,7 @@ class _ReceiverProof:
                 return self.static_receiver(statement.value, active)
             return None
         if isinstance(node, ast.Call):
-            if (isinstance(node.func, ast.Name) and node.func.id == 'set'
-                    and self.builtin_set
-                    and self.builtin_visible('set', self.engine.enclosing(node))):
+            if self.native_set_constructor(node):
                 return 'set'
             if self.static_receiver(node.func, active) == 're.compile':
                 return 're.Pattern'

@@ -3436,6 +3436,281 @@ STDOUT.write(JSON.generate($observed))
                                  (int(bool(count)), 'ok', count), (payload, result.stderr))
 
 
+URI_SHARED_GUARD = "raise 'blocked' unless uri.scheme == 'https' && ['api.example.com'].include?(uri.host)\n"
+URI_SHARED_COPY_GUARD = "raise 'blocked' unless copy.scheme == 'https' && ['api.example.com'].include?(copy.host)\n"
+URI_SHARED_PARSE = 'uri = URI.parse(params[:url])\n' + URI_SHARED_GUARD
+URI_SHARED_SAFE = 'https://api.example.com/leaf'
+URI_SHARED_UNSAFE = 'https://evil.example.net/leaf'
+URI_SHARED_SINKS = 'Net::HTTP.get(uri)\nNet::HTTP.get(copy)\n'
+URI_SHARED_CASES = (
+    (Case('uri_shared_copy_host', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          'copy.host.replace(params[:host])\n' + URI_SHARED_SINKS, (5, 6)),
+     [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_original_host', URL, URI_SHARED_PARSE + 'copy = uri.dup\n' + URI_SHARED_COPY_GUARD
+          + 'uri.host.replace(params[:host])\n' + URI_SHARED_SINKS, (6, 7)),
+     [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_read_before_copy', URL, URI_SHARED_PARSE + 'host = uri.host\ncopy = uri.dup\n'
+          'host.replace(params[:host])\n' + URI_SHARED_SINKS, (6, 7)),
+     [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_read_after_clone', URL, URI_SHARED_PARSE + 'copy = uri.clone\nhost = copy.host\n'
+          'host.replace(params[:host])\n' + URI_SHARED_SINKS, (6, 7)),
+     [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_initially_literal', URL, "uri = URI.parse('https://api.example.com/leaf')\n"
+          'copy = uri.dup\ncopy.host.replace(params[:host])\n' + URI_SHARED_SINKS, (4, 5)),
+     [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_setter_detaches', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          'copy.host = params[:host]\n' + URI_SHARED_SINKS, (6,)),
+     [URI_SHARED_SAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_setter_rhs_alias', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          "replacement = 'api.example.com'\ncopy.host = replacement\n" + URI_SHARED_COPY_GUARD
+          + 'replacement.replace(params[:host])\n' + URI_SHARED_SINKS, (9,)),
+     [URI_SHARED_SAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_string_copy_detaches', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          'host = copy.host.dup\nhost.replace(params[:host])\n' + URI_SHARED_SINKS, ()),
+     [URI_SHARED_SAFE, URI_SHARED_SAFE]),
+    (Case('uri_shared_snapshot_detaches', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          'snapshot = copy.to_s\nsnapshot.replace(params[:other_url])\n' + URI_SHARED_SINKS, ()),
+     [URI_SHARED_SAFE, URI_SHARED_SAFE]),
+    (Case('uri_shared_component_helper', URL, 'def change(value, payload)\n  value.replace(payload)\nend\n'
+          + URI_SHARED_PARSE + 'copy = uri.dup\nchange(copy.host, params[:host])\n' + URI_SHARED_SINKS, (8, 9)),
+     [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_object_helper', URL, 'def change(value, payload)\n  value.host.replace(payload)\nend\n'
+          + URI_SHARED_PARSE + 'copy = uri.dup\nchange(copy, params[:host])\n' + URI_SHARED_SINKS, (8, 9)),
+     [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_returned_copy', URL, 'def duplicate(value)\n  value.dup\nend\n' + URI_SHARED_PARSE
+          + 'copy = duplicate(uri)\ncopy.host.replace(params[:host])\n' + URI_SHARED_SINKS, (8, 9)),
+     [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_copy_setter_then_mutation', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          "copy.host = 'api.example.com'\n" + URI_SHARED_COPY_GUARD
+          + 'copy.host.replace(params[:host])\n' + URI_SHARED_SINKS, (8,)),
+     [URI_SHARED_SAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_original_setter_then_mutation', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          "uri.host = 'other.example.com'\n"
+          "raise 'blocked' unless uri.scheme == 'https' && ['other.example.com'].include?(uri.host)\n"
+          'copy.host.replace(params[:host])\n' + URI_SHARED_SINKS, (8,)),
+     ['https://other.example.com/leaf', URI_SHARED_UNSAFE]),
+    (Case('uri_shared_mutable_scheme', URL, URI_SHARED_PARSE + "uri.scheme = 'https'\n" + URI_SHARED_GUARD
+          + 'copy = uri.dup\ncopy.scheme.replace(params[:scheme])\n' + URI_SHARED_SINKS, (7, 8)),
+     ['ftp://api.example.com/leaf', 'ftp://api.example.com/leaf']),
+    (Case('uri_shared_scheme_setter_copies_rhs', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          "scheme = 'https'\ncopy.scheme = scheme\n" + URI_SHARED_COPY_GUARD
+          + 'scheme.replace(params[:scheme])\n' + URI_SHARED_SINKS, ()),
+     [URI_SHARED_SAFE, URI_SHARED_SAFE]),
+    (Case('uri_shared_indexed_write', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          'copy.host[0, 3] = params[:prefix]\n' + URI_SHARED_SINKS, (5, 6)),
+     ['https://evil.example.com/leaf', 'https://evil.example.com/leaf']),
+    (Case('uri_shared_bang_write', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          "copy.host.gsub!('api', params[:prefix])\n" + URI_SHARED_SINKS, (5, 6)),
+     ['https://evil.example.com/leaf', 'https://evil.example.com/leaf']),
+    (Case('uri_shared_repeated_copies', URL, URI_SHARED_PARSE + 'first = uri.dup\nsecond = first.clone\n'
+          'second.host.replace(params[:host])\nNet::HTTP.get(uri)\nNet::HTTP.get(first)\nNet::HTTP.get(second)\n',
+          (6, 7, 8)), [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_revalidation', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          'copy.host.replace(params[:host])\n' + URI_SHARED_GUARD + 'Net::HTTP.get(uri)\n', ()), ['blocked']),
+    (Case('uri_shared_sink_order', URL, URI_SHARED_PARSE + 'copy = uri.dup\n' + URI_SHARED_SINKS
+          + 'copy.host.replace(params[:host])\n' + URI_SHARED_SINKS, (7, 8)),
+     [URI_SHARED_SAFE, URI_SHARED_SAFE, URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_equal_parse_detaches', URL, "uri = URI.parse('https://api.example.com/leaf')\n"
+          "other = URI.parse('https://api.example.com/leaf')\ncopy = uri.dup\n"
+          'copy.host.replace(params[:host])\nNet::HTTP.get(other)\n' + URI_SHARED_SINKS, (6, 7)),
+     [URI_SHARED_SAFE, URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+    (Case('uri_shared_setter_rejoins', URL, URI_SHARED_PARSE + 'copy = uri.dup\ncopy.host = uri.host\n'
+          + URI_SHARED_COPY_GUARD + 'uri.host.replace(params[:host])\n' + URI_SHARED_SINKS, (7, 8)),
+     [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]),
+)
+URI_SHARED_BOUNDARIES = (
+    ('uri_copy_hook', 'class URI::Generic\n  def initialize_copy(other)\n    self\n  end\nend\n'
+     + URI_SHARED_PARSE + 'copy = uri.dup\n'),
+    ('uri_string_copy_hook', 'class String\n  def dup\n    self\n  end\nend\n'
+     + URI_SHARED_PARSE + 'copy = uri.dup\nhost = copy.host.dup\n'),
+    ('uri_string_write_hook', 'class String\n  def replace(other)\n    self\n  end\nend\n'
+     + URI_SHARED_PARSE + 'copy = uri.dup\ncopy.host.replace(params[:host])\n'),
+    ('uri_scheme_singleton_conversion', URI_SHARED_PARSE + "copy = uri.dup\nscheme = 'https'\n"
+     'def scheme.downcase\n  self\nend\ncopy.scheme = scheme\n' + URI_SHARED_COPY_GUARD
+     + 'scheme.replace(params[:scheme])\n' + URI_SHARED_SINKS),
+    ('uri_scheme_subclass_conversion', 'class CustomScheme < String\n  def downcase\n    self\n  end\nend\n'
+     + URI_SHARED_PARSE + "copy = uri.dup\nscheme = CustomScheme.new('https')\ncopy.scheme = scheme\n"
+     + URI_SHARED_COPY_GUARD + 'scheme.replace(params[:scheme])\n' + URI_SHARED_SINKS),
+    ('uri_compound_conditional', URI_SHARED_PARSE + "copy = uri.dup\ncopy.host ||= 'other.example.net'\n"
+     'uri.host.replace(params[:host])\n' + URI_SHARED_SINKS),
+    ('uri_frozen_scheme', URI_SHARED_PARSE + 'copy = uri.dup\ncopy.scheme.replace(params[:scheme])\n'),
+    ('uri_hostname_identity', URI_SHARED_PARSE + 'copy = uri.dup\ncopy.hostname.replace(params[:host])\n'),
+    ('uri_object_join', URI_SHARED_PARSE + 'copy = URI.join(uri)\ncopy.host.replace(params[:host])\n'),
+    ('uri_parameter_field_replacement', 'def change(value, payload)\n  value.host = payload\nend\n'
+     + URI_SHARED_PARSE + 'copy = uri.dup\nchange(copy, params[:host])\n'),
+    ('uri_unknown_entry_host_alias', 'def dispatch(host)\n'
+     "  uri = URI.parse('https://api.example.com/leaf')\n  uri.host = host\n"
+     + URI_SHARED_GUARD + '  host.replace(params[:host])\n  Net::HTTP.get(uri)\nend\n'),
+)
+
+
+URI_COMPOUND_CLEAN_BOUNDARIES = (
+    (Case('uri_compound_addition_clean', URL, URI_SHARED_PARSE + "copy = uri.dup\nsuffix = '.internal'\n"
+          'copy.host += suffix\n'
+          "raise 'blocked' unless copy.scheme == 'https' && ['api.example.com.internal'].include?(copy.host)\n"
+          'suffix.replace(params[:host])\n' + URI_SHARED_SINKS, ()),
+     [URI_SHARED_SAFE, 'https://api.example.com.internal/leaf']),
+    (Case('uri_compound_conditional_clean', URL, URI_SHARED_PARSE + 'copy = uri.dup\n'
+          "replacement = 'other.example.com'\ncopy.host ||= replacement\n" + URI_SHARED_COPY_GUARD
+          + 'replacement.replace(params[:host])\n' + URI_SHARED_SINKS, ()),
+     [URI_SHARED_SAFE, URI_SHARED_SAFE]),
+)
+
+
+class RubyUriSharedComponentTests(LoggedCase):
+    native_scan = RubyRequestSourceTests.native_scan
+
+    def test_shared_components_match_exact_sink_sites(self):
+        for case, _native in URI_SHARED_CASES:
+            with self.subTest(case=case.name):
+                directory = self.artifact / case.name
+                directory.mkdir()
+                target = directory / 'source.rb'
+                target.write_text(case.source)
+                rows = list(taint_ruby_traversal.flow_findings(target, 'url'))
+                (directory / 'findings.json').write_text(json.dumps(rows, indent=2) + '\n')
+                self.assertEqual([(row[0], row[1]) for row in rows], [(URL, line) for line in case.lines],
+                                 (case.source, rows))
+
+    def test_unsupported_component_contracts_preserve_prior_findings(self):
+        for name, body in URI_SHARED_BOUNDARIES:
+            with self.subTest(case=name):
+                directory = self.artifact / name
+                directory.mkdir()
+                target = directory / 'source.rb'
+                target.write_text('Net::HTTP.get(URI.parse(params[:prior]))\n' + body)
+                rows = []
+                with self.assertRaisesRegex(ValueError, 'incomplete'):
+                    rows.extend(taint_ruby_traversal.flow_findings(target, 'url'))
+                (directory / 'findings.json').write_text(json.dumps(rows, indent=2) + '\n')
+                self.assertIn((URL, 1), [(row[0], row[1]) for row in rows], rows)
+
+    def test_clean_compound_setters_are_partial_without_false_findings(self):
+        # These two native clean controls previously completed. Their compound
+        # writes are now explicitly outside the supported field-store contract.
+        for case, _native in URI_COMPOUND_CLEAN_BOUNDARIES:
+            with self.subTest(case=case.name):
+                directory = self.artifact / case.name
+                directory.mkdir()
+                target = directory / 'source.rb'
+                target.write_text(case.source)
+                rows = []
+                with self.assertRaisesRegex(ValueError, 'compound URI component assignment.*incomplete'):
+                    rows.extend(taint_ruby_traversal.flow_findings(target, 'url'))
+                self.assertEqual(rows, [], (case.source, rows))
+
+    def test_native_shared_components_match_exact_sources(self):
+        executable = os.environ.get('UBS_RUBY_BIN') or shutil.which('ruby')
+        if not executable:
+            self.skipTest('native Ruby is required for URI shallow-copy witnesses')
+        driver = r'''require 'uri'
+require 'json'
+$observed = []
+def params
+  {url: 'https://api.example.com/leaf', host: 'evil.example.net', scheme: 'ftp',
+   prefix: 'evil', other_url: 'https://evil.example.net/leaf'}
+end
+module Net
+  module HTTP
+    def self.get(value); $observed << value.to_s; end
+  end
+end
+begin
+  load ARGV[0]
+rescue RuntimeError => error
+  raise unless error.message == 'blocked'
+  $observed << 'blocked'
+end
+STDOUT.write(JSON.generate($observed))
+'''
+        cases = list(URI_SHARED_CASES + URI_COMPOUND_CLEAN_BOUNDARIES)
+        for name, body in URI_SHARED_BOUNDARIES:
+            if name in {'uri_scheme_singleton_conversion', 'uri_scheme_subclass_conversion'}:
+                cases.append((Case(name, URL, body, ()), [URI_SHARED_SAFE, 'ftp://api.example.com/leaf']))
+            elif name == 'uri_compound_conditional':
+                cases.append((Case(name, URL, body, ()), [URI_SHARED_UNSAFE, URI_SHARED_UNSAFE]))
+        for case, expected in cases:
+            with self.subTest(case=case.name):
+                directory = self.artifact / ('native-' + case.name)
+                directory.mkdir()
+                target = directory / 'source.rb'
+                target.write_text(case.source)
+                command = [executable, '-e', driver, str(target)]
+                result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+                                        preexec_fn=prevent_child_deletion)
+                (directory / 'stdout.log').write_text(result.stdout)
+                (directory / 'stderr.log').write_text(result.stderr)
+                (directory / 'identity.json').write_text(json.dumps({
+                    'command': command, 'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                    'exit': result.returncode, 'expected': expected,
+                }, indent=2) + '\n')
+                self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                self.assertEqual(json.loads(result.stdout), expected, (case.name, result.stdout, result.stderr))
+
+    def test_unresolved_field_identity_follows_actual_sink_operands(self):
+        cases = (
+            ('eval', 'eval(uri.to_s)', True),
+            ('dispatch', 'public_send(uri.to_s)', True),
+            ('command', 'system(uri.to_s)', True),
+            ('interpreter', "system('sh', '-c', uri.to_s)", True),
+            ('backticks', '`#{uri.to_s}`', True),
+            ('sql_query', 'ActiveRecord::Base.connection.execute(uri.to_s)', True),
+            ('rescued_eval', 'begin\n    raise uri.to_s\n  rescue => error\n    eval(error.message)\n  end', True),
+            ('path', 'File.read(uri.to_s)', True),
+            ('returned_value', 'uri', False),
+            ('fixed_argv_data', "system('/bin/echo', uri.to_s)", False),
+            ('bound_sql_value', "ActiveRecord::Base.connection.exec_query('SELECT $1', 'SQL', [uri.to_s])", False),
+        )
+        for name, sink, partial in cases:
+            with self.subTest(case=name):
+                directory = self.artifact / ('unresolved-sink-' + name)
+                directory.mkdir()
+                target = directory / 'source.rb'
+                target.write_text('system(params[:prior])\ndef dispatch(host)\n'
+                    "  uri = URI.parse('https://api.example.com/leaf')\n  uri.host = host\n"
+                    '  host.replace(params[:host])\n  ' + sink + '\nend\n')
+                rows = []
+                if partial:
+                    with self.assertRaisesRegex(ValueError, 'URI field identity.*incomplete'):
+                        rows.extend(taint_ruby_traversal.flow_findings(target, 'path'))
+                else:
+                    rows.extend(taint_ruby_traversal.flow_findings(target, 'path'))
+                self.assertEqual([(row[0], row[1]) for row in rows], [(SHELL_COMMAND, 1)], rows)
+
+    def test_shared_component_cache_and_policy_controls(self):
+        directory = self.artifact / 'cache-policy'
+        directory.mkdir()
+        target = directory / 'selected.rb'
+        unsafe = next(case for case, _ in URI_SHARED_CASES if case.name == 'uri_shared_copy_host')
+        safe = next(case for case, _ in URI_SHARED_CASES if case.name == 'uri_shared_string_copy_detaches')
+        for attempt, (case, hits) in enumerate(((unsafe, 0), (unsafe, 1), (safe, 0), (safe, 1))):
+            target.write_text(case.source)
+            result, payload, _env = self.native_scan(directory / str(attempt), target)
+            self.assertEqual((result.returncode, payload['status'], payload['files'], payload['critical']),
+                             (int(bool(case.lines)), 'ok', 1, len(case.lines)), (payload, result.stderr))
+            self.assertEqual(payload['extras']['profile']['cache_hits'], hits, payload)
+            self.assertEqual([(row['rule'], row['line']) for row in payload['findings'] if row['severity'] == 'critical'],
+                             [(URL, line) for line in case.lines], payload)
+        for label, marker, skip, count in (
+                ('suppressed', ' # ubs:ignore[ruby.taint.outbound_url]', '', 0),
+                ('unrelated', ' # ubs:ignore[ruby.taint.path_traversal]', '', 2),
+                ('disabled', '', '6', 0)):
+            with self.subTest(case=label):
+                target.write_text('\n'.join(line + marker if line.startswith('Net::HTTP.get') else line
+                                            for line in unsafe.source.splitlines()) + '\n')
+                result, payload, _env = self.native_scan(directory / label, target, skip=skip)
+                self.assertEqual((result.returncode, payload['status'], payload['critical']),
+                                 (int(bool(count)), 'ok', count), (payload, result.stderr))
+        target.write_text('Net::HTTP.get(URI.parse(params[:prior]))\n' + URI_SHARED_BOUNDARIES[0][1])
+        for attempt in range(2):
+            result, payload, _env = self.native_scan(directory / ('partial-' + str(attempt)), target)
+            self.assertEqual((result.returncode, payload['status'], payload['critical']),
+                             (2, 'partial', 1), (payload, result.stderr))
+            self.assertEqual(payload['extras']['profile']['cache_hits'], 0, payload)
+            self.assertEqual([(row['rule'], row['line']) for row in payload['findings']
+                              if row['severity'] == 'critical'], [(URL, 1)], payload)
+
+
 class RubySemanticTests(LoggedCase):
     def check_case(self, case):
         target, records = self.observe(case)
@@ -4282,6 +4557,64 @@ class RubyPublicTests(LoggedCase):
                         if partial:
                             self.assertIn('sanitizer guard dispatch', json.dumps(payload), payload)
                         print('RUBY_GUARD_PUBLIC_PASS', name, 'module' if module else 'runner', fmt, flush=True)
+
+    def test_shared_uri_mutations_reach_module_and_runner_reports(self):
+        self.check_shared_uri_public(('uri_shared_copy_host', 'uri_shared_initially_literal',
+                                      'uri_shared_object_helper', 'uri_shared_mutable_scheme'))
+
+    def test_shared_uri_detachment_and_partial_reports(self):
+        self.check_shared_uri_public(('uri_shared_setter_detaches', 'uri_shared_string_copy_detaches',
+                                      'uri_shared_scheme_setter_copies_rhs', 'uri_compound_conditional_clean'))
+
+    def check_shared_uri_public(self, names):
+        cases = {case.name: case for case, _ in URI_SHARED_CASES + URI_COMPOUND_CLEAN_BOUNDARIES}
+        partial_names = {case.name for case, _ in URI_COMPOUND_CLEAN_BOUNDARIES}
+        for name in names:
+            case, partial = cases[name], name in partial_names
+            directory = self.artifact / name
+            directory.mkdir()
+            selected = directory / 'selected.rb'
+            selected.write_text(case.source)
+            (directory / 'unselected.rb').write_text('Net::HTTP.get(URI.parse(params[:unselected]))\n')
+            expected = [(URL, line, 1, 'critical') for line in case.lines]
+            for module in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=name, module=module, format=fmt):
+                        result, payload = self.scan(directory / f'{module}-{fmt}', selected, fmt, module=module)
+                        self.assertEqual(result.returncode, 2 if partial else int(bool(case.lines)),
+                                         (result.stdout, result.stderr))
+                        if fmt == 'json':
+                            self.assertEqual(payload['status'], 'partial' if partial else 'ok', payload)
+                            counts = payload if module else payload['totals']
+                            self.assertEqual(tuple(counts[key] for key in ('files', 'critical', 'warning', 'info')),
+                                             (1, len(case.lines), 0, 0), payload)
+                            rows = payload['findings']
+                            actual = [(row['rule' if module else 'rule_id'], row['line'], row['col'], row['severity'])
+                                      for row in rows]
+                            for row in rows:
+                                self.assertEqual(Path(row.get('path', row.get('file'))).name, selected.name, row)
+                            if not module:
+                                self.assertEqual(bool(payload['failed_modules']), partial, payload)
+                        else:
+                            self.assertEqual(payload['version'], '2.1.0', payload)
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])]
+                            actual = []
+                            for row in rows:
+                                physical = row['locations'][0]['physicalLocation']
+                                actual.append((row['ruleId'], physical['region']['startLine'],
+                                               physical['region']['startColumn'],
+                                               {'error': 'critical', 'warning': 'warning', 'note': 'info'}[row['level']]))
+                                self.assertEqual(Path(physical['artifactLocation']['uri']).name, selected.name, row)
+                            invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                            if partial:
+                                self.assertTrue(any(not item['executionSuccessful'] and item.get('exitCode') == 2
+                                                    for item in invocations), payload)
+                            else:
+                                self.assertTrue(all(item['executionSuccessful'] for item in invocations), payload)
+                        self.assertEqual(sorted(actual), sorted(expected), payload)
+                        if partial:
+                            self.assertIn('compound URI component assignment', json.dumps(payload), payload)
+                        print('RUBY_URI_SHARED_PUBLIC_PASS', name, 'module' if module else 'runner', fmt, flush=True)
 
     def test_constant_receiver_identity_reaches_json_and_sarif(self):
         for case in CONSTANT_RECEIVER_CASES:

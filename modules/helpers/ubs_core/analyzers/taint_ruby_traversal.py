@@ -86,6 +86,10 @@ API_CONSTANTS = frozenset(tuple(name.split('::')) for name in (
 ))
 NATIVE_INPUT_CONSTANTS = {('ARGV',): 'native-argv', ('ENV',): 'native-environment'}
 NATIVE_INPUT_SHAPES = frozenset(NATIVE_INPUT_CONSTANTS.values()) | {'native-argv-copy'}
+URI_COMPONENT_FIELDS = frozenset({'host', 'scheme'})
+URI_COMPONENT_TAGS = frozenset('uri-field:' + field for field in URI_COMPONENT_FIELDS)
+URI_COMPONENT_KINDS = frozenset('uri-' + field for field in URI_COMPONENT_FIELDS)
+STRING_OBJECT_KINDS = frozenset({'string', 'request'}) | URI_COMPONENT_KINDS
 REQUEST_BINDINGS = {
     'request': 'request', 'req': 'request', 'rack_request': 'request',
     'params': 'request-params', 'env': 'environment', 'cookies': 'request-params',
@@ -1343,6 +1347,7 @@ class RubyEngine:
                 'Ruby ActiveRecord SQL arguments need a supported positional signature; analysis is incomplete')
             return CLEAN
         query = positional[0]
+        self.uri_field_sink(query)
         if any(trace.kind == 'object' and trace.key[0] == 'array' for trace in query):
             query = retag(query, add=frozenset({'sql-unresolved-value'}))
         unbound = frozenset(trace for trace in tainted(query)
@@ -1365,7 +1370,9 @@ class RubyEngine:
 
     def exception_value(self, value, kind):
         previous = frozenset(tag for trace in value for tag in trace.tags if tag.startswith('exception-type:'))
-        return join(retag(tainted(value), add=frozenset({'exception-type:' + kind}),
+        payload = join(tainted(value), frozenset(trace for trace in value
+                       if trace.kind == 'shape' and trace.key[0] == 'unresolved-uri-field'))
+        return join(retag(payload, add=frozenset({'exception-type:' + kind}),
                           remove=VALUE_TAGS | previous), frozenset({Trace('exception', (kind,))}))
 
     def literal(self, tokens):
@@ -1530,7 +1537,7 @@ class RubyEngine:
             return self.fresh(retag(arguments[0], add=HEADER_PROOFS,
                                     remove=VALUE_TAGS - HEADER_PROOFS), 'string', token.start)
         kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
-        if not kinds or not kinds <= {'string', 'request'}:
+        if not kinds or not kinds <= STRING_OBJECT_KINDS:
             return None
         removed = frozenset()
         if method == 'delete' and arguments:
@@ -1837,7 +1844,14 @@ class RubyEngine:
             defaults_state[name] = value
         return tuple(bound) if position == len(positional) and not keywords else None
 
+    def uri_field_sink(self, value):
+        """Consume a deferred field-identity obligation only at a sink operand."""
+        if has_shape(value, 'unresolved-uri-field'):
+            self.unresolved_calls.add(
+                f'{self.path}: Ruby URI field identity is unresolved at a sink; analysis is incomplete')
+
     def record(self, offset, value, operation=''):
+        self.uri_field_sink(value)
         unsafe = frozenset(trace for trace in tainted(value)
                            if ('contained-path' not in trace.tags if self.policy == 'path'
                                else not HEADER_PROOFS <= trace.tags if self.policy == 'header'
@@ -1864,7 +1878,8 @@ class RubyEngine:
         boundary, but their result remains untrusted and existing validation
         proofs cannot survive arbitrary execution in the current context.
         """
-        if self.policy == 'path':
+        self.uri_field_sink(value)
+        if self.policy == 'path' and tainted(value):
             site = (rule, offset)
             evidence = advance(tainted(value), self.step(offset, 'sink', operation))
             self.effects[site] = join(self.effects.get(site, CLEAN), evidence)
@@ -1989,7 +2004,7 @@ class RubyEngine:
         all_values = join(*arguments)
 
         def incomplete(reason):
-            if tainted(all_values):
+            if tainted(all_values) or has_shape(all_values, 'unresolved-uri-field'):
                 self.unresolved_calls.add(
                     f'{self.path}:{self.step(token.start, "call", name).line}: '
                     f'Ruby process {reason}; analysis is incomplete')
@@ -2051,10 +2066,10 @@ class RubyEngine:
             command = vector[0]  # argv[0]'s display name cannot select a program.
             explicit_executable = True
         if not explicit_executable:
-            if tainted(command):
+            if tainted(command) or has_shape(command, 'unresolved-uri-field'):
                 self.execution_sink(token.start, command, SHELL_COMMAND_RULE,
                                     name + ' request-derived command string', state)
-        elif tainted(command):
+        elif tainted(command) or has_shape(command, 'unresolved-uri-field'):
             self.execution_sink(token.start, command, EXECUTABLE_RULE,
                                 name + ' request-selected executable', state)
         program = self.process_literal(command)
@@ -2062,11 +2077,13 @@ class RubyEngine:
             # Provenance alone does not identify a clean executable: it could
             # select an interpreter. A reported attacker-selected command is
             # already a terminal execution boundary, not a missing analysis.
-            if not tainted(command) and tainted(join(*argv, keywords.get('stdin_data', CLEAN), options)):
+            operands = join(*argv, keywords.get('stdin_data', CLEAN), options)
+            if not tainted(command) and (tainted(operands) or has_shape(operands, 'unresolved-uri-field')):
                 incomplete('executable identity is unresolved for request-derived argv/stdin')
         else:
             if (not explicit_executable and not re.fullmatch(r'[A-Za-z0-9_./+-]+', program)
-                    and tainted(join(keywords.get('stdin_data', CLEAN), options))):
+                    and (tainted(join(keywords.get('stdin_data', CLEAN), options))
+                         or has_shape(join(keywords.get('stdin_data', CLEAN), options), 'unresolved-uri-field'))):
                 incomplete('compound command stdin needs shell syntax analysis')
             executable = program.rsplit('/', 1)[-1].lower()
             posix = executable in {'sh', 'bash', 'dash', 'zsh', 'ksh', 'ash'}
@@ -2119,9 +2136,9 @@ class RubyEngine:
                         incomplete('captured interpreter stdin was changed by a later argument')
                         return self.fresh(retag(all_values, remove=VALUE_TAGS), 'unknown', token.start)
                     code = join(code, stdin_data)
-                    if tainted(options):
+                    if tainted(options) or has_shape(options, 'unresolved-uri-field'):
                         incomplete('interpreter stdin options need resolved keys')
-                if tainted(code):
+                if tainted(code) or has_shape(code, 'unresolved-uri-field'):
                     self.execution_sink(token.start, code, SHELL_ARGV_RULE,
                                         name + ' request-derived interpreter input', state)
         # system/exec/spawn return status/PID metadata, not command contents.
@@ -2140,6 +2157,14 @@ class RubyEngine:
         """
         identities = object_ids(previous)
         roots = frozenset(trace for trace in previous if trace.kind == 'object')
+        uri_component = (any(trace.tags & URI_COMPONENT_TAGS for trace in roots) or any(
+            trace.kind == 'member' and trace.tags & URI_COMPONENT_TAGS
+            and ('object', trace.key) in identities for fact in state.values() for trace in fact))
+        if has_shape(previous, 'unresolved-uri-component') or any(
+                'uri-frozen-component' in trace.tags for trace in roots):
+            self.unresolved_calls.add(
+                f'{self.path}: Ruby URI component mutation needs a supported mutable-string identity; '
+                'analysis is incomplete')
         definite = len(identities) == 1 and bool(roots) and all(
             trace.key[1] not in self.repeated_sites
             and not any(offset in self.repeated_sites for offset in trace.key[2])
@@ -2159,7 +2184,7 @@ class RubyEngine:
             fact = retag(self.invalidate_sql_binding(fact), remove=VALUE_TAGS)
             fact = frozenset(trace for trace in fact if not (
                 trace.kind == 'shape' and trace.key[0] in {'literal-list', 'canonical-path'}))
-            if has_shape(previous, 'uri'):
+            if has_shape(previous, 'uri') or (has_shape(fact, 'uri') and uri_component):
                 fact = retag(join(fact, frozenset(trace for trace in previous
                                                 if trace.kind == 'shape' and trace.key[0] == 'uri')),
                              add=frozenset({'parsed-uri'}))
@@ -2187,6 +2212,65 @@ class RubyEngine:
             if identities & (object_ids(fact) | object_ids(fact, members=True)):
                 self.mutations[index] = join(self.mutations.get(index, CLEAN), changed)
         return changed
+
+    def native_uri_available(self, token, *methods):
+        owners = {('Object',), ('Kernel',), ('URI', 'Generic'), ('URI', 'HTTP'), ('URI', 'HTTPS')}
+        owners.update(function.owner for function in self.parser.functions.values()
+                      if function.owner[:1] == ('URI',))
+        uncertain = self.unresolved_guard_methods | self.unresolved_definition_methods
+        if (uncertain.intersection(methods) or self.refined_guard_owners.intersection(owners | {None})
+                or any(self.native_instance_override(owner, method) for owner in owners for method in methods)):
+            self.unresolved_calls.add(
+                f'{self.path}:{self.step(token.start, "call", methods[0]).line}: '
+                'Ruby URI component or copy dispatch is unresolved; analysis is incomplete')
+            return False
+        return True
+
+    def uri_component_assignment(self, receiver, field, value, token, state):
+        """Replace one field on one URI object, retaining the other copy's strings."""
+        roots = frozenset(trace for trace in receiver if trace.kind == 'object')
+        members = frozenset(trace for trace in receiver if trace.kind == 'member'
+                            and trace.tags & URI_COMPONENT_TAGS)
+        identities = object_ids(receiver)
+        definite = len(identities) == 1 and bool(roots) and all(
+            trace.key[0] == 'uri' and trace.key[1] not in self.repeated_sites
+            and not any(offset in self.repeated_sites for offset in trace.key[2])
+            and len(trace.key[2]) < 2 for trace in roots)
+        parameter = any(identities & object_ids(fact) for fact in self.parameter_values.values())
+        supported = self.native_uri_available(token, field + '=', 'set_' + field)
+        if not definite or not members or parameter or not supported:
+            self.unresolved_calls.add(
+                f'{self.path}:{self.step(token.start, "assign", field).line}: '
+                'Ruby URI component replacement requires one local native object; analysis is incomplete')
+            self.mutate(receiver, value, state)
+            return
+        tag = 'uri-field:' + field
+        strings = frozenset(trace for trace in value if trace.kind == 'object')
+        native_strings = bool(strings) and all(trace.key[0] in STRING_OBJECT_KINDS for trace in strings)
+        if field == 'scheme':
+            # URI#scheme= stores a new lowercase string. URI#host= keeps
+            # the supplied string itself, so later RHS alias writes matter.
+            if not native_strings or not self.native_guard_available((token,), ('String',), 'downcase'):
+                self.unresolved_calls.add(
+                    f'{self.path}: Ruby URI scheme conversion string identity is unresolved; analysis is incomplete')
+            replacement = frozenset({Trace('member', ('uri-scheme', token.start, ()), tags=frozenset({tag}))})
+        else:
+            if value and not native_strings:
+                self.unresolved_calls.add(
+                    f'{self.path}: Ruby URI host replacement string identity is unresolved; analysis is incomplete')
+            replacement = frozenset(replace(trace, kind='member',
+                tags=(trace.tags - URI_COMPONENT_TAGS) | frozenset({tag})) for trace in strings)
+            if not value:
+                # An exploratory helper entry has empty formal facts. Keep
+                # the unresolved field until a concrete call supplies an
+                # identity, or until consuming the URI requires that proof.
+                replacement = shape('unresolved-uri-field', field)
+        self.mutate(receiver, value, state)
+        for binding, fact in tuple(state.items()):
+            if object_ids(fact) == identities:
+                state[binding] = join(frozenset(trace for trace in fact if not (
+                    trace.kind == 'member' and tag in trace.tags or
+                    trace.kind == 'shape' and trace.key == ('unresolved-uri-field', field))), replacement)
 
     def native_instance_override(self, owner, method):
         """Do not borrow a builtin instance contract through an override/alias."""
@@ -2376,7 +2460,7 @@ class RubyEngine:
                 if len(arguments) == 2:
                     buffer = arguments[1]
                     kinds = {trace.key[0] for trace in buffer if trace.kind == 'object'}
-                    if kinds and kinds <= {'string', 'request'}:
+                    if kinds and kinds <= STRING_OBJECT_KINDS:
                         return self.mutate(buffer, value, state, overwrite=True)
                     # Unknown output-buffer identity can affect the caller's
                     # later reads; returning tainted bytes alone is insufficient.
@@ -2504,7 +2588,11 @@ class RubyEngine:
                     self.effects[site] = join(self.effects.get(site, CLEAN), fact)
                 for index, fact in summary.mutations.items():
                     if index < len(values):
-                        self.mutate(values[index], fact, state)
+                        components = {trace.key for trace in values[index] if trace.kind == 'member'
+                                      and trace.tags & URI_COMPONENT_TAGS}
+                        target = fact if any(trace.kind == 'object' and trace.key in components
+                                             for trace in fact) else values[index]
+                        self.mutate(target, fact, state)
             if matched:
                 if framework_models:
                     framework_receiver = frozenset(trace for trace in receiver
@@ -2598,11 +2686,11 @@ class RubyEngine:
         if pathname_result is not None:
             return pathname_result
         kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
-        if kinds and kinds <= {'string', 'request'} and method == 'to_i' and len(arguments) <= 1:
+        if kinds and kinds <= STRING_OBJECT_KINDS and method == 'to_i' and len(arguments) <= 1:
             return self.fresh(retag(value, add=frozenset({'sql-integer-value'}),
                                     remove=VALUE_TAGS | frozenset({'sql-raw-fragment'})),
                               'integer', token.start)
-        if (kinds and (kinds <= {'string', 'request'}
+        if (kinds and (kinds <= STRING_OBJECT_KINDS
                       or kinds <= {'sql-query'} and has_shape(receiver, 'arel-sql-literal'))) and method in {
                 'upcase', 'downcase', 'capitalize', 'swapcase', 'reverse', 'strip', 'lstrip', 'rstrip',
                 'chop', 'chomp', 'delete', 'delete_prefix', 'delete_suffix', 'sub', 'gsub', 'tr', 'tr_s',
@@ -2611,12 +2699,26 @@ class RubyEngine:
             return self.fresh(retag(self.invalidate_sql_binding(self.without_sql_api(value)),
                                     remove=VALUE_TAGS | frozenset({'sql-raw-fragment'})), 'string', token.start)
         if receiver and (method.endswith('!') or method in {'push', 'append', 'prepend', 'concat', 'replace', 'clear', 'unshift', 'insert', 'update', 'delete', 'delete_at', 'delete_if'}):
+            if (kinds and kinds <= STRING_OBJECT_KINDS
+                    and not self.native_guard_available((token,), ('String',), method)):
+                self.unresolved_calls.add(
+                    f'{self.path}: Ruby native string mutation is overridden; analysis is incomplete')
             replacement = constant('', 'literal') if method == 'clear' else join(*arguments)
             binding = name.rsplit('.', 1)[0] if '.' in name else ''
             binding = binding if re.fullmatch(r'(?:@@?|\$)?[A-Za-z_]\w*', binding) else None
             return self.mutate(receiver, replacement, state, binding,
                                overwrite=method in {'replace', 'clear'})
         if receiver and method in {'dup', 'clone'}:
+            if kinds == {'uri'}:
+                self.native_uri_available(token, method, 'initialize_copy', 'initialize_' + method)
+                if not any(trace.kind == 'member' and trace.tags & URI_COMPONENT_TAGS for trace in receiver):
+                    self.unresolved_calls.add(
+                        f'{self.path}: Ruby URI shallow-copy storage is unresolved; analysis is incomplete')
+            elif (kinds and kinds <= STRING_OBJECT_KINDS and not all(self.native_guard_available(
+                    (token,), owner, method, 'initialize_copy', 'initialize_' + method)
+                    for owner in (('String',), ('Object',), ('Kernel',)))):
+                self.unresolved_calls.add(
+                    f'{self.path}: Ruby native string copy is overridden; analysis is incomplete')
             kind = next(iter(kinds)) if len(kinds) == 1 else 'copy'
             return self.fresh(receiver, 'string' if kind == 'request' else kind, token.start, shallow=True)
         if method in {'[]', 'fetch', 'first', 'last', 'at'} and any(
@@ -2624,28 +2726,37 @@ class RubyEngine:
             return self.elements(receiver)
         if method in {'send', 'public_send', '__send__'} and arguments:
             selector, forwarded = arguments[0], arguments[1:]
-            if tainted(selector):
+            if tainted(selector) or has_shape(selector, 'unresolved-uri-field'):
                 return self.execution_sink(token.start, selector, DISPATCH_RULE,
                                            name + ' request-selected method', state)
             target = self.dispatch_target(selector)
             if target is not None:
                 dispatched = name.rsplit('.', 1)[0] + '.' + target if '.' in name else target
                 return self.call(dispatched, receiver, forwarded, token, state)
-            if tainted(join(receiver, *forwarded)):
+            if (tainted(join(receiver, *forwarded))
+                    or has_shape(join(receiver, *forwarded), 'unresolved-uri-field')):
                 self.unresolved_calls.add(
                     f'{self.path}:{self.step(token.start, "call", name).line}: '
                     'Ruby dispatch target is unresolved for request-derived arguments; analysis is incomplete')
-        if method in {'eval', 'instance_eval', 'class_eval', 'module_eval'} and arguments and tainted(arguments[0]):
+        if method in {'eval', 'instance_eval', 'class_eval', 'module_eval'} and arguments and (
+                tainted(arguments[0]) or has_shape(arguments[0], 'unresolved-uri-field')):
             return self.execution_sink(token.start, arguments[0], EVAL_RULE,
                                        name + ' request-derived code', state)
-        if method == 'define_method' and arguments and tainted(arguments[0]):
+        if method == 'define_method' and arguments and (
+                tainted(arguments[0]) or has_shape(arguments[0], 'unresolved-uri-field')):
             return self.execution_sink(token.start, arguments[0], DISPATCH_RULE,
                                        name + ' request-selected definition', state)
         if method in {'fetch', 'dig', '[]'} and any(has_shape(receiver, kind) for kind in REQUEST_MAP_SHAPES):
             return self.source(token.start, name)
         if name in {'URI.parse', 'URI.join', 'Addressable::URI.parse', 'Addressable::URI.join', 'URI'}:
-            return self.fresh(join(retag(value, add=frozenset({'parsed-uri'})), shape('uri', token.start)),
-                              'uri', token.start)
+            result = self.fresh(join(retag(value, add=frozenset({'parsed-uri'})), shape('uri', token.start)),
+                                'uri', token.start)
+            if name == 'URI.parse' and self.native_uri_available(token, 'initialize', 'set_host', 'set_scheme'):
+                result = join(result, frozenset(Trace('member', ('uri-' + field, token.start, ()),
+                    tags=frozenset({'uri-field:' + field}) | (
+                        frozenset({'uri-frozen-component'}) if field == 'scheme' else frozenset()))
+                    for field in URI_COMPONENT_FIELDS))
+            return result
         if name in {'File.expand_path', 'File.realpath', 'File.realdirpath'}:
             return self.fresh(join(retag(value, add=frozenset({'canonical-path'})), shape('canonical-path', token.start)),
                               'string', token.start)
@@ -2729,11 +2840,22 @@ class RubyEngine:
         if method in {'to_s', 'to_str'}:
             value = retag(self.without_sql_api(value), remove=frozenset({'sql-raw-fragment'}))
             kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
-            if kinds and kinds <= {'string', 'request'}:
+            if kinds and kinds <= STRING_OBJECT_KINDS:
                 return value
             converted = self.fresh(value, 'string', token.start)
             return converted if kinds and kinds <= {'uri', 'pathname', 'sql-query'} else join(value, converted)
         if method in {'host', 'hostname', 'scheme', 'path', 'query', 'fragment', 'port'}:
+            if has_shape(receiver, 'uri') and kinds == {'uri'}:
+                members = frozenset(trace for trace in receiver if trace.kind == 'member'
+                                    and 'uri-field:' + method in trace.tags)
+                content = frozenset(trace for trace in retag(value, remove=VALUE_TAGS)
+                                    if trace.kind not in {'object', 'member'} and not (
+                                        trace.kind == 'shape' and trace.key[0] == 'uri'))
+                if (method in URI_COMPONENT_FIELDS and members and not arguments
+                        and self.native_uri_available(token, method)):
+                    return join(content, frozenset(replace(trace, kind='object') for trace in members))
+                return join(content, self.fresh(CLEAN, 'component', token.start),
+                            shape('unresolved-uri-component', token.start))
             value = retag(value, remove=PROOF_TAGS)
             return join(value, self.fresh(value, 'component', token.start))
         # Unknown calls are not validators. Preserve request dependencies while
@@ -2797,7 +2919,7 @@ class RubyEngine:
                     preserved -= self.header_added_controls(atom)
                 atom = retag(self.invalidate_sql_binding(atom),
                              remove=VALUE_TAGS - preserved)
-                if token.kind == 'dynamic' and tainted(atom):
+                if token.kind == 'dynamic' and (tainted(atom) or has_shape(atom, 'unresolved-uri-field')):
                     atom = self.execution_sink(token.start, atom, COMMAND_RULE,
                                                'request-derived shell command', state)
                 atom = retag(self.without_sql_api(atom), remove=frozenset({'sql-raw-fragment'}))
@@ -3233,12 +3355,32 @@ class RubyEngine:
                         self.unresolved_calls.add(
                             f'{self.path}:{self.step(lhs[0].start, "assign", token_text(lhs)).line}: '
                             'Ruby process input element mutation needs store analysis; analysis is incomplete')
+                    string_kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
+                    if (opening is not None and string_kinds and string_kinds <= STRING_OBJECT_KINDS
+                            and not self.native_guard_available((lhs[0],), ('String',), '[]=')):
+                        self.unresolved_calls.add(
+                            f'{self.path}: Ruby native string indexed write is overridden; analysis is incomplete')
                     if self.policy in {'header', 'redirect'}:
                         if opening is not None:
                             key = self.expression(lhs[opening + 1:-1], state)
                             if has_shape(receiver, 'response-headers') or has_shape(receiver, 'response'):
                                 self.response_field(key, value, lhs[0], 'response header assignment')
                                 continue
+                    if (len(lhs) >= 3 and lhs[-2].value == '.' and lhs[-1].value in URI_COMPONENT_FIELDS):
+                        uri = self.expression(lhs[:-2], state)
+                        if has_shape(uri, 'uri'):
+                            if operator == '=':
+                                self.uri_component_assignment(uri, lhs[-1].value, value, lhs[-1], state)
+                            else:
+                                self.unresolved_calls.add(
+                                    f'{self.path}: Ruby compound URI component assignment needs operator '
+                                    'and conditional-write analysis; analysis is incomplete')
+                                self.mutate(uri, value, state)
+                            continue
+                    if opening is not None and any(trace.kind == 'object' and trace.tags & URI_COMPONENT_TAGS
+                                                   for trace in receiver):
+                        self.mutate(receiver, value, state)
+                        continue
                     name = lhs[0].value
                     self.mutate(state.get(name, CLEAN), value, state, name)
             offset -= len(lhs_group) + 1
@@ -3296,7 +3438,8 @@ class RubyEngine:
                 return {}
             state['@exception'] = frozenset(trace for trace in state.get('@exception', CLEAN)
                                             if (trace.kind != 'exception' or trace.key[0] in admitted)
-                                            and (not tainted(frozenset({trace})) or
+                                            and (not (tainted(frozenset({trace})) or
+                                                      has_shape(frozenset({trace}), 'unresolved-uri-field')) or
                                                  any('exception-type:' + name in trace.tags for name in admitted)))
             return state
         if kind in {'exception', 'raise'}:
@@ -3331,7 +3474,8 @@ class RubyEngine:
                 # correlated with its class through handler selection.
                 raised = join(raised, self.pending_raises)
             state['@exception'] = join(retag(tainted(raised), remove=VALUE_TAGS),
-                                       frozenset(trace for trace in raised if trace.kind == 'exception'))
+                                       frozenset(trace for trace in raised if trace.kind == 'exception'
+                                                 or trace.kind == 'shape' and trace.key[0] == 'unresolved-uri-field'))
             return state
         if kind == 'guard':
             for name, tags in self.proof(tokens, extra, state).items():

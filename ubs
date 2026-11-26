@@ -5765,8 +5765,24 @@ ensure_ast_grep(){
   if [[ "${UBS_TEST_RUNNER_NO_AST_GREP:-0}" == "1" ]]; then
     return 1
   fi
+  if [[ -n "${UBS_AST_GREP_BIN:-}" ]]; then
+    found="$(command -v "$UBS_AST_GREP_BIN" 2>/dev/null || true)"
+    if [[ -n "$found" ]] && verify_ast_grep_bin "$found"; then
+      AST_GREP_BIN="$found"
+      case "$AST_GREP_BIN" in
+        /*|[[:alpha:]]:[\\/]*) ;;
+        *) AST_GREP_BIN="$PWD/$AST_GREP_BIN" ;;
+      esac
+      AST_GREP_SOURCE="env"
+      return 0
+    fi
+  fi
   if found="$(find_ast_grep_in_path)"; then
     AST_GREP_BIN="$found"
+    case "$AST_GREP_BIN" in
+      /*|[[:alpha:]]:[\\/]*) ;;
+      *) AST_GREP_BIN="$PWD/$AST_GREP_BIN" ;;
+    esac
     AST_GREP_SOURCE="path"
     return 0
   fi
@@ -5791,6 +5807,10 @@ ensure_ast_grep(){
 
   found="$(ensure_ast_grep_tool_cache)" || return $?
   AST_GREP_BIN="$found"
+  case "$AST_GREP_BIN" in
+    /*|[[:alpha:]]:[\\/]*) ;;
+    *) AST_GREP_BIN="$PWD/$AST_GREP_BIN" ;;
+  esac
   AST_GREP_SOURCE="cache"
   return 0
 }
@@ -5879,26 +5899,55 @@ verify_ast_grep_bin(){
   return 1
 }
 
-# Modules and helpers resolve `ast-grep` through PATH (`command -v ast-grep`,
-# then the name itself). When that is the `sg` launcher (see
-# is_ast_grep_launcher), every module would run it and recurse, so the runner
-# shadows it for the whole run: a verified ast-grep (another PATH entry or the
-# tool cache) is linked first on PATH and exported; without one, a stub that
-# fails fast takes its place. No module ever executes the launcher.
+# Every module must see the selected engine, including Rust-only runs and
+# modules that resolve ast-grep through PATH instead of UBS_AST_GREP_BIN.
+# Never execute the recursive sg launcher or an incompatible older engine.
 shadow_ast_grep_launcher(){
-  local candidate shim
-  candidate="$(command -v ast-grep 2>/dev/null)" || return 0
-  is_ast_grep_launcher "$candidate" || return 0
+  local candidate shim version="" launcher=0 explicit=0 sg_only=0
+  AST_GREP_SETUP_ERROR="ast-grep-incompatible"
+  AST_GREP_SETUP_MESSAGE="Could not prepare a compatible ast-grep binary; refusing to execute modules"
+  if [[ -n "${UBS_AST_GREP_BIN:-}" ]]; then
+    explicit=1
+    candidate="$(command -v "$UBS_AST_GREP_BIN" 2>/dev/null || true)"
+    [[ -n "$candidate" ]] || candidate="$UBS_AST_GREP_BIN"
+  elif ! candidate="$(command -v ast-grep 2>/dev/null)"; then
+    candidate="$(command -v sg 2>/dev/null)" || return 0
+    sg_only=1
+  fi
+
+  if is_ast_grep_launcher "$candidate"; then
+    launcher=1
+    AST_GREP_SETUP_ERROR="ast-grep-launcher"
+    AST_GREP_SETUP_MESSAGE="Could not isolate ast-grep's recursive sg launcher; refusing to execute modules"
+    say_err "${YELLOW}${WARN}${RESET} $candidate is ast-grep's deprecated \`sg\` launcher, not ast-grep (it runs itself recursively); this run uses a verified ast-grep instead. Repair: re-run install.sh"
+  elif version="$("$candidate" --version </dev/null 2>&1)" && ast_grep_version_supported "$version"; then
+    # Preserve scanner diagnostics for supported engines that later fail a
+    # rule: version screening must not turn a failed analyzer into a clean run.
+    if [[ "$explicit" -eq 0 ]]; then return 0; fi
+    # A supported explicit engine that fails readiness is an environment
+    # error, not permission to replace a failed analyzer with a clean one.
+    verify_ast_grep_bin "$candidate" || return 1
+  else
+    # util-linux also ships sg. It is not an AST engine and must not cause
+    # unrelated scans to provision ast-grep merely because it is on PATH.
+    if [[ "$sg_only" -eq 1 && "$version" != *ast-grep* ]]; then return 0; fi
+    version="${version%%$'\n'*}"
+    version="${version//$'\r'/}"
+    say_err "${YELLOW}${WARN}${RESET} Ignoring incompatible ast-grep at $candidate (${version:-unrecognized version}); requires stable ast-grep >= ${AST_GREP_MIN_VERSION:-0.45.3}. Selecting a verified replacement."
+  fi
+
   ensure_tmpdir_run || return 1
   shim="$TMPDIR_RUN/ast-grep-path"
   mkdir -p "$shim" || return 1
-  say_err "${YELLOW}${WARN}${RESET} $candidate is ast-grep's deprecated \`sg\` launcher, not ast-grep (it runs itself recursively); this run uses a verified ast-grep instead. Repair: re-run install.sh"
   if ensure_ast_grep; then
     ln -sf "$AST_GREP_BIN" "$shim/ast-grep" || return 1
     export UBS_AST_GREP_BIN="$AST_GREP_BIN"
-  else
+  elif [[ "$launcher" -eq 1 ]]; then
     printf '%s\n' '#!/bin/sh' 'echo "ast-grep unavailable: PATH entry is the sg launcher; re-run install.sh" >&2' 'exit 127' > "$shim/ast-grep" || return 1
     chmod 0755 "$shim/ast-grep" || return 1
+    export UBS_AST_GREP_BIN="$shim/ast-grep"
+  else
+    return 1
   fi
   export PATH="$shim:$PATH"
 }
@@ -10877,10 +10926,10 @@ fi
 export UBS_SCAN_CONFIG_POLICY
 unset _policy_args _policy_lang
 
-# Never let a module run ast-grep's `sg` launcher (shadow_ast_grep_launcher).
+# Screen AST engine versions for every language, not only JS/TS provisioning.
 if ! shadow_ast_grep_launcher; then
-  emit_error_envelope "environment" "error" "ast-grep-launcher" \
-    "Could not isolate ast-grep's recursive sg launcher; refusing to execute modules" \
+  emit_error_envelope "environment" "error" "$AST_GREP_SETUP_ERROR" \
+    "$AST_GREP_SETUP_MESSAGE" \
     '"failed_modules":[]'
   exit 2
 fi

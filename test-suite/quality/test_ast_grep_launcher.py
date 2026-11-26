@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -41,17 +42,14 @@ def function(source: Path, name: str, *, optional: bool = False) -> str:
 
 RUNNER_FUNCTIONS = "\n".join(function(ROOT / "ubs", name) for name in (
     "ubs_remove_temp", "is_ast_grep_launcher", "verify_ast_grep_bin", "find_ast_grep_in_path",
-    "shadow_ast_grep_launcher",
+    "shadow_ast_grep_launcher", "ensure_ast_grep",
 )) + function(ROOT / "ubs", "ast_grep_version_supported", optional=True)
 # Minimal stand-ins for the runner's environment around shadow_ast_grep_launcher.
 RUNNER_STUBS = """
-YELLOW= WARN= RESET=
+RED= X= YELLOW= WARN= RESET=
 say_err(){ echo "$*" >&2; }
 ensure_tmpdir_run(){ TMPDIR_RUN="${TEST_RUN_DIR}"; mkdir -p "$TMPDIR_RUN"; }
-ensure_ast_grep(){
-  [ "${TEST_NO_VERIFIED_AST_GREP:-0}" = 1 ] && return 1
-  AST_GREP_BIN="$(find_ast_grep_in_path)" || return 1
-}
+ast_grep_target_triple(){ return 1; }
 """
 INSTALLER_FUNCTIONS = "\n".join(function(ROOT / "install.sh", name) for name in (
     "is_ast_grep_launcher", "check_ast_grep", "select_ast_grep_member",
@@ -216,6 +214,84 @@ raise SystemExit(2)
                            str(engine.parent))
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_runner_selects_supported_engine_after_stale_path_entry(self) -> None:
+        old = self.write_versioned_engine("old-path", "ast-grep 0.40.1")
+        result = self.bash(RUNNER_FUNCTIONS, "find_ast_grep_in_path",
+                           f"{old.parent}{os.pathsep}{self.real_dir}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.real))
+        calls = [json.loads(line) for line in
+                 (self.root / "old-path-executions.jsonl").read_text().splitlines()]
+        self.assertEqual(calls, [["--version"]])
+
+    def test_runner_shadows_stale_engine_for_every_module(self) -> None:
+        old = self.write_versioned_engine("old-shadow", "ast-grep 0.40.1")
+        result = self.shadow(f"{old.parent}{os.pathsep}{self.real_dir}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        out = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        self.assertEqual(out["target"], str(self.real))
+        self.assertEqual(out["exported"], str(self.real))
+        self.assertEqual(out["version_rc"], "0")
+        self.assertIn(str(old), result.stderr)
+        self.assertIn("0.40.1", result.stderr)
+        calls = [json.loads(line) for line in
+                 (self.root / "old-shadow-executions.jsonl").read_text().splitlines()]
+        self.assertTrue(calls)
+        self.assertTrue(all(args == ["--version"] for args in calls), calls)
+
+    def test_runner_replaces_stale_explicit_engine(self) -> None:
+        old = self.write_versioned_engine("old-explicit", "ast-grep 0.40.1")
+        result = self.shadow(str(self.real_dir), f"UBS_AST_GREP_BIN={shlex.quote(str(old))}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        out = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        self.assertEqual(out["exported"], str(self.real))
+        self.assertEqual(out["version_rc"], "0")
+        self.assertIn(str(old), result.stderr)
+
+    def test_runner_refuses_stale_engine_without_replacement(self) -> None:
+        old = self.write_versioned_engine("old-only", "ast-grep 0.40.1")
+        result = self.shadow(str(old.parent), "TEST_NO_VERIFIED_AST_GREP=1")
+        self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        calls = [json.loads(line) for line in
+                 (self.root / "old-only-executions.jsonl").read_text().splitlines()]
+        self.assertTrue(calls)
+        self.assertTrue(all(args == ["--version"] for args in calls), calls)
+
+    def test_runner_replaces_stale_sg_alias(self) -> None:
+        old = self.write_versioned_engine("old-sg", "ast-grep 0.40.1", name="sg")
+        current = self.write_versioned_engine("current-sg", "ast-grep 0.51.3", name="sg")
+        result = self.shadow(f"{old.parent}{os.pathsep}{current.parent}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        out = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        self.assertEqual(out["target"], str(current))
+        self.assertEqual(out["exported"], str(current))
+        self.assertEqual(out["version_rc"], "0")
+
+    def test_runner_resolves_relative_path_before_creating_shim(self) -> None:
+        old = self.write_versioned_engine("old-relative", "ast-grep 0.40.1")
+        result = self.shadow(f"{old.parent.name}{os.pathsep}{self.real_dir.name}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        out = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        self.assertEqual(out["target"], str(self.real))
+        self.assertEqual(out["exported"], str(self.real))
+        self.assertEqual(out["version_rc"], "0")
+
+    def test_runner_honors_relative_supported_explicit_engine_outside_path(self) -> None:
+        current = self.write_versioned_engine("explicit current", "ast-grep 0.51.3",
+                                              name="custom-grep")
+        old = self.write_versioned_engine("ambient-old", "ast-grep 0.40.1")
+        relative = str(current.relative_to(self.root))
+        result = self.shadow(str(old.parent), f"UBS_AST_GREP_BIN={shlex.quote(relative)}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        out = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        self.assertEqual(out["target"], str(current))
+        self.assertEqual(out["exported"], str(current))
+        self.assertEqual(out["version_rc"], "0")
+        self.assertIn("ast-grep 0.51.3", result.stdout)
+        self.assertFalse((self.root / "ambient-old-executions.jsonl").exists(),
+                         "a valid explicit choice must not probe or execute an ambient engine")
+
     def test_runner_skips_a_launcher_named_ast_grep_on_path(self) -> None:
         result = self.bash(RUNNER_FUNCTIONS, "find_ast_grep_in_path",
                            f"{self.launcher_dir}{os.pathsep}{self.real_dir}")
@@ -233,6 +309,7 @@ raise SystemExit(2)
         run_dir = self.root / "run"
         return self.bash(RUNNER_STUBS + RUNNER_FUNCTIONS,
                          f'export TEST_RUN_DIR="{run_dir}" {extra}\n'
+                         'UBS_TEST_RUNNER_NO_AST_GREP="${TEST_NO_VERIFIED_AST_GREP:-0}"\n'
                          'shadow_ast_grep_launcher || exit 9\n'
                          'echo "resolved=$(command -v ast-grep)"\n'
                          'echo "target=$(readlink "$(command -v ast-grep)" || true)"\n'
@@ -313,6 +390,68 @@ raise SystemExit(2)
         self.assertEqual(out["resolved"], str(self.real))
         self.assertEqual(out["exported"], "")
         self.assertNotIn("launcher", result.stderr)
+
+    def test_rust_only_runner_recovers_from_stale_engine_without_losing_findings(self) -> None:
+        # Run the shipped runner and Rust module. The external AST engines are
+        # protocol doubles: old no-match exits reproduce 0.40.x; current exits
+        # distinguish an empty result and emit one known unwrap location.
+        old = self.write_versioned_engine("rust-old", "ast-grep 0.40.1", no_match_exit=0)
+        current = self.write_versioned_engine("rust-current", "ast-grep 0.45.3")
+        tool_dirs = [str(old.parent), str(current.parent)]
+        for name in ("bash", "python3", "rg", "jq"):
+            located = shutil.which(name)
+            self.assertIsNotNone(located, f"{name} is required for the real runner test")
+            tool_dirs.append(str(Path(located).parent))
+        tool_dirs.extend(("/usr/bin", "/bin"))
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith("UBS_") and key not in ("BASH_ENV", "ENV", "PYTHONPATH")}
+        env.update(PATH=os.pathsep.join(dict.fromkeys(tool_dirs)), HOME=str(self.root),
+                   XDG_CACHE_HOME=str(self.root / "cache"), XDG_CONFIG_HOME=str(self.root / "config"),
+                   XDG_DATA_HOME=str(self.root / "data"), TMPDIR=str(self.scratch),
+                   UBS_KEEP_TEMP="1", UBS_NO_AUTO_UPDATE="1", UBS_NO_CACHE="1",
+                   UBS_SKIP_RUST_BUILD="1", NO_COLOR="1", PYTHONDONTWRITEBYTECODE="1")
+        for case, source, warnings in (
+            ("clean", "fn main() {}\n", 0),
+            ("unwrap", "fn read(input: Option<i32>) -> i32 {\n    input.unwrap()\n}\n", 1),
+        ):
+            with self.subTest(case=case):
+                target = self.root / f"{case}.rs"
+                target.write_text(source, encoding="utf-8")
+                command = ["bash", str(ROOT / "ubs"), str(target),
+                           f'--module-dir={ROOT / "modules"}', "--only=rust",
+                           "--format=json", "--ci", "--fail-on-warning"]
+                started = time.monotonic()
+                print(f"[{self.id()}/{case}] RUN {shlex.join(command)}", flush=True)
+                result = subprocess.run(command, cwd=self.root, env=env, capture_output=True,
+                                        text=True, timeout=60, check=False)
+                (self.root / f"{case}.stdout.json").write_text(result.stdout, encoding="utf-8")
+                (self.root / f"{case}.stderr.log").write_text(result.stderr, encoding="utf-8")
+                details = result.stdout + "\n" + result.stderr
+                self.assertEqual(result.returncode, warnings, details)
+                try:
+                    report = json.loads(result.stdout)
+                except json.JSONDecodeError as exc:
+                    self.fail(f"invalid runner JSON: {exc}\n{details}")
+                self.assertEqual(report["status"], "ok", details)
+                self.assertEqual(report["failed_modules"], [], details)
+                self.assertEqual({key: report["totals"][key] for key in
+                                  ("files", "critical", "warning")},
+                                 {"files": 1, "critical": 0, "warning": warnings}, details)
+                expected = [("rust.ownership.unwrap-expect", "warning", 2, 5)] if warnings else []
+                findings = report["findings"] if warnings else report.get("findings", [])
+                self.assertEqual([(item["rule_id"], item["severity"], item["line"], item["col"])
+                                  for item in findings if item["severity"] != "info"], expected, details)
+                self.assertEqual(target.read_text(encoding="utf-8"), source)
+                print(f"[{self.id()}/{case}] PASS ({time.monotonic() - started:.3f}s)", flush=True)
+        old_calls = [json.loads(line) for line in
+                     (self.root / "rust-old-executions.jsonl").read_text().splitlines()]
+        self.assertTrue(old_calls)
+        self.assertTrue(all(args == ["--version"] for args in old_calls), old_calls)
+        current_calls = [json.loads(line) for line in
+                         (self.root / "rust-current-executions.jsonl").read_text().splitlines()]
+        self.assertTrue(any(args and args[0] == "scan" and "-h" not in args
+                            for args in current_calls), current_calls)
+        self.assertTrue(any(args[:2] == ["run", "--pattern"] for args in current_calls), current_calls)
 
     def test_installer_treats_a_launcher_on_path_as_missing(self) -> None:
         result = self.bash(INSTALLER_FUNCTIONS, "check_ast_grep && echo present || echo missing",

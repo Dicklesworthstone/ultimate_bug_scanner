@@ -9,7 +9,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
-[![Version](https://img.shields.io/badge/version-5.5.167-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
+[![Version](https://img.shields.io/badge/version-5.5.168-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
 <div align="center">
 
@@ -1932,7 +1932,12 @@ available dependency inventory in this order:
    entries. It uses the same batched, resolution-free audit as uv. When a
    package's registry is ambiguous, private, or a local/VCS source, coverage
    is partial and verified PyPI packages still contribute findings.
-5. Static runtime dependencies declared in `[project]` in `pyproject.toml`,
+5. `poetry.lock` (lock formats 1.1, 2.0 and 2.1). UBS audits exact PyPI
+   package rows from every group and platform branch, using separate batches
+   for different versions of the same name. Unsupported origins make the
+   audit partial. When both Pipenv and Poetry locks are present, export
+   resolved requirements to select the intended inventory.
+6. Static runtime dependencies declared in `[project]` in `pyproject.toml`,
    resolved by pip-audit's positional project-directory interface.
 
 A manifest is never treated as an installed-package directory, and the tool's
@@ -1955,7 +1960,7 @@ freshness. Checked local workspace project metadata is included in `inputs`;
 these projects are excluded from the PyPI audit only after their declared
 identity and containment inside the selected project have been verified.
 A missing manifest or unavailable tool is explicit skipped coverage. Dynamic
-dependencies, legacy project metadata, and unsupported lockfiles (`poetry.lock`)
+dependencies, legacy project metadata, and unsupported lockfile formats
 require an exported resolved `requirements.txt`
 or PEP 751 lockfile. An unsupported lockfile is never silently replaced with
 fresh resolution of potentially different versions from `pyproject.toml`.

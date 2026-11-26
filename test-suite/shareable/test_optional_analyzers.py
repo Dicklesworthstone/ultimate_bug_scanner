@@ -43,6 +43,12 @@ def uv_lock(*pins: tuple[str, str], revision: int = 3) -> str:
         'source = { registry = "https://pypi.org/simple" }\n' for name, version in pins)
 
 
+def poetry_lock(*pins: tuple[str, str], schema: str = "2.1") -> str:
+    return f'[metadata]\nlock-version = "{schema}"\n' + "".join(
+        f'\n[[package]]\nname = {json.dumps(name)}\nversion = {json.dumps(version)}\n'
+        for name, version in pins)
+
+
 def pipenv_lock(default, **categories):
     return {"_meta": {"pipfile-spec": 6, "sources": [
         {"name": "pypi", "url": "https://pypi.org/simple", "verify_ssl": True}]},
@@ -269,6 +275,36 @@ class UvLockAudit(unittest.TestCase):
                 self.assertEqual(outcome["status"], "ok")
                 self.assertEqual(outcome["dependencies"], 1)
                 self.assertEqual(len(findings), 1)
+
+    def test_poetry_audits_all_pins_and_reports_unverified_origins(self):
+        self.project = self.root / "poetry-project"
+        self.project.mkdir()
+        lock = self.project / "poetry.lock"
+        for schema in ("1.1", "2.0", "2.1"):
+            with self.subTest(schema=schema):
+                lock.write_text(poetry_lock(("Example_Package", "1.0"), ("example-package", "2.0"),
+                                            ("other", "1.0"), schema=schema)
+                                + '[package.source]\ntype = "legacy"\nurl = "https://pypi.org/simple/"\n')
+                outcome, findings, errors = self.audit()
+                self.assertFalse(errors, errors)
+                self.assertEqual((outcome["input_kind"], outcome["status"]), ("poetry-lock", "ok"))
+                self.assertEqual((outcome["audit_batches"], outcome["dependencies"], len(findings)), (2, 3, 2))
+
+        for source in ('{type="legacy", url="https://index.example/simple"}',
+                       '{type="git", url="https://pypi.org/simple"}', '{}', '""'):
+            with self.subTest(source=source):
+                lock.write_text(poetry_lock(("example-package", "1.0"), ("private-name", "2.0"))
+                                + f"source = {source}\n")
+                outcome, findings, errors = self.audit()
+                self.assertTrue(errors)
+                self.assertEqual((outcome["status"], len(findings)), ("partial", 1))
+                self.assertEqual(self.calls[-1]["pins"], [("example-package", "1.0")])
+
+        lock.write_text(poetry_lock(("example-package", "1.0"), schema="3.0"))
+        calls_before = len(self.calls)
+        outcome, findings, errors = self.audit()
+        self.assertEqual((outcome["status"], findings, len(self.calls)), ("partial", [], calls_before))
+        self.assertTrue(any("schema" in error for error in errors))
 
     def use_pipenv_lock(self):
         self.project = self.root / "pipenv-project"
@@ -497,6 +533,9 @@ class RealPipAuditIntegration(unittest.TestCase):
 
     def test_real_uv_lock_audits_known_vulnerable_package_without_resolution(self):
         self.assert_vulnerable("uv.lock", uv_lock(("urllib3", "1.26.4")))
+
+    def test_real_poetry_lock_audits_known_vulnerable_package_without_resolution(self):
+        self.assert_vulnerable("poetry.lock", poetry_lock(("urllib3", "1.26.4")))
 
     def test_real_pipenv_lock_audits_known_vulnerable_package_without_resolution(self):
         self.assert_vulnerable("Pipfile.lock", json.dumps(pipenv_lock({"urllib3": {"version": "==1.26.4"}})))
@@ -1080,6 +1119,28 @@ sys.exit(CODE)
         self.assertEqual(outcome["inputs"], [str(lock)])
         self.assertEqual(outcome["dependencies"], 1)
         self.assertEqual(len(self.calls.read_text().splitlines()), 2)
+
+    def test_lock_only_poetry_project_is_discovered_and_audited(self):
+        self.project = self.root / "poetry-only"
+        self.project.mkdir()
+        lock = self.project / "poetry.lock"
+        lock.write_text(poetry_lock(("example-package", "1.0")))
+        self.audit_tool([audit_dependency()], code=1)
+        for fmt in ("json", "sarif"):
+            with self.subTest(fmt=fmt):
+                proc = subprocess.run([str(ROOT / "ubs"), str(self.project), f"--format={fmt}", "--ci"],
+                                      cwd=self.root, env={**self.env, "UV_TOOLS": "pip-audit"},
+                                      capture_output=True, text=True, timeout=60, check=False)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                report = json.loads(proc.stdout)
+                if fmt == "json":
+                    self.assertEqual((report["status"], report["totals"]["critical"]), ("ok", 1))
+                    self.assertEqual(report["scanners"][0]["extras"]["external_tools"][0]["inputs"], [str(lock)])
+                else:
+                    result, = report["runs"][0]["results"]
+                    self.assertEqual(result["ruleId"], "py.pip-audit.PYSEC-2026-123.example-package")
+                    self.assertTrue(result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+                                    .endswith("poetry.lock"))
 
     def test_lock_only_pipenv_project_emits_advisory_and_audit_status(self):
         self.project = self.root / "pipenv-only"

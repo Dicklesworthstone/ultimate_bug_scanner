@@ -440,6 +440,30 @@ def _pipenv_audit_inventory(manifest: Path, errors: list[str]) -> set[tuple[str,
     return pins
 
 
+def _poetry_audit_inventory(manifest: Path, errors: list[str]) -> set[tuple[str, str]]:
+    """Collect the package rows Poetry locked across groups and environments."""
+    doc = _audit_toml(manifest)
+    meta = doc.get("metadata")
+    if not isinstance(meta, dict) or meta.get("lock-version") not in ("1.1", "2.0", "2.1"):
+        raise ValueError("unsupported poetry.lock schema (expected 1.1, 2.0 or 2.1)")
+    pins = set()
+    for index, package in enumerate(_array(doc, "package"), 1):
+        try:
+            if not isinstance(package, dict):
+                raise ValueError("invalid package record")
+            # Poetry omits source for its built-in PyPI repository. Other
+            # sources carry a table even when the package name matches PyPI.
+            if "source" in package:
+                source = package["source"]
+                if (not isinstance(source, dict) or source.get("type") != "legacy"
+                        or source.get("url") not in ("https://pypi.org/simple", "https://pypi.org/simple/")):
+                    raise ValueError("package origin is not verified as PyPI")
+            pins.add((_audit_package_name(package.get("name")), _audit_version(package.get("version"))))
+        except ValueError as exc:
+            errors.append(f"pip-audit: poetry.lock package {index}: {exc}")
+    return pins
+
+
 def _uv_audit_inventory(manifest: Path, errors: list[str]) -> tuple[set[tuple[str, str]], list[str]]:
     """Collect all locked PyPI identities without resolving or building code.
 
@@ -655,7 +679,7 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
                       diagnostics: TextIO | None = None) -> dict:
     """Audit selected project dependencies, never the tool's own environment.
 
-    Requirements have precedence over PEP 751, uv and Pipenv locks, then PEP 621
+    Requirements have precedence over PEP 751, uv, Pipenv and Poetry locks, then PEP 621
     runtime dependencies. ``--path`` is intentionally absent: pip-audit reserves it
     for installed distributions, and a manifest passed there audits nothing.
     Missing tools/inputs are explicit skips; empty or failed audits are partial.
@@ -690,6 +714,10 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
         manifest, arguments = pipenv_lock, []
         outcome.update(input_kind="pipenv-lock", inputs=[str(manifest)],
                        coverage="all-locked-registry-packages", lock_freshness="not-checked")
+    elif poetry_lock.is_file() and not pipenv_lock.is_file():
+        manifest, arguments = poetry_lock, []
+        outcome.update(input_kind="poetry-lock", inputs=[str(manifest)],
+                       coverage="all-locked-registry-packages", lock_freshness="not-checked")
     elif poetry_lock.is_file():
         manifest, arguments = poetry_lock, []
         locks_present = [path for path in (poetry_lock, pipenv_lock) if path.is_file()]
@@ -720,19 +748,21 @@ def scan_python_audit(project_dir: str, sink: TextIO, timeout: float,
         outcome["status"] = "partial"
         return outcome
     pins: set[tuple[str, str]] | None = None
-    if manifest in (uv_lock, pipenv_lock):
+    if manifest in (uv_lock, pipenv_lock, poetry_lock):
         try:
             if manifest == uv_lock:
                 pins, projects = _uv_audit_inventory(manifest, errors)
                 outcome.update(workspace_projects=projects)
                 outcome["inputs"].extend(projects)
+            elif manifest == poetry_lock:
+                pins = _poetry_audit_inventory(manifest, errors)
             else:
                 pins = _pipenv_audit_inventory(manifest, errors)
             outcome["locked_dependencies"] = len(pins)
             if not pins:
                 raise ValueError("empty dependency inventory; no locked PyPI packages were collected")
         except ImportError:
-            errors.append("pip-audit: validating uv.lock requires Python 3.11+ or tomli; "
+            errors.append(f"pip-audit: validating {manifest.name} requires Python 3.11+ or tomli; "
                           "export resolved requirements.txt")
             outcome["status"] = "partial"
             return outcome

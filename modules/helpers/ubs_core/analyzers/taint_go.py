@@ -1708,7 +1708,18 @@ class _Analysis:
                               for alias in state.get(_PointerKey(target.cell), ()))) for target in targets))
         fact = _advance(fact, label)
         self.invalidate_native_targets(targets, state)
+        global_backing = {pointer.cell for cell in self.global_cells
+                          if state.get(_BufferKey(cell)) is not None
+                          for pointer in state.get(_PointerKey(cell), ())}
         for target in targets:
+            if target.indexed and target.cell in global_backing:
+                raise AnalysisLimit('Go package buffer mutation is unsupported; analysis is incomplete')
+            target_buffer = state.get(_BufferKey(target.cell))
+            if target.indexed and target_buffer is not None and not target_buffer.definite:
+                # A returned or joined slice may still carry readable contents
+                # without an owned backing identity. Updating a scalar snapshot
+                # here would lose writes visible through its original aliases.
+                raise AnalysisLimit('Go reader result buffer mutation is unsupported; analysis is incomplete')
             if (target.cell.startswith('@byte-buffer:')
                     and any(escaped.cell == target.cell for escaped in self.buffer_escapes)):
                 raise AnalysisLimit('Go escaped buffer mutation is unsupported; analysis is incomplete')
@@ -1848,8 +1859,9 @@ class _Analysis:
         if chain is not None:
             self.chained_call_results.pop((result_offset, offset + outer_end), None)
 
-        def finish(stop, facts, decoder=None, reader=None):
+        def finish(stop, facts, decoder=None, reader=None, first_info=None):
             result_infos = tuple(
+                first_info if index == 0 and first_info is not None else
                 _ValueInfo(decoder=decoder if index == 0 else None, reader=reader if index == 0 else None)
                 for index in range(len(facts)))
             self.call_results[result_offset] = result_infos
@@ -2004,8 +2016,21 @@ class _Analysis:
         if readall:
             payload = (self.reader_payload(*raw_arguments[0], values[0], state, scope, require=True)
                        if len(values) == 1 else fallback)
+            # Native ReadAll owns a fresh byte array, even when the Reader's
+            # contents are clean or the operation returns a partial read/error.
+            # Slice assignments share that storage; string conversions do not.
+            # A call-site cell is finite across loops, so retain previous facts
+            # when the same allocation site may still have a live older alias.
+            info = _ValueInfo(buffer=_BufferInfo(definite=False))
+            if (not native.unknown and operations
+                    and operations <= {('io', 'ReadAll'), ('ioutil', 'ReadAll')}
+                    and len(values) == 1):
+                target = _Target(f'@byte-buffer:readall:{result_offset}')
+                state[target.cell] = _join(state.get(target.cell, _CLEAN), payload)
+                self.buffer_writes[target] = _join(self.buffer_writes.get(target, _CLEAN), payload)
+                info = _ValueInfo(pointers=frozenset({target}), buffer=_BufferInfo())
             return finish(end, (_join(payload, callable_source),
-                                _join(payload, fallback) if native.unknown else _CLEAN))
+                                _join(payload, fallback) if native.unknown else _CLEAN), first_info=info)
         if sanitizer:
             # Only a definite native escaper grants HTML sanitization; unknown
             # alternatives retain argument effects and captured source data.
@@ -2608,11 +2633,17 @@ class _Analysis:
                         # clean presence/error results as input contents.
                         # Local pointee cells do not outlive this evaluator;
                         # exporting them needs a separate escaped-heap model.
+                        result_infos = tuple(
+                            replace(info, pointers=frozenset(), buffer=replace(info.buffer, definite=False))
+                            if (info is not None and info.buffer is not None and info.pointers
+                                and all(target.cell.startswith('@byte-buffer:readall:')
+                                        and target.cell not in state for target in info.pointers))
+                            else info for info in nested.value_returns)
                         if any(info is not None and any(target.cell not in state for target in info.pointers)
-                               for info in nested.value_returns):
+                               for info in result_infos):
                             raise AnalysisLimit('Go closure-local pointer result transport is unsupported; '
                                                 'analysis is incomplete')
-                        for index, info in enumerate(nested.value_returns):
+                        for index, info in enumerate(result_infos):
                             if info is not None and info.pointers and index < len(nested.returns):
                                 # A returned outer alias may already have been
                                 # written inside the closure. Publishing only
@@ -2620,7 +2651,7 @@ class _Analysis:
                                 # when assignment clears the handle's own fact.
                                 self.write_targets(info.pointers, nested.returns[index], state, 'closure result',
                                                    buffer=info.buffer is not None)
-                        self.closure_results[offset] = (nested.returns, nested.value_returns)
+                        self.closure_results[offset] = (nested.returns, result_infos)
                     else:
                         if any(info is not None and info.decoder is not None for info in nested.value_returns):
                             raise AnalysisLimit('Go decoder closure-result transport is unsupported; analysis is incomplete')
@@ -3368,7 +3399,7 @@ def _write_go(tmp_dir: Path, body: str) -> Path:
 
 
 def _selftest_xss_positive() -> None:
-    import tempfile
+    from ubs_core.io import temporary_directory
 
     code = (
         "import (\n"
@@ -3381,7 +3412,7 @@ def _selftest_xss_positive() -> None:
         "\tfmt.Fprintf(w, \"hello \"+name)\n"
         "}\n"
     )
-    with tempfile.TemporaryDirectory(prefix="ubs_core_taint_go_") as tmp:
+    with temporary_directory(prefix="ubs_core_taint_go_") as tmp:
         path = _write_go(Path(tmp), code)
         ctx = RunContext(lang="go", files=[path])
         findings = [f for f in run(ctx) if f["rule"] == "go.taint.xss"]
@@ -3393,7 +3424,7 @@ def _selftest_xss_positive() -> None:
 
 
 def _selftest_sanitizer_suppresses() -> None:
-    import tempfile
+    from ubs_core.io import temporary_directory
 
     code = (
         "import (\n"
@@ -3407,14 +3438,14 @@ def _selftest_sanitizer_suppresses() -> None:
         "\tfmt.Fprintf(w, \"hello \"+html.EscapeString(name))\n"
         "}\n"
     )
-    with tempfile.TemporaryDirectory(prefix="ubs_core_taint_go_") as tmp:
+    with temporary_directory(prefix="ubs_core_taint_go_") as tmp:
         path = _write_go(Path(tmp), code)
         findings = list(run(RunContext(lang="go", files=[path])))
         assert findings == [], findings
 
 
 def _selftest_parameterized_sql_suppressed() -> None:
-    import tempfile
+    from ubs_core.io import temporary_directory
 
     code = (
         "import (\n"
@@ -3429,7 +3460,7 @@ def _selftest_parameterized_sql_suppressed() -> None:
         "\t_ = err\n"
         "}\n"
     )
-    with tempfile.TemporaryDirectory(prefix="ubs_core_taint_go_") as tmp:
+    with temporary_directory(prefix="ubs_core_taint_go_") as tmp:
         path = _write_go(Path(tmp), code)
         findings = [f for f in run(RunContext(lang="go", files=[path])) if f["rule"] == "go.taint.sql"]
         assert findings == [], findings

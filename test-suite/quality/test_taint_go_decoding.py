@@ -523,6 +523,201 @@ class NativeScanningFlowTests(packages.PackageTestCase):
                          ('output', 'xss', 'fmt.Fprint')],
                         imports='import ("os"; "fmt"; "os/exec")')
 
+    def test_readall_owned_aliases_observe_index_writes(self):
+        for imported in ('io', 'io/ioutil'):
+            with self.subTest(imported=imported):
+                self.check_scan('read := stream.ReadAll\n'
+                                'raw, err := read(strings.NewReader("fixed"))\nalias := raw\n'
+                                'alias[0] = os.Getenv("QUERY")[0]\n'
+                                'db.Query(string(raw)) // original\n'
+                                'db.Query(string(alias)) // alias\n'
+                                'fmt.Fprint(w, err, len(raw), cap(raw))',
+                                [('original', 'sql', 'db.Query'), ('alias', 'sql', 'db.Query')],
+                                imports='import (stream "' + imported + '"; "strings"; "os"; "fmt")')
+
+    def test_readall_alias_rebinding_and_snapshots_are_independent(self):
+        self.check_scan('raw, _ := io.ReadAll(strings.NewReader("fixed"))\n'
+                        'alias := raw[1:]\nsnapshot := string(raw)\ncopied := []byte(string(raw))\n'
+                        'raw, _ = io.ReadAll(strings.NewReader("other"))\n'
+                        'alias[0] = os.Getenv("QUERY")[0]\n'
+                        'db.Query(string(alias)) // alias\ndb.Query(string(raw))\n'
+                        'db.Query(snapshot)\ndb.Query(string(copied))',
+                        [('alias', 'sql', 'db.Query')], imports='import ("io"; "strings"; "os")')
+
+    def test_readall_owned_backing_supports_copy_and_readinto(self):
+        self.check_scan('raw, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := raw\n'
+                        'n := copy(alias, os.Getenv("QUERY"))\n'
+                        'db.Query(string(raw)) // copied\n'
+                        'destination := make([]byte, 5)\ncopy(destination, raw)\n'
+                        'db.Query(string(destination)) // destination\n'
+                        'more, _ := io.ReadAll(strings.NewReader("other"))\n'
+                        'io.ReadFull(r.Body, more)\ndb.Query(string(more)) // readinto\n'
+                        'fmt.Fprint(w, n)\ndb.Query("SELECT $1", string(raw))',
+                        [('copied', 'sql', 'db.Query'), ('destination', 'sql', 'db.Query'),
+                         ('readinto', 'sql', 'db.Query')], imports='import ("io"; "strings"; "os"; "fmt")')
+
+    def test_readall_selected_helper_aliases_preserve_backing(self):
+        self.check_scan('raw, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := identity(raw)\n'
+                        'write(alias, os.Getenv("QUERY"))\ndb.Query(string(raw)) // query',
+                        [('query', 'sql', 'db.Query')], imports='import ("io"; "strings"; "os")',
+                        helpers='func identity(value []byte) []byte { return value }\n'
+                                'func write(value []byte, input string) { value[0] = input[0] }')
+
+    def test_readall_captured_aliases_and_branch_targets_preserve_writes(self):
+        for preparation in ('alias := raw\nfunc() { alias[0] = os.Getenv("QUERY")[0] }()',
+                            'alias := func() []byte { return raw }()\n'
+                            'alias[0] = os.Getenv("QUERY")[0]'):
+            with self.subTest(preparation=preparation):
+                self.check_scan('raw, _ := io.ReadAll(strings.NewReader("fixed"))\n' + preparation + '\n'
+                                'db.Query(string(raw)) // query', [('query', 'sql', 'db.Query')],
+                                imports='import ("io"; "strings"; "os")')
+        self.check_scan('first, _ := io.ReadAll(strings.NewReader("first"))\n'
+                        'second, _ := io.ReadAll(strings.NewReader("other"))\n'
+                        'selected := first\nif choice { selected = second }\n'
+                        'selected[0] = os.Getenv("QUERY")[0]\n'
+                        'db.Query(string(first)) // first\ndb.Query(string(second)) // second',
+                        [('first', 'sql', 'db.Query'), ('second', 'sql', 'db.Query')],
+                        imports='import ("io"; "strings"; "os")')
+
+    def test_readall_returned_contents_retain_local_alias_writes(self):
+        body = ('raw, _ := io.ReadAll(strings.NewReader("fixed")); alias := raw; '
+                'alias[0] = os.Getenv("QUERY")[0]; return raw')
+        for helpers, construction in (
+            ('func fresh() []byte { ' + body + ' }', 'raw := fresh()'),
+            ('', 'raw := func() []byte { ' + body + ' }()'),
+        ):
+            with self.subTest(construction=construction):
+                self.check_scan(construction + '\ndb.Query(string(raw)) // query',
+                                [('query', 'sql', 'db.Query')], imports='import ("io"; "strings"; "os")',
+                                helpers=helpers)
+
+    def test_readall_partial_writes_preserve_suffix_and_clean_rebinding(self):
+        self.check_scan('raw, _ := io.ReadAll(os.Stdin)\nalias := raw\n'
+                        "alias[0] = 'x'\ndb.Query(string(raw)) // suffix\n"
+                        'raw, _ = io.ReadAll(strings.NewReader("fixed"))\ndb.Query(string(raw))\n'
+                        'db.Query(string(alias)) // original',
+                        [('suffix', 'sql', 'db.Query'), ('original', 'sql', 'db.Query')],
+                        imports='import ("io"; "os"; "strings")')
+
+    def test_readall_mutated_alias_remains_visible_through_copies(self):
+        for expression in ('raw', 'string(raw)', '[]byte(string(raw))'):
+            with self.subTest(expression=expression):
+                self.check_scan('raw, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := raw\n'
+                                'alias[0] = os.Getenv("QUERY")[0]\n'
+                                'destination := make([]byte, 5)\ncopy(destination, ' + expression + ')\n'
+                                'db.Query(string(destination)) // query',
+                                [('query', 'sql', 'db.Query')], imports='import ("io"; "strings"; "os")')
+
+    def test_readall_borrowed_or_escaped_backing_is_explicitly_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for preparation in ('reader := bytes.NewReader(raw)', 'external.Mutate(raw)'):
+            with self.subTest(preparation=preparation):
+                self.source('handler.go', 'package app\nimport ("io"; "strings"; "bytes"; "os")\n'
+                            'func h() {\ndb.Query(os.Getenv("BEFORE"))\n'
+                            'raw, _ := io.ReadAll(strings.NewReader("fixed"))\n' + preparation + '\n'
+                            'raw[0] = os.Getenv("QUERY")[0]\ndb.Query(string(raw))\n}\n')
+                findings = []
+                with self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+                    for row in packages.taint_go.run(packages.RunContext(lang='go', files=list(self.sources.values()))):
+                        findings.append(row)
+                self.assertEqual([(row['line'], row['rule']) for row in findings],
+                                 [(4, 'go.taint.sql')], findings)
+
+    def test_readall_opaque_transport_cannot_leave_clean_contents_certified(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for transport in ('external.Mutate(raw)', 'external.Mutate(&raw)',
+                          'address := &raw\nexternal.Mutate(address)', 'stored := [][]byte{raw}',
+                          'callback := func() { raw[0] = os.Getenv("QUERY")[0] }\n'
+                          'external.Register(callback)'):
+            with self.subTest(transport=transport):
+                self.source('handler.go', 'package app\nimport ("io"; "strings"; "os")\n'
+                            'func h() {\ndb.Query(os.Getenv("BEFORE"))\n'
+                            'raw, _ := io.ReadAll(strings.NewReader("fixed"))\n' + transport + '\n'
+                            'db.Query(string(raw))\n}\n')
+                findings = []
+                with self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+                    for row in packages.taint_go.run(packages.RunContext(lang='go', files=list(self.sources.values()))):
+                        findings.append(row)
+                self.assertEqual([(row['line'], row['rule']) for row in findings],
+                                 [(4, 'go.taint.sql')], findings)
+
+    def test_readall_unowned_results_refuse_alias_mutations(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for helpers, construction in (
+            ('func fresh() []byte { raw, _ := io.ReadAll(strings.NewReader("fixed")); return raw }\n',
+             'raw := fresh()'),
+            ('', 'raw := func() []byte { value, _ := io.ReadAll(strings.NewReader("fixed")); return value }()'),
+            ('', 'read := io.ReadAll\nif choice { read = custom }\n'
+             'raw, _ := read(strings.NewReader("fixed"))'),
+            ('', 'read := io.ReadAll\nraw, _ := read(func() io.Reader { '
+             'read = custom; return strings.NewReader("fixed") }())'),
+        ):
+            with self.subTest(construction=construction):
+                source = ('package app\nimport ("io"; "strings"; "os")\n' + helpers +
+                          'func h() {\ndb.Query(os.Getenv("BEFORE")) // prior\n' + construction + '\n'
+                          'alias := raw\nalias[0] = os.Getenv("QUERY")[0]\ndb.Query(string(raw))\n}\n')
+                self.source('handler.go', source)
+                findings = []
+                with self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+                    for row in packages.taint_go.run(packages.RunContext(lang='go', files=list(self.sources.values()))):
+                        findings.append(row)
+                expected = [(number, 'go.taint.sql') for number, line in enumerate(source.splitlines(), 1)
+                            if '// prior' in line]
+                self.assertEqual([(row['line'], row['rule']) for row in findings], expected, findings)
+
+    def test_readall_package_buffer_writes_remain_incomplete(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        for target in ('raw', 'alias'):
+            with self.subTest(target=target), self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+                self.check_scan('db.Query(string(raw))', imports='import ("io"; "strings"; "os")',
+                                helpers='var raw, _ = io.ReadAll(strings.NewReader("fixed"))\n'
+                                        'func mutate() { alias := raw; ' + target + '[0] = os.Getenv("QUERY")[0] }')
+
+    @unittest.skipUnless(os.environ.get('UBS_GO_READINTO_NATIVE') == '1',
+                         'set UBS_GO_READINTO_NATIVE=1 for real Go ReadAll backing witnesses')
+    def test_readall_native_alias_and_snapshot_witness(self):
+        source = textwrap.dedent('''
+            package main
+            import ("io"; "os"; "strings"; "encoding/json"; "fmt")
+            type Recorder struct { Queries []string }
+            func (db *Recorder) Query(query string) { db.Queries = append(db.Queries, query) }
+            func write(value []byte, input string) { value[0] = input[0] }
+            func main() {
+                db := &Recorder{}
+                raw, err := io.ReadAll(strings.NewReader("fixed"))
+                alias := raw
+                snapshot := string(raw)
+                independent := []byte(string(raw))
+                write(alias, os.Getenv("UBS_GO_BUFFERED_INPUT"))
+                db.Query(string(raw)) // original
+                db.Query(snapshot)
+                db.Query(string(independent))
+                db.Query(fmt.Sprint(err, ":", len(raw)))
+                copied := make([]byte, 5)
+                n := copy(copied, raw)
+                db.Query(string(copied)) // copied
+                db.Query(fmt.Sprint(n))
+                raw, _ = io.ReadAll(strings.NewReader("other"))
+                db.Query(string(raw))
+                db.Query(string(alias)) // alias
+                io.ReadFull(os.Stdin, raw)
+                db.Query(string(raw)) // readinto
+                if err := json.NewEncoder(os.Stdout).Encode(db.Queries); err != nil { panic(err) }
+            }
+        ''').lstrip('\n')
+        BufferedReaderFlowTests.run_native_reader(
+            self, source, ['<ixed', 'fixed', 'fixed', '<nil>:5', '<ixed', '5', 'other', '<ixed', '<stdi'])
+        findings = self.scan()
+        markers = ('original', 'copied', 'alias', 'readinto')
+        expected = sorted((number, line.index('db.Query') + 1, 'go.taint.sql')
+                          for number, line in enumerate(source.splitlines(), 1)
+                          if any('// ' + marker in line for marker in markers))
+        self.assertEqual(sorted((row['line'], row['col'], row['rule']) for row in findings), expected, findings)
+
     def test_copy_aliases_and_string_snapshots_remain_distinct(self):
         self.check_scan('buffer := make([]byte, 8)\nalias := buffer\n'
                         'snapshot := string(buffer)\nbuffer = make([]byte, 8)\n'
@@ -630,12 +825,6 @@ class NativeScanningFlowTests(packages.PackageTestCase):
             'buffer := make([]byte, 8)\n'
             "copy(buffer[:'\\x01'], os.Getenv(\"UBS_COPY_INPUT\"))",
             'buffer := make([]byte, 8)\ncopy(buffer, r.FormValue("q"))',
-            'source, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := source\n'
-            'alias[0] = r.FormValue("q")[0]\nbuffer := make([]byte, 5)\n'
-            'copy(buffer, source)\ndb.Query(string(buffer))',
-            'source, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := source\n'
-            'alias[0] = r.FormValue("q")[0]\nbuffer := make([]byte, 5)\n'
-            'copy(buffer, string(source))\ndb.Query(string(buffer))',
             'buffer := make([]byte, 8)\nsource := r.FormValue("q")\n'
             'copy(func() []byte { source = "fixed"; return buffer }(), source)',
             'buffer := make([]byte, 8)\nsource := r.FormValue("q")\n'
@@ -664,15 +853,22 @@ class NativeScanningFlowTests(packages.PackageTestCase):
         self.assertEqual([(finding['line'], finding['rule']) for finding in findings],
                          [(3, 'go.taint.sql')], findings)
 
-    def test_copy_untracked_buffer_conversion_cannot_create_clean_content_proof(self):
-        from ubs_core.taint_flow import AnalysisLimit
+    def test_copy_readall_alias_writes_reach_native_buffer_and_string_sources(self):
+        for source in ('source', 'string(source)'):
+            with self.subTest(source=source):
+                self.check_scan('source, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := source\n'
+                                'alias[0] = r.FormValue("q")[0]\nbuffer := make([]byte, 5)\n'
+                                'copy(buffer, ' + source + ')\ndb.Query(string(buffer)) // query',
+                                [('query', 'sql', 'db.Query')], imports='import ("io"; "strings")')
 
+    def test_copy_readall_buffer_conversion_preserves_aliased_source_contents(self):
         for source in ('[]byte(string(raw))', 'snapshot'):
-            with self.subTest(source=source), self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+            with self.subTest(source=source):
                 self.check_scan('raw, _ := io.ReadAll(strings.NewReader("fixed"))\n'
                                 'alias := raw\nalias[0] = os.Getenv("QUERY")[0]\n'
                                 'snapshot := []byte(string(raw))\nbuffer := make([]byte, 8)\n'
-                                'copy(buffer, ' + source + ')\ndb.Query(string(buffer))',
+                                'copy(buffer, ' + source + ')\ndb.Query(string(buffer)) // query',
+                                [('query', 'sql', 'db.Query')],
                                 imports='import ("io"; "strings"; "os")')
 
     @unittest.skipUnless(os.environ.get('UBS_GO_COPY_NATIVE') == '1',
@@ -1398,6 +1594,27 @@ func h() {
 class BufferedReaderCacheTests(packages.PackageTestCase):
     scan_main = packages.PackageCacheTests.scan_main
 
+    def test_readall_alias_helper_edit_invalidates_warm_selected_package(self):
+        helper = self.source('helper.go', 'package app\nimport "os"\n'
+                             'func mutate(value []byte) { value[0] = 120 }\n')
+        handler = self.source('handler.go', 'package app\nimport ("io"; "strings")\nfunc h() {\n'
+                              'raw, _ := io.ReadAll(strings.NewReader("fixed"))\n'
+                              'alias := raw\nmutate(alias)\ndb.Query(string(raw))\n}\n')
+        (self.root / 'unselected.go').write_text('package app\nimport "os"\n'
+                                              'func unselected() { db.Query(os.Getenv("SQL")) }\n')
+        self.assertEqual(self.scan_main()[0], [])
+        warm, stats = self.scan_main()
+        self.assertEqual(warm, [])
+        self.assertEqual(stats['hits'], 2, stats)
+        self.source('helper.go', 'package app\nimport "os"\n'
+                    'func mutate(value []byte) { value[0] = os.Getenv("SQL")[0] }\n')
+        changed, stats = self.scan_main()
+        self.assertEqual([(Path(row['path']).name, row['line'], row['col'], row['rule']) for row in changed],
+                         [('handler.go', 7, 1, 'go.taint.sql')], changed)
+        self.assertEqual(stats['misses'], 2, stats)
+        self.assertEqual(self.scan_main([helper])[0], [])
+        self.assertEqual(self.scan_main([helper, handler])[0], changed)
+
     def test_copy_helper_edit_invalidates_warm_selected_package(self):
         helper = self.source('helper.go', 'package app\nimport "os"\n'
                              'func move(buffer []byte) { copy(buffer, "fixed") }\n')
@@ -1482,6 +1699,12 @@ class BufferedReaderModuleTests(unittest.TestCase):
     def test_public_copy_controls_suppression_and_partial_findings(self):
         self.check_public_cases(20, 24)
 
+    def test_public_readall_alias_writes_and_metadata_reports(self):
+        self.check_public_cases(24, 28)
+
+    def test_public_readall_snapshots_suppression_and_partial_findings(self):
+        self.check_public_cases(28, 32)
+
     def check_public_cases(self, start, end):
         from test_keep_temp import prevent_child_deletion
 
@@ -1538,6 +1761,26 @@ class BufferedReaderModuleTests(unittest.TestCase):
              'db.Query(string(buffer))', False, False),
             ('copy-partial', 'db.Query(r.FormValue("prior")) // query\n'
              'buffer := external()\ncopy(buffer, r.FormValue("q"))', True, True),
+            ('readall-alias', 'raw, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := raw\n'
+             'alias[0] = os.Getenv("QUERY")[0]\ndb.Query(string(raw)) // query', True, False),
+            ('readall-copy', 'raw, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := raw\n'
+             'copy(alias, os.Getenv("QUERY"))\ndb.Query(string(raw)) // query', True, False),
+            ('readall-metadata', 'raw, err := io.ReadAll(os.Stdin)\n'
+             'fmt.Fprint(w, err, len(raw), cap(raw))', False, False),
+            ('readall-bound', 'raw, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := raw\n'
+             'alias[0] = os.Getenv("QUERY")[0]\ndb.Query("SELECT $1", string(raw))', False, False),
+            ('readall-snapshot', 'raw, _ := io.ReadAll(strings.NewReader("fixed"))\n'
+             'snapshot := string(raw)\nalias := raw\nalias[0] = os.Getenv("QUERY")[0]\n'
+             'db.Query(snapshot)', False, False),
+            ('readall-rebound', 'raw, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := raw\n'
+             'raw, _ = io.ReadAll(strings.NewReader("other"))\nalias[0] = os.Getenv("QUERY")[0]\n'
+             'db.Query(string(raw))', False, False),
+            ('readall-suppressed', 'raw, _ := io.ReadAll(strings.NewReader("fixed"))\nalias := raw\n'
+             'alias[0] = os.Getenv("QUERY")[0]\n'
+             'db.Query(string(raw)) // ubs:ignore[go.taint.sql]', False, False),
+            ('readall-partial', 'db.Query(r.FormValue("prior")) // query\n'
+             'raw, _ := io.ReadAll(strings.NewReader("fixed"))\nreader := bytes.NewReader(raw)\n'
+             'copy(raw, os.Getenv("QUERY"))\ndb.Query(string(raw))', True, True),
         )
         artifacts = packages.ROOT / 'test-suite' / 'artifacts'
         artifacts.mkdir(parents=True, exist_ok=True)
@@ -1546,7 +1789,7 @@ class BufferedReaderModuleTests(unittest.TestCase):
         for name, body, unsafe, partial in cases[start:end]:
             folder = root / name
             folder.mkdir()
-            source = ('package app\nimport ("bufio"; "os"; "io"; "strings"; "fmt")\n'
+            source = ('package app\nimport ("bufio"; "os"; "io"; "strings"; "fmt"; "bytes")\n'
                       'func h() {\n' + body + '\n}\n')
             path = folder / 'handler.go'
             path.write_text(source)
@@ -2084,10 +2327,34 @@ class NativeFunctionValueTests(packages.PackageTestCase):
                 fmt.Fprint(w, raw)
                 fmt.Fprint(w, err)
                 clean, cleanErr := saved(strings.NewReader("fixed"))
-                fmt.Fprint(w, clean, cleanErr)
+                fmt.Fprint(w, string(clean), cleanErr)
             }
         ''')
         self.assert_hits([('handler.go', 8, 'go.taint.xss'), ('handler.go', 9, 'go.taint.xss')])
+
+    def test_readall_raw_output_transport_is_incomplete_with_prior_findings(self):
+        from ubs_core.taint_flow import AnalysisLimit
+
+        self.source('handler.go', '''
+            package app
+            import ("io"; "strings"; "fmt"; callbacks "example.test/callbacks")
+            func h() {
+                read := io.ReadAll
+                saved := read
+                if choice { read = callbacks.Reader(r.FormValue("q")) }
+                raw, err := read(strings.NewReader("fixed"))
+                fmt.Fprint(w, raw)
+                fmt.Fprint(w, err)
+                clean, cleanErr := saved(strings.NewReader("fixed"))
+                fmt.Fprint(w, clean, cleanErr)
+            }
+        ''')
+        findings = []
+        with self.assertRaisesRegex(AnalysisLimit, 'buffer'):
+            for row in packages.taint_go.run(packages.RunContext(lang='go', files=list(self.sources.values()))):
+                findings.append(row)
+        self.assertEqual([(Path(row['path']).name, row['line'], row['col'], row['rule']) for row in findings],
+                         [('handler.go', 8, 5, 'go.taint.xss'), ('handler.go', 9, 5, 'go.taint.xss')], findings)
 
     def test_unknown_unmarshal_preserves_captured_source_in_writes_and_error(self):
         self.source('handler.go', '''

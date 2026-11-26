@@ -64,6 +64,9 @@ _ENCODERS = {
 _FILTER_FORMAT = 'ldap.filter.filter_format'
 _SEARCH_CONSTRUCTOR = 'django_auth_ldap.config.LDAPSearch'
 _KNOWN_IMPORTS = _MODULES | set(_FACTORIES) | set(_ENCODERS) | {_FILTER_FORMAT, _SEARCH_CONSTRUCTOR}
+_REGEX_CALLABLES = frozenset({'search', 'compile'})
+_REGEX_FLAGS = frozenset({'A', 'ASCII', 'I', 'IGNORECASE', 'L', 'LOCALE', 'M', 'MULTILINE',
+                          'S', 'DOTALL', 'U', 'UNICODE', 'X', 'VERBOSE', 'DEBUG', 'NOFLAG'})
 _LOCAL_CALLABLES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                     flow._BoundClassMethod, flow._FunctionValue, flow._ClosureValue)
 
@@ -91,13 +94,15 @@ def _request_source(node):
     return name if root == 'request' or root.endswith('_request') else None
 
 
-def _has_sink(tree):
+def _has_sink(tree, receiver_proof=None):
     # A saved method still contains its original attribute read. Keep the
     # prefilter syntactic and broad, before the semantic receiver proof.
-    return any(isinstance(node, ast.Attribute) and node.attr in _SINK_METHODS
-               or isinstance(node, ast.Name) and node.id in _SINK_METHODS | {'LDAPSearch'}
-               or isinstance(node, ast.ImportFrom) and any(alias.name == 'LDAPSearch' for alias in node.names)
-               for node in ast.walk(tree))
+    candidates = (node for node in ast.walk(tree)
+                  if isinstance(node, ast.Attribute) and node.attr in _SINK_METHODS
+                  or isinstance(node, ast.Name) and node.id in _SINK_METHODS | {'LDAPSearch'}
+                  or isinstance(node, ast.ImportFrom) and any(alias.name == 'LDAPSearch' for alias in node.names))
+    return any(receiver_proof is None or not receiver_proof.non_directory(node)
+               for node in candidates)
 
 
 def _prove(fact, domain):
@@ -194,6 +199,26 @@ class _ReceiverProof:
                 alias.name == '*' for alias in node.names)
             for node in nodes)
         self.builtin_set = not self.reflection and not factory_shadowed
+        self.applicability_exposed = (self.reflection or engine.generator_builtin_reflection
+                                      or engine.generator_namespace_exposed or engine.generator_frame_exposed
+                                      or engine.generator_literal_authority_exposed)
+        self.attribute_writes = attribute_writes | reflected_fields
+        self.named_writes = {name for node in nodes if isinstance(node, (ast.Global, ast.Nonlocal))
+                             for name in node.names}
+        self.name_reads = {}
+        for node in nodes:
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                self.name_reads.setdefault(node.id, []).append(node)
+        self.regex_imports = []
+        for node in nodes:
+            if isinstance(node, ast.Import):
+                self.regex_imports.extend((node, alias.asname or alias.name, None)
+                                          for alias in node.names if alias.name == 're')
+            elif isinstance(node, ast.ImportFrom) and node.module == 're' and not node.level:
+                self.regex_imports.extend((node, alias.asname or alias.name, alias.name)
+                                          for alias in node.names)
+        self.regex_authority = None
+        self.non_directory_proofs = {}
         self.fields = {}
         # A method named cell_contents or a read-only vars(builtins) inventory
         # is not a write to an instance field. Still reject real namespace
@@ -313,6 +338,151 @@ class _ReceiverProof:
         receiver, fields = self.fields.get(scope, (None, ()))
         return (isinstance(node, ast.Attribute) and node.attr in fields
                 and isinstance(node.value, ast.Name) and node.value.id == receiver)
+
+    def single_binding(self, node):
+        """Resolve one lexical binding, refusing writes through another frame.
+
+        This is an applicability proof, not a replacement for flow analysis.
+        Multiple stores, parameters, comprehension targets and class bodies
+        deliberately retain the full semantic path.
+        """
+        if node.id in self.named_writes:
+            return None
+        child = node
+        parent = self.engine.parents.get(child)
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                if (child is parent.args or child in getattr(parent, 'decorator_list', ())
+                        or child is getattr(parent, 'returns', None)):
+                    # Defaults/decorators execute in the enclosing frame, not
+                    # the function whose argument/local names they precede.
+                    return None
+                break
+            child, parent = parent, self.engine.parents.get(parent)
+        for scope in self.lexical_scopes(self.engine.enclosing(node)):
+            if isinstance(scope, ast.ClassDef):
+                return None
+            if node.id in self.engine.locals.get(scope, ()):
+                binders = self.engine.generator_binders.get(scope, {}).get(node.id, ())
+                return binders[0] if len(binders) == 1 else None
+        return None
+
+    def regex_callable_unexposed(self, node, active=frozenset()):
+        # re.search/compile are mutable Python functions. Capturing a private
+        # alias is safe; passing the function to opaque code can rewrite its
+        # __code__ or globals and must invalidate even earlier captures.
+        if node in active or len(active) >= 32:
+            return False
+        parent = self.engine.parents.get(node)
+        if isinstance(parent, ast.Call) and parent.func is node:
+            return True
+        target = (parent.targets[0] if isinstance(parent, ast.Assign) and len(parent.targets) == 1
+                  else parent.target if isinstance(parent, ast.AnnAssign) else None)
+        if (not isinstance(target, ast.Name) or getattr(parent, 'value', None) is not node
+                or self.single_binding(target) is not target):
+            return False
+        for use in self.name_reads.get(target.id, ()):
+            binding = self.single_binding(use)
+            if binding is None:
+                return False
+            if binding is target and not self.regex_callable_unexposed(use, active | {node}):
+                return False
+        return True
+
+    def regex_unexposed(self):
+        if self.regex_authority is not None:
+            return self.regex_authority
+        self.regex_authority = False
+        if self.applicability_exposed or {None, 'search', 'compile', '__code__'} & self.attribute_writes:
+            return False
+        # All aliases refer to the same mutable re module. A write through a
+        # second import, an exposed internal (_compile, caches, compiler), or
+        # an escaped function revokes authority for every import in this file.
+        for binder, name, member in self.regex_imports:
+            if member is not None and member not in _REGEX_CALLABLES | _REGEX_FLAGS:
+                return False
+            for use in self.name_reads.get(name, ()):
+                binding = self.single_binding(use)
+                # An ambiguous alias can still denote this import on one
+                # branch. Only a proved distinct lexical binding is private.
+                if binding is None:
+                    return False
+                if binding is not binder:
+                    continue
+                if member is None:
+                    attribute = self.engine.parents.get(use)
+                    if (not isinstance(attribute, ast.Attribute) or attribute.value is not use
+                            or not isinstance(attribute.ctx, ast.Load)
+                            or attribute.attr not in _REGEX_CALLABLES | _REGEX_FLAGS):
+                        return False
+                    if attribute.attr in _REGEX_CALLABLES and not self.regex_callable_unexposed(attribute):
+                        return False
+                elif member in _REGEX_CALLABLES and not self.regex_callable_unexposed(use):
+                    return False
+        self.regex_authority = True
+        return True
+
+    def static_receiver(self, node, active=None):
+        if self.applicability_exposed:
+            return None
+        active = set() if active is None else active
+        if node in active or len(active) >= 32:
+            return None
+        active = active | {node}
+        if isinstance(node, (ast.Set, ast.SetComp)):
+            return 'set'
+        if isinstance(node, ast.Name):
+            binder = self.single_binding(node)
+            if isinstance(binder, (ast.Import, ast.ImportFrom)):
+                if getattr(binder, 'level', 0) or not self.regex_unexposed():
+                    return None
+                for alias in binder.names:
+                    if (alias.asname or alias.name.split('.')[0]) != node.id:
+                        continue
+                    if isinstance(binder, ast.Import) and alias.name == 're':
+                        return 're'
+                    if isinstance(binder, ast.ImportFrom) and binder.module == 're':
+                        if alias.name in {'search', 'compile'}:
+                            return 're.' + alias.name
+                return None
+            if not isinstance(binder, ast.Name):
+                return None
+            statement = self.engine.parents.get(binder)
+            if (isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                    and statement.targets[0] is binder
+                    or isinstance(statement, ast.AnnAssign) and statement.target is binder):
+                return self.static_receiver(statement.value, active)
+            return None
+        if isinstance(node, ast.Call):
+            if (isinstance(node.func, ast.Name) and node.func.id == 'set'
+                    and self.builtin_set
+                    and self.builtin_visible('set', self.engine.enclosing(node))):
+                return 'set'
+            if self.static_receiver(node.func, active) == 're.compile':
+                return 're.Pattern'
+        if isinstance(node, ast.Attribute):
+            parent = self.static_receiver(node.value, active)
+            if parent == 're' and node.attr in {'search', 'compile'}:
+                return 're.' + node.attr
+            if parent == 're.Pattern' and node.attr == 'search':
+                return 're.Pattern.search'
+            if parent == 'set' and node.attr == 'add':
+                return 'set.add'
+        return None
+
+    def non_directory(self, node):
+        """Exclude only proved native operations before imposing LDAP work.
+
+        The regex module and builtin sets share common LDAP method names.
+        A file containing only those operations has no LDAP sink to analyze;
+        unrelated generator protocols must not make that detector partial.
+        Any unresolved candidate keeps the original whole-file analysis and
+        its completeness requirements, including all called helper scopes.
+        """
+        if node not in self.non_directory_proofs:
+            self.non_directory_proofs[node] = self.static_receiver(node) in {
+                'set.add', 're.search', 're.Pattern.search'}
+        return self.non_directory_proofs[node]
 
 
 class _LDAPFlow(flow._Flow):
@@ -501,7 +671,8 @@ class _LDAPFlow(flow._Flow):
     def _sinks(self, node, state, target, name, inputs):
         if name.startswith(_CHANGED_RECEIVER):
             raise flow.AnalysisLimit('native LDAP receiver escaped before use; analysis is incomplete')
-        if isinstance(target, _LOCAL_CALLABLES) or name.startswith(_SET + '.'):
+        if (isinstance(target, _LOCAL_CALLABLES) or name.startswith(_SET + '.')
+                or self.engine.receiver_proof.non_directory(node.func)):
             return
         flavor, receiver_offset = None, 0
         unbound = _native_class_method(target)
@@ -630,6 +801,8 @@ def find(files: Sequence[Path]) -> Iterable[tuple[Path, int, int, str]]:
             if not _has_sink(tree):
                 continue
             analyzer = _LDAPAnalysis(tree)
+            if not _has_sink(tree, analyzer.receiver_proof):
+                continue
             analyzer.source_path = path
             effects = analyzer.analyze()
         except (OSError, UnicodeError, SyntaxError, RecursionError, RuntimeError, flow.AnalysisLimit) as exc:

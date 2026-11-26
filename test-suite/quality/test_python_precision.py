@@ -2188,6 +2188,342 @@ class LDAPFlowTests(unittest.TestCase):
             ''',
         })
 
+    def test_proven_non_directory_receivers_do_not_require_unrelated_flow(self):
+        unrelated = ('def opaque(values):\n'
+                     '    return any(item in values for item in ("a", "b"))\n')
+        cases = {
+            'regex-module': '''
+                import re
+                re.search('pattern', request.args['text'])
+            ''',
+            'regex-module-alias': '''
+                import re as patterns
+                patterns.search('pattern', request.args['text'])
+            ''',
+            'regex-imported-search': '''
+                from re import search
+                search('pattern', request.args['text'])
+            ''',
+            'regex-captured-search': '''
+                import re
+                lookup = re.search
+                lookup('pattern', request.args['text'])
+            ''',
+            'regex-distinct-local-parameter': '''
+                import re
+                def setup(re):
+                    configure(re)
+                re.search('pattern', request.args['text'])
+            ''',
+            'regex-captured-distinct-local-parameter': '''
+                import re
+                lookup = re.search
+                def setup(lookup):
+                    configure(lookup)
+                lookup('pattern', request.args['text'])
+            ''',
+            'regex-compiled-pattern': '''
+                import re
+                compiled = re.compile('pattern')
+                compiled.search(request.args['text'])
+            ''',
+            'regex-imported-compiler': '''
+                from re import compile as make_pattern
+                compiled = make_pattern('pattern')
+                compiled.search(request.args['text'])
+            ''',
+            'regex-compiled-with-native-flags': '''
+                import re
+                compiled = re.compile('pattern', re.IGNORECASE | re.MULTILINE)
+                compiled.search(request.args['text'])
+            ''',
+            'literal-set': '''
+                {'fixed'}.add(request.args['dn'])
+            ''',
+            'constructed-set': '''
+                values = set()
+                values.add(request.args['dn'])
+            ''',
+            'local-set': '''
+                def collect(request):
+                    values = {'fixed'}
+                    values.add(request.args['dn'])
+                    return values
+            ''',
+            'mixed-regex-set': '''
+                import re
+                values = set()
+                values.add(request.args['dn'])
+                re.search('pattern', request.args['text'])
+            ''',
+        }
+        self.check_cases({name: unrelated + textwrap.dedent(source).lstrip('\n')
+                          for name, source in cases.items()})
+
+    def test_non_directory_applicability_requires_unshadowed_unescaped_identity(self):
+        unrelated = ('def opaque(values):\n'
+                     '    return any(item in values for item in ("a", "b"))\n')
+        cases = {
+            'regex-module-rebound': '''
+                import re
+                re = directory
+                re.search('dc=example', request.args['filter'])
+            ''',
+            'regex-shadowed-parameter': '''
+                import re
+                def lookup(re, request):
+                    re.search('dc=example', request.args['filter'])
+            ''',
+            'regex-member-replaced': '''
+                import re
+                re.search = external_search
+                re.search('dc=example', request.args['filter'])
+            ''',
+            'regex-module-escaped': '''
+                import re
+                configure(re)
+                re.search('dc=example', request.args['filter'])
+            ''',
+            'regex-search-escaped': '''
+                import re
+                configure(re.search)
+                re.search('dc=example', request.args['filter'])
+            ''',
+            'regex-captured-search-escaped': '''
+                import re
+                search = re.search
+                configure(search)
+                search('dc=example', request.args['filter'])
+            ''',
+            'regex-imported-search-internal-replacement': '''
+                from re import search
+                import re as patterns
+                patterns._compile = directory_factory
+                search('dc=example', request.args['filter'])
+            ''',
+            'regex-ambiguous-module-escape': '''
+                from re import search
+                import re as patterns
+                if enabled:
+                    patterns = alternate_patterns
+                configure(patterns)
+                search('dc=example', request.args['filter'])
+            ''',
+            'regex-ambiguous-module-internal-replacement': '''
+                from re import search
+                import re as patterns
+                if enabled:
+                    patterns = alternate_patterns
+                patterns._compile = directory_factory
+                search('dc=example', request.args['filter'])
+            ''',
+            'regex-imported-search-default-escape': '''
+                from re import search as lookup
+                import re
+                def setup(callback=configure(lookup)): pass
+                re.search('dc=example', request.args['filter'])
+            ''',
+            'regex-captured-search-default-escape': '''
+                import re
+                lookup = re.search
+                def setup(lookup=configure(lookup)): pass
+                re.search('dc=example', request.args['filter'])
+            ''',
+            'regex-captured-search-decorator-escape': '''
+                import re
+                lookup = re.search
+                @configure(lookup)
+                def setup(): pass
+                re.search('dc=example', request.args['filter'])
+            ''',
+            'regex-captured-search-class-header-escape': '''
+                import re
+                lookup = re.search
+                class Holder(configure(lookup)): pass
+                re.search('dc=example', request.args['filter'])
+            ''',
+            'regex-imported-compiler-escaped': '''
+                from re import compile
+                configure(compile)
+                compiled = compile('pattern')
+                compiled.search(request.args['filter'])
+            ''',
+            'regex-callable-rebound': '''
+                from re import search
+                search = external_search
+                search('dc=example', request.args['filter'])
+            ''',
+            'regex-relative-import': '''
+                from .re import search
+                search('dc=example', request.args['filter'])
+            ''',
+            'set-constructor-shadowed': '''
+                set = directory_factory
+                values = set()
+                values.add(request.args['dn'])
+            ''',
+            'set-variable-rebound': '''
+                values = set()
+                values = directory
+                values.add(request.args['dn'])
+            ''',
+            'set-conditional-rebind': '''
+                values = set()
+                if enabled:
+                    values = directory
+                values.add(request.args['dn'])
+            ''',
+            'set-unproved-field': '''
+                class Holder:
+                    def __init__(self): self.values = set()
+                    def replace(self): self.values = directory
+                    def use(self, request): self.values.add(request.args['dn'])
+            ''',
+        }
+        for label, operation in cases.items():
+            with self.subTest(case=label):
+                started = time.monotonic()
+                print(f'[ldap-applicability-{label}] RUN', flush=True)
+                target = self.work / f'applicability-{label}.py'
+                source = unrelated + textwrap.dedent(operation).lstrip('\n')
+                target.write_text(source, encoding='utf-8')
+                findings = []
+                with self.assertRaisesRegex(ldap_injection.LDAPAnalysisLimit, 'opaque') as raised:
+                    findings.extend(ldap_injection.find([target]))
+                self.assertTrue(raised.exception.components, (source, findings))
+                print(f'[ldap-applicability-{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    def test_reflective_namespace_write_cannot_prove_a_set_receiver(self):
+        self.check_cases({
+            'reflective-set-replacement': '''
+                values = set()
+                globals()['values'] = directory
+                values.add(request.args['dn'])  # ldap-finding
+            ''',
+        })
+
+    def test_captured_mutators_cannot_establish_builtin_set_authority(self):
+        from unittest import mock
+        cases = {
+            'captured-builtin': '''
+                import builtins
+                update = setattr
+                update(builtins, 'set', directory_factory)
+            ''',
+            'imported-builtin': '''
+                import builtins
+                from builtins import setattr as update
+                update(builtins, 'set', directory_factory)
+            ''',
+            'captured-module-member': '''
+                import builtins
+                update = builtins.setattr
+                update(builtins, 'set', directory_factory)
+            ''',
+        }
+        for label, operation in cases.items():
+            with self.subTest(case=label):
+                target = self.work / f'captured-set-mutator-{label}.py'
+                source = ('def expensive(value):\n' + '    value = str(value)\n' * 100 +
+                          '    return value\n' + textwrap.dedent(operation).lstrip('\n') +
+                          'values = set()\nvalues.add(request.args["dn"])\n')
+                target.write_text(source, encoding='utf-8')
+                with mock.patch.dict(os.environ, {'UBS_PYTHON_FLOW_SCOPE_STEPS': '200'}), \
+                        self.assertRaisesRegex(ldap_injection.LDAPAnalysisLimit, 'work limit') as raised:
+                    list(ldap_injection.find([target]))
+                self.assertTrue(raised.exception.components)
+
+    def test_native_regex_callable_escape_can_replace_its_behavior(self):
+        # A real Python function is mutable even when its owning module
+        # variable never escapes. Run in a child so the imported re module
+        # used by this test process keeps its original implementation.
+        source = '''
+import re
+def configure(function):
+    def directory_search(base, user_filter, flags=0):
+        return ('directory-operation', base, user_filter)
+    function.__code__ = directory_search.__code__
+lookup = re.search
+configure(lookup)
+assert re.search('dc=example', '(uid=*)') == (
+    'directory-operation', 'dc=example', '(uid=*)')
+assert lookup('dc=example', '(uid=*)') == (
+    'directory-operation', 'dc=example', '(uid=*)')
+'''
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', source],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+
+    def test_native_regex_ambiguous_alias_can_replace_imported_search_behavior(self):
+        # A second assignment does not make the import incapable of escape:
+        # on the untaken branch, re.search still consults that module's _compile.
+        source = '''
+from re import search
+import re as patterns
+enabled = False
+if enabled:
+    patterns = object()
+class Directory:
+    def __init__(self, base): self.base = base
+    def search(self, value): return ('directory-operation', self.base, value)
+def directory_factory(base, flags=0): return Directory(base)
+patterns._compile = directory_factory
+assert search('dc=example', '(uid=*)') == (
+    'directory-operation', 'dc=example', '(uid=*)')
+'''
+        result = subprocess.run([sys.executable, '-I', '-S', '-c', source],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+
+    def test_applicability_keeps_reached_ldap_and_independent_evidence_partial(self):
+        cases = {
+            'local-callee-after-failure': '''
+                def lookup(value):
+                    directory.search('dc=example', value)
+                def scan(request, values):
+                    any(item in values for item in ('a', 'b'))
+                    lookup(request.args['filter'])
+            ''',
+            'captured-method-after-failure': '''
+                lookup = directory.search
+                def scan(request, values):
+                    any(item in values for item in ('a', 'b'))
+                    lookup('dc=example', request.args['filter'])
+            ''',
+            'callback-after-failure': '''
+                def invoke(action, value, values):
+                    any(item in values for item in ('a', 'b'))
+                    action('dc=example', value)
+                invoke(directory.search, request.args['filter'], external_values)
+            ''',
+            'producer-before-sink': '''
+                def build(request, values):
+                    any(item in values for item in ('a', 'b'))
+                    return request.args['filter']
+                def scan(request, values):
+                    directory.search('dc=example', build(request, values))
+            ''',
+        }
+        for label, operation in cases.items():
+            with self.subTest(case=label):
+                started = time.monotonic()
+                print(f'[ldap-reachable-{label}] RUN', flush=True)
+                target = self.work / f'reachable-{label}.py'
+                source = ('from ldap3 import Connection\n'
+                          'directory = Connection("directory.invalid")\n'
+                          'directory.search("dc=example", request.args["first"])\n'
+                          + textwrap.dedent(operation).lstrip('\n') +
+                          'later = Connection("other-directory.invalid")\n'
+                          'later.search("dc=example", request.args["last"])\n')
+                target.write_text(source, encoding='utf-8')
+                findings = []
+                with self.assertRaisesRegex(ldap_injection.LDAPAnalysisLimit, 'opaque'):
+                    findings.extend(ldap_injection.find([target]))
+                found_lines = [line for _, line, _, _ in findings]
+                self.assertIn(3, found_lines, (source, findings))
+                self.assertIn(len(source.splitlines()), found_lines, (source, findings))
+                print(f'[ldap-reachable-{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
     @unittest.skipUnless(os.environ.get('UBS_LDAP_NATIVE') == '1', 'set UBS_LDAP_NATIVE=1 with ldap3 installed')
     def test_native_unbound_class_runtime(self):
         from ldap3 import Connection, Server, MOCK_SYNC, NONE
@@ -3415,6 +3751,13 @@ class LDAPInjectionPublicTests(unittest.TestCase):
         clean = ('from ldap3.utils.conv import escape_filter_chars as encode\n'
                  'def prepare(value): return encode(value)\n' + unsafe.replace(
                      'lookup(request.args["filter"])', 'lookup(prepare(request.args["filter"]))'))
+        non_directory = ('import re\n'
+                         'seen = set()\n'
+                         'seen.add("fixed")\n'
+                         're.search("pattern", "fixed text")\n')
+        non_directory_opaque = ('def unrelated(values):\n'
+                                '    return any(item in values for item in ("a", "b"))\n'
+                                + non_directory)
         limited = ('def expensive(value):\n' + '    value = str(value)\n' * 100 +
                    '    return value\n' + unsafe)
         env = {**os.environ, 'UBS_NO_AUTO_UPDATE': '1', 'UBS_ENABLE_AUTO_UPDATE': '0',
@@ -3424,6 +3767,8 @@ class LDAPInjectionPublicTests(unittest.TestCase):
         skip = '--skip=' + ','.join(str(i) for i in range(1, 24) if i != 7)
         for label, source, expected, partial in (
                 ('unsafe', unsafe, [3], False), ('clean', clean, [], False),
+                ('non-directory', non_directory, [], False),
+                ('non-directory-opaque', non_directory_opaque, [], True),
                 ('suppressed', unsafe.replace('value)\n', 'value)  # ubs:ignore[py.security.ldap-injection]\n'), [], False),
                 ('partial', unsafe, [3], True), ('limited', limited, [105], True)):
             selected = work / label
@@ -3450,6 +3795,9 @@ class LDAPInjectionPublicTests(unittest.TestCase):
                         payload = json.loads(result.stdout)
                         if fmt == 'json':
                             self.assertEqual(payload['status'], 'partial' if partial else 'ok', payload)
+                            analysis_errors = (payload.get('analysis_errors', []) if module else
+                                               [error for item in payload.get('failed_modules', [])
+                                                for error in item.get('analysis_errors', [])])
                             rows = [row for row in payload.get('findings', [])
                                     if row['rule' if module else 'rule_id'] == ldap_injection.RULE_ID]
                             samples = ([sample for row in rows for sample in row['samples']]
@@ -3469,12 +3817,22 @@ class LDAPInjectionPublicTests(unittest.TestCase):
                             self.assertEqual([row['locations'][0]['physicalLocation']['region']['startLine']
                                               for row in rows], expected, payload)
                             invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                            analysis_errors = [error for item in invocations
+                                               for notification in item.get('toolExecutionNotifications', [])
+                                               for error in notification.get('properties', {}).get('analysis_errors', [])]
                             if partial:
                                 self.assertTrue(invocations, payload)
                                 self.assertTrue(all(item['executionSuccessful'] is False for item in invocations), payload)
                             else:
                                 self.assertTrue(all(item.get('executionSuccessful') is not False
                                                     for item in invocations), payload)
+                        if label == 'non-directory-opaque':
+                            # LDAP applicability must not erase another
+                            # analyzer's independent incomplete coverage.
+                            self.assertEqual(len(analysis_errors), 1, payload)
+                            self.assertTrue(analysis_errors[0]['stage'].startswith('taint_py ('), payload)
+                            self.assertEqual([component['symbol'] for component in
+                                              analysis_errors[0].get('components', [])], ['unrelated'], payload)
                         print('PYTHON_LDAP_PUBLIC', label, module, fmt, 'PASS', flush=True)
 
     def test_runner_cache_edits_suppression_and_partial_nonreuse(self):

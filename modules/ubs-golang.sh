@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 # Shared primitives (bead A1): locale export, json_escape, format contract,
 # NUL-safe file listing. Shipped and checksum-verified next to the modules.
-UBS_LIB_CHECKSUM="cfb3387475d51bb5ca0fc5d1ebafe1a4740e8e408c06e41d4382e4b60fb1e8d0"
+UBS_LIB_CHECKSUM="e5f5bdf46a5f5fd24c2eb4ad348dca8c761889c4075750c237d175473428f1d7"
 UBS_MODULE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -n "${UBS_VERIFIED_ASSET_DIR:-}" ]]; then
   if [[ -f "${UBS_VERIFIED_ASSET_DIR}/lib/ubs-common.sh" ]]; then
@@ -296,27 +296,21 @@ fi
 # ── Legacy-parity bridges for the contract-v2 path ──────────────────────────
 run_v2_legacy_parity_bridges_go(){
   local sink="$1" list_file="$2" go_exit="$3" text_out="${4:-}" skip_csv="${5:-}" \
-        tally_file="${6:-}" life_raw_path="${7:-}" life_status_raw="${8:-0}" run_life_raw="${9:-0}"
+        tally_file="${6:-}"
   local files_n bridge_rc=0
   files_n="$(tr -dc '\0' <"$list_file" 2>/dev/null | wc -c)"
   python3 - "$sink" "$text_out" "$files_n" "${FAIL_ON_WARNING:-0}" "$skip_csv" \
-    "$go_exit" "$tally_file" "$life_raw_path" "$life_status_raw" "$run_life_raw" \
-    "$list_file" "$PROJECT_DIR" <<'PYV2BRIDGE' || bridge_rc=$?
+    "$go_exit" "$tally_file" <<'PYV2BRIDGE' || bridge_rc=$?
 import json
 import os
-import re
 import sys
-from pathlib import Path
 
 (sink_path, text_out, files_raw, fow_raw, skip_csv, go_exit_raw,
- tally_file, life_raw_path, life_status_raw, run_life_raw,
- list_path, project_dir) = sys.argv[1:13]
+ tally_file) = sys.argv[1:8]
 files_n = int(files_raw or 0)
 fail_on_warning = fow_raw == "1"
 skip = {int(x) for x in skip_csv.split(",") if x.strip().isdigit()}
 go_exit = int(go_exit_raw or "0")
-life_status = int(life_status_raw or "0")
-run_life = run_life_raw == "1"
 as_text = bool(text_out)
 
 # Mirror go_scan._CATEGORY_SLUGS/_SECTION_HEADERS (legacy print_header titles).
@@ -339,24 +333,6 @@ SECTION = {1: "1. CONCURRENCY & GOROUTINE SAFETY", 2: "2. CHANNELS & SELECT",
            19: "19. DEPENDENCY & BUILD DRIFT", 20: "20. NIL PANICS FROM DEFER ORDERING (AST)",
            21: "21. DATABASE & SQL ROBUSTNESS", 22: "22. SHUTDOWN & RESOURCE RELEASE (HTTP/NET)"}
 
-LIFE_SEVERITY = {"context_cancel": "critical", "ticker_stop": "warning",
-                 "timer_stop": "warning", "file_handle": "warning",
-                 "db_handle": "warning", "mutex_lock": "warning"}
-LIFE_SUMMARY = {"context_cancel": "context.With* without deferred cancel",
-                "ticker_stop": "time.NewTicker not stopped",
-                "timer_stop": "time.NewTimer not stopped",
-                "file_handle": "os.Open/OpenFile without defer Close()",
-                "db_handle": "sql.Open without DB.Close()",
-                "mutex_lock": "Mutex Lock without Unlock()"}
-LIFE_REMEDIATION = {
-    "context_cancel": "Store the cancel func and defer cancel() immediately after acquiring the context",
-    "ticker_stop": "Keep the ticker handle and call Stop() when finished",
-    "timer_stop": "Stop or drain timers to avoid leaks",
-    "file_handle": "Call defer f.Close() immediately after Open to avoid FD leaks",
-    "db_handle": "Close sql.DB handles when shutting down or prefer context-managed lifecycle",
-    "mutex_lock": "Pair Lock() with defer Unlock() to avoid deadlocks when returning early",
-}
-
 try:
     with open(sink_path, encoding="utf-8") as fh:
         records = [json.loads(line) for line in fh if line.strip()]
@@ -367,109 +343,6 @@ out = []
 
 def emit(line=""):
     out.append(line)
-
-def lifecycle_scan_paths(list_path, project_dir):
-    """Map the lifecycle helper's file names back to the scanned paths.
-
-    resource_lifecycle_go.go names a file by filepath.Rel(abs(root), file),
-    which is "." when the target is a single file. Every other Go finding
-    carries the selected list entry as go_scan spells it, and the runner maps
-    that spelling back to the caller's path (also for staged/diff mirrors).
-    Rebuild the helper's name for each selected .go entry so a lifecycle
-    finding points at the same file as its neighbours.
-    """
-    try:
-        with open(list_path, "rb") as fh:
-            data = fh.read()
-    except OSError:
-        return {}
-    root = os.path.abspath(project_dir)
-    nul = b"\0" in data
-    names = {}
-    for raw in (data.split(b"\0") if nul else data.splitlines()):
-        if not raw.strip():
-            continue
-        shown = raw.decode("utf-8", "surrogateescape")
-        entry = shown if nul else shown.strip()
-        if not entry.endswith(".go"):
-            continue
-        full = entry if os.path.isabs(entry) else os.path.join(root, entry)
-        names.setdefault(os.path.relpath(full, root), str(Path(shown)))
-    return names
-
-
-# The helper prints "<name>:<line>"; the name itself may contain colons.
-LIFE_LOCATION = re.compile(r"(.+):([0-9]+)", re.DOTALL)
-
-# Bridge 1: run_resource_lifecycle_checks (cat 17) → sink records + text.
-if run_life:
-    raw = ""
-    if life_raw_path and os.path.isfile(life_raw_path):
-        with open(life_raw_path, encoding="utf-8", errors="replace", newline="") as fh:
-            raw = fh.read()
-    rows = []
-    name_start = ""
-    for line in raw.split("\n"):
-        # A row is "<name>:<line>\t<kind>\t<message>". Kind and message hold only
-        # fixed text and Go identifiers, so split from the right: the name may
-        # contain a tab, and a line that is not a whole row starts a name with a
-        # newline in it.
-        parts = (name_start + line).rsplit("\t", 2)
-        if len(parts) == 3 and LIFE_LOCATION.fullmatch(parts[0]):
-            rows.append(parts)
-            name_start = ""
-        else:
-            name_start += line + "\n"
-    if name_start.strip():
-        rows.append(name_start.rstrip("\n").rsplit("\t", 2))
-    new_records = []
-    if rows:
-        scan_paths = lifecycle_scan_paths(list_path, project_dir)
-        for parts in rows:
-            location = parts[0]
-            match = LIFE_LOCATION.fullmatch(location)
-            if match:
-                name, source_line = match.group(1), int(match.group(2))
-                source_path = scan_paths.get(name) or os.path.normpath(
-                    os.path.join(os.path.abspath(project_dir), name))
-                if name == ".":
-                    # A single-file target is "." relative to itself, which
-                    # tells a reader nothing: show the file's name instead.
-                    location = parts[0] = f"{os.path.basename(source_path)}:{source_line}"
-            else:
-                # Not the helper's format: keep the token rather than guess.
-                source_path, source_line = location, 0
-            kind = parts[1] if len(parts) > 1 else ""
-            message = parts[2] if len(parts) > 2 else ""
-            severity = LIFE_SEVERITY.get(kind, "warning")
-            summary = LIFE_SUMMARY.get(kind, "Resource imbalance")
-            remediation = LIFE_REMEDIATION.get(kind, "Ensure matching cleanup call")
-            desc = f"{remediation}: {message}" if message else remediation
-            new_records.append({
-                "rule": f"go.lifecycle.{kind or 'imbalance'}",
-                "category_id": "golang.lifecycle-correlation",
-                "path": source_path,
-                "line": source_line,
-                "col": 1,
-                "severity": severity,
-                "message": f"{summary} [{location}] — {desc}"[:300],
-                "suppressed": False,
-            })
-        with open(sink_path, "a", encoding="utf-8") as fh:
-            for rec in new_records:
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        records.extend(new_records)
-        if as_text:
-            # The text report keeps the helper's short "<name>:<line>" form.
-            for rec, parts in zip(new_records, rows):
-                emit(f"[{rec['severity']}] {LIFE_SUMMARY.get(rec['rule'].rsplit('.', 1)[-1], rec['message'])} (1 found) — {rec['rule']}")
-                emit(f"    {parts[0]}  {rec['message'][:180]}")
-    elif life_status == 0:
-        if as_text:
-            emit("good: All tracked resource acquisitions have matching cleanups")
-    elif as_text:
-        emit("Info (0 found)")
-        emit("    AST helper failed (go run resource_lifecycle_go.go)")
 
 # Final severity recount over the whole sink (legacy 7935-7937 inputs).
 counts = {"critical": 0, "warning": 0, "info": 0}
@@ -492,8 +365,8 @@ if as_text:
     for num in sorted(SECTION):
         if num in skip:
             continue
-        if num == 18:
-            continue  # go_scan renders actual optional-tool coverage, even with zero findings
+        if num in {17, 18}:
+            continue  # go_scan renders lifecycle and optional-tool coverage
         if f"golang.{SLUG[num]}" in covered and num != 16:
             continue
         emit("")
@@ -502,12 +375,6 @@ if as_text:
             emit("ast-grep produced structured matches. Tally by rule id:")
             for rid, n in sorted(tally.items()):
                 emit(f"  • {rid:<44} {n:>5}")
-        if num == 17 and not run_life:
-            emit("Info (0 found)")
-            if os.environ.get("UBS_KEEP_TEMP") == "1":
-                emit("    Go lifecycle helper refused: UBS_KEEP_TEMP=1 cannot retain compiler scratch")
-            else:
-                emit("    Go toolchain unavailable — Install Go to run the AST helper")
     emit("")
     emit("Summary Statistics:")
     emit(f"Files scanned: {files_n}")
@@ -562,8 +429,10 @@ run_contract_v2_go(){
   if [[ "$RUN_GO_TOOLS" -eq 1 ]]; then
     scan_args+=(--go-tools "--test-pkgs=$GOTEST_PKGS" "--go-timeout=$GO_TIMEOUT")
   fi
-  if [[ "${UBS_KEEP_TEMP:-0}" == "1" && ",$v2_skip," != *",17,"* ]]; then
-    scan_args+=(--lifecycle-refused)
+  if [[ ",$v2_skip," != *",17,"* ]]; then
+    local go_life_helper=""
+    ubs_resolve_helper go_life_helper "helpers/resource_lifecycle_go.go" || go_life_helper=""
+    scan_args+=("--lifecycle-helper=$go_life_helper" "--go-timeout=$GO_TIMEOUT")
   fi
   if command -v ast-grep >/dev/null 2>&1 || command -v sg >/dev/null 2>&1; then
     ast_rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-gov2-rules.XXXXXX)"
@@ -609,25 +478,8 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
     PYTHONPATH="$helpers_dir${PYTHONPATH:+:$PYTHONPATH}" python3 -m ubs_core findings-sarif --combined "$v2_json_out" || exit_code=$?
     ubs_remove_temp -f "$v2_json_out" 2>/dev/null || true
   else
-    local life_raw="" life_status=0 run_life=0
-    local go_life_helper=""
-    ubs_resolve_helper go_life_helper "helpers/resource_lifecycle_go.go" || go_life_helper=""
-    if [[ "${UBS_KEEP_TEMP:-0}" != "1" && ",$v2_skip," != *",17,"* && -n "$go_life_helper" && -f "$go_life_helper" ]] && command -v go >/dev/null 2>&1; then
-      life_raw="$(mktemp 2>/dev/null || mktemp -t ubs-gov2-life.XXXXXX)"
-      local -a life_args=()
-      if [[ -n "$list_file" && -f "$list_file" ]]; then
-        life_args+=(--files-from "$list_file")
-      fi
-      life_args+=("$PROJECT_DIR")
-      if go run "$go_life_helper" "${life_args[@]}" >"$life_raw" 2>/dev/null; then
-        life_status=0
-      else
-        life_status=$?
-      fi
-      run_life=1
-    fi
     run_v2_legacy_parity_bridges_go "$sink" "$list_file" "$exit_code" "$text_out" \
-      "$v2_skip" "$tally_file" "$life_raw" "$life_status" "$run_life" || exit_code=$?
+      "$v2_skip" "$tally_file" || exit_code=$?
     if [[ -n "$text_out" ]]; then
       cat "$text_out" 2>/dev/null || true
       ubs_remove_temp -f "$text_out" 2>/dev/null || true
@@ -636,7 +488,7 @@ generate(Path('$DUMP_RULES_DIR'), Path('$USER_RULE_DIR') if '$USER_RULE_DIR' els
   if [[ -n "$REPORT_JSON" ]]; then
     cp "$sink" "$REPORT_JSON" 2>/dev/null || true   # K2: the sink IS the findings record stream
   fi
-  ubs_remove_temp -f "$list_file" "$sink" "$tally_file" "${life_raw:-}" 2>/dev/null || true
+  ubs_remove_temp -f "$list_file" "$sink" "$tally_file" 2>/dev/null || true
   if [[ -n "$ast_rule_dir" ]]; then
     ubs_remove_temp -rf -- "$ast_rule_dir" 2>/dev/null || true
   fi

@@ -9,9 +9,11 @@ claim equivalence to an unexecuted cleanup-mode baseline or every language.
 from __future__ import annotations
 
 import hashlib
+from contextlib import redirect_stderr
 import ctypes
 import datetime
 import errno
+import io
 import json
 import os
 from pathlib import Path
@@ -23,6 +25,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 import zlib
 
 
@@ -1024,13 +1027,13 @@ class KeepTempCliTests(unittest.TestCase):
         self.assertEqual(set(listed), dumped, context)
         self.assertTrue(observations["created_paths"], context)
 
-    def test_go_security_reports_retain_scratch_and_refused_helper_is_partial(self) -> None:
+    def test_go_security_reports_retain_scratch_and_failed_helper_is_partial(self) -> None:
         unsafe = ('package sample\nimport "os"\nfunc run() {\n'
                   'db.Query(os.Getenv("QUERY"))\n}\n')
         clean = 'package sample\nfunc run() {\ndb.Query("SELECT 1")\n}\n'
-        for scenario in ("unsafe", "clean", "compiled-helper-refused"):
+        for scenario in ("unsafe", "clean", "compiled-helper-failed"):
             target = self.source(scenario + ".go", clean if scenario == "clean" else unsafe)
-            kept = {9, 17} if scenario == "compiled-helper-refused" else {9}
+            kept = {9, 17} if scenario == "compiled-helper-failed" else {9}
             skip = "--skip=" + ",".join(str(number) for number in range(1, 23) if number not in kept)
             expected = [] if scenario == "clean" else [("go.taint.sql", target.name, 4)]
             for direct in (True, False):
@@ -1041,9 +1044,11 @@ class KeepTempCliTests(unittest.TestCase):
                             arguments.extend(("--only=golang", f"--module-dir={ROOT / 'modules'}"))
                         arguments.append(str(target))
                         result, observations, run = self.run_scan(
-                            "golang", target, *arguments, command_mode="--ci", direct_module=direct)
+                            "golang", target, *arguments, command_mode="--ci", direct_module=direct,
+                            environment={"GOROOT": str(self.root / "missing-go-toolchain")}
+                            if scenario == "compiled-helper-failed" else None)
                         context = f"{run}\n{result.stdout}\n{result.stderr}"
-                        partial = scenario == "compiled-helper-refused"
+                        partial = scenario == "compiled-helper-failed"
                         self.assertEqual(result.returncode, 2 if partial else 0 if not expected else 1,
                                          context)
                         document = json.loads(result.stdout)
@@ -1067,7 +1072,7 @@ class KeepTempCliTests(unittest.TestCase):
                             self.assertEqual(unsuccessful, partial, context)
                         self.assertEqual(actual, expected, context)
                         if partial:
-                            self.assertIn("cannot retain compiler scratch", result.stdout + result.stderr,
+                            self.assertIn("Go lifecycle helper", result.stdout + result.stderr,
                                           context)
                         self.assertTrue(observations["created_paths"], context)
 
@@ -1571,6 +1576,183 @@ class KeepTempCliTests(unittest.TestCase):
             self.assertGreater(scanner[severity], 0, context)
         self.assertTrue(observations["created_paths"], context)
         self.assertTrue(list((run / "tmp").rglob("combined.json")), context)
+
+
+@unittest.skipUnless(shutil.which("go"), "native Go is required for lifecycle execution controls")
+class GoLifecycleNativeTests(unittest.TestCase):
+    """Native execution and retained WORK evidence, separate from syscall audit.
+
+    The strict KeepTempCliTests tracing assertions above remain authoritative
+    for zero deletion attempts. These controls run the actual compiler/helper
+    behind the same deletion fence without requiring ptrace support.
+    """
+    LEAK = 'package sample\nimport "os"\nfunc run() {\n fh, _ := os.Open("fixed")\n _ = fh\n}\n'
+    CLEAN = 'package sample\nimport "os"\nfunc run() {\n fh, _ := os.Open("fixed")\n defer fh.Close()\n}\n'
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        seccomp_library()
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        cls.root = Path(tempfile.mkdtemp(prefix="go-lifecycle-native-", dir=ARTIFACTS))
+        cls.cache = Path(os.environ.get("GOCACHE") or str(cls.root / "compiler-cache"))
+        cls.cache.mkdir(parents=True, exist_ok=True)
+
+    def setUp(self) -> None:
+        self.case = self.root / self._testMethodName
+        self.case.mkdir()
+        self.project = self.case / "project"
+        self.project.mkdir()
+        self.scratch = self.case / "scratch"
+        self.scratch.mkdir()
+        self.environment = {key: value for key, value in os.environ.items()
+                            if not key.startswith("UBS_")}
+        self.environment.update(
+            UBS_KEEP_TEMP="1", UBS_NO_AUTO_UPDATE="1", UBS_ENABLE_AUTO_UPDATE="0",
+            UBS_CACHE_DIR=str(self.case / "scanner-cache"), UBS_PROFILE="1",
+            PYTHONDONTWRITEBYTECODE="1", NO_COLOR="1", GOTOOLCHAIN="local",
+            GOPROXY="off", GOSUMDB="off", GOWORK="off", GOMAXPROCS="2",
+            GOCACHE=str(self.cache), GOTMPDIR=str(self.scratch), TMPDIR=str(self.scratch),
+            TMP=str(self.scratch), TEMP=str(self.scratch), GOFLAGS="-work=false")
+        self.sequence = 0
+        print(f"[{self.id()}] RUN; retained artifacts: {self.case}", flush=True)
+
+    def native_helper(self, files, **environment):
+        from ubs_core.go_scan import run_lifecycle
+        errors, stderr = [], io.StringIO()
+        before = digest(ROOT / "modules/helpers/resource_lifecycle_go.go")
+        with patch.dict(os.environ, {**self.environment, **environment}, clear=True), redirect_stderr(stderr):
+            records = run_lifecycle(str(ROOT / "modules/helpers/resource_lifecycle_go.go"),
+                                    files, str(self.project), 120, errors)
+        self.sequence += 1
+        evidence = {"records": records, "errors": errors, "stderr": stderr.getvalue(),
+                    "helper_sha256": before, "compiler_cache": str(self.cache)}
+        (self.case / f"native-{self.sequence}.json").write_text(json.dumps(evidence, indent=2) + "\n")
+        self.assertEqual(digest(ROOT / "modules/helpers/resource_lifecycle_go.go"), before)
+        work = re.search(r"^WORK=(.+)$", stderr.getvalue(), re.MULTILINE)
+        self.assertIsNotNone(work, evidence)
+        directory = Path(work.group(1))
+        self.assertTrue(directory.is_dir() and directory.is_relative_to(self.scratch), evidence)
+        return records, errors
+
+    def test_native_helper_repeats_and_ignores_ambient_dry_run_flags(self):
+        source = self.project / "leak.go"
+        source.write_text(self.LEAK)
+        goenv = self.case / "go-env"
+        goenv.write_text("GOFLAGS=-n\n")
+        previous_cache = {str(path.relative_to(self.cache)) for path in self.cache.rglob("*")
+                          if path.is_file()}
+        for label, environment in (("cold-or-existing", {}), ("warm", {}),
+                                   ("ambient-flags", {"GOFLAGS": "-n"}),
+                                   ("persisted-flags", {"GOENV": str(goenv), "GOFLAGS": ""})):
+            with self.subTest(run=label):
+                records, errors = self.native_helper([source], **environment)
+                self.assertEqual(errors, [])
+                self.assertEqual([(row["rule"], row["path"], row["line"], row["severity"])
+                                  for row in records],
+                                 [("go.lifecycle.file_handle", str(source), 4, "warning")])
+                current_cache = {str(path.relative_to(self.cache)) for path in self.cache.rglob("*")
+                                 if path.is_file()}
+                self.assertTrue(current_cache)
+                self.assertTrue(previous_cache <= current_cache, "compiler cache entries disappeared")
+                previous_cache = current_cache
+        print(f"[{self.id()}] PASS: four actual helper invocations", flush=True)
+
+    def test_native_helper_retains_findings_when_selected_inputs_fail(self):
+        source = self.project / "valid.go"
+        source.write_text(self.LEAK)
+        invalid = self.project / "invalid.go"
+        invalid.write_text("package sample\nfunc broken( {\n")
+        missing = self.project / "missing.go"
+        directory = self.project / "directory.go"
+        directory.mkdir()
+        records, errors = self.native_helper([source, invalid, missing, directory])
+        self.assertEqual([(row["rule"], row["path"], row["line"]) for row in records],
+                         [("go.lifecycle.file_handle", str(source), 4)])
+        self.assertTrue(any("Go lifecycle helper exited" in error for error in errors), errors)
+        evidence = json.loads((self.case / "native-1.json").read_text())
+        for path in (invalid, missing, directory):
+            self.assertIn(str(path), evidence["stderr"])
+        print(f"[{self.id()}] PASS: valid finding retained with all three input errors", flush=True)
+
+    def scan(self, source, *, direct=True, output="json", environment=None):
+        self.sequence += 1
+        entrypoint = ROOT / "modules/ubs-golang.sh" if direct else ROOT / "ubs"
+        arguments = ["bash", str(entrypoint), "--ci", "--fail-on-warning", f"--format={output}",
+                     "--skip=" + ",".join(str(number) for number in range(1, 23) if number != 17)]
+        if not direct:
+            arguments += ["--only=golang", "--no-config", f"--module-dir={ROOT / 'modules'}"]
+        arguments.append(str(source))
+        before = scanner_assets()
+        result = subprocess.run(arguments, cwd=self.case,
+                                env={**self.environment, **(environment or {})},
+                                capture_output=True, text=True, timeout=180,
+                                preexec_fn=prevent_child_deletion)
+        (self.case / f"scan-{self.sequence}.stdout").write_text(result.stdout)
+        (self.case / f"scan-{self.sequence}.stderr").write_text(result.stderr)
+        (self.case / f"scan-{self.sequence}.json").write_text(json.dumps({
+            "command": arguments, "exit": result.returncode,
+            "scanner_assets": before, "deletion_guard": DELETION_GUARD,
+        }, indent=2) + "\n")
+        self.assertEqual(scanner_assets(), before, "scan changed scanner source")
+        return result, json.loads(result.stdout)
+
+    def test_public_formats_cache_repair_and_compiler_failure_keep_exact_coverage(self):
+        source = self.project / "leak.go"
+        source.write_text(self.LEAK)
+        expected = [("go.lifecycle.file_handle", "leak.go", 4)]
+        for direct in (True, False):
+            for output in ("json", "sarif"):
+                with self.subTest(direct=direct, output=output):
+                    result, report = self.scan(source, direct=direct, output=output)
+                    context = result.stdout + result.stderr
+                    self.assertEqual(result.returncode, 1, context)
+                    if output == "json":
+                        self.assertEqual(report["status"], "ok", context)
+                        actual = [(row["rule"] if direct else row["rule_id"],
+                                   Path(row["path"] if direct else row["file"]).name, row["line"])
+                                  for row in report["findings"]]
+                        counts = report if direct else report["totals"]
+                        self.assertEqual({key: counts[key] for key in SEVERITIES},
+                                         {"critical": 0, "warning": 1, "info": 0}, context)
+                    else:
+                        actual = [(row["ruleId"], Path(row["locations"][0]["physicalLocation"]
+                                  ["artifactLocation"]["uri"]).name,
+                                  row["locations"][0]["physicalLocation"]["region"]["startLine"])
+                                  for run in report["runs"] for row in run["results"]]
+                        self.assertTrue(all(invocation["executionSuccessful"]
+                                            for run in report["runs"]
+                                            for invocation in run.get("invocations", [])), context)
+                    self.assertEqual(actual, expected, context)
+        result, repeated = self.scan(source)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(repeated["status"], "ok")
+        self.assertEqual(repeated["profile"]["cache_hits"], 1)
+        self.assertEqual([(row["rule"], row["line"]) for row in repeated["findings"]],
+                         [("go.lifecycle.file_handle", 4)])
+        source.write_text(self.CLEAN)
+        result, repaired = self.scan(source)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(repaired["status"], "ok")
+        self.assertEqual(repaired["findings"], [])
+        self.assertEqual(repaired["profile"]["cache_misses"], 1)
+        for _ in range(2):
+            result, failed = self.scan(source, environment={"GOROOT": str(self.case / "missing-go")})
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertEqual(failed["status"], "partial")
+            self.assertEqual(failed["module_error"], "ANALYZER_ERROR")
+            self.assertIn("Go lifecycle helper exited", failed["message"])
+            self.assertEqual(failed["profile"]["cache_hits"], 1)
+        invalid = self.project / "invalid.go"
+        invalid.write_text("package sample\nfunc broken( {\n")
+        source.write_text(self.LEAK)
+        for _ in range(2):
+            result, partial = self.scan(self.project)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertEqual(partial["status"], "partial")
+            self.assertEqual([(row["rule"], Path(row["path"]).name, row["line"])
+                              for row in partial["findings"]], expected)
+            self.assertIn("invalid.go", result.stderr)
+        print(f"[{self.id()}] PASS: ten real scanner calls", flush=True)
 
 
 if __name__ == "__main__":

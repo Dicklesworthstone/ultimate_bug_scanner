@@ -488,13 +488,13 @@ func formatMessage(kind resourceKind, name string) string {
 }
 
 var ignoreDirs = map[string]struct{}{
-	".git":       {},
-	"vendor":      {},
+	".git":         {},
+	"vendor":       {},
 	"node_modules": {},
-	"testdata":    {},
-	"dist":        {},
-	"build":       {},
-	"bin":         {},
+	"testdata":     {},
+	"dist":         {},
+	"build":        {},
+	"bin":          {},
 }
 
 func loadUbcsIgnore(root string) ([]string, error) {
@@ -592,9 +592,9 @@ func readFilesFrom(listPath, root string) ([]string, error) {
 		if !filepath.IsAbs(full) {
 			full = filepath.Join(root, entry)
 		}
-		if st, err := os.Stat(full); err == nil && !st.IsDir() {
-			files = append(files, full)
-		}
+		// Explicitly selected files must reach analyzeFile even if they became
+		// unreadable or disappeared. A missing input is incomplete coverage.
+		files = append(files, full)
 	}
 	sort.Strings(files)
 	return files, nil
@@ -623,9 +623,12 @@ func main() {
 		os.Exit(2)
 	}
 	var outputs []string
+	failed := false
 	for _, file := range files {
 		issues, err := analyzeFile(file, root)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", file, err)
+			failed = true
 			continue
 		}
 		outputs = append(outputs, issues...)
@@ -633,5 +636,7 @@ func main() {
 	if len(outputs) > 0 {
 		fmt.Println(strings.Join(outputs, "\n"))
 	}
+	if failed {
+		os.Exit(2)
+	}
 }
-

@@ -32,6 +32,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -39,7 +41,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from ubs_core.registry import RunContext
-from ubs_core.io import read_ndjson
+from ubs_core.io import keep_temp_enabled, read_ndjson, temporary_file
 from ubs_core.suppression import SourceSuppressions, build_index, may_have_markers
 
 _CATEGORY_SLUGS = {
@@ -834,8 +836,102 @@ def _finding_title(rec: dict) -> str:
     return str(rec.get("message", rec.get("rule", "")))
 
 
+def run_lifecycle(helper: str, files: Sequence[Path], project_dir: str,
+                  timeout: float, errors: list[str]) -> list[dict]:
+    """Run the native helper before rendering, independently of static caches.
+
+    Go's -work build flag retains compiler scratch on success and failure.
+    Ambient build flags can select dry-run mode or replace compiler execution;
+    they cannot establish that this standalone analyzer actually ran.
+    The helper parses selected source; it never executes the scanned program.
+    """
+    selected = [path for path in files if path.suffix == ".go"]
+    if not selected:
+        return []
+    executable = shutil.which("go")
+    if not executable or not helper or not Path(helper).is_file():
+        errors.append("Go lifecycle helper unavailable: a Go toolchain and verified helper are required")
+        return []
+    root = os.path.abspath(project_dir or ".")
+    names = {}
+    full_paths = []
+    for path in selected:
+        full = str(path) if path.is_absolute() else os.path.join(root, str(path))
+        full_paths.append(full)
+        names.setdefault(os.path.relpath(full, root), str(path))
+    command = [executable, "run"]
+    if keep_temp_enabled():
+        command.append("-work")
+    try:
+        with temporary_file(prefix="ubs-go-lifecycle-", named=True) as listing:
+            listing.write(b"".join(os.fsencode(path) + b"\0" for path in full_paths))
+            listing.flush()
+            command.extend((helper, "--files-from", listing.name, root))
+            environment = dict(os.environ, GOFLAGS="", GOENV="off")
+            result = subprocess.run(command, env=environment, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        errors.append(f"Go lifecycle helper failed: {exc}")
+        return []
+    if result.stderr:
+        # Retain native compiler diagnostics, including its WORK directory.
+        sys.stderr.write(result.stderr)
+    if result.returncode:
+        errors.append(f"Go lifecycle helper exited {result.returncode}: {result.stderr.strip()[:300]}")
+
+    severity = {"context_cancel": "critical"}
+    summaries = {
+        "context_cancel": "context.With* without deferred cancel",
+        "ticker_stop": "time.NewTicker not stopped",
+        "timer_stop": "time.NewTimer not stopped",
+        "file_handle": "os.Open/OpenFile without defer Close()",
+        "db_handle": "sql.Open without DB.Close()",
+        "mutex_lock": "Mutex Lock without Unlock()",
+    }
+    remediation = {
+        "context_cancel": "Store the cancel func and defer cancel() immediately after acquiring the context",
+        "ticker_stop": "Keep the ticker handle and call Stop() when finished",
+        "timer_stop": "Stop or drain timers to avoid leaks",
+        "file_handle": "Call defer f.Close() immediately after Open to avoid FD leaks",
+        "db_handle": "Close sql.DB handles when shutting down or prefer context-managed lifecycle",
+        "mutex_lock": "Pair Lock() with defer Unlock() to avoid deadlocks when returning early",
+    }
+    records, pending = [], ""
+    for line in result.stdout.split("\n"):
+        # The filename may itself contain tabs/newlines/colons. The helper's
+        # two final fields contain only fixed text and Go identifiers.
+        parts = (pending + line).rsplit("\t", 2)
+        location = re.fullmatch(r"(.+):([0-9]+)", parts[0], re.DOTALL)
+        if len(parts) != 3 or location is None:
+            pending += line + "\n"
+            continue
+        pending = ""
+        name, line_number = location.group(1), int(location.group(2))
+        kind, message = parts[1:]
+        if name not in names or line_number < 1 or kind not in {*summaries, "listener_close"}:
+            errors.append("Go lifecycle helper produced an invalid or unselected finding")
+            continue
+        source_path = names[name]
+        shown = f"{os.path.basename(source_path) if name == '.' else name}:{line_number}"
+        summary = summaries.get(kind, "Resource imbalance")
+        advice = remediation.get(kind, "Ensure matching cleanup call")
+        description = f"{advice}: {message}" if message else advice
+        records.append({
+            "rule": f"go.lifecycle.{kind}",
+            "category_id": "golang.lifecycle-correlation",
+            "path": source_path, "line": line_number, "col": 1,
+            "severity": severity.get(kind, "warning"),
+            "message": f"{summary} [{shown}] — {description}"[:300],
+            "suppressed": False,
+        })
+    if pending.strip():
+        errors.append("Go lifecycle helper produced malformed output")
+    return records
+
+
 def _render_text(args, files: Sequence[Path], counters: dict[str, int],
-                 errors: Sequence[str] = (), external_tools: Sequence[dict] = ()) -> None:
+                 errors: Sequence[str] = (), external_tools: Sequence[dict] = (),
+                 lifecycle_complete: bool = False) -> None:
     """Render the legacy-format text report from the NDJSON sink."""
     import datetime
 
@@ -894,6 +990,8 @@ def _render_text(args, files: Sequence[Path], counters: dict[str, int],
     # Legacy "good" notes for categories with no records at all.
     categories_with_records = {category_of(rec) for rec in records}
     for num, note in _GOOD_NOTES.items():
+        if num == 17 and not lifecycle_complete:
+            continue
         if num not in categories_with_records and num not in _skip_set(args):
             lines.append(f"good: {note}")
 
@@ -933,7 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", default="", help="module version recorded in the json summary")
     parser.add_argument("--fail-on-warning", action="store_true")
     parser.add_argument("--go-tools", action="store_true", help="run optional Go analyzers")
-    parser.add_argument("--lifecycle-refused", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--lifecycle-helper", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--test-pkgs", default="./...", help="Go package patterns per selected module")
     parser.add_argument("--go-timeout", type=float, default=120, help="per-tool timeout in seconds")
     parser.add_argument("--enable-new-analyzers", action="store_true",
@@ -977,14 +1075,6 @@ def main(argv: list[str] | None = None) -> int:
     # Every analysis layer that could not complete appends here, so a scan that
     # did not finish is never reported as a finished one (#111).
     scan_errors: list[str] = []
-    if args.lifecycle_refused:
-        # The module's compiled lifecycle bridge cannot retain compiler scratch.
-        # Direct static-core callers do not request that bridge. Keep its
-        # refusal outside the cache so warm scans report the same coverage.
-        scan_errors.append(
-            "Go lifecycle helper refused: UBS_KEEP_TEMP=1 cannot retain compiler scratch; "
-            "select --skip=17 for static checks without the compiled helper"
-        )
     if files_to_scan:
         from ubs_core.prefilter import build_prefilter_index, run_prefilter
         from ubs_core.registry import analyzers_for_lang
@@ -1073,6 +1163,16 @@ def main(argv: list[str] | None = None) -> int:
     cache_file = os.environ.get("UBS_CACHE_FILE") or (os.path.splitext(args.sink)[0] + ".cache")
     cache.write_stats(cache_file)
 
+    lifecycle_complete = False
+    if args.lifecycle_helper is not None and 17 not in skip:
+        before = len(scan_errors)
+        lifecycle_records = run_lifecycle(args.lifecycle_helper, selected_files,
+                                          args.project_dir, args.go_timeout, scan_errors)
+        lifecycle_complete = len(scan_errors) == before
+        with open(args.sink, "a", encoding="utf-8") as sink_file:
+            for record in suppressions.filter(lifecycle_records):
+                sink_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
     external_tools = []
     if args.go_tools and 18 not in skip:
         from ubs_core.external_tools import scan_go_tools
@@ -1150,7 +1250,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.text_out:
-        _render_text(args, files, counters, scan_errors, external_tools)
+        _render_text(args, files, counters, scan_errors, external_tools, lifecycle_complete)
 
     for problem in scan_errors:
         sys.stderr.write(f"ubs-golang: analysis incomplete: {problem}\n")

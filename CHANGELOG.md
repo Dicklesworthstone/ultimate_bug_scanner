@@ -10,6 +10,8 @@ Repository: <https://github.com/Dicklesworthstone/ultimate_bug_scanner>
 
 ## [Unreleased]
 
+- Keep Swift forced unwrap findings when a nil check exits only a nested closure, loop, local function, or one conditional branch.
+
 - Preserve native Python string elements through `split`, `rsplit`,
   `splitlines`, saved methods, selected helpers, indexing, slices and simple
   eager comprehensions. Supported generator consumers retain source findings

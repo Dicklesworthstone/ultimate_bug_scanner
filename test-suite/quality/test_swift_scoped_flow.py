@@ -2081,6 +2081,28 @@ class SwiftNarrowingOperators(unittest.TestCase):
         self.assertEqual([(item[0], item[2], item[3]) for item in findings],
                          [('guard_let_no_exit', 1, 1)])
 
+    def test_exit_must_leave_the_guard_on_each_branch(self):
+        from ubs_core.analyzers.narrowing_swift import scan_text
+        cases = (
+            ('if ready { return }', True),
+            ('if ready { return } else if other { throw Missing() }', True),
+            ('items.forEach { _ in return }', True),
+            ('func done() { return }; done()', True),
+            ('for item in items { if item.ready { return } }', True),
+            ('if ready { return } else { throw Missing() }', False),
+            ('if ready { log() }; return', False),
+            ('if ready { return } else { Swift.fatalError("missing") }', False),
+        )
+        for body, unsafe in cases:
+            for prefix, rule, site in (
+                    ('if value == nil', 'negative_nil_guard', (2, 5)),
+                    ('guard let value = raw else', 'guard_let_no_exit', (1, 1))):
+                with self.subTest(body=body, rule=rule):
+                    source = prefix + ' { ' + body + ' }\nuse(value!)'
+                    rows = scan_text(Path('Branches.swift'), source)
+                    self.assertEqual([(row[0], row[2:4]) for row in rows],
+                                     [(rule, site)] if unsafe else [])
+
     def test_public_json_and_sarif_distinguish_comparisons_from_unwraps(self):
         import hashlib
         import os
@@ -2096,9 +2118,15 @@ class SwiftNarrowingOperators(unittest.TestCase):
             ('literal-before-unwrap', 'print(#"value = 4"#)\nprint("value \\(value!)")', [3]),
             ('inert-unwrap', 'print("value!")\n/* value! */', []),
         )
-        for name, tail, lines in cases:
+        sources = [(name, 'if value == nil { recordMissing() }\n' + tail, lines)
+                   for name, tail, lines in cases]
+        sources.extend((
+            ('conditional-exit', 'if value == nil { if ready { return } }\nuse(value!)', [2]),
+            ('exhaustive-exit', 'if value == nil { if ready { return } else { throw Missing() } }\nuse(value!)', []),
+        ))
+        for name, source, lines in sources:
             target = artifact / (name + '.swift')
-            target.write_text('if value == nil { recordMissing() }\n' + tail + '\n', encoding='utf-8')
+            target.write_text(source + '\n', encoding='utf-8')
             for fmt in ('json', 'sarif'):
                 with self.subTest(case=name, format=fmt):
                     command = [str(ROOT / 'ubs'), '--only=swift', '--ci', '--no-cache',

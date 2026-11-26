@@ -76,6 +76,47 @@ def unwrap_after_guard(code: str, start: int, end: int, name: str) -> int | None
     return None
 
 
+def guard_body_exits(text: str, code: str, start: int, end: int) -> bool:
+    """A return from a callback or only one branch leaves a fall-through path."""
+    if not EXIT_PATTERN.search(code, start, end):
+        return False
+    if code.find("{", start, end) == -1:
+        return True
+    # Only guards with nested bodies and an exit token need statement parsing.
+    # Retain the existing lexical treatment for unsupported Swift syntax.
+    from ubs_core.analyzers.taint_swift_traversal import SwiftParser
+
+    body = text[start:end]
+    try:
+        statements = SwiftParser(body, recover=True).functions[-1].body
+    except ValueError:
+        return True
+
+    def exits(block):
+        for statement in block:
+            if statement.kind in {"return", "throw", "break", "continue"}:
+                return True
+            if statement.kind == "if":
+                if exits(statement.body) and exits(statement.alternate):
+                    return True
+            elif statement.kind == "simple":
+                tokens = statement.tokens
+                name = tuple(t.value for t in tokens[:4])
+                if (name[:2] in {("fatalError", "("), ("preconditionFailure", "(")}
+                        or name in {("Swift", ".", "fatalError", "("),
+                                    ("Swift", ".", "preconditionFailure", "(")}):
+                    return True
+            elif statement.kind not in {"for", "while", "guard", "definition"} and statement.tokens:
+                # Keep the prior handling for constructs such as do/catch or
+                # exhaustive switch. Their exits have different targets.
+                first, last = statement.tokens[0], statement.tokens[-1]
+                if EXIT_PATTERN.search(code, start + first.start, start + last.end):
+                    return True
+        return False
+
+    return exits(statements)
+
+
 def scan_text(path: Path, text: str) -> list[tuple[str, Path, int, int, str]]:
     """Return (kind, path, line, col, message) findings for one file's text."""
     issues: list[tuple[str, Path, int, int, str]] = []
@@ -84,7 +125,7 @@ def scan_text(path: Path, text: str) -> list[tuple[str, Path, int, int, str]]:
     for kind, pattern, template, skip_on_exit in _GUARD_SPECS:
         for match in pattern.finditer(code):
             brace = match.end() - 1
-            if skip_on_exit and EXIT_PATTERN.search(code, brace, ends[brace]):
+            if skip_on_exit and guard_body_exits(text, code, brace + 1, ends[brace]):
                 continue
             name = match.group(1)
             pos = unwrap_after_guard(code, ends[brace] + 1, ends[parents[brace]], name)
@@ -94,7 +135,7 @@ def scan_text(path: Path, text: str) -> list[tuple[str, Path, int, int, str]]:
     for match in GUARD_PATTERN.finditer(code):
         name = match.group(1)
         brace = match.end() - 1
-        if EXIT_PATTERN.search(code, brace, ends[brace]):
+        if guard_body_exits(text, code, brace + 1, ends[brace]):
             continue
         line, col = line_col(text, match.start())
         message = _GUARD_LET_TEMPLATE.format(name=name)

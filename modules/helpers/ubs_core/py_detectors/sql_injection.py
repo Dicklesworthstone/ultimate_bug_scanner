@@ -8026,16 +8026,16 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
         for member in group:
             local = frozenset(bindings.owner_scopes[member]['names'])
             loaded = self.closure_load_names(member, bindings)
-            indirect, free = set(), loaded - local
+            captures.update(loaded - local)
+            indirect = set()
             for node in self.deferred_nodes(member):
                 if isinstance(node, ast.Call):
                     target = self.ownership_call_target(node, captured=False)
                     if target and target[0] == 'function' and target[1] in self._sealed_closures:
                         record = self._sealed_closures[target[1]]
                         indirect.update(record[0])
-                        free.update(record[2])
+                        captures.update(record[2])
             roots.update(self.exclusive_lists.intersection(loaded | indirect) - local)
-            captures.update(free)
             records[member] = local
         if not roots:
             return set()

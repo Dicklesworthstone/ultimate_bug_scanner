@@ -55,6 +55,91 @@ class Case:
         return textwrap.dedent(self.code).strip('\n') + '\n'
 
 
+ARGUMENT_MUTATION_CASES = (
+    Case('argument_mutation_append_aliases', PATH, '''
+        def replace_path(value)
+          value.replace(params[:path])
+          ''
+        end
+        path = 'fixed.txt'
+        alias_path = path
+        path.concat(replace_path(path))
+        File.read(path)
+        File.read(alias_path)''', (8, 9)),
+    Case('argument_mutation_array_append', PATH, '''
+        def fill_paths(values)
+          values.push(params[:path])
+          'fixed.txt'
+        end
+        paths = []
+        paths.push(fill_paths(paths))
+        File.read(paths.first)''', (7,)),
+    Case('argument_mutation_returned_alias', URL, '''
+        def replace_url(value)
+          value.replace(params[:url])
+          ''
+        end
+        target = 'https://api.example.com/'
+        result = target.concat(replace_url(target))
+        Net::HTTP.get(URI.parse(result))''', (7,)),
+    Case('argument_mutation_replacement_control', PATH, '''
+        def replace_path(value)
+          value.replace(params[:path])
+          'fixed.txt'
+        end
+        path = 'initial.txt'
+        alias_path = path
+        path.replace(replace_path(path))
+        File.read(path)
+        File.read(alias_path)''', ()),
+    Case('argument_mutation_rootless_exception_alternative', PATH, '''
+        path = 'fixed'
+        if params[:choose]
+          alias_path = path
+        else
+          begin
+            raise params[:path]
+          rescue StandardError => error
+            alias_path = error.message
+          end
+        end
+        path.concat('x')
+        File.read(path)''', ()),
+    Case('argument_mutation_shovel_rhs', PATH, '''
+        def replace_path(value)
+          value.replace(params[:path])
+          ''
+        end
+        path = 'fixed.txt'
+        path << replace_path(path)
+        File.read(path)''', (7,)),
+    Case('argument_mutation_index_receiver', PATH, '''
+        def replace_index(value)
+          value.replace(params[:path])
+          0
+        end
+        path = 'fixed.txt'
+        result = path[replace_index(path), 1000]
+        File.read(result)''', (7,)),
+    Case('argument_mutation_direct_argument_cleans_receiver', PATH, '''
+        path = params[:path]
+        path.concat(path.replace('fixed.txt'))
+        File.read(path)''', ()),
+)
+ARGUMENT_MUTATION_BY_NAME = {case.name: case for case in ARGUMENT_MUTATION_CASES}
+
+# A selected helper's mutation summary still replays conservatively. Keep the
+# native clean oracle visible without claiming strong cross-helper erasure.
+ARGUMENT_MUTATION_CLEAN_HELPER_FOLLOWUP = Case('argument_mutation_argument_cleans_receiver', PATH, '''
+    def clear_path(value)
+      value.replace('fixed.txt')
+      ''
+    end
+    path = params[:path]
+    path.concat(clear_path(path))
+    File.read(path)''', ())
+
+
 CASES = (
     Case('url_direct', URL, 'Net::HTTP.get(URI.parse(params[:url]))', (1,)),
     Case('url_safe_named_identity', URL, '''
@@ -4086,6 +4171,122 @@ puts $observed
                 self.assertEqual(result.stdout.splitlines(), [expected], (command, result.stdout, result.stderr))
 
 
+    def test_argument_mutation_survives_appending_receiver_call(self):
+        self.check_case(ARGUMENT_MUTATION_BY_NAME['argument_mutation_append_aliases'])
+
+    def test_argument_mutation_array_append_preserves_element(self):
+        self.check_case(ARGUMENT_MUTATION_BY_NAME['argument_mutation_array_append'])
+
+    def test_argument_mutation_returns_live_receiver_alias(self):
+        self.check_case(ARGUMENT_MUTATION_BY_NAME['argument_mutation_returned_alias'])
+
+    def test_argument_mutation_final_replacement_still_cleans(self):
+        self.check_case(ARGUMENT_MUTATION_BY_NAME['argument_mutation_replacement_control'])
+
+    def test_argument_mutation_does_not_import_rootless_exception_alternative(self):
+        self.check_case(ARGUMENT_MUTATION_BY_NAME['argument_mutation_rootless_exception_alternative'])
+
+    def test_argument_mutation_shovel_rhs_preserves_receiver_write(self):
+        self.check_case(ARGUMENT_MUTATION_BY_NAME['argument_mutation_shovel_rhs'])
+
+    def test_argument_mutation_index_uses_receiver_after_index_evaluation(self):
+        self.check_case(ARGUMENT_MUTATION_BY_NAME['argument_mutation_index_receiver'])
+
+    @unittest.expectedFailure
+    def test_argument_mutation_argument_replacement_cleans_before_append(self):
+        # The source and zero-finding expectation stay intact: helper mutation
+        # summaries still retain old provenance after this proven clean write.
+        self.check_case(ARGUMENT_MUTATION_CLEAN_HELPER_FOLLOWUP)
+
+    def test_argument_mutation_direct_replacement_cleans_before_append(self):
+        self.check_case(ARGUMENT_MUTATION_BY_NAME['argument_mutation_direct_argument_cleans_receiver'])
+
+    def test_argument_mutation_transient_join_does_not_change_process_operand(self):
+        self.check_case(Case('argument_mutation_transient_process_receiver', SHELL_COMMAND, '''
+            def choose(flag, left, right)
+              if flag
+                left
+              else
+                right
+              end
+            end
+            command = 'echo'
+            choose(flag, command, params[:path]).concat(system(command).to_s)''', ()))
+
+    def test_argument_mutation_does_not_import_other_joined_objects(self):
+        self.check_case(Case('argument_mutation_unrelated_join', PATH, '''
+            clean = 'fixed.txt'
+            other = params[:path]
+            if params[:choose]
+              maybe = clean
+            else
+              maybe = other
+            end
+            clean.concat('')
+            File.read(clean)''', ()))
+
+    def test_argument_mutation_does_not_import_contained_siblings(self):
+        self.check_case(Case('argument_mutation_contained_sibling', PATH, '''
+            clean = 'fixed.txt'
+            other = params[:path]
+            values = [clean, other]
+            clean.concat('')
+            File.read(clean)''', ()))
+
+    def test_argument_mutation_native_ruby_value_witnesses(self):
+        executable = os.environ.get('UBS_RUBY_BIN') or shutil.which('ruby')
+        if not executable:
+            self.skipTest('native Ruby is required for captured-receiver mutation witnesses')
+        driver = r'''require 'json'
+require 'uri'
+$observed = []
+def params
+  {path: '../outside.txt', url: 'https://evil.example/', choose: ARGV[1] == 'true'}
+end
+class File
+  def self.read(value); $observed << value.dup; end
+end
+module Net
+  module HTTP
+    def self.get(value); $observed << value.to_s; end
+  end
+end
+eval(File.binread(ARGV[0]), TOPLEVEL_BINDING, ARGV[0])
+STDOUT.write(JSON.generate($observed))
+'''
+        expected_values = {
+            'argument_mutation_append_aliases': ['../outside.txt', '../outside.txt'],
+            'argument_mutation_array_append': ['../outside.txt'],
+            'argument_mutation_returned_alias': ['https://evil.example/'],
+            'argument_mutation_replacement_control': ['fixed.txt', 'fixed.txt'],
+            'argument_mutation_rootless_exception_alternative': ['fixedx'],
+            'argument_mutation_shovel_rhs': ['../outside.txt'],
+            'argument_mutation_index_receiver': ['../outside.txt'],
+            'argument_mutation_direct_argument_cleans_receiver': ['fixed.txtfixed.txt'],
+            'argument_mutation_argument_cleans_receiver': ['fixed.txt'],
+        }
+        for case in (*ARGUMENT_MUTATION_CASES, ARGUMENT_MUTATION_CLEAN_HELPER_FOLLOWUP):
+            choices = (False, True) if case.name == 'argument_mutation_rootless_exception_alternative' else (False,)
+            for choice in choices:
+                with self.subTest(case=case.name, choose=choice):
+                    directory = self.artifact / ('native-' + case.name + '-' + str(choice))
+                    directory.mkdir()
+                    target = directory / 'source.rb'
+                    target.write_text(case.source)
+                    command = [executable, '--disable-gems', '-e', driver, str(target), str(choice).lower()]
+                    result = subprocess.run(command, cwd=directory, text=True, capture_output=True,
+                                            timeout=30, preexec_fn=prevent_child_deletion)
+                    expected = expected_values[case.name]
+                    (directory / 'stdout.log').write_text(result.stdout)
+                    (directory / 'stderr.log').write_text(result.stderr)
+                    (directory / 'identity.json').write_text(json.dumps({
+                        'command': command, 'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                        'exit': result.returncode, 'expected': expected,
+                    }, indent=2) + '\n')
+                    self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+                    self.assertEqual(json.loads(result.stdout), expected, (case.name, result.stdout, result.stderr))
+
+
 def semantic_test(case):
     def test(self):
         self.check_case(case)
@@ -4146,6 +4347,56 @@ class RubyPublicTests(LoggedCase):
         for path in paths:
             from urllib.parse import unquote
             self.assertEqual(Path(unquote(path)).name, selected.name, payload)
+
+    def test_argument_mutation_reaches_public_json_and_sarif(self):
+        for case in ARGUMENT_MUTATION_CASES:
+            directory = self.artifact / case.name
+            directory.mkdir()
+            selected = directory / 'selected.rb'
+            selected.write_text(case.source)
+            (directory / 'unselected.rb').write_text('File.read(params[:unselected])\n')
+            expected = [(case.rule, line, 1, 'critical') for line in case.lines]
+            for module in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=case.name, module=module, format=fmt):
+                        result, payload = self.scan(directory / f'{module}-{fmt}', selected, fmt, module=module)
+                        self.assertEqual(result.returncode, int(bool(case.lines)),
+                                         (result.stdout, result.stderr))
+                        if fmt == 'json':
+                            self.assertEqual(payload['status'], 'ok', payload)
+                            counts = payload if module else payload['totals']
+                            self.assertEqual(tuple(counts[key] for key in ('files', 'critical', 'warning', 'info')),
+                                             (1, len(case.lines), 0, 0), payload)
+                            rows = payload['findings']
+                            actual = [(row['rule' if module else 'rule_id'], row['line'], row['col'], row['severity'])
+                                      for row in rows]
+                            for row in rows:
+                                self.assertEqual(Path(row.get('path', row.get('file'))).name, selected.name, row)
+                            if not module:
+                                self.assertEqual(payload['failed_modules'], [], payload)
+                        else:
+                            self.assertEqual(payload['version'], '2.1.0', payload)
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])]
+                            actual = []
+                            for row in rows:
+                                physical = row['locations'][0]['physicalLocation']
+                                actual.append((row['ruleId'], physical['region']['startLine'],
+                                               physical['region']['startColumn'],
+                                               {'error': 'critical', 'warning': 'warning', 'note': 'info'}[row['level']]))
+                                self.assertEqual(Path(physical['artifactLocation']['uri']).name, selected.name, row)
+                            # UBS emits invocation metadata for incomplete/error
+                            # runs; healthy SARIF runs may omit that optional field.
+                            self.assertTrue(payload['runs'], payload)
+                            invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                            for item in invocations:
+                                self.assertIs(item['executionSuccessful'], True, payload)
+                                if 'exitCode' in item:
+                                    self.assertIn(item['exitCode'], (0, 1), payload)
+                                self.assertFalse(any(note.get('level') == 'error' for note in
+                                                     item.get('toolExecutionNotifications', [])), payload)
+                        self.assertEqual(sorted(actual), sorted(expected), payload)
+                        print('RUBY_ARGUMENT_MUTATION_PUBLIC_PASS', case.name,
+                              'module' if module else 'runner', fmt, flush=True)
 
     def test_process_flow_reaches_public_json_and_sarif(self):
         names = {'process_system', 'process_helper_sink', 'process_fixed_argv',

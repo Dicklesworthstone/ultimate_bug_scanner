@@ -1965,7 +1965,12 @@ class RubyEngine:
 
         collect(value)
         changed = CLEAN
-        for current in state.values():
+        for binding, current in state.items():
+            # Private expression holders preserve a captured reference. They
+            # may join unrelated alternatives and are not independent evidence
+            # that a process operand's contents changed during evaluation.
+            if binding.startswith(('@call-receiver:', '@index-receiver:', '@shift-receiver:')):
+                continue
             self.budget.spend()
             for identity in object_ids(current):
                 # A joined capture can contain more possible values than an
@@ -2886,7 +2891,13 @@ class RubyEngine:
         shifted = split_tokens(tokens, {'<<'})
         if len(shifted) == 2:
             previous = self.expression(shifted[0], state, depth + 1)
-            value = self.expression(shifted[1], state, depth + 1)
+            capture = f'@shift-receiver:{depth}:{tokens[0].start}'
+            state[capture] = previous
+            try:
+                value = self.expression(shifted[1], state, depth + 1)
+                previous = state[capture]
+            finally:
+                state.pop(capture, None)
             name = shifted[0][0].value if len(shifted[0]) == 1 else None
             return self.mutate(previous, value, state, name)
         for operators in ({'=>', ':'}, {'||', 'or'}, {'&&', 'and'}, {'==', '!=', '=~', '!~', '<', '>', '<=', '>='}, {'+', '-', '*', '/', '..'}):
@@ -3010,21 +3021,38 @@ class RubyEngine:
             while cursor < len(tokens):
                 if tokens[cursor].value == '[':
                     end = closing_token(tokens, cursor)
-                    arguments = [self.expression(part, state, depth + 1) for part in split_tokens(tokens[cursor + 1:end], {','})]
+                    capture = f'@index-receiver:{depth}:{tokens[cursor].start}'
+                    state[capture] = atom
+                    try:
+                        arguments = [self.expression(part, state, depth + 1)
+                                     for part in split_tokens(tokens[cursor + 1:end], {','})]
+                        atom = state[capture]
+                    finally:
+                        state.pop(capture, None)
                     atom = self.call(name + '.[]', atom, arguments, token, state)
                     cursor = end + 1
                 elif tokens[cursor].value in {'.', '&.'} and cursor + 1 < len(tokens):
                     member = tokens[cursor + 1]
                     name = name + '.' + member.value if name else member.value
                     cursor += 2
-                    arguments = []
-                    if cursor < len(tokens) and tokens[cursor].value == '(':
-                        end = closing_token(tokens, cursor)
-                        arguments = self.call_arguments(tokens[cursor + 1:end], state, depth + 1)
-                        cursor = end + 1
-                    elif cursor < len(tokens) and tokens[cursor].value not in {'.', '&.', '[', ',', ')', ']', '}'}:
-                        arguments = self.call_arguments(tokens[cursor:], state, depth + 1)
-                        cursor = len(tokens)
+                    # The receiver is an object reference, not a snapshot of
+                    # its contents. Keep a private alias while arguments run
+                    # so normal mutation/summary handling updates this exact
+                    # reference, including a receiver returned by a helper.
+                    capture = f'@call-receiver:{depth}:{member.start}'
+                    state[capture] = atom
+                    try:
+                        arguments = []
+                        if cursor < len(tokens) and tokens[cursor].value == '(':
+                            end = closing_token(tokens, cursor)
+                            arguments = self.call_arguments(tokens[cursor + 1:end], state, depth + 1)
+                            cursor = end + 1
+                        elif cursor < len(tokens) and tokens[cursor].value not in {'.', '&.', '[', ',', ')', ']', '}'}:
+                            arguments = self.call_arguments(tokens[cursor:], state, depth + 1)
+                            cursor = len(tokens)
+                        atom = state[capture]
+                    finally:
+                        state.pop(capture, None)
                     if member.value in {'filename', 'original_filename'} and self.policy == 'path':
                         atom = self.source(token.start, name)
                     else:

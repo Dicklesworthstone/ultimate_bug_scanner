@@ -140,6 +140,306 @@ ARGUMENT_MUTATION_CLEAN_HELPER_FOLLOWUP = Case('argument_mutation_argument_clean
     File.read(path)''', ())
 
 
+# Hash#store returns its value and changes only the addressed entry. These
+# source oracles also run through native Ruby below; no analyzer value or heap
+# representation is used to determine the expected findings.
+HASH_STORE_CASES = (
+    Case('hash_store_ignored_write', PATH, '''
+        slots = {}
+        slots.store(:target, params[:path])
+        File.read(slots[:target])''', (3,)),
+    Case('hash_store_receiver_alias', PATH, '''
+        slots = {}
+        alias_slots = slots
+        alias_slots.store(:target, params[:path])
+        File.read(slots[:target])''', (4,)),
+    Case('hash_store_separate_keys', PATH, '''
+        slots = {}
+        slots.store(:unsafe, params[:path])
+        slots.store(:safe, 'fixed.txt')
+        File.read(slots[:unsafe])
+        File.read(slots[:safe])''', (4,)),
+    Case('hash_store_clean_overwrite', PATH, '''
+        slots = {target: params[:path]}
+        slots.store(:target, 'fixed.txt')
+        File.read(slots[:target])''', ()),
+    Case('hash_store_overwrite_keeps_other_entry', PATH, '''
+        slots = {target: params[:path], other: params[:other]}
+        slots.store(:target, 'fixed.txt')
+        File.read(slots[:target])
+        File.read(slots[:other])''', (4,)),
+    Case('hash_store_symbol_string_keys', PATH, '''
+        slots = {target: 'fixed.txt'}
+        slots.store('target', params[:path])
+        File.read(slots[:target])
+        File.read(slots['target'])''', (4,)),
+    Case('hash_store_integer_key', PATH, '''
+        slots = {1 => 'fixed.txt'}
+        slots.store(2, params[:path])
+        File.read(slots[1])
+        File.read(slots[2])''', (4,)),
+    Case('hash_store_rhs_identity', PATH, '''
+        slots = {}
+        payload = 'fixed.txt'
+        result = slots.store(:target, payload)
+        result.replace(params[:path])
+        File.read(payload)
+        File.read(slots[:target])
+        File.read(result)''', (5, 6, 7)),
+    Case('hash_store_value_alias', PATH, '''
+        payload = 'fixed.txt'
+        slots = {}
+        slots.store(:target, payload)
+        payload.replace(params[:path])
+        File.read(slots[:target])''', (5,)),
+    Case('hash_store_read_alias_updates_sibling_values', PATH, '''
+        slots = {}
+        payload = 'fixed.txt'
+        slots.store(:first, payload)
+        slots.store(:second, payload)
+        picked = slots[:first]
+        picked.replace(params[:path])
+        File.read(slots[:first])
+        File.read(slots[:second])''', (7, 8)),
+    Case('hash_store_overwrite_detaches_slot', PATH, '''
+        slots = {}
+        payload = params[:path]
+        result = slots.store(:target, payload)
+        slots.store(:target, 'fixed.txt')
+        File.read(result)
+        File.read(slots[:target])''', (5,)),
+    Case('hash_store_helper_updates_receiver', PATH, '''
+        def put_target(slots, value)
+          slots.store(:target, value)
+        end
+        slots = {}
+        put_target(slots, params[:path])
+        File.read(slots[:target])''', (6,)),
+    Case('hash_store_helper_rhs_identity', PATH, '''
+        def put_target(slots, value)
+          slots.store(:target, value)
+        end
+        slots = {}
+        payload = 'fixed.txt'
+        result = put_target(slots, payload)
+        result.replace(params[:path])
+        File.read(slots[:target])
+        File.read(payload)''', (8, 9)),
+    Case('hash_store_helper_allocated_rhs_identity', PATH, '''
+        def put_target(slots)
+          value = 'fixed.txt'
+          slots.store(:target, value)
+        end
+        slots = {}
+        result = put_target(slots)
+        result.replace(params[:path])
+        File.read(slots[:target])''', (8,)),
+    Case('hash_store_helper_returns_hash', PATH, '''
+        def wrap_target(value)
+          slots = {}
+          slots.store(:target, value)
+          slots
+        end
+        slots = wrap_target(params[:path])
+        File.read(slots[:target])''', (7,)),
+    Case('hash_store_helper_clean_overwrite', PATH, '''
+        def clear_target(slots)
+          slots.store(:target, 'fixed.txt')
+        end
+        slots = {target: params[:path]}
+        clear_target(slots)
+        File.read(slots[:target])''', ()),
+    Case('hash_store_helper_write_before_raise', PATH, '''
+        def inject_target(slots)
+          slots.store(:target, params[:path])
+          raise 'failed'
+        end
+        slots = {target: 'fixed.txt'}
+        begin
+          inject_target(slots)
+        rescue StandardError
+          File.read(slots[:target])
+        end''', (9,)),
+    Case('hash_store_path_sanitizer', PATH, '''
+        slots = {}
+        slots.store(:target, File.basename(params[:path]))
+        File.read(slots[:target])''', ()),
+    Case('hash_store_path_sanitizer_is_not_url_proof', URL, '''
+        slots = {}
+        slots.store(:target, File.basename(params[:path]))
+        Net::HTTP.get(URI.parse('https://' + slots[:target]))''', (3,)),
+    Case('hash_store_sql_value', SQL, '''
+        slots = {}
+        slots.store(:query, params[:sql])
+        ActiveRecord::Base.connection.execute(slots[:query])''', (3,)),
+    Case('hash_store_branch_write', PATH, '''
+        slots = {target: 'fixed.txt'}
+        if params[:choose]
+          slots.store(:target, params[:path])
+        end
+        File.read(slots[:target])''', (5,)),
+    Case('hash_store_branch_clean_overwrites', PATH, '''
+        slots = {target: params[:path]}
+        if params[:choose]
+          slots.store(:target, 'left.txt')
+        else
+          slots.store(:target, 'right.txt')
+        end
+        File.read(slots[:target])''', ()),
+    Case('hash_store_index_assignment_coherence', PATH, '''
+        slots = {}
+        slots[:target] = params[:path]
+        File.read(slots[:target])
+        slots.store(:target, 'fixed.txt')
+        File.read(slots[:target])''', (3,)),
+    Case('hash_store_fetch_default', PATH, '''
+        slots = {}
+        slots.store(:target, params[:path])
+        File.read(slots.fetch(:target, 'fixed.txt'))
+        File.read(slots.fetch(:absent, 'fallback.txt'))''', (3,)),
+    Case('hash_store_keys_are_not_values', PATH, '''
+        slots = {}
+        slots.store(:target, params[:path])
+        File.read(slots.keys.first.to_s)
+        File.read(slots.values.first)''', (4,)),
+    Case('hash_store_string_key_capture', PATH, '''
+        slots = {}
+        key = 'target'
+        slots.store(key, params[:path])
+        key.replace('other')
+        File.read(slots['target'])
+        File.read(slots.fetch('other', 'fixed.txt'))''', (5,)),
+    Case('hash_store_argument_effect_on_other_entry', PATH, '''
+        def choose_value(slots)
+          slots.store(:other, params[:path])
+          'fixed.txt'
+        end
+        slots = {}
+        slots.store(:target, choose_value(slots))
+        File.read(slots[:target])
+        File.read(slots[:other])''', (8,)),
+)
+HASH_STORE_BY_NAME = {case.name: case for case in HASH_STORE_CASES}
+HASH_STORE_RUNTIME_VALUES = {
+    'hash_store_ignored_write': ['../outside.txt'],
+    'hash_store_receiver_alias': ['../outside.txt'],
+    'hash_store_separate_keys': ['../outside.txt', 'fixed.txt'],
+    'hash_store_clean_overwrite': ['fixed.txt'],
+    'hash_store_overwrite_keeps_other_entry': ['fixed.txt', '../other.txt'],
+    'hash_store_symbol_string_keys': ['fixed.txt', '../outside.txt'],
+    'hash_store_integer_key': ['fixed.txt', '../outside.txt'],
+    'hash_store_rhs_identity': ['../outside.txt', '../outside.txt', '../outside.txt'],
+    'hash_store_value_alias': ['../outside.txt'],
+    'hash_store_read_alias_updates_sibling_values': ['../outside.txt', '../outside.txt'],
+    'hash_store_overwrite_detaches_slot': ['../outside.txt', 'fixed.txt'],
+    'hash_store_helper_updates_receiver': ['../outside.txt'],
+    'hash_store_helper_rhs_identity': ['../outside.txt', '../outside.txt'],
+    'hash_store_helper_allocated_rhs_identity': ['../outside.txt'],
+    'hash_store_helper_returns_hash': ['../outside.txt'],
+    'hash_store_helper_clean_overwrite': ['fixed.txt'],
+    'hash_store_helper_write_before_raise': ['../outside.txt'],
+    'hash_store_path_sanitizer': ['outside.txt'],
+    'hash_store_path_sanitizer_is_not_url_proof': ['https://outside.txt'],
+    'hash_store_sql_value': ['SELECT untrusted'],
+    'hash_store_branch_write': ['../outside.txt'],
+    'hash_store_branch_clean_overwrites': ['left.txt'],
+    'hash_store_index_assignment_coherence': ['../outside.txt', 'fixed.txt'],
+    'hash_store_fetch_default': ['../outside.txt', 'fallback.txt'],
+    'hash_store_keys_are_not_values': ['target', '../outside.txt'],
+    'hash_store_string_key_capture': ['../outside.txt', 'fixed.txt'],
+    'hash_store_argument_effect_on_other_entry': ['fixed.txt', '../outside.txt'],
+}
+HASH_STORE_BOUNDARIES = (
+    ('hash_store_unknown_key', '''
+        slots = {}
+        result = slots.store(params[:key], 'fixed.txt')
+        File.read(result)'''),
+    ('hash_store_unknown_receiver', '''
+        slots = obtain_slots()
+        slots.store(:target, 'fixed.txt')
+        File.read(slots[:target])'''),
+    ('hash_store_custom_key_protocol', '''
+        class Key
+          def hash
+            1
+          end
+          def eql?(other)
+            true
+          end
+        end
+        slots = {}
+        slots.store(Key.new, 'fixed.txt')'''),
+    ('hash_store_instance_override', '''
+        class Hash
+          def store(key, value)
+            self[:target] = params[:path]
+            value
+          end
+        end
+        slots = {}
+        slots.store(:target, 'fixed.txt')
+        File.read(slots[:target])'''),
+    ('hash_store_singleton_override', '''
+        slots = {}
+        def slots.store(key, value)
+          self[:target] = params[:path]
+          value
+        end
+        slots.store(:target, 'fixed.txt')
+        File.read(slots[:target])'''),
+    ('hash_store_refined_dispatch', '''
+        module CustomStore
+          refine Hash do
+            def store(key, value)
+              self[:target] = params[:path]
+              value
+            end
+          end
+        end
+        using CustomStore
+        slots = {}
+        slots.store(:target, 'fixed.txt')
+        File.read(slots[:target])'''),
+    ('hash_store_nested_hash', '''
+        slots = {}
+        slots.store(:inner, {})
+        slots[:inner].store(:target, params[:path])
+        File.read(slots[:inner][:target])'''),
+    ('hash_store_key_mutated_during_rhs', '''
+        def choose_value(key)
+          key.replace('other')
+          params[:path]
+        end
+        slots = {}
+        key = 'target'
+        slots.store(key, choose_value(key))
+        File.read(slots.fetch('target', 'fixed.txt'))
+        File.read(slots['other'])'''),
+    ('hash_literal_string_key_override', '''
+        class String
+          def hash
+            1
+          end
+          def eql?(other)
+            true
+          end
+        end
+        slots = {'target' => 'fixed.txt'}
+        File.read(slots['target'])'''),
+    ('hash_literal_symbol_key_override', '''
+        class Symbol
+          def hash
+            1
+          end
+          def eql?(other)
+            true
+          end
+        end
+        slots = {target: 'fixed.txt'}
+        File.read(slots[:target])'''),
+)
+
+
 CASES = (
     Case('url_direct', URL, 'Net::HTTP.get(URI.parse(params[:url]))', (1,)),
     Case('url_safe_named_identity', URL, '''
@@ -4287,6 +4587,123 @@ STDOUT.write(JSON.generate($observed))
                     self.assertEqual(json.loads(result.stdout), expected, (case.name, result.stdout, result.stderr))
 
 
+class RubyHashStoreTests(LoggedCase):
+    check_case = RubySemanticTests.check_case
+    native_scan = RubyRequestSourceTests.native_scan
+
+    def test_hash_store_boundaries_preserve_prior_findings(self):
+        for name, body in HASH_STORE_BOUNDARIES:
+            with self.subTest(case=name):
+                directory = self.artifact / name
+                directory.mkdir()
+                target = directory / 'source.rb'
+                source = 'File.read(params[:prior])\n' + textwrap.dedent(body).strip('\n') + '\n'
+                target.write_text(source)
+                rows = []
+                with self.assertRaisesRegex(ValueError, 'incomplete'):
+                    for row in taint_ruby_traversal.flow_findings(target, 'path'):
+                        rows.append(row)
+                (directory / 'findings.json').write_text(json.dumps(rows, indent=2) + '\n')
+                self.assertIn((PATH, 1), [(row[0], row[1]) for row in rows], (source, rows))
+                if name == 'hash_store_unknown_key':
+                    # A key protocol is unresolved, but a fixed RHS is not a
+                    # tainted value merely because that key came from input.
+                    self.assertEqual([(row[0], row[1]) for row in rows], [(PATH, 1)], (source, rows))
+
+    def test_hash_store_native_ruby_value_witnesses(self):
+        executable = shutil.which('ruby')
+        if not executable:
+            self.skipTest('native Ruby is required for Hash#store value witnesses')
+        driver = r'''require 'json'
+require 'uri'
+$observed = []
+$input = JSON.parse(ARGV[1], symbolize_names: true)
+def params; $input; end
+def obtain_slots; {}; end
+class File
+  def self.read(value); $observed << value.dup; end
+end
+module Net
+  module HTTP
+    def self.get(value); $observed << value.to_s; end
+  end
+end
+module ActiveRecord
+  class Base
+    def self.connection; self; end
+    def self.execute(value); $observed << value.dup; end
+  end
+end
+load ARGV[0]
+STDOUT.write(JSON.generate($observed))
+'''
+        programs = [(case.name, case.source, HASH_STORE_RUNTIME_VALUES[case.name], True)
+                    for case in HASH_STORE_CASES]
+        programs.extend((name + '_false', HASH_STORE_BY_NAME[name].source, values, False)
+                        for name, values in (
+                            ('hash_store_branch_write', ['fixed.txt']),
+                            ('hash_store_branch_clean_overwrites', ['right.txt'])))
+        boundary_values = {
+            'hash_store_unknown_key': ['../before.txt', 'fixed.txt'],
+            'hash_store_unknown_receiver': ['../before.txt', 'fixed.txt'],
+            'hash_store_custom_key_protocol': ['../before.txt'],
+            'hash_store_instance_override': ['../before.txt', '../outside.txt'],
+            'hash_store_singleton_override': ['../before.txt', '../outside.txt'],
+            'hash_store_refined_dispatch': ['../before.txt', '../outside.txt'],
+            'hash_store_nested_hash': ['../before.txt', '../outside.txt'],
+            'hash_store_key_mutated_during_rhs': ['../before.txt', 'fixed.txt', '../outside.txt'],
+            'hash_literal_string_key_override': ['../before.txt', 'fixed.txt'],
+            'hash_literal_symbol_key_override': ['../before.txt', 'fixed.txt'],
+        }
+        programs.extend((name, 'File.read(params[:prior])\n' + textwrap.dedent(body).strip('\n') + '\n',
+                         boundary_values[name], True) for name, body in HASH_STORE_BOUNDARIES)
+        for name, source, expected, choose in programs:
+            with self.subTest(case=name):
+                directory = self.artifact / ('native-' + name)
+                directory.mkdir()
+                target = directory / 'source.rb'
+                target.write_text(source)
+                inputs = {'path': '../outside.txt', 'other': '../other.txt', 'prior': '../before.txt',
+                          'url': 'https://outside.example/private', 'sql': 'SELECT untrusted',
+                          'key': 'target', 'choose': choose}
+                command = [executable, '--disable-gems', '-e', driver, str(target), json.dumps(inputs)]
+                result = subprocess.run(command, cwd=directory, text=True, capture_output=True,
+                                        timeout=30, preexec_fn=prevent_child_deletion)
+                (directory / 'stdout.log').write_text(result.stdout)
+                (directory / 'stderr.log').write_text(result.stderr)
+                (directory / 'identity.json').write_text(json.dumps({
+                    'command': command, 'source_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                    'exit': result.returncode, 'expected': expected,
+                }, indent=2) + '\n')
+                self.assertEqual(result.returncode, 0, (source, result.stdout, result.stderr))
+                self.assertEqual(json.loads(result.stdout), expected, (name, result.stdout, result.stderr))
+
+    def test_hash_store_cache_edit_and_policy_controls(self):
+        directory = self.artifact / 'hash-store-cache-policy'
+        directory.mkdir()
+        target = directory / 'selected.rb'
+        unsafe = HASH_STORE_BY_NAME['hash_store_ignored_write'].source
+        clean = HASH_STORE_BY_NAME['hash_store_clean_overwrite'].source
+        for attempt, (source, lines, hits) in enumerate(((unsafe, (3,), 0), (unsafe, (3,), 1),
+                                                       (clean, (), 0), (clean, (), 1))):
+            target.write_text(source)
+            result, payload, _env = self.native_scan(directory / str(attempt), target)
+            self.assertEqual((result.returncode, payload['status'], payload['files'], payload['critical']),
+                             (int(bool(lines)), 'ok', 1, len(lines)), (payload, result.stderr))
+            self.assertEqual([(row['rule'], row['line'], row['col']) for row in payload['findings']
+                              if row['severity'] == 'critical'], [(PATH, line, 1) for line in lines], payload)
+            self.assertEqual(payload['extras']['profile']['cache_hits'], hits, payload)
+        for label, source, skip, count in (
+                ('sink-suppressed', unsafe.rstrip() + ' # ubs:ignore[ruby.taint.path_traversal]\n', '', 0),
+                ('unrelated-suppression', unsafe.rstrip() + ' # ubs:ignore[ruby.taint.outbound_url]\n', '', 1),
+                ('security-disabled', unsafe, '6', 0)):
+            with self.subTest(case=label):
+                target.write_text(source)
+                result, payload, _env = self.native_scan(directory / label, target, skip=skip)
+                self.assertEqual((result.returncode, payload['status'], payload['critical']),
+                                 (int(bool(count)), 'ok', count), (payload, result.stderr))
+
+
 def semantic_test(case):
     def test(self):
         self.check_case(case)
@@ -4295,6 +4712,9 @@ def semantic_test(case):
 
 for _case in CASES:
     setattr(RubySemanticTests, 'test_' + _case.name, semantic_test(_case))
+
+for _case in HASH_STORE_CASES:
+    setattr(RubyHashStoreTests, 'test_' + _case.name, semantic_test(_case))
 
 
 @unittest.skipUnless(os.environ.get('UBS_RUBY_TAINT_E2E') == '1', 'set UBS_RUBY_TAINT_E2E=1 for actual CLI scans')
@@ -4347,6 +4767,69 @@ class RubyPublicTests(LoggedCase):
         for path in paths:
             from urllib.parse import unquote
             self.assertEqual(Path(unquote(path)).name, selected.name, payload)
+
+    def test_hash_store_reaches_public_json_and_sarif(self):
+        names = ('hash_store_ignored_write', 'hash_store_rhs_identity',
+                 'hash_store_clean_overwrite', 'hash_store_helper_updates_receiver',
+                 'hash_store_path_sanitizer_is_not_url_proof')
+        cases = [HASH_STORE_BY_NAME[name] for name in names]
+        boundary_name, boundary_body = HASH_STORE_BOUNDARIES[0]
+        cases.append(Case(boundary_name, PATH, 'File.read(params[:prior])\n'
+                          + textwrap.dedent(boundary_body).strip('\n') + '\n', (1,)))
+        for case in cases:
+            partial = case.name == boundary_name
+            directory = self.artifact / case.name
+            directory.mkdir()
+            selected = directory / 'selected.rb'
+            selected.write_text(case.source)
+            (directory / 'unselected.rb').write_text('File.read(params[:unselected])\n')
+            expected = [(case.rule, line, 1, 'critical') for line in case.lines]
+            for module in (False, True):
+                for fmt in ('json', 'sarif'):
+                    with self.subTest(case=case.name, module=module, format=fmt):
+                        result, payload = self.scan(directory / f'{module}-{fmt}', selected,
+                                                    fmt, module=module)
+                        self.assertEqual(result.returncode, 2 if partial else int(bool(case.lines)),
+                                         (result.stdout, result.stderr))
+                        if fmt == 'json':
+                            self.assertEqual(payload['status'], 'partial' if partial else 'ok', payload)
+                            counts = payload if module else payload['totals']
+                            self.assertEqual(tuple(counts[key] for key in ('files', 'critical', 'warning', 'info')),
+                                             (1, len(case.lines), 0, 0), payload)
+                            rows = payload.get('findings', [])
+                            actual = [(row['rule' if module else 'rule_id'], row['line'],
+                                       row['col'], row['severity']) for row in rows]
+                            for row in rows:
+                                self.assertEqual(Path(row.get('path', row.get('file'))).name,
+                                                 selected.name, row)
+                            if module and partial:
+                                self.assertEqual(payload['module_error'], 'ANALYZER_ERROR', payload)
+                            if not module:
+                                self.assertEqual(bool(payload['failed_modules']), partial, payload)
+                        else:
+                            self.assertEqual(payload['version'], '2.1.0', payload)
+                            self.assertTrue(payload['runs'], payload)
+                            rows = [row for run in payload['runs'] for row in run.get('results', [])]
+                            actual = []
+                            for row in rows:
+                                physical = row['locations'][0]['physicalLocation']
+                                actual.append((row['ruleId'], physical['region']['startLine'],
+                                               physical['region']['startColumn'],
+                                               {'error': 'critical', 'warning': 'warning',
+                                                'note': 'info'}[row['level']]))
+                                self.assertEqual(Path(physical['artifactLocation']['uri']).name,
+                                                 selected.name, row)
+                            invocations = [item for run in payload['runs'] for item in run.get('invocations', [])]
+                            if partial:
+                                self.assertTrue(any(not item['executionSuccessful'] and item.get('exitCode') == 2
+                                                    for item in invocations), payload)
+                            else:
+                                self.assertTrue(all(item['executionSuccessful'] for item in invocations), payload)
+                        self.assertEqual(sorted(actual), sorted(expected), payload)
+                        if partial:
+                            self.assertIn('incomplete', json.dumps(payload).lower(), payload)
+                        print('RUBY_HASH_STORE_PUBLIC_PASS', case.name,
+                              'module' if module else 'runner', fmt, flush=True)
 
     def test_argument_mutation_reaches_public_json_and_sarif(self):
         for case in ARGUMENT_MUTATION_CASES:

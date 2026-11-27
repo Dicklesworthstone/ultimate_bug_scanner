@@ -50,7 +50,7 @@ HEADER_PROOFS = frozenset({'header-no-cr', 'header-no-lf'})
 HEADER_ENTRIES = frozenset({'header-entry-value', 'header-entry-location', 'header-entry-key',
                             'header-entry-unknown', 'header-map-known', 'header-map-implicit'})
 PROOF_TAGS = frozenset({'url-host', 'url-scheme', 'contained-path', 'redirect-slash-prefix', 'redirect-not-double-slash', 'safe-redirect'}) | HEADER_PROOFS
-VALUE_TAGS = PROOF_TAGS | HEADER_ENTRIES | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name', 'exact-literal', 'sql-bound-value', 'sql-integer-value', 'exact-process-vector'})
+VALUE_TAGS = PROOF_TAGS | HEADER_ENTRIES | frozenset({'canonical-path', 'parsed-uri', 'basename-path', 'not-dot-name', 'exact-literal', 'sql-bound-value', 'sql-integer-value', 'exact-process-vector', 'hash-layout-exact'})
 PATH_RULE = 'ruby.taint.path_traversal'
 URL_RULE = 'ruby.taint.outbound_url'
 REDIRECT_RULE = 'ruby.redirect.open'
@@ -833,6 +833,8 @@ class RubySummary:
     effects: dict = field(default_factory=dict)
     mutations: dict = field(default_factory=dict)
     raised: Fact = CLEAN
+    hash_mutations: dict = field(default_factory=dict)
+    hash_raised_mutations: dict = field(default_factory=dict)
 
     def merged(self, other):
         effects = dict(self.effects)
@@ -841,8 +843,18 @@ class RubySummary:
         mutations = dict(self.mutations)
         for parameter, fact in other.mutations.items():
             mutations[parameter] = join(mutations.get(parameter, CLEAN), fact)
+        hash_mutations = dict(self.hash_mutations)
+        for parameter, fact in other.hash_mutations.items():
+            hash_mutations[parameter] = join(hash_mutations.get(parameter, CLEAN), fact)
+        hash_raised_mutations = dict(self.hash_raised_mutations)
+        for parameter, fact in other.hash_raised_mutations.items():
+            hash_raised_mutations[parameter] = join(hash_raised_mutations.get(parameter, CLEAN), fact)
         return RubySummary(join(self.returned, other.returned), effects, mutations,
-                           join(self.raised, other.raised))
+                           join(self.raised, other.raised), hash_mutations, hash_raised_mutations)
+
+
+class PendingHashSummary(Exception):
+    """A known hash argument must wait for its selected callee's store effects."""
 
 
 def tainted(fact):
@@ -881,6 +893,7 @@ class RubyEngine:
         self.lines = [0, *(index + 1 for index, char in enumerate(text) if char == '\n')]
         self.budget, self.graphs = Budget(), {}
         self.contexts, self.summaries = {}, {}
+        self.ready_hash_contexts = set()
         self.dispatch_failures = {}
         self.pending_raises = CLEAN
         self.constants = {}
@@ -1251,7 +1264,7 @@ class RubyEngine:
         # Rails' ToSql visitor quotes ordinary bind values, but visits Arel
         # nodes (including nodes inside bind arrays) as executable SQL.
         unresolved_type = any(trace.kind in {'object', 'member'}
-                              and trace.key[0] not in {'string', 'request', 'integer', 'array'}
+                              and trace.key[0] not in {'string', 'request', 'integer', 'array', 'hash'}
                               for trace in value)
         tag = 'sql-unresolved-value' if unresolved_type else 'sql-bound-value'
         return frozenset(replace(trace, tags=trace.tags | frozenset({tag}))
@@ -1421,6 +1434,98 @@ class RubyEngine:
                          for trace in value if trace.kind not in {'object', 'process-vector'}
                          and not (trace.kind == 'shape' and trace.key[0] in {
                              'literal-list', 'mapped-list', 'native-argv-copy'}))
+
+    @staticmethod
+    def hash_key(value):
+        """Read a literal key, independently of a String key's mutable identity."""
+        keys = set()
+        for trace in value:
+            if trace.kind == 'object' and trace.key[0] == 'string':
+                continue
+            if trace.kind == 'constant' and trace.key[0] == 'header-string':
+                continue
+            if trace.kind != 'constant':
+                return None
+            kind, literal = trace.key
+            if kind in {'literal', 'symbol'} and 'exact-literal' in trace.tags and '\\' not in literal:
+                keys.add(('string' if kind == 'literal' else 'symbol', literal))
+            elif kind == 'number' and re.fullmatch(r'(?:0|[1-9][0-9]*)', literal):
+                keys.add(('integer', literal))
+            else:
+                return None
+        return next(iter(keys)) if len(keys) == 1 else None
+
+    @staticmethod
+    def hash_layouts(value):
+        roots = {trace.key for trace in value if trace.kind == 'object'}
+        layouts = [trace for trace in value if trace.kind == 'hash-layout']
+        if (not roots or any(root[0] != 'hash' for root in roots) or not layouts
+                or {trace.key[0] for trace in layouts} != roots
+                or any('hash-layout-exact' not in trace.tags for trace in layouts)):
+            return None
+        return layouts
+
+    def hash_fact(self, identity, entries, *, frozen=False, header_mapping=True):
+        if len(entries) > 64:
+            raise AnalysisLimit('Ruby Hash entry limit exceeded; analysis is incomplete')
+        values = join(*(value for _key, value in entries))
+        members = frozenset(replace(trace, kind='member') if trace.kind == 'object' else trace
+                            for trace in values if trace.kind not in {'hash-layout', 'process-vector'})
+        if self.policy in {'header', 'redirect'}:
+            members = self.header_map_shape((), ())
+            for (kind, key), value in entries:
+                key_value = constant(key, 'literal' if kind == 'string' else 'number' if kind == 'integer' else 'symbol')
+                members = self.merge_header_maps(members, self.header_entry(key_value, value))
+            if not header_mapping:
+                members = retag(members, remove=frozenset({'header-map-known'}))
+        tags = frozenset({'hash-layout-exact'}) | (frozenset({'hash-frozen'}) if frozen else frozenset())
+        if not header_mapping:
+            tags |= frozenset({'hash-header-unknown'})
+        return join(members, shape('ruby-hash', identity[1]),
+                    frozenset({Trace('object', identity), Trace('hash-layout', (identity, tuple(entries)), tags=tags)}))
+
+    def hash_mapping(self, tokens, state, depth, offset):
+        entries, opaque = {}, CLEAN
+        header_only = False
+        header_fallback = self.header_map_shape((), ())
+        for part in split_tokens(tokens, {','}):
+            if not part:
+                continue
+            self.budget.spend()
+            pair = split_tokens(part, {'=>'})
+            if len(pair) == 2:
+                key_value = self.expression(pair[0], state, depth + 1)
+                value = self.expression(pair[1], state, depth + 1)
+            elif len(part) >= 3 and part[0].kind == 'code' and part[1].value == ':':
+                key_value = constant(part[0].value, 'symbol')
+                value = self.expression(part[2:], state, depth + 1)
+            else:
+                key_value = CLEAN
+                value = self.expression(part, state, depth + 1)
+            key = self.hash_key(key_value)
+            if self.policy in {'header', 'redirect'}:
+                header_fallback = self.merge_header_maps(header_fallback, self.header_entry(key_value, value))
+                if key is None and self.header_names(key_value) is not None:
+                    header_only = True
+                    continue
+            owner = {'symbol': ('Symbol',), 'string': ('String',), 'integer': ('Integer',)}.get(key[0]) if key else None
+            if (key is None or has_shape(value, 'ruby-hash')
+                    or not self.native_guard_available((part[0],), owner, 'hash', 'eql?')
+                    or self.captured_process_change(key_value, state)):
+                self.unresolved_calls.add(
+                    f'{self.path}:{self.step(offset, "hash", "literal").line}: '
+                    'Ruby Hash key or nested value needs store analysis; analysis is incomplete')
+                opaque = join(opaque, value, shape('opaque-hash-layout', offset))
+            else:
+                entries[key] = value
+        if header_only and not opaque:
+            return join(self.collection(header_fallback, offset), shape('ruby-hash', offset))
+        result = self.hash_fact(('hash', offset, ()), tuple(entries.items()))
+        if opaque:
+            result = join(retag(result, remove=frozenset({'hash-layout-exact'})),
+                          frozenset(replace(trace, kind='member') if trace.kind == 'object' else trace
+                                    for trace in opaque if trace.kind != 'hash-layout'))
+        return result
 
     def literal_value(self, tokens, shared=False):
         """Attach allocation identities without changing literal proof facts."""
@@ -1596,7 +1701,9 @@ class RubyEngine:
                 continue
             if trace.kind == 'shape' and trace.key[0] in {'header-map', 'ruby-hash'}:
                 continue
-            if trace.kind == 'object' and trace.key[0] == 'array':
+            if trace.kind == 'object' and trace.key[0] in {'array', 'hash'}:
+                continue
+            if trace.kind == 'hash-layout' and 'hash-layout-exact' in trace.tags:
                 continue
             # An opaque alternative at a join is still opaque even when a
             # different branch supplied a completely known literal hash.
@@ -1701,10 +1808,21 @@ class RubyEngine:
         """
         borrowed = {trace.key for argument in arguments for trace in argument
                     if trace.kind in {'object', 'member'}}
-        return frozenset(replace(trace, key=(trace.key[0], trace.key[1], (*trace.key[2], offset)[-2:]))
-                         if trace.kind in {'object', 'member'} and trace.key not in borrowed
-                         and trace.key[0] != 'request' and 'shared-allocation' not in trace.tags
-                         else trace for trace in value)
+        def identity(key, tags=frozenset()):
+            return ((key[0], key[1], (*key[2], offset)[-2:])
+                    if key not in borrowed and key[0] != 'request' and 'shared-allocation' not in tags else key)
+
+        output = []
+        for trace in value:
+            if trace.kind in {'object', 'member'}:
+                trace = replace(trace, key=identity(trace.key, trace.tags))
+            elif trace.kind == 'hash-layout':
+                entries = tuple((key, frozenset(
+                    replace(item, key=identity(item.key, item.tags)) if item.kind in {'object', 'member'}
+                    else item for item in fact)) for key, fact in trace.key[1])
+                trace = replace(trace, key=(identity(trace.key[0], trace.tags), entries))
+            output.append(trace)
+        return frozenset(output)
 
     def context(self, function, arguments, entry=False):
         key = function.key, arguments, entry
@@ -2204,6 +2322,11 @@ class RubyEngine:
             aliases = object_ids(fact)
             direct = bool(identities & aliases) or binding == name and not identities
             contained = bool(identities & object_ids(fact, members=True))
+            if contained and not direct:
+                mapped = self.hash_member_mutation(fact, identities, changed, definite)
+                if mapped is not None:
+                    state[binding] = mapped
+                    continue
             if direct or contained:
                 if binding.removeprefix('::')[:1].isupper() and tainted(changed):
                     raise ValueError('Request-derived Ruby constant mutation needs shared-state analysis; analysis is incomplete')
@@ -2214,9 +2337,173 @@ class RubyEngine:
                     # object's contents, including other array elements.
                     state[binding] = invalidate(join(fact, content))
         for index, fact in self.parameter_values.items():
+            if self.hash_layouts(fact) is not None:
+                continue  # Final Hash storage is summarized at normal exits.
             if identities & (object_ids(fact) | object_ids(fact, members=True)):
                 self.mutations[index] = join(self.mutations.get(index, CLEAN), changed)
         return changed
+
+    def hash_update(self, previous, replacement, state):
+        """Replace selected Hash storage while preserving aliases and copies."""
+        identities = object_ids(previous)
+        roots = [trace for trace in previous if trace.kind == 'object']
+        definite = len(identities) == 1 and bool(roots) and all(
+            root.key[1] not in self.repeated_sites
+            and not any(site in self.repeated_sites for site in root.key[2])
+            and len(root.key[2]) < 2 for root in roots)
+        for binding, fact in tuple(state.items()):
+            aliases = object_ids(fact)
+            if not identities & aliases:
+                if identities & object_ids(fact, members=True):
+                    self.unresolved_calls.add(
+                        f'{self.path}: Ruby nested Hash alias mutation needs heap analysis; analysis is incomplete')
+                    state[binding] = retag(join(fact, replacement), remove=VALUE_TAGS)
+                continue
+            if binding.removeprefix('::')[:1].isupper() and tainted(replacement):
+                self.unresolved_calls.add(
+                    f'{self.path}: Ruby shared Hash mutation needs shared-state analysis; analysis is incomplete')
+            state[binding] = replacement if definite and aliases == identities else join(fact, replacement)
+        return replacement
+
+    def hash_member_mutation(self, fact, identities, changed, definite):
+        layouts = self.hash_layouts(fact)
+        if layouts is None:
+            return None
+        output, touched = CLEAN, False
+        content = frozenset(trace for trace in changed if trace.kind != 'object')
+        for layout in layouts:
+            entries = []
+            for key, value in layout.key[1]:
+                self.budget.spend()
+                aliases = object_ids(value)
+                if identities & aliases:
+                    value = (changed if definite and aliases == identities
+                             else retag(join(value, content), remove=VALUE_TAGS))
+                    touched = True
+                elif identities & object_ids(value, members=True):
+                    value = retag(join(value, content), remove=VALUE_TAGS)
+                    touched = True
+                entries.append((key, value))
+            output = join(output, self.hash_fact(layout.key[0], entries,
+                                                frozen='hash-frozen' in layout.tags, header_mapping=False))
+        return output if touched else None
+
+    def native_hash_call(self, name, receiver, arguments, token, state):
+        method = name.rsplit('.', 1)[-1]
+        roots = {trace.key[0] for trace in receiver if trace.kind == 'object'}
+        if 'hash' not in roots:
+            if method == 'store' and has_shape(receiver, 'detached-response-map') and len(arguments) == 2:
+                self.mutate(receiver, arguments[1], state)
+                return arguments[1]
+            if method == 'store' and receiver:
+                self.unresolved_calls.add(
+                    f'{self.path}:{self.step(token.start, "call", name).line}: '
+                    'Ruby Hash store receiver is unresolved; analysis is incomplete')
+                return arguments[1] if len(arguments) == 2 else CLEAN
+            return None
+
+        def incomplete(reason, *, writing=False):
+            self.unresolved_calls.add(
+                f'{self.path}:{self.step(token.start, "call", name).line}: '
+                f'Ruby Hash {reason}; analysis is incomplete')
+            if writing:
+                value = arguments[1] if method in {'store', '[]='} and len(arguments) == 2 else join(*arguments)
+                self.mutate(receiver, value, state)
+
+        if not all(self.native_guard_available((token,), owner, method) for owner in (
+                ('Hash',), ('Object',), ('Kernel',))):
+            incomplete('native method dispatch is overridden', writing=True)
+            return arguments[1] if method in {'store', '[]='} and len(arguments) == 2 else CLEAN
+        layouts = self.hash_layouts(receiver)
+        if layouts is None or roots != {'hash'}:
+            incomplete('storage identity is unresolved', writing=method in {'store', '[]='})
+            return (arguments[1] if method in {'store', '[]='} and len(arguments) == 2
+                    else frozenset(trace for trace in self.elements(receiver) if trace.kind != 'hash-layout'))
+        if len(layouts) > 16:
+            raise AnalysisLimit('Ruby Hash layout alternative limit exceeded; analysis is incomplete')
+        if any(trace.kind == 'keyword' for argument in arguments for trace in argument):
+            incomplete('native arguments require positional binding', writing=True)
+            return CLEAN
+        if method in {'store', '[]=', '[]', 'fetch', 'dig', 'delete', 'key?', 'has_key?', 'include?', 'member?'}:
+            arity = len(arguments)
+            valid = (arity == 2 if method in {'store', '[]='}
+                     else arity in {1, 2} if method == 'fetch' else arity == 1)
+            key = self.hash_key(arguments[0]) if valid else None
+            owner = {'symbol': ('Symbol',), 'string': ('String',), 'integer': ('Integer',)}.get(key[0]) if key else None
+            if key is None or not self.native_guard_available((token,), owner, 'hash', 'eql?'):
+                incomplete('key identity or equality protocol is unresolved', writing=method in {'store', '[]=', 'delete'})
+                return arguments[1] if method in {'store', '[]='} and arity == 2 else CLEAN
+            if self.captured_process_change(arguments[0], state):
+                incomplete('captured key changed during later argument evaluation', writing=method in {'store', '[]='})
+                return arguments[1] if method in {'store', '[]='} else CLEAN
+            if method in {'store', '[]=', 'delete'}:
+                if any('hash-frozen' in layout.tags for layout in layouts):
+                    incomplete('write targets a frozen receiver')
+                    return CLEAN
+                if method != 'delete' and has_shape(arguments[1], 'ruby-hash'):
+                    incomplete('nested values require heap analysis', writing=True)
+                    return arguments[1]
+                result, changed = CLEAN, CLEAN
+                for layout in layouts:
+                    entries = dict(layout.key[1])
+                    if method == 'delete':
+                        result = join(result, entries.pop(key, constant('nil', 'code')))
+                    else:
+                        entries[key] = arguments[1]
+                        result = arguments[1]
+                    changed = join(changed, self.hash_fact(layout.key[0], tuple(entries.items()), header_mapping=False))
+                self.hash_update(receiver, changed, state)
+                return result
+            if method in {'key?', 'has_key?', 'include?', 'member?'}:
+                return shape('hash-metadata', token.start)
+            return join(*(dict(layout.key[1]).get(key,
+                          arguments[1] if method == 'fetch' and arity == 2 else constant('nil', 'code'))
+                          for layout in layouts))
+        return self.native_hash_projection(method, receiver, arguments, token, state, layouts, incomplete)
+
+    def native_hash_projection(self, method, receiver, arguments, token, state, layouts, incomplete):
+        if method in {'keys', 'values'} and not arguments:
+            values = []
+            for layout in layouts:
+                for (kind, key), value in layout.key[1]:
+                    if method == 'keys':
+                        value = constant(key, 'literal' if kind == 'string' else 'number' if kind == 'integer' else 'symbol')
+                        if kind == 'string':
+                            value = self.fresh(value, 'string', token.start)
+                    values.append(value)
+            return self.collection(join(*values), token.start)
+        if method in {'size', 'length', 'empty?', 'object_id', '__id__', 'hash', 'frozen?'} and not arguments:
+            return shape('hash-metadata', token.start)
+        if method in {'itself', 'to_h', 'to_hash'} and not arguments:
+            return receiver
+        if method in REQUEST_MAP_ITERATORS | {'map', 'collect'} and not arguments:
+            return receiver  # The CFG binds and executes the selected block.
+        if method == 'freeze' and not arguments:
+            changed = join(*(self.hash_fact(layout.key[0], layout.key[1], frozen=True,
+                             header_mapping='hash-header-unknown' not in layout.tags) for layout in layouts))
+            return self.hash_update(receiver, changed, state)
+        if method in {'dup', 'clone'} and not arguments:
+            if not all(self.native_guard_available((token,), owner, 'initialize_copy', 'initialize_' + method)
+                       for owner in (('Hash',), ('Object',), ('Kernel',))):
+                incomplete('copy hook is overridden')
+                return CLEAN
+            return join(*(self.hash_fact(('hash', token.start, ()), layout.key[1],
+                                        frozen=method == 'clone' and 'hash-frozen' in layout.tags,
+                                        header_mapping='hash-header-unknown' not in layout.tags)
+                          for layout in layouts))
+        if method == 'clear' and not arguments:
+            if any('hash-frozen' in layout.tags for layout in layouts):
+                incomplete('clear targets a frozen receiver')
+                return CLEAN
+            changed = join(*(self.hash_fact(layout.key[0], (), header_mapping=False) for layout in layouts))
+            return self.hash_update(receiver, changed, state)
+        if method in {'to_s', 'inspect'} and not arguments:
+            content = frozenset(trace for trace in receiver if trace.kind != 'hash-layout')
+            return self.fresh(retag(content, remove=VALUE_TAGS), 'string', token.start)
+        if method in {'send', 'public_send', '__send__'}:
+            return None
+        incomplete('method needs a supported native store contract', writing=True)
+        return self.fresh(retag(join(receiver, *arguments), remove=VALUE_TAGS), 'unknown', token.start)
 
     def native_uri_available(self, token, *methods):
         owners = {('Object',), ('Kernel',), ('URI', 'Generic'), ('URI', 'HTTP'), ('URI', 'HTTPS')}
@@ -2585,7 +2872,11 @@ class RubyEngine:
                     returned = join(returned, retag(join(receiver, *arguments), remove=VALUE_TAGS))
                 call = self.step(token.start, 'call', name + '()')
                 bound = tuple(advance(value, call) for value in values)
-                summary = self.summaries[self.context(function, bound)]
+                context = self.context(function, bound)
+                if (any(self.hash_layouts(value) is not None for value in values)
+                        and context not in self.ready_hash_contexts):
+                    raise PendingHashSummary(context)
+                summary = self.summaries[context]
                 result = self.returned_objects(summary.returned, (*arguments, receiver), token.start)
                 returned = join(returned, advance(result, call))
                 self.pending_raises = join(self.pending_raises, advance(summary.raised, call))
@@ -2598,6 +2889,14 @@ class RubyEngine:
                         target = fact if any(trace.kind == 'object' and trace.key in components
                                              for trace in fact) else values[index]
                         self.mutate(target, fact, state)
+                hash_changes = dict(summary.hash_mutations)
+                if self.exceptional_evaluation:
+                    for index, fact in summary.hash_raised_mutations.items():
+                        hash_changes[index] = join(hash_changes.get(index, CLEAN), fact)
+                for index, fact in hash_changes.items():
+                    if index < len(values):
+                        storage = self.returned_objects(fact, (*arguments, receiver), token.start)
+                        self.hash_update(values[index], advance(storage, call), state)
             if matched:
                 if framework_models:
                     framework_receiver = frozenset(trace for trace in receiver
@@ -2630,6 +2929,8 @@ class RubyEngine:
         process_result = self.process_call(name, arguments, token, state)
         if process_result is not None:
             return process_result
+        if name == 'Hash.new' and not arguments and ('Hash',) not in self.constant_definitions:
+            return self.hash_fact(('hash', token.start, ()), ())
         if method == 'new':
             owner = tuple(name.rsplit('.', 1)[0].split('::'))
             if any(function.scope and function.owner == owner for function in self.parser.functions.values()):
@@ -2660,7 +2961,8 @@ class RubyEngine:
             if has_shape(receiver, 'response-headers') and method in {'dup', 'clone', 'merge'}:
                 detached = frozenset(trace for trace in join(receiver, *arguments)
                                      if not (trace.kind == 'shape' and trace.key[0] == 'response-headers'))
-                return self.fresh(detached, 'array', token.start, shallow=True)
+                return self.fresh(join(detached, shape('detached-response-map', token.start)),
+                                  'array', token.start, shallow=True)
             response_map = has_shape(receiver, 'response-headers') or has_shape(receiver, 'response')
             if response_map and method in {'store', '[]=', 'set', 'set_header', 'add_header'}:
                 if len(arguments) >= 2:
@@ -2687,6 +2989,9 @@ class RubyEngine:
                 for argument in arguments:
                     if any(trace.kind == 'keyword' and trace.key == ('filename',) for trace in argument):
                         self.record(token.start, argument, name)
+        hash_result = self.native_hash_call(name, receiver, arguments, token, state)
+        if hash_result is not None:
+            return hash_result
         pathname_result = self.pathname_call(method, receiver, arguments, token)
         if pathname_result is not None:
             return pathname_result
@@ -2866,6 +3171,15 @@ class RubyEngine:
         # Unknown calls are not validators. Preserve request dependencies while
         # discarding proofs that their result still has the checked value. An
         # unknown result may borrow an argument or be a newly allocated value.
+        native_http = (name in {'URI.open', 'OpenURI.open'} or re.fullmatch(
+            r'(?:Net::HTTP|Faraday|HTTParty|RestClient|Excon|HTTP|Typhoeus|Curl)\.(?:get|get_response|post|post_form|put|patch|delete|head|request|start|new)', name))
+        ternary_operand = self.text[token.end:].lstrip().startswith('?')
+        for argument in (() if native_http or ternary_operand else (receiver, *arguments)):
+            if any(trace.kind == 'object' and trace.key[0] == 'hash' for trace in argument):
+                self.unresolved_calls.add(
+                    f'{self.path}:{self.step(token.start, "call", name).line}: '
+                    'Ruby Hash passed to an unresolved helper may change storage; analysis is incomplete')
+                self.mutate(argument, CLEAN, state)
         value = retag(self.invalidate_sql_binding(self.without_sql_api(value)), remove=VALUE_TAGS)
         return join(value, self.fresh(value, 'unknown', token.start, shallow=True))
 
@@ -2951,14 +3265,12 @@ class RubyEngine:
                 if token.value == '[':
                     items = tuple(self.expression(part, state, depth + 1)
                                   for part in split_tokens(tokens[cursor + 1:end], {','}) if part)
-                atom = (self.header_mapping(tokens[cursor + 1:end], state, depth)
-                        if self.policy in {'header', 'redirect'} and token.value == '{'
+                atom = (self.hash_mapping(tokens[cursor + 1:end], state, depth, token.start)
+                        if token.value == '{'
                         else join(*items) if items is not None
                         else join(*(self.expression(part, state, depth + 1) for part in split_tokens(tokens[cursor + 1:end], {','}))))
-                if token.value in {'[', '{'}:
+                if token.value == '[':
                     atom = self.collection(atom, token.start, items)
-                    if token.value == '{':
-                        atom = join(atom, shape('ruby-hash', token.start))
                 cursor, name = end + 1, ''
             elif (re.fullmatch(r'(?:@@?|\$)?[A-Za-z_]\w*[!?]?', token.value)
                   or token.value == '::' and cursor + 1 < len(tokens)
@@ -2975,7 +3287,7 @@ class RubyEngine:
                 if re.fullmatch(r'(?:::)?[A-Z]\w*(?:::[A-Z]\w*)*', name):
                     native_owner = self.constant_owner(name, self.function.owner, self.function.lexical_owners)
                     bound_kinds = {trace.key[0] for trace in state.get(name, CLEAN) if trace.kind == 'object'}
-                    bound_value = bool(bound_kinds and bound_kinds <= {'array', 'string'})
+                    bound_value = bool(bound_kinds and bound_kinds <= {'array', 'string', 'hash'})
                     if (native_owner in NATIVE_INPUT_CONSTANTS and native_owner in self.constant_definitions
                             and (self.constant_value_owner(native_owner) is None and not bound_value
                                  or self.constant_positions.get(native_owner, -1) > token.start)):
@@ -3383,17 +3695,26 @@ class RubyEngine:
                         self.unresolved_calls.add(
                             f'{self.path}:{self.step(lhs[0].start, "assign", token_text(lhs)).line}: '
                             'Ruby process input element mutation needs store analysis; analysis is incomplete')
+                    if self.policy in {'header', 'redirect'} and opening is not None:
+                        if has_shape(receiver, 'response-headers') or has_shape(receiver, 'response'):
+                            key = self.expression(lhs[opening + 1:-1], state)
+                            self.response_field(key, value, lhs[0], 'response header assignment')
+                            continue
+                    if opening is not None and any(trace.kind == 'object' and trace.key[0] == 'hash'
+                                                   for trace in receiver):
+                        if operator != '=':
+                            self.unresolved_calls.add(
+                                f'{self.path}: Ruby compound Hash assignment needs conditional-store analysis; analysis is incomplete')
+                            self.mutate(receiver, value, state)
+                        else:
+                            key = self.expression(lhs[opening + 1:-1], state)
+                            self.native_hash_call('.[]=', receiver, [key, value], lhs[0], state)
+                        continue
                     string_kinds = {trace.key[0] for trace in receiver if trace.kind == 'object'}
                     if (opening is not None and string_kinds and string_kinds <= STRING_OBJECT_KINDS
                             and not self.native_guard_available((lhs[0],), ('String',), '[]=')):
                         self.unresolved_calls.add(
                             f'{self.path}: Ruby native string indexed write is overridden; analysis is incomplete')
-                    if self.policy in {'header', 'redirect'}:
-                        if opening is not None:
-                            key = self.expression(lhs[opening + 1:-1], state)
-                            if has_shape(receiver, 'response-headers') or has_shape(receiver, 'response'):
-                                self.response_field(key, value, lhs[0], 'response header assignment')
-                                continue
                     if (len(lhs) >= 3 and lhs[-2].value == '.' and lhs[-1].value in URI_COMPONENT_FIELDS):
                         uri = self.expression(lhs[:-2], state)
                         if has_shape(uri, 'uri'):
@@ -3420,13 +3741,22 @@ class RubyEngine:
         if not state.get('@reachable'):
             return state
         self.pending_raises = CLEAN
+        self.exceptional_evaluation = kind == 'exception'
         if kind == 'branch':
             return state
         if kind == 'exit':
             self.returned = join(self.returned, state.get('@result', CLEAN))
+            for index, original in self.parameter_values.items():
+                if self.hash_layouts(original) is not None:
+                    final = state.get('@hash-parameter:' + str(index), original)
+                    self.hash_mutations[index] = join(self.hash_mutations.get(index, CLEAN), final)
             return state
         if kind == 'raise-exit':
             self.raised = join(self.raised, state.get('@exception', CLEAN))
+            for index, original in self.parameter_values.items():
+                if self.hash_layouts(original) is not None:
+                    final = state.get('@hash-parameter:' + str(index), original)
+                    self.hash_raised_mutations[index] = join(self.hash_raised_mutations.get(index, CLEAN), final)
             return state
         if kind in {'save-result', 'restore-result'}:
             saved = '@result:' + extra
@@ -3572,6 +3902,7 @@ class RubyEngine:
             if '_2' in parameters and not (map_entry and method not in {'each_key', 'each_value'}):
                 raise ValueError('Ruby higher numbered block parameters need arity binding; analysis is incomplete')
             arity = 1 if method == 'with_connection' or body_line or input_element else None
+            hash_parameters = None
             if body_line:
                 offset = min(trace.key[1] for trace in value
                              if trace.kind == 'shape' and trace.key[0] == 'request-body')
@@ -3590,11 +3921,25 @@ class RubyEngine:
                     # Hash#each gives one formal the [key, value] pair; Ruby
                     # destructures it for two formals and fills extras with nil.
                     value = self.collection(value, offset)
+            elif method in REQUEST_MAP_ITERATORS | {'map', 'collect'} and self.hash_layouts(value) is not None:
+                keys, values = CLEAN, CLEAN
+                for layout in self.hash_layouts(value):
+                    for (key_kind, key_value), item in layout.key[1]:
+                        keys = join(keys, constant(key_value, 'literal' if key_kind == 'string'
+                                                  else 'number' if key_kind == 'integer' else 'symbol'))
+                        values = join(values, item)
+                if method in {'each_key', 'each_value'}:
+                    value, arity = (keys if method == 'each_key' else values), 1
+                elif len(parameters) == 1:
+                    value, arity = self.collection(join(keys, values), tokens[0].start if tokens else 0), 1
+                else:
+                    hash_parameters, arity = (keys, values), 2
             elif method in REQUEST_MAP_ITERATORS | {'map', 'collect'} and any(
                     trace.kind == 'object' and trace.key[0] == 'array' for trace in value):
                 value = self.elements(value)
             for index, name in enumerate(parameters):
-                state[name] = constant('nil', 'code') if arity is not None and index >= arity else value
+                state[name] = (constant('nil', 'code') if arity is not None and index >= arity
+                               else hash_parameters[index] if hash_parameters is not None else value)
             for name in locals_:
                 state[name] = constant('nil', 'code')
             state['@result'] = constant('nil', 'code')
@@ -3637,10 +3982,14 @@ class RubyEngine:
         changed = True
         while changed:
             changed = False
+            deferred = set()
             contexts = tuple(self.contexts.items())
             for key, function in contexts:
                 self.budget.spend()
                 self.function, self.effects, self.returned, self.mutations, self.raised = function, {}, CLEAN, {}, CLEAN
+                self.hash_mutations = {}
+                self.hash_raised_mutations = {}
+                self.exceptional_evaluation = False
                 self.unresolved_calls = set()
                 self.parameter_values = dict(enumerate(key[1]))
                 state = {'@reachable': constant('reachable')}
@@ -3678,15 +4027,34 @@ class RubyEngine:
                         fact = self.expression(function.defaults[index], state)
                     if fact or name not in state:
                         state[name] = fact
+                    if self.hash_layouts(fact) is not None:
+                        state['@hash-parameter:' + str(index)] = fact
                 if function.key not in self.graphs:
                     self.graphs[function.key] = self.graph(function)
                 entry, actions, edges = self.graphs[function.key]
-                solve(entry, state, edges, lambda node, incoming: self.transfer(actions[node], incoming), self.budget)
+                try:
+                    solve(entry, state, edges, lambda node, incoming: self.transfer(actions[node], incoming), self.budget)
+                except PendingHashSummary:
+                    # Do not freeze pre-call storage into an exact caller
+                    # summary while the selected callee has not run. Prior
+                    # independently reached findings remain reportable.
+                    deferred.add(key)
+                    self.summaries[key] = self.summaries[key].merged(RubySummary(effects=self.effects))
+                    continue
                 self.dispatch_failures[key] = self.unresolved_calls
-                updated = self.summaries[key].merged(RubySummary(self.returned, self.effects, self.mutations, self.raised))
+                if key not in self.ready_hash_contexts:
+                    self.ready_hash_contexts.add(key)
+                    changed = True
+                updated = self.summaries[key].merged(RubySummary(
+                    self.returned, self.effects, self.mutations, self.raised,
+                    self.hash_mutations, self.hash_raised_mutations))
                 if updated != self.summaries[key]:
                     self.summaries[key], changed = updated, True
             changed = changed or len(contexts) != len(self.contexts)
+            if deferred and not changed:
+                for key in deferred:
+                    self.dispatch_failures[key] = {
+                        f'{self.path}: Recursive Ruby Hash helper storage is unresolved; analysis is incomplete'}
         effects = {}
         for summary in self.summaries.values():
             for (rule, offset), fact in summary.effects.items():

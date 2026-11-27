@@ -556,6 +556,20 @@ class _NativeSequence:
 
 
 @dataclass(frozen=True)
+class _NativeRange:
+    """Exact immutable integer progression; construction never expands it."""
+    start: int
+    stop: int
+    step: int
+    format_safe: bool = True
+
+    @property
+    def count(self):
+        distance = self.stop - self.start if self.step > 0 else self.start - self.stop
+        return 0 if distance <= 0 else 1 + (distance - 1) // abs(self.step)
+
+
+@dataclass(frozen=True)
 class _CsvReader:
     """A native lazy CSV iterator; its handle and metadata are not row data."""
     stream: str
@@ -952,7 +966,7 @@ def _readonly_builtin_modules(nodes, parents):
         return frozenset()  # Exported names can replace even an earlier module alias.
     names = {alias.asname or alias.name for node in nodes if isinstance(node, ast.Import)
              for alias in node.names if alias.name == 'builtins'}
-    allowed = {'input', 'list', 'tuple', 'any', 'all', 'next'}
+    allowed = {'input', 'list', 'tuple', 'any', 'all', 'next', 'range'}
     result = set()
     for name in names:
         valid = True
@@ -1154,7 +1168,7 @@ class _ModuleBinding:
 # Preserve the existing conventional unimported names, but never restore one
 # after a local assignment/parameter has explicitly shadowed it.
 _IMPLICIT_IDENTITIES = frozenset({
-    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'len', 'list', 'tuple', 'set', 'frozenset', 'dict', 'sorted', 'min', 'max', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'filter', 'map', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
+    'eval', 'exec', 'input', 'raw_input', 'print', 'str', 'len', 'list', 'tuple', 'set', 'frozenset', 'dict', 'sorted', 'min', 'max', 'any', 'all', 'next', 'iter', 'zip', 'enumerate', 'filter', 'map', 'range', 'globals', 'builtins', 'staticmethod', 'classmethod', 'bytearray',
     'html', 'django', 'flask', 'markupsafe', 'bleach', 'shlex', 'subprocess', 'os', 'asyncio',
     'sys', 'request', 'cursor', 'session', 'conn', 'engine', 'db',
     'render_template', 'render_template_string', 'HttpResponse', 'Response',
@@ -3361,6 +3375,10 @@ class _Flow:
                         continue  # This body cannot run in a discarded argument.
                 call = engine.parents.get(capability)
                 spelling = capability.id if isinstance(capability, ast.Name) else capability.attr
+                if engine is self.engine and spelling == 'eval' and not isinstance(call, ast.Call):
+                    aliases = self.stdin_parser_alias_calls(capability)
+                    if aliases is not None and all(self.stdin_parser_after(alias, consumer) for alias in aliases):
+                        continue
                 if (engine is not self.engine or spelling == 'exec'
                         or not isinstance(call, ast.Call) or call.func is not capability
                         or self.engine.enclosing(call) is not scope
@@ -3598,7 +3616,7 @@ class _Flow:
     @staticmethod
     def unproved_producer(binding):
         return any(isinstance(value, _UnprovedProducer)
-                   or isinstance(value, (_LiteralString, _GeneratorString, _NativeSequence, _LiteralJoinInstance,
+                   or isinstance(value, (_LiteralString, _GeneratorString, _NativeSequence, _NativeRange, _LiteralJoinInstance,
                                          _CsvReader, _StdinCallableIterator, _ByteBuffer)) and not value.format_safe
                    for value in _binding_choices(binding))
 
@@ -3663,6 +3681,8 @@ class _Flow:
                                               for operand, fact in value.operands), value.references)
             elif isinstance(value, _NativeSequence):
                 value = _NativeSequence(self.without_format_authority(value.element), False)
+            elif isinstance(value, _NativeRange):
+                value = _NativeRange(value.start, value.stop, value.step, False)
             elif isinstance(value, _LiteralMapping):
                 value = _LiteralMapping(self.without_format_authority(value.value_binding)
                                         if value.value_binding is not None else _UnprovedProducer(), value.keys)
@@ -3676,11 +3696,12 @@ class _Flow:
                 value = _StdinCallableIterator(value.reader, value.eof_terminated, False)
             elif isinstance(value, _ByteBuffer):
                 value = _ByteBuffer(value.empty, False)
-            elif isinstance(value, str) and value in _STDIN_PARSER_CARRIERS:
+            elif isinstance(value, str) and value in _STDIN_PARSER_CARRIERS | {'range', 'builtins.range'}:
                 value = _BoundCallable(value, NO_REFERENCES, namespace_proven=True,
                                        producer_unproved=True)
             elif isinstance(value, _BoundCallable) and (
-                    value.receiver_binding is not None or value.name in _STDIN_PARSER_CARRIERS):
+                    value.receiver_binding is not None
+                    or value.name in _STDIN_PARSER_CARRIERS | {'range', 'builtins.range'}):
                 value = _BoundCallable(value.name, value.references, value.receiver, value.namespace_proven,
                                        True, self.without_format_authority(value.receiver_binding)
                                        if value.receiver_binding is not None else None)
@@ -3772,6 +3793,10 @@ class _Flow:
             if (isinstance(value, ast.Constant)
                     and type(value.value) in {str, bytes, int, float, complex, bool, type(None)}):
                 continue
+            if isinstance(value, _NativeRange) and value.format_safe:
+                continue
+            if isinstance(value, str) and value in {'range', 'builtins.range'} and self.generator_builtins_stable():
+                continue
             if isinstance(value, _ArgumentVector) and all(
                     self.materialized_generator_binding(operand, value.references_at(index), state)
                     for index, (operand, _fact) in enumerate(value.operands)):
@@ -3825,6 +3850,11 @@ class _Flow:
         if target in ('input', 'builtins.input'):
             return (self.generator_builtins_stable() and len(node.args) <= 1 and not node.keywords
                     and all(self.formatted_string_operand(argument, state) for argument in node.args))
+        if (target in {'builtins.Exception', 'builtins.ValueError', 'builtins.TypeError', 'builtins.RuntimeError'}
+                and not node.args and not node.keywords):
+            # These native zero-argument constructors own no user values and
+            # cannot invoke a conversion protocol before the explicit raise.
+            return self.stdin_parser_stable(node, members={target.rsplit('.', 1)[-1], '__new__', '__init__'})
         closure = target if isinstance(target, _ClosureValue) else None
         if closure is not None:
             target = closure.value
@@ -3955,6 +3985,14 @@ class _Flow:
                     and not expression.keywords and len(expression.args) <= 1
                     and self.generator_builtins_stable()):
                 return all(prompt(argument) for argument in expression.args)
+            if (isinstance(expression, ast.Call) and isinstance(expression.func, ast.Name)
+                    and lookup(expression.func.id) in ('range', 'builtins.range')
+                    and not expression.keywords and 1 <= len(expression.args) <= 3
+                    and self.stdin_parser_stable(node, members={'range', '__index__'})):
+                return all(isinstance(argument, ast.Constant) and type(argument.value) in {int, bool}
+                           or isinstance(argument, ast.Name) and isinstance(lookup(argument.id), ast.Constant)
+                           and type(lookup(argument.id).value) in {int, bool}
+                           for argument in expression.args)
             return literal_call(expression) is not None
 
         def prompt(expression):
@@ -4116,6 +4154,8 @@ class _Flow:
         # aliases. Never recover a mutable collection from stale source text.
         references = self.expression_references.get(node, NO_REFERENCES)
         choices = _binding_choices(self.expression_bindings.get(node))
+        if choices and all(isinstance(value, _NativeRange) and value.format_safe for value in choices):
+            return True
         if (not references & state.mutated and choices
                 and all(isinstance(value, (_LiteralString, _GeneratorString)) for value in choices)):
             return True
@@ -5889,6 +5929,123 @@ class _Flow:
         return join_facts(*scalar_facts, *(fact for output in outputs if output is not None
                                           for _row, fact in output.operands))
 
+    def range_value(self, node, state, target, inputs):
+        """Capture native integer bounds after evaluating every argument once.
+
+        __index__ can mutate unrelated state, and an exact integer result
+        does not prove its producer frame harmless. Require existing native
+        scalar identities; unknown protocols remain an explicit boundary.
+        """
+        if (isinstance(target, _BoundCallable) and target.producer_unproved
+                or not self.stdin_parser_stable(node, members={'range', '__index__'})):
+            raise AnalysisLimit('native range callable identity is unresolved; analysis is incomplete')
+        positions = self.call_positions(node, inputs.arguments, state)
+        if (None in inputs.keywords or any(isinstance(expression, (ast.Starred, _ArgumentExpansion))
+                                          for expression, _fact, _binding, _refs in positions)):
+            raise AnalysisLimit('native range argument expansion is unresolved; analysis is incomplete')
+        evaluated = [(binding, references) for _expression, _fact, binding, references in positions]
+        evaluated.extend((self.expression_bindings.get(expression),
+                          self.expression_references.get(expression, NO_REFERENCES))
+                         for expression in inputs.keyword_nodes.values())
+        symbolic = False
+        for binding, references in evaluated:
+            self.require_value(binding)
+            if isinstance(binding, _SymbolicValue):
+                symbolic = True
+            elif not self.materialized_generator_binding(binding, references, state):
+                # All arguments run before even an arity/type error. A
+                # later discarded operand may own a state-changing finalizer.
+                raise AnalysisLimit('native range argument producer effects are unresolved; analysis is incomplete')
+        if symbolic:
+            # Revisit the selected caller with actual scalar identities.
+            return CLEAN
+        if inputs.keywords or not 1 <= len(positions) <= 3:
+            self.pending.append(_Completion('raise', state.copy(), exception_type='TypeError'))
+            state.reachable = False
+            return CLEAN
+        bounds = []
+        for expression, _fact, binding, _references in positions:
+            if (isinstance(expression, ast.UnaryOp) and isinstance(expression.op, (ast.UAdd, ast.USub))
+                    and isinstance(expression.operand, ast.Constant)
+                    and type(expression.operand.value) in {int, bool}):
+                integer = int(expression.operand.value)
+                bounds.append(-integer if isinstance(expression.op, ast.USub) else integer)
+            elif isinstance(binding, ast.Constant) and type(binding.value) in {int, bool}:
+                bounds.append(int(binding.value))
+            elif isinstance(binding, (_LiteralString, _GeneratorString, ast.Constant)):
+                self.pending.append(_Completion('raise', state.copy(), exception_type='TypeError'))
+                state.reachable = False
+                return CLEAN
+            else:
+                raise AnalysisLimit('native range index protocol or producer is unresolved; analysis is incomplete')
+        start, stop, step = ((0, bounds[0], 1) if len(bounds) == 1 else
+                             (bounds[0], bounds[1], 1) if len(bounds) == 2 else tuple(bounds))
+        if step == 0:
+            self.pending.append(_Completion('raise', state.copy(), exception_type='ValueError'))
+            state.reachable = False
+            return CLEAN
+        self.expression_bindings[node] = _NativeRange(start, stop, step)
+        self.expression_references[node] = NO_REFERENCES
+        return CLEAN
+
+    def range_elements(self, node, value):
+        """Bound cardinality before allocation, including enormous endpoints."""
+        if not value.format_safe:
+            raise AnalysisLimit('native range producer effects are unresolved; analysis is incomplete')
+        count = value.count
+        if count > self.comprehension_budget:
+            raise AnalysisLimit('native range iteration exceeds the bounded model; analysis is incomplete')
+        key = (node, value)
+        elements = self.engine.generator_literal_elements.get(key)
+        if elements is None:
+            self.engine.budget.spend(count)
+            elements = tuple(ast.copy_location(ast.Constant(value=value.start + value.step * index), node)
+                             for index in range(count))
+            self.engine.generator_literal_elements[key] = elements
+        return elements
+
+    def range_loop(self, node, state, choices):
+        """Run each finite progression in order, preserving break/else edges."""
+        if (not isinstance(node, ast.For) or not isinstance(node.target, ast.Name)
+                or not all(isinstance(value, _NativeRange) for value in choices)):
+            raise AnalysisLimit('native range iteration alternatives are unresolved; analysis is incomplete')
+        callees = (_binding_choices(self.expression_bindings.get(node.iter.func))
+                   if isinstance(node.iter, ast.Call) else ())
+        freshly_constructed = callees and all(
+            isinstance(value, str) and value in {'range', 'builtins.range'}
+            or isinstance(value, _BoundCallable) and value.namespace_proven
+            and value.name in {'range', 'builtins.range'} for value in callees)
+        if not freshly_constructed and not self.stdin_parser_stable(node, members={'__iter__', '__next__'}):
+            raise AnalysisLimit('native range iteration identity is unresolved; analysis is incomplete')
+        finished, broken, outgoing = [], [], []
+        for value in choices:
+            elements = self.range_elements(node.iter, value)
+            self.comprehension_budget -= len(elements)
+            current = state.copy()
+            for element in elements:
+                if current is None:
+                    break
+                # Exact iteration must prove both replacement of the prior
+                # target and every body effect; either can release an owned
+                # value whose finalizer writes unrelated state.
+                self.materialized_generator_depth += 1
+                try:
+                    self.assign_captured(node.target, CLEAN, element, NO_REFERENCES, current)
+                    normal, pending = self.capture(node.body, current)
+                finally:
+                    self.materialized_generator_depth -= 1
+                broken.extend(item.state for item in pending if item.kind == 'break')
+                outgoing.extend(item for item in pending if item.kind not in {'break', 'continue'})
+                current = _join_states(normal, *(item.state for item in pending if item.kind == 'continue'))
+            finished.append(current)
+        self.pending.extend(_merge_completions(outgoing))
+        self.materialized_generator_depth += 1
+        try:
+            normal = self.block(node.orelse, _join_states(*finished))
+        finally:
+            self.materialized_generator_depth -= 1
+        return _join_states(normal, *broken)
+
     def zip_call(self, node, state, target, name, inputs):
         native = isinstance(target, str) or isinstance(target, _BoundCallable) and target.namespace_proven
         if native and name in {'map', 'builtins.map'}:
@@ -6070,12 +6227,20 @@ class _Flow:
                 # A for/comprehension's first iterable is constructed once,
                 # before its loop starts. Its body and later clauses can run
                 # after an earlier iteration's eval, so retain that boundary.
-                if (isinstance(parent, (ast.For, ast.AsyncFor)) and parent.iter is not child
-                        or isinstance(parent, ast.comprehension) and parent.iter is not child
+                if (isinstance(parent, ast.comprehension) and parent.iter is not child
                         or isinstance(parent, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp))
-                        and parent.generators[0] is not child
-                        or isinstance(parent, ast.While)):
+                        and parent.generators[0] is not child):
                     return False
+                if (isinstance(parent, (ast.For, ast.AsyncFor)) and parent.iter is not child
+                        or isinstance(parent, ast.While)):
+                    repeated = execution
+                    while repeated in engine.parents and repeated is not parent:
+                        repeated = engine.parents[repeated]
+                    if repeated is parent:
+                        return False  # An earlier iteration can execute it.
+                    # An eval outside the synchronous loop cannot run on
+                    # its back edge. Ordinary enclosing order still has to
+                    # prove that eval follows every possible construction.
                 if isinstance(parent, (ast.For, ast.AsyncFor)) and parent.iter is child:
                     # Constructing its iterable precedes every body/else
                     # execution, even though both share the same statement
@@ -6104,6 +6269,12 @@ class _Flow:
                         return False
                     if isinstance(parent, ast.With) and any(
                             left_stmt is item for item in parent.items) and after in parent.body:
+                        return True
+                    if ((isinstance(parent, ast.Try)
+                         or hasattr(ast, 'TryStar') and isinstance(parent, ast.TryStar)) and left_stmt in parent.body
+                            and after in (*parent.handlers, *parent.orelse, *parent.finalbody)):
+                        # Handlers and finalization cannot resume the try
+                        # body. Repeated consumers were rejected above.
                         return True
                     for block in (getattr(parent, 'body', None), getattr(parent, 'orelse', None),
                                   getattr(parent, 'finalbody', None)):
@@ -6149,6 +6320,41 @@ class _Flow:
             return True
         return bool(calls) and all(self.stdin_parser_after(execution, call, seen | {scope}) for call in calls)
 
+    def stdin_parser_alias_calls(self, capability):
+        """Locate every use of a private, once-bound module eval alias.
+
+        Saving the builtin does not execute it. An escaped alias, attribute
+        getter, other module or deferred scope still lacks an ordering proof.
+        """
+        engine = self.engine
+        assignment = engine.parents.get(capability)
+        if (not isinstance(capability, ast.Name) or capability.id != 'eval'
+                or not isinstance(assignment, ast.Assign) or assignment.value is not capability
+                or assignment not in engine.tree.body or len(assignment.targets) != 1
+                or not isinstance(assignment.targets[0], ast.Name)
+                or len(engine.generator_peers) != 1):
+            return None
+        target = assignment.targets[0]
+        if (target.id in engine.generator_external_writers
+                or engine.generator_binders[engine.tree].get(target.id) != [target]):
+            return None
+        calls = []
+        for reference, parent in engine.parents.items():
+            engine.budget.spend()
+            if (isinstance(reference, ast.Attribute) and reference.attr == target.id
+                    or isinstance(reference, ast.ImportFrom)
+                    and any(alias.name == target.id for alias in reference.names)
+                    or isinstance(reference, ast.Import)
+                    and any(alias.name == '__main__' for alias in reference.names)):
+                return None
+            if not isinstance(reference, ast.Name) or reference.id != target.id or reference is target:
+                continue
+            if (not isinstance(reference.ctx, ast.Load) or not isinstance(parent, ast.Call)
+                    or parent.func is not reference or engine.enclosing(reference) is not engine.tree):
+                return None
+            calls.append(parent)
+        return tuple(calls)
+
     def stdin_parser_stable(self, node, *, members=None, deferred_lambdas=()):
         """Require the native loader's decoder and module to remain intact."""
         names = (members if members is not None else {
@@ -6174,6 +6380,10 @@ class _Flow:
                         continue
                 call = engine.parents.get(capability)
                 spelling = capability.id if isinstance(capability, ast.Name) else capability.attr
+                if engine is self.engine and spelling == 'eval' and not isinstance(call, ast.Call):
+                    aliases = self.stdin_parser_alias_calls(capability)
+                    if aliases is not None and all(self.stdin_parser_after(alias, node) for alias in aliases):
+                        continue
                 if (engine is not self.engine or spelling == 'exec'
                         or not isinstance(call, ast.Call) or call.func is not capability
                         or not self.stdin_parser_after(call, node)):
@@ -8559,6 +8769,18 @@ class _Flow:
             raise AnalysisLimit('prepared HTTP request called as a function; analysis is incomplete')
         native_name = (target if isinstance(target, str) else target.name
                        if isinstance(target, _BoundCallable) and target.namespace_proven else None)
+        if native_name in {'range', 'builtins.range'}:
+            return self.range_value(node, state, target, inputs)
+        if (self.materialized_generator_depth and native_name in _STDIN_EAGER_PARSERS
+                and len(node.args) == 1 and not node.keywords):
+            streams = _binding_choices(self.expression_bindings.get(node.args[0]))
+            if streams and all(self.stdin_identity(value) in _STDIN_STREAMS for value in streams):
+                # A single retained native stream has no discarded opaque
+                # operands. The loader's own proof must still admit decoder,
+                # producer and execution ordering before any parsed value.
+                parsed = self.stdin_parser(node, state, target, native_name, receiver, inputs)
+                if parsed is not None:
+                    return parsed
         if native_name in _URLLIB_APIS or _http_contract(target, (_UrllibRequest, _UrllibOpener)):
             return self.urllib_call(node, state, target, inputs)
         if native_name in _HTTP_CLIENT_CONSTRUCTORS:
@@ -9184,11 +9406,12 @@ class _Flow:
             # the caller's distinct generator/closure cells.
             format_frame_inert = (bool(self.materialized_generator_depth) or native_callback or not any(
                 isinstance(value, (_LiteralString, _GeneratorString, _LiteralJoinInstance, _LiteralMethodInstance,
-                                   _ArgumentVector, _LiteralMapping, _NativeSequence, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer,
+                                   _ArgumentVector, _LiteralMapping, _NativeSequence, _NativeRange, _CsvReader, _StdinCallableIterator, _ZipIterator, _ByteBuffer,
                                    _SymbolicValue, ast.Constant))
-                or isinstance(value, str) and value in _STDIN_PARSER_CARRIERS
+                or isinstance(value, str) and value in _STDIN_PARSER_CARRIERS | {'range', 'builtins.range'}
                 or isinstance(value, _BoundCallable) and (
-                    value.receiver_binding is not None or value.name in _STDIN_PARSER_CARRIERS)
+                    value.receiver_binding is not None
+                    or value.name in _STDIN_PARSER_CARRIERS | {'range', 'builtins.range'})
                 for value in _binding_choices(summary.returned_binding) if not _http_contract(value)))
             if not format_frame_inert and isinstance(node, ast.Call):
                 format_frame_inert = (self.generator_predicate_frame(
@@ -9598,7 +9821,7 @@ class _Flow:
                 identity = (str, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda,
                             ast.ClassDef, _FunctionValue, _ClosureValue, _BoundCallable,
                             _BoundClassMethod, _ModuleBinding, _ArgumentVector, _LiteralString, _GeneratorString,
-                            _UnprovedProducer, _LiteralMapping, _NativeSequence, _LiteralJoinInstance, _LiteralMethodInstance,
+                            _UnprovedProducer, _LiteralMapping, _NativeSequence, _NativeRange, _LiteralJoinInstance, _LiteralMethodInstance,
                             _ProcessInput, _StdinCallableIterator, _ZipIterator, _ByteBuffer, ast.Constant)
                 if (not nominal_helper and any(isinstance(value, identity)
                         for value in (*_binding_choices(binding), *_binding_choices(nominal)))):
@@ -9616,6 +9839,17 @@ class _Flow:
                         and self.engine.parents[parent].func is parent
                         and binding == 'builtins' and node.id in self.engine.generator_readonly_builtins):
                     is_callee = True
+                if isinstance(parent, ast.Attribute) and parent.value is node and isinstance(binding, str):
+                    member = binding + '.' + parent.attr
+                    call = self.engine.parents.get(parent)
+                    if isinstance(call, ast.Call) and (
+                            member in _STDIN_EAGER_PARSERS and call.func is parent
+                            or member in _STDIN_STREAMS and parent in call.args
+                            and _imported_name(call.func, state.bindings) in _STDIN_EAGER_PARSERS):
+                        # Native parser dispatch proves its loader/decoder
+                        # and stream effects after capturing these operands.
+                        # An opaque module read must not replace that proof.
+                        is_callee = True
                 if not is_callee and not self.materialized_generator_binding(binding, refs, state):
                     # A primitive final result is insufficient: an earlier
                     # truth test, index, format or discarded operand can have
@@ -10121,12 +10355,21 @@ class _Flow:
             return CLEAN  # A comparison produces a bool, not executable text.
         if isinstance(node, ast.UnaryOp):
             operand = self.expr(node.operand, state)
+            binding = self.expression_bindings.get(node.operand)
             if isinstance(node.op, ast.Not):
-                binding = self.expression_bindings.get(node.operand)
                 if binding is _PREDICATE_RESULTS[0]:
                     self.expression_bindings[node] = _PREDICATE_RESULTS[1]
                 elif binding is _PREDICATE_RESULTS[1]:
                     self.expression_bindings[node] = _PREDICATE_RESULTS[0]
+            elif (isinstance(node.op, (ast.UAdd, ast.USub)) and isinstance(binding, ast.Constant)
+                    and type(binding.value) in {int, bool}):
+                integer = -int(binding.value) if isinstance(node.op, ast.USub) else int(binding.value)
+                key = (node, integer)
+                scalar = self.engine.scalar_literal_bindings.get(key)
+                if scalar is None:
+                    scalar = ast.copy_location(ast.Constant(value=integer), node)
+                    self.engine.scalar_literal_bindings[key] = scalar
+                self.expression_bindings[node] = scalar
             return CLEAN if isinstance(node.op, ast.Not) else operand
         if isinstance(node, ast.Name):
             return state.value(node.id)
@@ -10514,6 +10757,8 @@ class _Flow:
                 if elements is None:
                     elements = tuple(ast.copy_location(ast.Constant(value=value), literal) for value in scalar)
                     self.engine.generator_literal_elements[key] = elements
+            if isinstance(binding, _NativeRange):
+                elements = self.range_elements(literal, binding)
             empty = (elements == [] or isinstance(literal, ast.Constant)
                      and isinstance(literal.value, (str, bytes)) and not literal.value
                      or scalar is not None and not scalar)
@@ -10617,12 +10862,14 @@ class _Flow:
                 return _join_states(*(self.zip_walk(entering, iterator,
                     lambda branch, fact, row: iteration(branch, captured=(row, fact, NO_REFERENCES)))
                     for iterator in zip_choices))
-            if (elements is not None and (isinstance(literal, (ast.List, ast.Tuple)) or scalar is not None)
+            if (elements is not None and (isinstance(literal, (ast.List, ast.Tuple))
+                                          or scalar is not None or isinstance(binding, _NativeRange))
                     and len(elements) <= self.comprehension_budget):
                 self.comprehension_budget -= len(elements)
                 current = entering
                 for element in elements:
-                    current = iteration(current, element)
+                    current = (iteration(current, captured=(element, CLEAN, NO_REFERENCES))
+                               if isinstance(binding, _NativeRange) else iteration(current, element))
                 return current
             if (synchronous_generator and isinstance(binding, _ArgumentVector)
                     and isinstance(generator.target, ast.Name)
@@ -10982,6 +11229,8 @@ class _Flow:
             value = join_facts(value, self.stdin_source(binding, exhausting=True))
             references = self.expression_references.get(node.iter, NO_REFERENCES)
             generators = _binding_choices(binding)
+            if any(isinstance(value, _NativeRange) for value in generators):
+                return self.range_loop(node, state, generators)
             if any(isinstance(value, (_DeferredGenerator, _GeneratorNext)) for value in generators):
                 return self.generator_loop(node, state, generators)
             if any(isinstance(value, _ZipIterator) for value in generators):
@@ -11181,7 +11430,7 @@ class _Analysis:
             or isinstance(node, ast.ImportFrom) and node.module
             and (node.module.split('.')[0] in {'sys', 'importlib'}
                  or node.module == 'builtins' and any(alias.name not in {
-                     'input', 'list', 'tuple', 'any', 'all', 'next'} for alias in node.names))
+                     'input', 'list', 'tuple', 'any', 'all', 'next', 'range'} for alias in node.names))
             or isinstance(node, ast.Attribute) and node.attr in {
                 '__builtins__', '__globals__', 'f_builtins', 'f_globals', 'stdin', 'import_module'}
             or isinstance(node, ast.Constant) and isinstance(node.value, str)
@@ -11262,6 +11511,7 @@ class _Analysis:
         self.generator_context_wrappers = {}
         self.generator_receiver_proofs = {}
         self.generator_literal_elements = {}
+        self.scalar_literal_bindings = {}
         self.definition_writers = set()
         self.direct_global_functions = set()
         self.locals = {}
@@ -12409,6 +12659,8 @@ class _Analysis:
                 # parameters must keep sharing their symbolic summaries.
                 pass
             elif isinstance(value, _NativeSequence) and (captured or name in value_parameters):
+                pass
+            elif isinstance(value, _NativeRange) and (captured or name in value_parameters):
                 pass
             elif isinstance(value, _UnprovedProducer) and (captured or name in value_parameters):
                 pass

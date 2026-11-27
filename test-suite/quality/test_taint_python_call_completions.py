@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 from test_taint_python_dataflow import ROOT, SourceTest, taint_py
@@ -3852,6 +3854,464 @@ class ImmediateGeneratorExpressionTests(SourceTest):
             '''
             with self.subTest(collector=collector), self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
                 self.scan(source)
+
+
+class NativeRangeCompletionTests(SourceTest):
+    """Independent native range oracles, authored against a41b153d.
+
+    Literal endpoints describe actual Python values and iteration order.
+    Native witnesses record eval operands; they never execute source text
+    supplied by input(). Opaque index protocols are explicit boundaries.
+    """
+
+    def range_witness(self, source, expected):
+        artifacts = ROOT / 'test-suite/artifacts/python-native-range'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='witness-', dir=artifacts))
+        target = scratch / 'witness.py'
+        target.write_text(source, encoding='utf-8')
+        driver = '''
+import builtins, contextlib, io, json, pathlib, sys
+source = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
+observed = []
+saved_range = builtins.range
+saved_stdin = sys.stdin
+namespace = {'eval': observed.append}
+failure = None
+try:
+    sys.stdin = io.StringIO('RANGE_SOURCE\\n' * 512)
+    with contextlib.redirect_stdout(io.StringIO()):
+        exec(compile(source, str(sys.argv[1]), 'exec'), namespace)
+except Exception as exc:
+    failure = type(exc).__name__
+finally:
+    builtins.range = saved_range
+    sys.stdin = saved_stdin
+print(json.dumps({'observed': observed, 'failure': failure}))
+'''
+        result = subprocess.run([sys.executable, '-I', '-S', '-B', '-c', driver, str(target)],
+                                capture_output=True, text=True, timeout=10)
+        (scratch / 'stdout.log').write_text(result.stdout, encoding='utf-8')
+        (scratch / 'stderr.log').write_text(result.stderr, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, (source, result.stdout, result.stderr))
+        self.assertEqual(json.loads(result.stdout), {'observed': expected, 'failure': None}, source)
+
+    def check_range(self, label, source, expected_lines, observed):
+        source = textwrap.dedent(source).lstrip('\n')
+        started = time.monotonic()
+        print(f'[native-range-{label}] RUN', flush=True)
+        try:
+            self.range_witness(source, observed)
+            findings = self.scan(source)
+            self.assertEqual([(row['rule'], row['line']) for row in findings],
+                             [('python.taint.eval', line) for line in expected_lines],
+                             (source, findings))
+        except Exception:
+            print(f'[native-range-{label}] FAIL ({time.monotonic() - started:.3f}s)\n{source}', flush=True)
+            raise
+        print(f'[native-range-{label}] PASS ({time.monotonic() - started:.3f}s)', flush=True)
+
+    def test_native_range_exact_values_and_exclusive_stop(self):
+        for expression, selected, unsafe in (
+            ('range(4)', 3, True), ('range(4)', 4, False),
+            ('range(-2, 5, 2)', 4, True), ('range(-2, 5, 2)', 3, False),
+            ('range(5, -2, -2)', -1, True), ('range(5, -2, -2)', -2, False),
+            ('range(False, True)', 0, True), ('range(True, False)', 0, False),
+        ):
+            source = ("code = 'fixed'\n"
+                      f"list((code := input()) if index == {selected} else 0 for index in {expression})\n"
+                      'eval(code)\n')
+            with self.subTest(expression=expression, selected=selected):
+                self.check_range('values', source, [3] if unsafe else [],
+                                 ['RANGE_SOURCE' if unsafe else 'fixed'])
+
+    def test_empty_ranges_skip_sources_and_preserve_prior_values(self):
+        for expression in ('range(0)', 'range(3, 3)', 'range(1, 4, -1)', 'range(4, 1)'):
+            for consumer in ('list', 'tuple', 'any', 'all'):
+                for initial, body, unsafe in (("'fixed'", 'input()', False),
+                                              ('input()', "'fixed'", True)):
+                    source = (f'code = {initial}\n'
+                              f'{consumer}((code := {body}) for index in {expression})\n'
+                              'eval(code)\n')
+                    with self.subTest(expression=expression, consumer=consumer, initial=initial):
+                        self.check_range('empty', source, [3] if unsafe else [],
+                                         ['RANGE_SOURCE' if unsafe else 'fixed'])
+
+    def test_range_iteration_order_determines_the_last_write(self):
+        for expression, selected, unsafe in (
+            ('range(3)', 0, False), ('range(3)', 2, True),
+            ('range(3, 0, -1)', 3, False), ('range(3, 0, -1)', 1, True),
+        ):
+            source = ("code = 'initial'\n"
+                      f"tuple((code := input() if index == {selected} else 'fixed') for index in {expression})\n"
+                      'eval(code)\n')
+            with self.subTest(expression=expression, selected=selected):
+                self.check_range('order', source, [3] if unsafe else [],
+                                 ['RANGE_SOURCE' if unsafe else 'fixed'])
+
+    def test_range_predicate_and_next_stop_before_later_writes(self):
+        for consumer, first in (('any', "'fixed'"), ('all', "''"), ('next', "'fixed'")):
+            source = ('code = input()\n'
+                      f'{consumer}((code := {first} if index == 0 else input()) for index in range(3))\n'
+                      'eval(code)\n')
+            with self.subTest(consumer=consumer):
+                self.check_range('short-circuit', source, [], ['' if consumer == 'all' else 'fixed'])
+
+    def test_native_range_aliases_imports_and_fixed_helper_arguments(self):
+        for declaration, expression in (
+            ('make = range\n', 'make(1)'),
+            ('from builtins import range as make\n', 'make(1)'),
+            ('import builtins as native\n', 'native.range(1)'),
+            ('def make(stop):\n    return range(stop)\n', 'make(1)'),
+            ('def make(factory, stop):\n    return factory(stop)\n', 'make(range, 1)'),
+        ):
+            source = declaration + "code = 'fixed'\n"
+            source += f'list((code := input()) for index in {expression})\neval(code)\n'
+            with self.subTest(declaration=declaration):
+                self.check_range('identity', source, [len(source.splitlines())], ['RANGE_SOURCE'])
+
+    def test_range_local_rebinding_keeps_captured_native_identity(self):
+        source = ("make = range\nrange = lambda stop: ()\ncode = 'fixed'\n"
+                  'list((code := input()) for index in make(1))\neval(code)\n')
+        self.check_range('captured-native', source, [5], ['RANGE_SOURCE'])
+        source = ("def range(stop):\n    return ()\ncode = 'fixed'\n"
+                  'list((code := input()) for index in range(1))\neval(code)\n')
+        self.check_range('local-shadow', source, [], ['fixed'])
+
+    def test_zero_step_raises_before_iteration_or_success_continuation(self):
+        source = ("code = input()\ntry:\n"
+                  "    list((code := 'fixed') for index in range(0, 5, 0))\n"
+                  "    code = 'fixed'\nexcept ValueError:\n    eval(code)\n")
+        self.check_range('zero-step', source, [6], ['RANGE_SOURCE'])
+        self.check_range('zero-step-no-normal',
+                         'try:\n    range(0, 5, 0)\n    eval(input())\nexcept ValueError:\n    pass\n',
+                         [], [])
+
+    def test_large_integer_endpoints_do_not_imply_large_cardinality(self):
+        endpoint = '1000000000000000000000000000000'
+        source = ("code = 'fixed'\n"
+                  f'list((code := input()) for index in range(0, {endpoint}, {endpoint}))\n'
+                  'eval(code)\n')
+        self.check_range('large-finite', source, [3], ['RANGE_SOURCE'])
+
+    def test_unbounded_expansion_reports_incomplete_and_keeps_prefix_findings(self):
+        source = ('cursor.execute(input())\n'
+                  'list(index for index in range(1000000000000000000000000000000))\n')
+        # A subprocess deadline catches an implementation which expands the
+        # host range before checking the analyzer's own operation budget.
+        script = '''
+import ast, json, sys
+sys.path.insert(0, sys.argv[1])
+from ubs_core.analyzers import taint_py
+try:
+    taint_py._Analysis(ast.parse(sys.stdin.read())).analyze()
+except taint_py.AnalysisLimit as exc:
+    print(json.dumps({'incomplete': str(exc), 'sites': sorted(
+        key[1] for key in exc.effects if key[0] == 'sql')}))
+else:
+    print(json.dumps({'incomplete': '', 'sites': []}))
+'''
+        result = subprocess.run([sys.executable, '-B', '-c', script, str(ROOT / 'modules/helpers')],
+                                input=source, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        report = json.loads(result.stdout)
+        self.assertIn('incomplete', report['incomplete'])
+        self.assertEqual(report['sites'], [1])
+
+    def test_index_protocol_effects_are_an_explicit_boundary(self):
+        for expression in ('range(Bound())', 'range(0, Bound())', 'range(0, 2, Bound())'):
+            source = ("code = 'fixed'\nclass Bound:\n"
+                      '    def __index__(self):\n        global code\n'
+                      '        code = input()\n        return 1\n'
+                      f'list(index for index in {expression})\neval(code)\n')
+            with self.subTest(expression=expression):
+                self.range_witness(source, ['RANGE_SOURCE'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_index_operand_finalizers_cannot_be_hidden_by_empty_ranges(self):
+        source = ("code = 'fixed'\nclass Bound:\n"
+                  '    def __index__(self):\n        return 0\n'
+                  '    def __del__(self):\n        global code\n        code = input()\n'
+                  'list(index for index in range(Bound()))\neval(code)\n')
+        self.range_witness(source, ['RANGE_SOURCE'])
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            self.scan(source)
+
+    def test_replaced_builtin_range_cannot_certify_native_empty_semantics(self):
+        source = ("import builtins\ndef replacement(stop):\n    return [input()]\n"
+                  "builtins.range = replacement\ncode = 'fixed'\n"
+                  'list((code := value) for value in range(0))\neval(code)\n')
+        self.range_witness(source, ['RANGE_SOURCE'])
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            self.scan(source)
+
+    def test_range_invalid_scalar_keeps_prompt_producer_effects(self):
+        for expression in ('range(input(Prompt()))', 'range(input(Prompt()), 0, 0, 0)',
+                           'range(stop=input(Prompt()))', "range('invalid', input(Prompt()))"):
+            source = ("code = 'fixed'\nclass Prompt:\n"
+                      '    def __str__(self):\n        global code\n'
+                      "        code = input()\n        return ''\n"
+                      f'try:\n    {expression}\n'
+                      'except TypeError:\n    eval(code)\n')
+            with self.subTest(expression=expression):
+                self.range_witness(source, ['RANGE_SOURCE'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_range_type_error_keeps_discarded_later_operand_finalizers(self):
+        for expression in ("range('invalid', Bound())", "range('invalid', 0, Bound())",
+                           "range('invalid', 0, 1, Bound())", 'range(stop=Bound())'):
+            source = ("code = 'fixed'\nclass Bound:\n"
+                      '    def __index__(self):\n        return 1\n'
+                      '    def __del__(self):\n        global code\n        code = input()\n'
+                      f'try:\n    {expression}\nexcept TypeError:\n    eval(code)\n')
+            with self.subTest(expression=expression):
+                self.range_witness(source, ['RANGE_SOURCE'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_range_scalar_helpers_keep_owned_finalizer_effects(self):
+        for value, tail in (
+            ('1', 'list(index for index in range(endpoint()))\neval(code)\n'),
+            ("'invalid'", 'try:\n    range(endpoint())\nexcept TypeError:\n    eval(code)\n'),
+        ):
+            source = ("code = 'fixed'\nclass Release:\n"
+                      '    def __del__(self):\n        global code\n        code = input()\n'
+                      'def endpoint():\n    owned = Release()\n'
+                      f'    return {value}\n' + tail)
+            with self.subTest(value=value):
+                self.range_witness(source, ['RANGE_SOURCE'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_range_callable_factories_keep_owned_finalizer_effects(self):
+        for expression in ('factory()(1)', 'make(1)'):
+            source = ("code = 'fixed'\nclass Release:\n"
+                      '    def __del__(self):\n        global code\n        code = input()\n'
+                      'def factory():\n    owned = Release()\n    return range\n')
+            if expression == 'make(1)':
+                source += 'make = factory()\n'
+            source += f'list(index for index in {expression})\neval(code)\n'
+            with self.subTest(expression=expression):
+                self.range_witness(source, ['RANGE_SOURCE'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_range_for_loop_preserves_exact_order_and_empty_target(self):
+        for expression, selected, unsafe in (
+            ('range(3)', 0, False), ('range(3)', 2, True),
+            ('range(3, 0, -1)', 3, False), ('range(3, 0, -1)', 1, True),
+        ):
+            source = ("code = 'fixed'\n"
+                      f'for index in {expression}:\n'
+                      f"    code = input() if index == {selected} else 'fixed'\n"
+                      'eval(code)\n')
+            with self.subTest(expression=expression, selected=selected):
+                self.check_range('for-order', source, [4] if unsafe else [],
+                                 ['RANGE_SOURCE' if unsafe else 'fixed'])
+        self.check_range('for-empty-target',
+                         "index = input()\nfor index in range(0):\n    pass\neval(index)\n",
+                         [4], ['RANGE_SOURCE'])
+
+    def test_range_for_loop_break_continue_and_else_completions(self):
+        for label, source, unsafe in (
+            ('break-skips-else',
+             "code = input()\nfor index in range(3):\n"
+             "    if index == 1:\n        break\n    code = 'fixed'\n"
+             'else:\n    code = input()\neval(code)\n', False),
+            ('break-retains-write',
+             "code = 'fixed'\nfor index in range(3):\n"
+             '    if index == 1:\n        code = input()\n        break\n'
+             "    code = 'fixed'\nelse:\n    code = 'fixed'\neval(code)\n", True),
+            ('continue-retains-write',
+             "code = 'fixed'\nfor index in range(3):\n"
+             '    if index == 2:\n        code = input()\n        continue\n'
+             "    code = 'fixed'\nelse:\n    pass\neval(code)\n", True),
+            ('else-overwrites-final-write',
+             "code = 'fixed'\nfor index in range(3):\n    code = input()\n"
+             "else:\n    code = 'fixed'\neval(code)\n", False),
+            ('empty-runs-else',
+             "code = 'fixed'\nfor index in range(0):\n    code = 'fixed'\n"
+             'else:\n    code = input()\neval(code)\n', True),
+        ):
+            with self.subTest(label=label):
+                self.check_range(label, source, [len(source.splitlines())] if unsafe else [],
+                                 ['RANGE_SOURCE' if unsafe else 'fixed'])
+
+    def test_range_for_loop_exception_skips_success_and_later_iterations(self):
+        source = ("code = 'fixed'\ntry:\n    for index in range(3):\n"
+                  '        if index == 1:\n            code = input()\n'
+                  "            raise ValueError()\n        code = 'fixed'\n"
+                  "    code = 'fixed'\nexcept ValueError:\n    eval(code)\n")
+        self.check_range('for-exception', source, [10], ['RANGE_SOURCE'])
+
+    def test_range_for_loop_owned_releases_are_an_explicit_boundary(self):
+        for label, tail in (
+            ('target-overwrite', 'owned = Release()\nfor owned in range(1):\n    pass\neval(code)\n'),
+            ('body-overwrite', "owned = Release()\nfor index in range(1):\n"
+             "    code = 'fixed'\n    owned = None\neval(code)\n"),
+            ('else-overwrite', "owned = Release()\nfor index in range(1):\n"
+             "    code = 'fixed'\nelse:\n    owned = None\neval(code)\n"),
+        ):
+            source = ("code = 'fixed'\nclass Release:\n"
+                      '    def __del__(self):\n        global code\n        code = input()\n' + tail)
+            with self.subTest(label=label):
+                self.range_witness(source, ['RANGE_SOURCE'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_range_for_loop_non_name_target_is_an_explicit_boundary(self):
+        source = ("code = input()\ntry:\n    for left, right in range(1):\n"
+                  "        code = 'fixed'\nexcept TypeError:\n    eval(code)\n")
+        self.range_witness(source, ['RANGE_SOURCE'])
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            self.scan(source)
+
+    def test_range_eval_before_or_on_backedge_keeps_native_identity_unproved(self):
+        for label, source in (
+            ('eval-before', "eval(input())\ncode = 'fixed'\n"
+             'list((code := input()) for index in range(1))\neval(code)\n'),
+            ('loop-backedge', "code = 'fixed'\nfor unused in [0, 1]:\n"
+             '    list((code := input()) for index in range(1))\n    eval(code)\n'),
+            ('try-finally-backedge', "code = 'fixed'\nfor unused in [0, 1]:\n"
+             '    try:\n        list((code := input()) for index in range(1))\n'
+             '    finally:\n        eval(code)\n'),
+            ('repeated-helper', "def step():\n    code = 'fixed'\n"
+             '    list((code := input()) for index in range(1))\n    eval(code)\nstep()\nstep()\n'),
+        ):
+            with self.subTest(label=label):
+                self.range_witness(source, ['RANGE_SOURCE', 'RANGE_SOURCE'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_range_simple_eval_alias_calls_after_construction_are_exact(self):
+        for expression, unsafe in (('range(1)', True), ('range(0)', False)):
+            source = ("execute = eval\ncode = 'fixed'\n"
+                      f'list((code := input()) for index in {expression})\nexecute(code)\n')
+            with self.subTest(expression=expression):
+                self.check_range('eval-alias-after', source, [4] if unsafe else [],
+                                 ['RANGE_SOURCE' if unsafe else 'fixed'])
+        self.check_range('eval-alias-two-later-calls',
+                         "execute = eval\ncode = 'fixed'\n"
+                         'list((code := input()) for index in range(1))\nexecute(code)\nexecute(code)\n',
+                         [4, 5], ['RANGE_SOURCE', 'RANGE_SOURCE'])
+        self.check_range('eval-alias-bound-after-range',
+                         "code = 'fixed'\nlist((code := input()) for index in range(1))\n"
+                         'execute = eval\nexecute(code)\n', [4], ['RANGE_SOURCE'])
+
+    def test_range_eval_alias_before_or_on_backedge_is_incomplete(self):
+        for label, source, observed in (
+            ('before', "execute = eval\nexecute(input())\ncode = 'fixed'\n"
+             'list((code := input()) for index in range(1))\nexecute(code)\n',
+             ['RANGE_SOURCE', 'RANGE_SOURCE']),
+            ('before-saved-for', "execute = eval\nvalues = range(1)\nexecute(input())\n"
+             "code = 'fixed'\nfor index in values:\n    code = input()\nexecute(code)\n",
+             ['RANGE_SOURCE', 'RANGE_SOURCE']),
+            ('backedge', "execute = eval\ncode = 'fixed'\nfor unused in [0, 1]:\n"
+             '    list((code := input()) for index in range(1))\n    execute(code)\n',
+             ['RANGE_SOURCE', 'RANGE_SOURCE']),
+            ('finally-backedge', "execute = eval\ncode = 'fixed'\nfor unused in [0, 1]:\n"
+             '    try:\n        list((code := input()) for index in range(1))\n'
+             '    finally:\n        execute(code)\n', ['RANGE_SOURCE', 'RANGE_SOURCE']),
+            ('range-argument', "execute = eval\ncode = 'fixed'\n"
+             'try:\n    range(execute(input()))\nexcept TypeError:\n    eval(code)\n',
+             ['RANGE_SOURCE', 'fixed']),
+        ):
+            with self.subTest(label=label):
+                self.range_witness(source, observed)
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_range_eval_alias_escape_rebinding_and_capture_are_incomplete(self):
+        for label, declaration, sink in (
+            ('rebound', 'execute = lambda value: None\n', 'eval(code)\n'),
+            ('second-alias', 'other = execute\n', 'other(code)\n'),
+            ('container-escape', 'saved = [execute]\n', 'saved[0](code)\n'),
+            ('argument-escape', 'def retain(callback):\n    return callback\nother = retain(execute)\n',
+             'other(code)\n'),
+            ('function-capture', 'def run(value):\n    execute(value)\n', 'run(code)\n'),
+            ('default-capture', 'def run(value, callback=execute):\n    callback(value)\n', 'run(code)\n'),
+            ('external-rebinding', 'def replace():\n    global execute\n    execute = lambda value: None\n',
+             'execute(code)\n'),
+        ):
+            source = ('execute = eval\n' + declaration + "code = 'fixed'\n"
+                      'list((code := input()) for index in range(1))\n' + sink)
+            with self.subTest(label=label):
+                self.range_witness(source, ['RANGE_SOURCE'])
+                with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+                    self.scan(source)
+
+    def test_range_eval_descriptor_read_is_not_an_inert_alias_assignment(self):
+        source = ("code = 'fixed'\nclass Provider:\n    @property\n"
+                  '    def eval(self):\n        global code\n        code = input()\n'
+                  "        return lambda value: None\nexecute = Provider().eval\n"
+                  "list(index for index in range(0))\nexecute('unused')\neval(code)\n")
+        self.range_witness(source, ['RANGE_SOURCE'])
+        with self.assertRaisesRegex(taint_py.AnalysisLimit, 'incomplete'):
+            self.scan(source)
+
+
+@unittest.skipUnless(os.environ.get('UBS_TAINT_E2E') == '1',
+                     'set UBS_TAINT_E2E=1 for real native-range module/runner checks')
+class NativeRangePublicTests(unittest.TestCase):
+    def test_native_range_module_runner_json_sarif_selection_and_suppression(self):
+        artifacts = ROOT / 'test-suite/artifacts/python-native-range-public'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        scratch = Path(tempfile.mkdtemp(prefix='formats-', dir=artifacts))
+        for label, source, expected in (
+            ('unsafe', "execute = eval\ncode = 'fixed'\n"
+             'list((code := input()) for index in range(1))\nexecute(code)\n', [4]),
+            ('empty', "execute = eval\ncode = 'fixed'\n"
+             'list((code := input()) for index in range(0))\nexecute(code)\n', []),
+            ('suppressed', "execute = eval\ncode = 'fixed'\n"
+             'list((code := input()) for index in range(1))\n'
+             'execute(code)  # ubs:ignore[python.taint.eval]\n', []),
+        ):
+            project = scratch / label
+            project.mkdir()
+            target = project / 'view.py'
+            target.write_text(source, encoding='utf-8')
+            (project / 'unselected.py').write_text('eval(input())\n', encoding='utf-8')
+            for meta in (False, True):
+                for output in ('json', 'sarif'):
+                    with self.subTest(case=label, meta=meta, output=output):
+                        executable = ROOT / ('ubs' if meta else 'modules/ubs-python.sh')
+                        command = [str(executable), str(target), '--ci', '--no-color', f'--format={output}']
+                        if meta:
+                            command.append('--only=python')
+                        result = subprocess.run(command, cwd=project, capture_output=True, text=True,
+                            timeout=180, env=dict(os.environ, UBS_KEEP_TEMP='1', UBS_NO_AUTO_UPDATE='1',
+                                                 UBS_NO_CACHE='1'))
+                        prefix = project / f'{meta}-{output}'
+                        prefix.with_suffix('.stdout').write_text(result.stdout, encoding='utf-8')
+                        prefix.with_suffix('.stderr').write_text(result.stderr, encoding='utf-8')
+                        context = (command, result.returncode, result.stdout, result.stderr)
+                        self.assertEqual(result.returncode, 1 if expected else 0, context)
+                        report = json.loads(result.stdout)
+                        if output == 'json':
+                            self.assertEqual(report['status'], 'ok', context)
+                            key = 'rule_id' if meta else 'rule'
+                            rows = [row for row in report.get('findings', [])
+                                    if row[key] == 'python.taint.eval']
+                            sites = ([row['line'] for row in rows] if meta else
+                                     [sample['line'] for row in rows for sample in row['samples']])
+                            self.assertEqual((report['totals'] if meta else report)['files'], 1, context)
+                            self.assertEqual((report['totals'] if meta else report)['critical'], len(expected), context)
+                            for row in rows:
+                                self.assertEqual(row['severity'], 'critical', context)
+                            if not meta:
+                                self.assertEqual(sum(row['count'] for row in rows), len(expected), context)
+                        else:
+                            self.assertEqual(report['version'], '2.1.0', context)
+                            rows = [row for run in report['runs'] for row in run.get('results', [])
+                                    if row['ruleId'] == 'python.taint.eval']
+                            sites = [row['locations'][0]['physicalLocation']['region']['startLine'] for row in rows]
+                            for row in rows:
+                                self.assertEqual(row['level'], 'error', context)
+                            self.assertFalse(any(invocation.get('executionSuccessful') is False
+                                for run in report['runs'] for invocation in run.get('invocations', [])), context)
+                        self.assertEqual(sites, expected, context)
 
 
 if __name__ == '__main__':

@@ -6907,6 +6907,10 @@ class SQLInjectionAnalyzer(ast.NodeVisitor):
             self.step()
             if bindings.unresolved_sql_aliases(call):
                 return None
+            if not (call.args or call.keywords):
+                # A terminal request.execute() has no SQL argument. Calls
+                # in its receiver have their own entries in this inventory.
+                continue
             short = sql_sink_name(call, bindings)
             if not short:
                 continue
@@ -8765,7 +8769,11 @@ def _find_file(path: Path, *, max_steps=None) -> Iterable[tuple[str, Path, int, 
     steps = max_steps if max_steps is not None else min(1_000_000, max(100_000, 2 * len(nodes)))
     budget = [steps]
     bindings = SanitizerBindings(tree, configured_sanitizer_targets(), budget)
-    if (not any(sql_sink_name(call, bindings) or bindings.unresolved_sql_aliases(call)
+    # GH #231: an argumentless execute() on a request object cannot supply
+    # a statement. A local facade can still construct SQL internally, and
+    # a saved or ambiguous callable can carry it through a captured default.
+    if (not any((call.args or call.keywords) and sql_sink_name(call, bindings)
+                or bindings.unresolved_sql_aliases(call)
                 for call in bindings.calls) and not bindings.sql_facade_flow()[1]
             and not bindings.escaped_sql_methods()):
         return

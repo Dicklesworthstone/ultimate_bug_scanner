@@ -544,10 +544,69 @@ class SQLSinkArguments(unittest.TestCase):
                 self.assertEqual([(finding[0], finding[2]) for finding in findings],
                                  [(CRITICAL, len(unsafe.read_text(encoding='utf-8').splitlines()))])
 
+    def test_preflight_closure_and_zero_argument_execute(self):
+        # GH #231: both stage branches share a reporting closure, and the
+        # remote API's execute() takes no SQL statement.
+        preflight = textwrap.dedent('''\
+            def preflight(stages, telemetry, results, service, config):
+                blocked: list[str] = []
+                def block(stage, reason):
+                    with telemetry.step(stage) as step:
+                        step.fail(reason)
+                    results[stage] = {"success": False}
+                    blocked.append(stage)
+                if "sheets" in stages:
+                    try:
+                        service.spreadsheets().get(spreadsheetId=config.sheet).execute()
+                    except Exception as exc:
+                        block("sheets", str(exc))
+                if "email" in stages:
+                    missing: list[str] = []
+                    if not config.get("sender"):
+                        missing.append("sender")
+                    if missing:
+                        block("email", ", ".join(missing))
+                return blocked
+        ''')
+        namespace = 'def diagnostics():\n    return globals()\n'
+        bound_query = 'def read(db, value):\n    return db.execute("SELECT ?", (value,))\n'
+        for name, sibling, expected_rules in (
+                ('preflight', '', []),
+                ('diagnostics', namespace, []),
+                ('bound', bound_query, []),
+                ('diagnostics-and-bound', namespace + bound_query, []),
+                ('computed', 'def read(db, value):\n    return db.execute(f"SELECT {value}")\n', [CRITICAL])):
+            with self.subTest(case=name):
+                path = self.artifacts / ('gh231-' + name + '.py')
+                source = preflight + '\n' + sibling
+                path.write_text(source, encoding='utf-8')
+                findings = [(rule, line) for rule, _, line, _, _ in detector.find([path])]
+                self.assertEqual(findings, [(rule, len(source.splitlines())) for rule in expected_rules])
+
     def test_core_tests_literal_sql_fits_the_original_budget(self):
         # This real source triggered the failure: fixed SQLite statements in
         # one method caused every unrelated test body to consume SQL flow.
         self.assertEqual(list(detector.find([Path(__file__).with_name('test_ubs_core.py')])), [])
+
+    def test_argumentless_execute_keeps_receiver_and_captured_sql(self):
+        path = self.artifacts / 'gh231-nested-query.py'
+        path.write_text('def read(db, user):\n'
+                        '    return db.execute(f"SELECT {user}").execute()\n', encoding='utf-8')
+        self.assertEqual([(rule, line) for rule, _, line, _, _ in detector.find([path])],
+                         [(CRITICAL, 2)])
+
+        # A local zero-argument wrapper can send a captured SQL string to
+        # an opaque backend. Dropping the wrapper from flow would hide it.
+        facade = ('from backend import dispatch\n'
+                  'def read(user):\n'
+                  '    def execute():\n'
+                  '        return dispatch(f"SELECT {user}")\n'
+                  '    return execute()\n')
+        for suffix in ('', '\ndb.execute("SELECT 1")\n'):
+            with self.subTest(literal_sibling=bool(suffix)):
+                path.write_text(facade + suffix, encoding='utf-8')
+                with self.assertRaisesRegex(detector.SQLFlowLimit, 'facade forwarding'):
+                    list(detector.find([path]))
 
     def test_large_binding_index_omits_only_operator_and_context_tags(self):
         # A non-SQL use of the admitted name still needs the full lexical

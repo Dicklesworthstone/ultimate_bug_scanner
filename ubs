@@ -11376,6 +11376,23 @@ case "$FORMAT" in
           "$TMPDIR_RUN/$L.json" | sed 's/^/  /'
         env_error_excerpt "$L" | sed 's/^/  /' || true
       fi
+      # The normal module summary remains bounded, but when an analyzer
+      # refuses completeness the full per-component evidence is already
+      # available in its JSON report. Let operators expand it on demand
+      # without weakening fail-closed status or truncating the JSON record.
+      if [[ "${UBS_ANALYSIS_COMPONENTS:-}" == "all" ]] && need_cmd jq && \
+         [[ -s "$TMPDIR_RUN/$L.json" ]] && \
+         jq -e 'any(.analysis_errors[]?; (.components // [] | length) > 0)' \
+           "$TMPDIR_RUN/$L.json" >/dev/null 2>&1; then
+        say "Incomplete analysis components (${L}):"
+        jq -r '
+          .analysis_errors[]? | . as $failure | .components[]? |
+          "  " + $failure.stage + ": " + (.file // "<unknown>") +
+          ":" + ((.start_line // "?") | tostring) +
+          "-" + ((.end_line // "?") | tostring) +
+          " " + (.symbol // "<module>") + ": " + (.reason // $failure.message)
+        ' "$TMPDIR_RUN/$L.json" || REPORT_FAILED=1
+      fi
     done
     fi
     if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
